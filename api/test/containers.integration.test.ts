@@ -1,6 +1,6 @@
 // Real Docker + control relay + Rust worker + Chromium. Opt in locally; Docker CI always runs this.
 import { describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,9 @@ describe.skipIf(!image)("real container workspaces", () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const project = dir.split("/").at(-1)!.toLowerCase();
     const fixture = join(dir, "fixture"); await mkdir(fixture);
+    // Only disposable approval signals, never credentials. The browser stays UID 1000,
+    // while the CI host may own this bind source as another UID. chmod bypasses umask.
+    await chmod(fixture, 0o777);
     const fakeGh = join(dir, "gh.cjs");
     await writeFile(fakeGh, await readFile(new URL("./fixtures/gh.cjs", import.meta.url)), { mode: 0o755 });
     const override = join(dir, "compose.test.json");
