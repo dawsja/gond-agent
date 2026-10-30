@@ -19,9 +19,14 @@ export function openStore(data: string) {
     CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT REFERENCES runs(id) ON DELETE CASCADE, media_type TEXT NOT NULL, bytes BLOB NOT NULL, created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS runners (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, enabled INTEGER NOT NULL, next_run_at INTEGER NOT NULL, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS occurrences (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS cli_usage_totals(key TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS cli_usage(event_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,run_id TEXT NOT NULL,model_id TEXT NOT NULL,data TEXT NOT NULL,created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS cli_accounts (user_id TEXT NOT NULL, backend TEXT NOT NULL, credentials TEXT NOT NULL, connected_at INTEGER NOT NULL DEFAULT 0, models TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(user_id,backend));
+    CREATE TABLE IF NOT EXISTS cli_sessions (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, state TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT, model_id TEXT NOT NULL, input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cost_micros INTEGER NOT NULL, created_at INTEGER NOT NULL);
 
   `);
+  if(!(db.pragma("table_info(cli_accounts)") as {name:string}[]).some(c=>c.name==="connected_at"))db.exec("ALTER TABLE cli_accounts ADD COLUMN connected_at INTEGER NOT NULL DEFAULT 0");
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
     db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
@@ -35,9 +40,12 @@ export function openStore(data: string) {
 // Better Auth creates the user table at startup. Install this afterwards so its
 // deletion and our account data cleanup are one atomic SQLite operation.
 export function installAccountCleanup(db: Store) {
-  db.exec(`CREATE TRIGGER IF NOT EXISTS gond_agent_delete_account AFTER DELETE ON "user" BEGIN
+  db.exec(`DROP TRIGGER IF EXISTS gond_agent_delete_account;
+  CREATE TRIGGER gond_agent_delete_account AFTER DELETE ON "user" BEGIN
     DELETE FROM occurrences WHERE EXISTS (SELECT 1 FROM runners r WHERE r.user_id=OLD.id AND occurrences.key GLOB 'schedule:' || r.id || ':*');
     DELETE FROM runners WHERE user_id=OLD.id;
+    DELETE FROM cli_usage WHERE user_id=OLD.id;
+    DELETE FROM cli_accounts WHERE user_id=OLD.id;
     DELETE FROM usage WHERE user_id=OLD.id;
     DELETE FROM images WHERE user_id=OLD.id;
     DELETE FROM runs WHERE user_id=OLD.id;

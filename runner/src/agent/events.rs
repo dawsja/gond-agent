@@ -126,6 +126,8 @@ pub enum AgentInput {
     Mode { mode: Mode },
     #[serde(rename = "model")]
     Model { model: String, context_window: u64 },
+    #[serde(rename = "effort")]
+    Effort { effort: String },
     /// Enable or disable a skill; applies from the next model request.
     #[serde(rename = "skill")]
     Skill { name: String, enabled: bool },

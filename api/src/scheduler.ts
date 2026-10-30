@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Store } from "./db";
 import type { Runs } from "./runs/service";
 import { ApiError } from "./wire";
+import { validateEffort } from "./effort";
 import { resolveModel } from "./models";
 import { validRepo, validBranch } from "./github";
 import { nextRunAt, validTimezone, type Schedule } from "./lib/schedule";
@@ -12,6 +13,7 @@ export function validateRunner(
   repo: string;
   base_branch: string | null;
   model_id: string;
+  effort?: string;
   prompt: string;
   enabled: boolean;
 } {
@@ -63,9 +65,10 @@ export async function saveRunner(
   user: string,
   body: unknown,
   id?: string,
+  resolveSelection?: (user:string,id:string)=>Promise<{capabilities: import("./adapters/types").ModelRow["capabilities"]}>,
 ) {
   const input = validateRunner(body);
-  await resolveModel(db, secret, input.model_id);
+  input.effort = validateEffort(resolveSelection ? await resolveSelection(user,input.model_id) : await resolveModel(db, secret, input.model_id), input.effort);
   const old = id
     ? (db
         .prepare("SELECT data FROM runners WHERE id=? AND user_id=?")
@@ -151,6 +154,7 @@ export class Scheduler {
               repo: r.repo,
               base_branch: r.base_branch ?? undefined,
               model: r.model_id,
+              effort: r.effort,
               prompt: r.prompt,
               source: "runner",
             });

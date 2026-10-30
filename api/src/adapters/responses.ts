@@ -62,7 +62,7 @@ export const responsesAdapter: Adapter = {
     if (req.tools?.length) {
       body.tools = req.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.input_schema, strict: false }));
     }
-    if (model.capabilities.reasoning === "effort") {
+    if (model.capabilities.reasoning === "effort" && req.reasoning?.effort !== "default") {
       const effort = req.reasoning?.effort ?? "medium";
       // "off" is each model's lowest setting: "none" where reasoning can be turned off, "low" where it can't.
       const off = model.capabilities.off === "low" || model.capabilities.off === "none" ? model.capabilities.off : "minimal";

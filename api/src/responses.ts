@@ -1,4 +1,5 @@
 import type { Store } from "./db";
+import { validateEffort } from "./effort";
 import { connectionFor } from "./providers";
 import { resolveModel } from "./models";
 import { adapterFor, callProvider } from "./adapters";
@@ -44,6 +45,7 @@ export async function modelResponse(
   const model = await resolveModel(db, secret, body.model),
     adapter = adapterFor(model),
     abort = new AbortController();
+  if (body.reasoning && model.capabilities.reasoning !== "none") validateEffort(model, body.reasoning.effort);
   req.signal.addEventListener("abort", () => abort.abort(), { once: true });
   // Resolve only images belonging to this run and user.
   for (const message of body.messages)

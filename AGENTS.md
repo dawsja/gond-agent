@@ -49,3 +49,5 @@ Provider settings manage connections, not a required model catalog. Saving name/
 - Verify first-account registration → provider setup → workspace with the real packaged API and SQLite at wide/phone sizes on a non-loopback HTTP origin. UI IDs must use `crypto.getRandomValues`, not secure-context-only `crypto.randomUUID`.
 
 Update this guide, README and protocol when behavior changes.
+
+Subscription backends: administrators manage pinned CLI runtime volumes in Settings; each account owns its own Claude Code/Codex sign-in. These native agent containers may receive only that account's managed subscription credential state in temporary storage outside the checkout. API keys, host credentials and application storage remain excluded. Native CLI sessions use Gond's MCP tools and fingerprint-based `finish_review` gate. Keep model/effort selections and recorded usage available for API and subscription tasks and schedules. Never silently fall back to API billing or infer plan allowance from token totals. Verify real subscription login, inference and token refresh separately from unauthenticated CLI startup tests.

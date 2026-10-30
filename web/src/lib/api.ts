@@ -8,11 +8,13 @@ export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "
 export interface Run {
   id: string
   user_id: string
+  backend?: "claude-code" | "codex"
   user_name?: string | null
   repo: string
   base_branch: string
   branch: string
   model_id: string
+  effort?: string
   title: string
   prompt: string
   status: RunStatus
@@ -50,6 +52,7 @@ export interface Runner {
   repo: string
   base_branch: string | null
   model_id: string
+  effort?: string
   prompt: string
   frequency: "daily" | "weekly"
   /** Monday = 0 … Sunday = 6. Empty for a daily schedule. */
@@ -70,6 +73,8 @@ export interface Model {
   provider: string
   display_name: string
   context_window: number
+  efforts?: string[]
+  backend?: "claude-code" | "codex"
   connection_id?: string
   connection_name?: string
 }

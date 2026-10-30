@@ -1,3 +1,5 @@
+import { NativeSelect } from "@shared/ui/input"
+import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { ChevronRight, ExternalLink, GitPullRequest, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
@@ -31,6 +33,8 @@ export function RunScreen() {
   const del = useDeleteRun()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const send = useSendMessage()
+  const [pickedModel,setPickedModel]=useState("")
+  const [effort,setEffort]=useState<string | null>(null)
   const attach = useImageAttachments()
   const [draft, setDraft] = useState("")
   const t = useMemo(() => buildTranscript(stream.events), [stream.events])
@@ -192,12 +196,11 @@ export function RunScreen() {
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />
           <FollowUpInput
-            // A run keeps its model, so follow-ups have no model picker (the details panel shows it).
             disabled={r.status === "merged" || send.isPending || attach.busy}
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={<AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} className="text-muted-foreground" />}
+            leading={<><NativeSelect className="max-w-[180px] flex-1" aria-label="Follow-up model" value={pickedModel || r.model_id} onChange={e=>{setPickedModel(e.target.value);setEffort("default")}}>{models?.filter(m=>m.id!=="auto"&&m.backend===r.backend).map(m=><option key={m.id} value={m.id}>{m.display_name}</option>)}</NativeSelect><EffortPicker model={models?.find(m=>m.id===(pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort}/><AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} className="text-muted-foreground" /></>}
             placeholder={
               r.status === "merged"
                 ? "This pull request is merged"
@@ -216,7 +219,7 @@ export function RunScreen() {
               if (!p && !images.length) return
               pinned.current = true
               // REST rather than the socket, so a refused follow-up (merged, expired) shows its reason.
-              send.mutate({ id: r.id, arg: { text: p, images } }, { onSuccess: () => { attach.clear(); setDraft("") } })
+              send.mutate({ id: r.id, arg: { text: p, images, model:pickedModel || undefined, effort:effortFor(models?.find(m=>m.id===(pickedModel || r.model_id)),effort ?? r.effort ?? "default") } }, { onSuccess: () => { attach.clear(); setDraft("") } })
             }}
           />
           {(attach.error ?? send.error) && (

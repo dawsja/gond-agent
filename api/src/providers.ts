@@ -9,6 +9,7 @@ const modelSchema = z.object({
   contextWindow: z.number().int().min(1024).max(10_000_000),
   maxOutput: z.number().int().min(256).max(1_000_000),
   reasoning: z.enum(["none", "adaptive", "budget", "effort"]),
+  efforts: z.array(z.enum(["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"])).max(8).optional(),
   images: z.boolean(),
 }).refine(m => m.maxOutput <= m.contextWindow, "Output must fit in the context window.");
 const connectionSchema = z.object({
@@ -65,6 +66,7 @@ export function saveProviderSettings(db: Store, secret: string, input: unknown) 
       throw new ApiError(400, "invalid_provider", "Adaptive and budget thinking require an Anthropic-compatible API.");
     if (c.format === "anthropic" && c.models.some(m => m.reasoning === "effort"))
       throw new ApiError(400, "invalid_provider", "Choose an Anthropic thinking mode for this provider.");
+    if(c.models.some(m => m.reasoning === "budget" && m.efforts?.some(e => !["off","low","medium","high"].includes(e))))throw new ApiError(400,"invalid_provider","Budget thinking supports Off, Low, Medium and High effort.");
     return { ...c, ...resolveCredentials(secret, { ...c, apiKey, clearKey }, old.connections.find(p => p.id === c.id)) };
   });
   const { defaultModel } = parsed.data;

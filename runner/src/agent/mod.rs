@@ -1,4 +1,4 @@
-mod completion;
+pub(crate) mod completion;
 pub mod core;
 pub mod events;
 

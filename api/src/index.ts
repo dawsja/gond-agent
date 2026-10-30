@@ -12,7 +12,7 @@ const cfg = configFromEnv(),
   auth = await createAuthentication(db, cfg),
   pool = new ContainerPool(cfg);
 await pool.recover();
-const runs = new Runs(db, cfg, (id, handler) => pool.start(id, handler));
+const runs = new Runs(db, cfg, (id, handler, volume) => pool.start(id, handler, volume));
 await runs.recover();
 const { app, tickets, githubLogin } = createApp(db, cfg, auth, runs);
 const server = serve({

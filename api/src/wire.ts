@@ -30,7 +30,7 @@ export interface ToolDef {
   input_schema: Record<string, unknown>;
 }
 
-export type Effort = "off" | "low" | "medium" | "high";
+export type Effort = "default" | "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ResponsesRequest {
   model: string;

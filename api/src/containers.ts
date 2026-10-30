@@ -10,12 +10,12 @@ export interface Workspace {
   rpc<T = any>(method: string, args?: Record<string, unknown>): Promise<T>;
   destroy(): Promise<void>;
 }
-export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>) => Promise<Workspace>;
+export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>, runtimeVolume?: string) => Promise<Workspace>;
 const MANAGED = "io.gond-agent.managed=true";
 const MAX_FRAME = 256 * 1024 * 1024;
 
 /** No host paths, credentials, devices, published ports or Docker socket enter a workspace. */
-export function containerArguments(cfg: Config, name: string, instance: string, run: string) {
+export function containerArguments(cfg: Config, name: string, instance: string, run: string, runtimeVolume?: string) {
   return [
     "create", "--name", name, "--interactive", "--init",
     "--label", MANAGED, "--label", `io.gond-agent.instance=${instance}`, "--label", `io.gond-agent.run=${run}`,
@@ -26,6 +26,7 @@ export function containerArguments(cfg: Config, name: string, instance: string, 
     "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=1777",
     "--tmpfs", "/home/gond-agent:rw,nosuid,nodev,size=256m,uid=1000,gid=1000",
     "--mount", `type=volume,source=${name}-work,target=/workspace/repo`,
+    ...(runtimeVolume ? ["--mount", `type=volume,source=${runtimeVolume},target=/opt/gond-runtime,readonly`] : []),
     "--network", `${name}-net`, "--log-driver", "none", cfg.workerImage,
   ];
 }
@@ -71,7 +72,7 @@ export class ContainerPool {
 
   async recover() { await this.cleanup(); }
 
-  async start(id: string, modelHandler: (req: Request) => Promise<Response>): Promise<Workspace> {
+  async start(id: string, modelHandler: (req: Request) => Promise<Response>, runtimeVolume?: string): Promise<Workspace> {
     if (!/^run_[a-f0-9]{24}$/.test(id)) throw new Error("Invalid workspace id");
     if (this.active.has(id)) throw new Error("This workspace is already running");
     if (this.active.size >= this.cfg.maxRuns) throw new Error("All workspace slots are in use");
@@ -159,7 +160,7 @@ export class ContainerPool {
       await this.docker(["image", "inspect", this.cfg.workerImage]);
       await this.docker(["volume", "create", ...labels, `${name}-work`]);
       await this.docker(["network", "create", ...labels, "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", `${name}-net`]);
-      await this.docker(containerArguments(this.cfg, name, instance, id));
+      await this.docker(containerArguments(this.cfg, name, instance, id, runtimeVolume));
       child = spawn(this.cfg.dockerBin, ["start", "--attach", "--interactive", name], { stdio: ["pipe", "pipe", "pipe"] });
       child.stdin.on("error", (error) => fail(error));
       child.on("error", (error) => fail(error));

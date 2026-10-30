@@ -9,6 +9,8 @@ import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnv } from "./github-login";
 import { getSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
+import { validateEffort } from "./effort";
+import { cli } from "./cli-runtime";
 import { ApiError } from "./wire";
 import { clearModelCatalog, loadModelCatalog } from "./models";
 import { deletionPolicy } from "./account";
@@ -130,7 +132,7 @@ export function createApp(
     return c.json({
       user: { ...u, ...photoFor(db, u) },
       admin: c.get("admin"),
-      setup_required: !setupComplete(db),
+      setup_required: !setupComplete(db) && !runs.cliAccounts.models(u.id).length,
       automations: {
         auto_pr: !!p.auto_pr,
       },
@@ -205,7 +207,42 @@ export function createApp(
     c.header("Content-Type", "image/png");
     return c.body(new Uint8Array(row.bytes));
   });
-  app.get("/api/v1/models", async (c) => c.json(await loadModelCatalog(db, cfg.secret, c.req.query("refresh") === "1")));
+  app.get("/api/v1/models", async (c) => c.json(await runs.catalog(c.get("user").id,c.req.query("refresh") === "1")));
+  app.use("/api/v1/cli/*",async(c,next)=>{c.header("Cache-Control","no-store");await next();});
+  app.get("/api/v1/cli/runtimes",c=>c.json({runtimes:runs.runtimes.status()}));
+  app.post("/api/v1/cli/runtimes/:backend",async c=>{
+    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can install coding agents.");
+    return c.json(await runs.runtimes.install(cli(c.req.param("backend"))));
+  });
+  app.post("/api/v1/cli/runtimes/:backend/close",async c=>{
+    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can close instance workspaces.");
+    return c.json(await runs.closeCLIRuntime(cli(c.req.param("backend"))));
+  });
+  app.post("/api/v1/cli/accounts/:backend/close",async c=>c.json(await runs.closeCLIRuntime(cli(c.req.param("backend")),c.get("user").id)));
+  app.delete("/api/v1/cli/runtimes/:backend",async c=>{
+    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can uninstall coding agents.");
+    return c.json(await runs.runtimes.uninstall(cli(c.req.param("backend"))));
+  });
+  app.get("/api/v1/cli/accounts",c=>c.json({accounts:runs.cliAccounts.status(c.get("user").id,c.get("session").token).map(a=>{
+    const latest=db.prepare("SELECT e.data FROM events e JOIN runs r ON r.id=e.run_id WHERE r.user_id=? AND json_extract(r.data,'$.backend')=? AND json_extract(e.data,'$.type')='cli.limits' AND json_extract(e.data,'$.ts')>=? ORDER BY e.seq DESC LIMIT 1").get(c.get("user").id,a.backend,a.connectedAt ?? Date.now()) as {data:string}|undefined;
+    const event=latest?JSON.parse(latest.data):undefined;
+    return {...a,limits:a.connected?event?.limits:undefined,limitsUpdatedAt:a.connected?event?.ts:undefined};
+  })}));
+  app.post("/api/v1/cli/accounts/:backend/login",async c=>{
+    const backend=cli(c.req.param("backend"));
+    if(runs.list(c.get("user").id).some(r=>r.backend===backend&&["queued","working"].includes(r.status)))throw new ApiError(409,"cli_in_use","Stop your subscription runs before reconnecting.");
+    return c.json(await runs.cliAccounts.start(c.get("user").id,c.get("session").token,backend,async()=>{
+      const current=await authentication.current.api.getSession({headers:c.req.raw.headers});
+      return current?.user.id===c.get("user").id && current.session.token===c.get("session").token;
+    }));
+  });
+  app.post("/api/v1/cli/accounts/:backend/code",async c=>c.json(await runs.cliAccounts.code(c.get("user").id,c.get("session").token,cli(c.req.param("backend")),(await c.req.json()).code)));
+  app.delete("/api/v1/cli/accounts/:backend/login",async c=>{await runs.cliAccounts.cancel(c.get("user").id,c.get("session").token,cli(c.req.param("backend")));return c.json({ok:true});});
+  app.delete("/api/v1/cli/accounts/:backend",async c=>{
+    const backend=cli(c.req.param("backend"));
+    if(runs.list(c.get("user").id).some(r=>r.backend===backend && r.phase!=="idle"))throw new ApiError(409,"cli_in_use","Close your subscription workspaces before signing out.");
+    await runs.cliAccounts.logout(c.get("user").id,backend);return c.json({ok:true});
+  });
   app.get("/api/v1/settings/oidc", (c) => {
     if (!c.get("admin"))
       throw new ApiError(
@@ -373,7 +410,14 @@ export function createApp(
       (b.images !== undefined && !Array.isArray(b.images))
     )
       throw new ApiError(400, "invalid_message", "Write a message.");
-    runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images);
+    const run=runs.get(c.req.param("id"),c.get("user").id);
+    if(b.model!==undefined && typeof b.model!=="string")throw new ApiError(400,"invalid_model","Choose an available model.");
+    if(b.effort!==undefined || b.model!==undefined){
+      const selected=await runs.resolveSelection(c.get("user").id,b.model ?? run.model_id);
+      if(selected.backend!==run.backend)throw new ApiError(400,"invalid_backend","Start a new run to change coding agents.");
+      validateEffort(selected,b.effort ?? "default");
+    }
+    runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images, b.effort,b.model);
     return c.json({ ok: true });
   });
   app.post("/api/v1/runs/:id/stop", async (c) => {
@@ -407,11 +451,11 @@ export function createApp(
     c.json({ runners: listRunners(db, c.get("user").id) }),
   );
   app.post("/api/v1/runners", async (c) =>
-    c.json(await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json()), 201),
+    c.json(await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json(), undefined, (user,id)=>runs.resolveSelection(user,id)), 201),
   );
   app.put("/api/v1/runners/:id", async (c) =>
     c.json(
-      await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json(), c.req.param("id")),
+      await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json(), c.req.param("id"), (user,id)=>runs.resolveSelection(user,id)),
     ),
   );
   app.put("/api/v1/runners/:id/enabled", async (c) => {
@@ -427,6 +471,7 @@ export function createApp(
         c.get("user").id,
         { ...row, ...(await c.req.json()) },
         row.id,
+        (user,id)=>runs.resolveSelection(user,id),
       ),
     );
   });
@@ -449,6 +494,7 @@ export function createApp(
       .all(u, from) as any[];
     return c.json({
       period,
+      subscriptions: (db.prepare("SELECT model_id,sum(json_extract(data,'$.input_uncached')) AS input,sum(json_extract(data,'$.output')) AS output,sum(json_extract(data,'$.cache_read')) AS cache_read,sum(json_extract(data,'$.cache_write')) AS cache_write,sum(json_extract(data,'$.reasoning')) AS reasoning FROM cli_usage WHERE user_id=? AND created_at>=? GROUP BY model_id").all(u,from)),
       models: rows,
       total: rows.reduce(
         (t, r) => ({

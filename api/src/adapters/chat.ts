@@ -56,9 +56,9 @@ export const chatAdapter: Adapter = {
     if (req.tools?.length) {
       body.tools = req.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description ?? "", parameters: t.input_schema } }));
     }
-    if (model.capabilities.reasoning === "effort") {
+    if (model.capabilities.reasoning === "effort" && req.reasoning?.effort !== "default") {
       const effort = req.reasoning?.effort ?? "medium";
-      body.reasoning_effort = model.capabilities.levels?.[effort] ?? (effort === "off" ? (model.capabilities.off ?? "low") : effort);
+      body.reasoning_effort = model.capabilities.levels?.[effort as "off" | "low" | "medium" | "high"] ?? (effort === "off" ? (model.capabilities.off ?? "low") : effort);
     }
     return { path: "v1/chat/completions", body };
   },

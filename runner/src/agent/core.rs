@@ -61,7 +61,7 @@ struct Shared {
     mode: Mutex<Mode>,
     rules: Mutex<Vec<Rule>>,
     model: Mutex<(String, u64)>,
-    effort: String,
+    effort: Mutex<String>,
     tools: Vec<Arc<dyn Tool>>,
     reads: ReadSet,
     shells: Shells,
@@ -132,7 +132,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         mode: Mutex::new(cfg.mode),
         rules: Mutex::new(cfg.rules),
         model: Mutex::new((cfg.model.clone(), cfg.context_window)),
-        effort: cfg.effort,
+        effort: Mutex::new(cfg.effort),
         tools: cfg.tools,
         reads: ReadSet::default(),
         shells: Shells::default(),
@@ -168,6 +168,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 AgentInput::PermissionReply { request_id, decision, message } => s.resolve(&request_id, Reply::Permission(decision, message)),
                 AgentInput::QuestionReply { request_id, answer } => s.resolve(&request_id, Reply::Answer(answer)),
                 AgentInput::Interrupt => s.turn_cancel.lock().unwrap().cancel(),
+                AgentInput::Effort { effort } => *s.effort.lock().unwrap() = effort,
                 AgentInput::Mode { mode } => *s.mode.lock().unwrap() = mode,
                 AgentInput::Model { model, context_window } => *s.model.lock().unwrap() = (model, context_window),
                 AgentInput::Compact => {
@@ -248,7 +249,7 @@ async fn summarize(s: &Arc<Shared>, history: &[Message], prompt: &str, id: &str,
         messages,
         tools,
         max_output_tokens: Some(8000),
-        reasoning: Some(Reasoning { effort: "low".into() }),
+        reasoning: Some(Reasoning { effort: "default".into() }),
         metadata: Metadata { session_id: Some(s.session_id.clone()), agent_id: Some(id.into()) },
     };
     let run = Run { id: id.into(), kind: Some(id.into()) };
@@ -372,7 +373,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 messages: history.clone(),
                 tools,
                 max_output_tokens: None,
-                reasoning: Some(Reasoning { effort: s.effort.clone() }),
+                reasoning: Some(Reasoning { effort: s.effort.lock().unwrap().clone() }),
                 metadata: Metadata { session_id: Some(s.session_id.clone()), agent_id: Some(run.id.clone()) },
             };
 

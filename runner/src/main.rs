@@ -10,6 +10,7 @@ mod prompt;
 mod skills;
 mod tools;
 mod transport;
+mod tool_server;
 
 use anyhow::{Context, Result};
 use agent::AgentConfig;
@@ -18,6 +19,8 @@ use permissions::Mode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--tool-server") { return tool_server::serve().await; }
+    if std::env::args().any(|a| a == "--check-review") { return tool_server::check().await; }
     let cwd = std::env::current_dir().context("no working directory")?;
     let api = ApiClient::new(std::env::var("GOND_AGENT_API_URL").context("GOND_AGENT_API_URL is required")?, None);
     let model = std::env::var("GOND_AGENT_MODEL").unwrap_or_else(|_| "auto".into());
@@ -28,7 +31,7 @@ async fn main() -> Result<()> {
     let mut tools = tools::builtin(); tools.extend(extra_tools);
     let cfg = AgentConfig {
         model, context_window, mode: Mode::Allow, rules: vec![], cwd: cwd.clone(),
-        effort: "high".into(), session_id: uuid::Uuid::new_v4().to_string(), history: vec![],
+        effort: std::env::var("GOND_AGENT_EFFORT").unwrap_or_else(|_| "high".into()), session_id: uuid::Uuid::new_v4().to_string(), history: vec![],
         interactive: false, require_review: true, tools, system: format!("{}{}", prompt::main_prompt(&cwd), prompt::AUTONOMOUS),
         sub_system: prompt::sub_prompt(&cwd), skills: skills::discover(&cwd, &[]),
     };

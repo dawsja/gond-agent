@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Store } from "./db";
 import type { ModelRow } from "./adapters/types";
 import { discoverProviderModels, modelId, providerSettings, type ProviderConnection, type ProviderModel } from "./providers";
+import { knownReasoning, supportedEfforts } from "./effort";
 import { ApiError } from "./wire";
 
 interface CatalogEntry {
@@ -28,7 +29,7 @@ export function modelRows(db: Store): ModelRow[] {
     provider: c.format === "anthropic" ? "anthropic" as const : "openai" as const,
     upstream_id: m.id, display_name: `${m.name} · ${c.name}`,
     context_window: m.contextWindow, max_output: m.maxOutput,
-    capabilities: { reasoning: m.reasoning, images: m.images },
+    capabilities: { reasoning: m.reasoning, images: m.images, efforts: m.efforts },
     input_micros: 0, output_micros: 0, cache_read_micros: 0, cache_write_micros: 0,
   })));
 }
@@ -47,7 +48,7 @@ export function publicModels(db: Store) {
     models: [...(auto ? [{ ...auto, id: "auto", provider: "auto" as const, display_name: "Auto" }] : []), ...rows].map(m => ({
       id: m.id, provider: m.provider, display_name: m.display_name,
       connection_id: m.connection_id, connection_name: settings.connections.find(c => c.id === m.connection_id)?.name,
-      context_window: m.context_window, max_output: m.max_output, capabilities: m.capabilities,
+      context_window: m.context_window, max_output: m.max_output, capabilities: m.capabilities, efforts: supportedEfforts(m),
     })),
     connections: settings.connections.map(c => {
       const entry = c.discover ? cached(db, c) : undefined;
@@ -76,7 +77,7 @@ export async function loadModelCatalog(db: Store, secret: string, refresh = fals
         const result = await discoverProviderModels(db, secret, { id: c.id, format: c.format, baseURL: c.baseURL });
         if (result.supported) current.models = result.models.map(m => {
           const contextWindow = m.contextWindow ?? 128000;
-          return { id: m.id, name: m.name, contextWindow, maxOutput: Math.min(m.maxOutput ?? 8192, contextWindow), reasoning: "none", images: m.images ?? false };
+          return { id: m.id, name: m.name, contextWindow, maxOutput: Math.min(m.maxOutput ?? 8192, contextWindow), ...knownReasoning(c.format,m.id), images: m.images ?? false };
         });
         current.status = !result.supported ? "unsupported" : current.models.length ? "ready" : "empty";
         current.message = !result.supported ? c.models.length ? "Model discovery is unsupported. Using manual model overrides." : "Model discovery is unsupported. Add manual model IDs in provider settings." : !current.models.length ? "The provider returned no models." : result.truncated ? "Showing the first 500 models. Other IDs can be added as manual overrides." : undefined;

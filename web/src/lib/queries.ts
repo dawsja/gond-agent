@@ -51,7 +51,7 @@ export const useBranches = (repo: string | null) =>
 export function useCreateRun() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (body: { repo: string; base_branch?: string; model: string; prompt: string; images?: string[] }) =>
+    mutationFn: (body: { repo: string; base_branch?: string; model: string; effort?: string; prompt: string; images?: string[] }) =>
       api<Run>("/v1/runs", { body }),
     onSuccess: (run) => {
       qc.setQueryData(["run", run.id], run)
@@ -79,7 +79,7 @@ export const useCreatePull = () => useRunAction((id) => ({ path: `/v1/runs/${id}
 export const useMergeRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}/merge` }))
 export const useDeleteRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}`, method: "DELETE" }))
 export const useSendMessage = () =>
-  useRunAction<{ text: string; images: string[] }>((id, body) => ({ path: `/v1/runs/${id}/messages`, body }))
+  useRunAction<{ text: string; images: string[]; effort?: string; model?: string }>((id, body) => ({ path: `/v1/runs/${id}/messages`, body }))
 
 /** An image attached to one of a run's messages, as an object URL (fetched with the session token). */
 export const useRunImage = (runId: string, imageId: string) =>
@@ -98,6 +98,7 @@ export interface RunnerInput {
   repo: string
   base_branch?: string
   model_id: string
+  effort?: string
   prompt: string
   frequency: "daily" | "weekly"
   weekdays: number[]

@@ -1,3 +1,4 @@
+import { CLIAgents } from "./cli-agents"
 import { useEffect } from "react"
 import { useLocation } from "react-router"
 import { useSession } from "@/app/auth"
@@ -16,6 +17,7 @@ export function SettingsScreen() {
     <h1 className="mb-5 text-3xl font-semibold">Settings</h1>
     <Section title="Account" description="Your account on this Gond Agent server."><ProfilePhoto /><Row label="Name">{me?.user?.name ?? "—"}</Row><Row label="Email">{me?.user?.email ?? "—"}</Row><Row label="Instance">Self-hosted</Row><div className="border-t border-border p-5"><button onClick={() => void session.signOut()} className="text-sm text-link">Sign out</button></div></Section>
     {me?.admin && <><div id="providers"><ProviderSettings /></div><div id="oidc"><OIDCSettings /></div></>}
+    <div id="subscription-agents"><CLIAgents /></div>
     <div id="sessions"><SessionsSection /></div>
     <Section title="Storage" description="Account data, run history, images and usage are stored on this server. Each run works in a dedicated container. Idle containers and their workspace volumes are removed after the configured timeout; pushed work stays on GitHub." />
     <div id="delete"><DeleteAccount /></div>

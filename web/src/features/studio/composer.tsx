@@ -1,3 +1,4 @@
+import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { Check, ChevronDown, GitBranch, Lock, Search } from "lucide-react"
 import { Popover } from "radix-ui"
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
@@ -138,6 +139,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
 
   const [picked, setRepo] = useState<string | null>(() => prefs.get("repo"))
   const [base, setBase] = useState<string | null>(null)
+  const [effort, setEffort] = useState("default")
   const [model, setModel] = useState<string | null>(() => prefs.get("model"))
 
   // The picked repo if this workspace can see it, else the most recently pushed one. Without the
@@ -174,7 +176,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
   const submit = (text: string) => {
     if (!repo || !modelId || !text.trim() || attach.busy) return
     create.mutate(
-      { repo, base_branch: target ?? undefined, model: modelId, prompt: text, images: attach.images() },
+      { repo, base_branch: target ?? undefined, model: modelId, effort: effortFor(modelInfo, effort), prompt: text, images: attach.images() },
       {
         onSuccess: (run) => {
           attach.clear()
@@ -258,6 +260,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
         disabled={needsGithub || !repo || !modelInfo}
         onSubmit={submit}
         footer={<>
+          <EffortPicker model={modelInfo} value={effort} onChange={setEffort} />
           <AttachButton onClick={attach.pick} count={attach.items.length} disabled={needsGithub || !repo} />
             <PickerPopover
               name="model"

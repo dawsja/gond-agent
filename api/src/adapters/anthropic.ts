@@ -85,15 +85,15 @@ export const anthropic: Adapter = {
 
     const effort = req.reasoning?.effort ?? "medium";
     const caps = model.capabilities;
-    if (caps.reasoning === "adaptive") {
+    if (caps.reasoning === "adaptive" && effort !== "default") {
       if (effort === "off" && caps.off === "between_tools") {
         body.thinking = { type: "between_tools" };
       } else {
         body.thinking = { type: "adaptive", display: "summarized" };
         body.output_config = { effort: effort === "off" ? "low" : effort };
       }
-    } else if (caps.reasoning === "budget" && effort !== "off") {
-      const budget = Math.min(BUDGET[effort], (body.max_tokens as number) - 1024);
+    } else if (caps.reasoning === "budget" && effort !== "off" && effort !== "default") {
+      const budget = Math.min(BUDGET[effort as keyof typeof BUDGET], (body.max_tokens as number) - 1024);
       if (budget >= 1024) body.thinking = { type: "enabled", budget_tokens: budget };
     }
 

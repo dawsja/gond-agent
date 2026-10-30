@@ -1,6 +1,7 @@
 import type { Provider, ResponsesRequest, StopReason, StreamEvent, Usage } from "../wire";
 
 interface Capabilities {
+  efforts?: string[];
   /** adaptive: Anthropic adaptive thinking + effort. budget: Anthropic budget_tokens. effort: a reasoning effort (OpenAI, Chat Completions models). */
   reasoning?: "adaptive" | "budget" | "effort" | "none";
   /** How to honor effort "off" when thinking can't simply be disabled. */

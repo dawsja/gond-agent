@@ -83,6 +83,7 @@ beforeEach(async () => {
             agent_id: "main",
             stop_reason: "interrupted",
           });
+        else if (input.type !== "user") return true as any;
         else if (workerFailure)
           events.push(
             { type: "turn.start", agent_id: "main" },
@@ -258,7 +259,7 @@ describe("persistent local run lifecycle", () => {
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     runs.enqueue(r.id, "u", "Add a test");
     await vi.waitFor(() =>
-      expect(log.filter((x) => x.method === "send")).toHaveLength(2),
+      expect(log.filter((x) => x.method === "send" && (x.input as {type?:string}|undefined)?.type === "user")).toHaveLength(2),
     );
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(log.filter((x) => x.method === "start")).toHaveLength(1);

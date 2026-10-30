@@ -25,6 +25,11 @@ import {
   totals,
   type Summary,
 } from "./fold";
+import { recordCLIUsage } from "../cli-usage";
+import { CLIRuntimes, type CLI } from "../cli-runtime";
+import { CLIAccounts, type CLIState } from "../cli-accounts";
+import { seal, unseal } from "../auth";
+import { validateEffort } from "../effort";
 import { ApiError } from "../wire";
 
 export interface Run {
@@ -34,6 +39,10 @@ export interface Run {
   base_branch: string;
   branch: string;
   model_id: string;
+  effort?: string;
+  backend?: CLI;
+  runtime_volume?: string;
+  runtime_version?: string;
   title: string;
   prompt: string;
   status: string;
@@ -57,7 +66,7 @@ export interface Run {
   pushed: boolean;
   diff: string;
   summary: Summary;
-  pending: { text: string; images: string[] }[];
+  pending: { text: string; images: string[]; effort?:string; model?:string }[];
   base_sha: string | null;
   idle_since: number;
   auto_pr: boolean;
@@ -72,6 +81,9 @@ interface Live {
 }
 export class Runs {
   events = new EventEmitter();
+  readonly runtimes: CLIRuntimes;
+  readonly cliAccounts: CLIAccounts;
+  private cliLeases = new Map<string,string>();
   private live = new Map<string, Live>();
   private booting = new Set<string>();
   private launches = new Map<string, Promise<void>>();
@@ -81,7 +93,26 @@ export class Runs {
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
-  ) {}
+  ) { this.runtimes = new CLIRuntimes(db,cfg); this.cliAccounts = new CLIAccounts(db,cfg.secret,workspaceFactory,this.runtimes); }
+  async catalog(user: string, refresh = false) {
+    const catalog = await loadModelCatalog(this.db,this.cfg.secret,refresh);
+    await Promise.all((["claude-code","codex"] as CLI[]).map(backend=>this.cliAccounts.refresh(user,backend,refresh)));
+    const own = this.cliAccounts.models(user).map(m => ({id:`cli-${m.backend}:${encodeURIComponent(m.id)}`,provider:m.backend === "codex" ? "openai" : "anthropic",display_name:`${m.name} · ${m.backend === "codex" ? "Codex" : "Claude Code"}`,connection_id:`cli-${m.backend}`,connection_name:m.backend === "codex" ? "Codex subscription" : "Claude subscription",context_window:200000,max_output:8192,capabilities:{images:true,reasoning:"effort" as const},efforts:m.efforts,backend:m.backend}));
+    return {...catalog,models:[...catalog.models,...own]};
+  }
+  async resolveSelection(user:string,id:string) {
+    if(!id.startsWith("cli-"))return {...await resolveModel(this.db,this.cfg.secret,id),backend:undefined};
+    const model=this.cliAccounts.models(user).find(m=>`cli-${m.backend}:${encodeURIComponent(m.id)}`===id);
+    if(!model)throw new ApiError(404,"unknown_model","Sign in and choose an available subscription model in Settings.");
+    return {id,upstream_id:model.id,backend:model.backend,capabilities:{reasoning:"effort" as const,images:true,efforts:model.efforts}};
+  }
+  private async captureCLI(r:Run,workspace:Workspace) {
+    if(!r.backend)return;
+    const state=await workspace.rpc<CLIState>("cli_state");
+    this.db.prepare("UPDATE cli_accounts SET credentials=? WHERE user_id=? AND backend=?").run(seal(this.cfg.secret,JSON.stringify(state.credentials)),r.user_id,r.backend);
+    this.db.prepare("INSERT INTO cli_sessions(run_id,state) VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET state=excluded.state").run(r.id,seal(this.cfg.secret,JSON.stringify({...state,credentials:{}})));
+  }
+  private releaseCLI(r:Run){if(r.backend && this.cliLeases.get(`${r.user_id}:${r.backend}`)===r.id)this.cliLeases.delete(`${r.user_id}:${r.backend}`);}
   assertAccount(user: string) {
     if (this.deletingAccounts.has(user)) throw new ApiError(409, "account_deleting", "Your account is being deleted.");
     if (!this.db.prepare('SELECT 1 FROM "user" WHERE id=?').get(user)) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
@@ -94,6 +125,7 @@ export class Runs {
         const rows = this.db.prepare("SELECT id,status FROM runs WHERE user_id=?").all(user) as { id: string; status: string }[];
         if (rows.some(r => ["queued", "working"].includes(r.status) || this.booting.has(r.id) || this.launches.has(r.id) || this.live.get(r.id)?.busy))
           throw new ApiError(409, "active_runs", "Stop your active runs and wait for them to finish before deleting your account.");
+        await this.cliAccounts.remove(user);
         for (const row of rows) {
           const live = this.live.get(row.id);
           try { await this.close(row.id); }
@@ -174,6 +206,7 @@ export class Runs {
     this.append(r.id, { type: "run.status", status, step, error });
   }
   async recover() {
+    await this.runtimes.recover();
     for (const row of this.db
       .prepare("SELECT data FROM runs WHERE status IN ('queued','working')")
       .all() as { data: string }[]) {
@@ -194,6 +227,7 @@ export class Runs {
       repo: string;
       base_branch?: string;
       model: string;
+      effort?: string;
       prompt: string;
       images?: string[];
       source?: string;
@@ -210,7 +244,7 @@ export class Runs {
         "invalid_request",
         "Choose a repository and describe the task.",
       );
-    const selectedModel = await resolveModel(this.db, this.cfg.secret, input.model);
+    const selectedModel = await this.resolveSelection(user,input.model);
     if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
       throw new ApiError(
         429,
@@ -237,6 +271,8 @@ export class Runs {
       base_branch: base,
       branch: `gond-agent/${slug(title)}-${id.slice(-6)}`,
       model_id: selectedModel.id,
+      ...(selectedModel.backend ? {backend:selectedModel.backend,runtime_volume:this.runtimes.get(selectedModel.backend)!.volume,runtime_version:this.runtimes.get(selectedModel.backend)!.version} : {}),
+      effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
       status: "queued",
@@ -311,6 +347,8 @@ export class Runs {
     user: string,
     text: string,
     images: string[] = [],
+    effort?:string,
+    model?:string,
   ) {
     this.assertAccount(user);
     const r = this.get(id, user);
@@ -337,7 +375,10 @@ export class Runs {
           .run(id, image, user);
     }
     if (!this.live.has(id) && r.status === "stopped") r.status = "queued";
-    r.pending.push({ text, images });
+    if(effort !== undefined){
+      if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
+    }
+    r.pending.push({ text, images, effort, model });
     this.save(r);
     this.append(id, {
       type: "user",
@@ -383,6 +424,7 @@ export class Runs {
         new URL(req.url).pathname === "/v1/models"
           ? loadModelCatalog(this.db, this.cfg.secret).then(catalog => Response.json(catalog))
           : modelResponse(this.db, this.cfg.secret, r.user_id, id, req),
+        r.runtime_volume,
       );
       r = this.get(id);
       if (this.shuttingDown || r.status === "stopped") {
@@ -395,7 +437,12 @@ export class Runs {
       r = this.get(id);
       if (this.shuttingDown || r.status === "stopped") return await workspace.destroy();
       this.status(r, "working", "Starting the agent");
-      await workspace.rpc("start", { model: r.model_id });
+      if(r.backend){
+        const saved=this.db.prepare("SELECT state FROM cli_sessions WHERE run_id=?").get(id) as {state:string}|undefined;
+        const state=saved?JSON.parse(unseal(this.cfg.secret,saved.state)):{};
+        await workspace.rpc("cli_prepare",{state:{...state,credentials:this.cliAccounts.credentials(r.user_id,r.backend)},config:{backend:r.backend,model:decodeURIComponent(r.model_id.split(":").slice(1).join(":")),effort:r.effort ?? "default"}});
+      }
+      if(!r.backend)await workspace.rpc("start", { model: r.model_id, effort: r.effort ?? "high" });
       if (this.shuttingDown) return await workspace.destroy();
       const live: Live = {
         workspace,
@@ -424,18 +471,48 @@ export class Runs {
   }
   private async next(id: string, live: Live) {
     const r = this.get(id);
-    const message = r.pending.shift();
-    if (!message || live.closed) return;
+    if(!r.pending.length || live.closed)return;
+    const message=r.pending[0];
+    if(message.model || message.effort !== undefined){
+      const selected=await this.resolveSelection(r.user_id,message.model ?? r.model_id);
+      if(selected.backend!==r.backend)throw new ApiError(400,"invalid_backend","Start a new run to change coding agents.");
+      r.model_id=selected.id;r.effort=validateEffort(selected,message.effort ?? "default");this.save(r);
+    }
+    if(r.backend){
+      const key=`${r.user_id}:${r.backend}`;
+      if(this.cliAccounts.busy(r.user_id,r.backend) || this.cliLeases.has(key) && this.cliLeases.get(key)!==id){this.status(r,"queued","Waiting for your subscription agent");return;}
+      this.cliLeases.set(key,id);
+      const state=await live.workspace.rpc<CLIState>("cli_state");
+      await live.workspace.rpc("cli_stop");
+      await live.workspace.rpc("cli_prepare",{state:{...state,credentials:this.cliAccounts.credentials(r.user_id,r.backend)},config:{backend:r.backend,model:decodeURIComponent(r.model_id.split(":").slice(1).join(":")),effort:r.effort??"default"}});
+      await live.workspace.rpc("start",{backend:r.backend,model:r.model_id,effort:r.effort??"default"});
+    }
+    r.pending.shift();
+    if (live.closed) return;
     r.summary = emptySummary();
     r.phase = "agent";
     this.status(r, "working", "Thinking");
+    if(message.effort !== undefined){
+      const selected=await this.resolveSelection(r.user_id,r.model_id);
+      r.effort=validateEffort(selected,message.effort);this.save(r);
+    }
     live.busy = true;
     live.turnAt = Date.now();
+    if(!r.backend){
+      const selected=await resolveModel(this.db,this.cfg.secret,r.model_id);
+      await live.workspace.rpc("send",{input:{type:"model",model:r.model_id,context_window:selected.context_window}});
+      await live.workspace.rpc("send", {input:{type:"effort",effort:r.effort ?? "high"}});
+    }
     await live.workspace.rpc("send", {
       input: {
         type: "user",
         text: message.text,
-        images: message.images.map((id) => ({ id })),
+        effort: message.effort ?? r.effort ?? "high",
+        images: message.images.map((id) => {
+          if(!r.backend)return {id};
+          const image=this.db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND run_id=? AND user_id=?").get(id,r.id,r.user_id) as {media_type:string;bytes:Buffer};
+          return {media_type:image.media_type,data:image.bytes.toString("base64")};
+        }),
       },
     });
   }
@@ -448,6 +525,13 @@ export class Runs {
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
+        if(event.type === "cli.usage"){
+          const owner=this.get(id);
+          const u=recordCLIUsage(this.db,owner.user_id,id,{...event,model:`cli-${owner.backend}:${encodeURIComponent(event.model)}`} as any);
+          if(u)this.append(id,{type:"usage",input:u.input_uncached,output:u.output,cache_read:u.cache_read,context_used:0,context_window:200000});
+          continue;
+        }
+        if(event.type === "cli.catalog" || event.type === "cli.account")continue;
         this.append(id, event);
         const r = this.get(id);
         r.summary = fold(r.summary, event as any);
@@ -458,11 +542,13 @@ export class Runs {
         });
         this.save(r);
         if (event.type === "error" && event.agent_id === "main") {
+          await this.captureCLI(r,live.workspace);this.releaseCLI(r);
           live.busy = false;
           r.idle_since = Date.now();
           this.status(r, "failed", null, String(event.message));
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
+          await this.captureCLI(r,live.workspace);this.releaseCLI(r);
           if (event.stop_reason === "error") continue;
           if (event.stop_reason === "interrupted") {
             live.busy = false;
@@ -476,7 +562,8 @@ export class Runs {
         }
       }
       const r = this.get(id);
-      if (!batch.alive) throw new Error("The workspace worker exited");
+      if(!live.busy && r.pending.length)await this.next(id,live);
+      if (!batch.alive && live.busy) throw new Error("The workspace worker exited");
       if (live.busy && Date.now() - live.turnAt > this.cfg.turnMs)
         await this.stop(id, r.user_id);
       if (!live.busy && Date.now() - r.idle_since > this.cfg.idleMs) {
@@ -591,7 +678,7 @@ export class Runs {
     r.idle_since = Date.now();
     this.status(r, "stopped");
     const live = this.live.get(id);
-    if (live) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
   }
   async remove(id: string, user: string) {
     this.get(id, user);
@@ -609,6 +696,9 @@ export class Runs {
     if (live) {
       live.closed = true;
       this.live.delete(id);
+      const closingRun=this.get(id);
+      if(closingRun.backend && this.cliLeases.get(`${closingRun.user_id}:${closingRun.backend}`)===id)await this.captureCLI(closingRun,live.workspace).catch(()=>{});
+      this.releaseCLI(this.get(id));
       await live.workspace.destroy();
     }
     try {
@@ -617,8 +707,16 @@ export class Runs {
       this.save(r);
     } catch {}
   }
+  async closeCLIRuntime(backend:CLI,user?:string){
+    const rows=this.db.prepare("SELECT data FROM runs WHERE json_extract(data,'$.backend')=? AND deleted_at IS NULL"+(user?" AND user_id=?":"")).all(...(user?[backend,user]:[backend])) as {data:string}[];
+    const runs=rows.map(r=>JSON.parse(r.data) as Run);
+    if(runs.some(r=>["queued","working"].includes(r.status)||this.live.get(r.id)?.busy||this.booting.has(r.id)))throw new ApiError(409,"cli_in_use","Stop active subscription runs before closing workspaces.");
+    for(const r of runs)await this.close(r.id);
+    return {ok:true};
+  }
   async shutdown() {
     this.shuttingDown = true;
+    await this.cliAccounts.close();
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));
   }

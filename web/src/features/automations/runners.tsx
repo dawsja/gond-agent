@@ -1,3 +1,4 @@
+import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { ChevronDown, Clock, GitBranch, LoaderCircle, Lock, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-react"
 import { useMemo, useState } from "react"
 import { Link } from "react-router"
@@ -70,6 +71,7 @@ function Editor({ runner, onClose }: { runner?: Runner; onClose: () => void }) {
   const [name, setName] = useState(runner?.name ?? "")
   const [repo, setRepo] = useState<string | null>(runner?.repo ?? null)
   const [branch, setBranch] = useState<string | null>(runner?.base_branch ?? null)
+  const [effort, setEffort] = useState(runner?.effort ?? "default")
   const [model, setModel] = useState(runner?.model_id ?? "")
   const [prompt, setPrompt] = useState(runner?.prompt ?? "")
   const [frequency, setFrequency] = useState<Runner["frequency"]>(runner?.frequency ?? "weekly")
@@ -91,6 +93,7 @@ function Editor({ runner, onClose }: { runner?: Runner; onClose: () => void }) {
       repo: repo ?? "",
       base_branch: branch ?? undefined,
       model_id: modelId,
+      effort: effortFor(modelList.find(m => m.id === modelId), effort),
       prompt: prompt.trim(),
       frequency,
       weekdays: frequency === "weekly" ? days : [],
@@ -180,6 +183,7 @@ function Editor({ runner, onClose }: { runner?: Runner; onClose: () => void }) {
           }
         />
         <PickerPopover value={branch} onSelect={setBranch} placeholder="Base branch" allowCustom={(value) => /^[A-Za-z0-9._/-]{1,200}$/.test(value)} items={(branches.data ?? [selectedRepo?.default_branch].filter((item): item is string => !!item)).map((item) => ({ value: item, label: <span style={mono}>{item}</span> }))} trigger={<button type="button" className={chip} disabled={!repo}><GitBranch className="size-3.5 text-muted-foreground" /><span style={mono}>{branch ?? selectedRepo?.default_branch ?? "Default branch"}</span></button>} />
+        <EffortPicker model={modelList.find(m => m.id === modelId)} value={effort} onChange={setEffort} />
         <PickerPopover value={modelId} onSelect={setModel} placeholder="Search models" items={modelList.map((item) => ({ value: item.id, label: <span className="flex items-center gap-2"><ModelMark id={item.id} size={15} />{item.display_name}</span>,  group: PROVIDER_LABEL[providerOf(item.id)] ?? item.provider, search: item.display_name }))} trigger={<button type="button" className={chip}>{modelId && <ModelMark id={modelId} size={15} />}<span className="max-w-40 truncate">{modelList.find((item) => item.id === modelId)?.display_name ?? "Model"}</span></button>} />
       </div>
       <p className="mt-3 text-[13px] text-muted-foreground">{describeRunner({ frequency, weekdays: days, minute })}, your time</p>

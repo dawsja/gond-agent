@@ -26,12 +26,14 @@ RUN node --test /opt/gond-agent-browser/browser.test.cjs
 FROM worker-tools AS worker-image
 COPY --from=worker-build /src/target/release/gond-agent-worker /usr/local/bin/gond-agent-worker
 COPY containers/agent.py /opt/gond-agent/agent.py
+COPY containers/cli.mjs /opt/gond-agent/cli.mjs
 COPY containers/smoke-worker.py /opt/gond-agent/smoke-worker.py
+COPY containers/smoke-native-tools.py /opt/gond-agent/smoke-native-tools.py
 RUN useradd --uid 1000 --gid 1000 --non-unique --home-dir /home/gond-agent --no-create-home --shell /bin/bash gond-agent \
  && mkdir -p /workspace/repo /home/gond-agent && chown -R 1000:1000 /workspace /home/gond-agent
 ENV HOME=/home/gond-agent
 USER 1000:1000
-RUN python3 /opt/gond-agent/smoke-worker.py
+RUN python3 /opt/gond-agent/smoke-worker.py && python3 /opt/gond-agent/smoke-native-tools.py
 WORKDIR /workspace/repo
 ENTRYPOINT ["python3", "-u", "/opt/gond-agent/agent.py"]
 
