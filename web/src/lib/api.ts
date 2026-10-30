@@ -25,10 +25,8 @@ export interface Run {
   pr_number: number | null
   pr_url: string | null
   pr_state: "open" | "closed" | "merged" | null
-  checks: "pending" | "success" | "failure" | null
   error: string | null
-  /** Where it was started; `issue`: from a labeled GitHub issue (Automations). */
-  source?: "web" | "issue" | "runner" | null
+  source?: "web" | "runner" | null
   created_at: number
   started_at: number | null
   finished_at: number | null
@@ -39,13 +37,10 @@ export interface Run {
 
 export interface Me {
   admin?: boolean
-  user: { id: string; email: string | null; name: string | null } | null
+  user: { id: string; email: string | null; name: string | null; image?: string | null; has_photo?: boolean } | null
   setup_required: boolean
-  /**
-   * The Automations page: labeled issues start runs and failing checks go back to the run (both start off);
-   * auto_pr opens the pull request when a turn ends (starts on; off, you create it from the run).
-   */
-  automations?: { issue_runs: boolean; fix_checks: boolean; auto_pr: boolean }
+  /** Open a pull request when a turn ends; otherwise create it from the run. */
+  automations?: { auto_pr: boolean }
 }
 
 /** A saved prompt that starts a fresh run on a schedule (Automations → Gond Agent Runners). */

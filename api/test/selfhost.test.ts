@@ -12,6 +12,7 @@ import { validRepo, validBranch } from "../src/github";
 import { validateRunner } from "../src/scheduler";
 import { GithubLogin } from "../src/github-login";
 import { getSetting } from "../src/db";
+import sharp from "sharp";
 import type { Config } from "../src/config";
 let dir: string,
   db: ReturnType<typeof openStore>,
@@ -77,6 +78,62 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 describe("local authentication and persistence", () => {
+  it("saves sanitized circular photos for the current account and removes them without changing other users", async () => {
+    const owner = await signup(), other = await signup("photo-other@example.test");
+    const input = await sharp({ create: { width: 300, height: 200, channels: 3, background: "#ff0000" } }).withExif({ IFD0: { Artist: "Private photo metadata" } }).jpeg().toBuffer();
+    const upload = (cookie: string, bytes = input, type = "image/jpeg", origin = cfg().origin) => app.request(cfg().origin + "/api/v1/me/photo", { method: "PUT", headers: { cookie, origin, "content-type": type }, body: new Uint8Array(bytes) });
+    expect((await upload("")).status).toBe(401);
+    expect((await upload(owner, input, "image/jpeg", "https://other.test")).status).toBe(403);
+    const saved = await upload(owner); expect(saved.status).toBe(200);
+    const photo = await saved.json(); expect(photo.has_photo).toBe(true);
+    expect(photo.image).toMatch(/^\/api\/v1\/users\/[^/]+\/photo\?v=[a-f0-9]{24}$/);
+    expect((await call(photo.image)).status).toBe(401);
+    const served = await call(photo.image, undefined, other);
+    expect(served.status).toBe(200); expect(served.headers.get("content-type")).toBe("image/png");
+    expect(served.headers.get("cache-control")).toBe("private, no-store");
+    const output = Buffer.from(await served.arrayBuffer()), metadata = await sharp(output).metadata();
+    expect(metadata).toMatchObject({ width: 256, height: 256, format: "png", hasAlpha: true });
+    expect(metadata.exif).toBeUndefined(); expect(metadata.icc).toBeUndefined(); expect(metadata.xmp).toBeUndefined();
+    const pixels = await sharp(output).raw().toBuffer();
+    expect(pixels[3]).toBe(0); expect(pixels[(128 * 256 + 128) * 4 + 3]).toBe(255);
+    expect((await (await call("/api/v1/me", undefined, owner)).json()).user.image).toBe(photo.image);
+    expect((await (await call("/api/v1/me", undefined, other)).json()).user.has_photo).toBe(false);
+    expect((await upload(owner, Buffer.from("not an image"))).status).toBe(400);
+    expect((await upload(owner, Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'), "image/png")).status).toBe(400);
+    expect((await upload(owner, Buffer.alloc(2 * 1024 * 1024 + 1))).status).toBe(400);
+    expect((await (await call("/api/v1/me", undefined, owner)).json()).user.image).toBe(photo.image);
+    expect((await call("/api/v1/me/photo", undefined, other, "DELETE")).status).toBe(200);
+    expect((await call(photo.image, undefined, owner)).status).toBe(200);
+    expect((await call("/api/v1/me/photo", undefined, owner, "DELETE")).status).toBe(200);
+    expect((await call(photo.image, undefined, owner)).status).toBe(404);
+  });
+  it("bounds decoded photos, rotates revisions on replacement and cascades account deletion", async () => {
+    const owner = await signup();
+    const upload = (bytes: Buffer) => app.request(cfg().origin + "/api/v1/me/photo", { method: "PUT", headers: { cookie: owner, origin: cfg().origin, "content-type": "image/png" }, body: new Uint8Array(bytes) });
+    const input = await sharp({ create: { width: 256, height: 256, channels: 3, background: "#2b61b9" } }).png().toBuffer();
+    const first = await (await upload(input)).json();
+    const oversized = await sharp({ create: { width: 4001, height: 4000, channels: 3, background: "#000000" } }).png().toBuffer();
+    expect(oversized.length).toBeLessThan(2 * 1024 * 1024);
+    expect((await upload(oversized)).status).toBe(400);
+    expect((await call(first.image, undefined, owner)).status).toBe(200);
+    const replacement = await upload(input); expect(replacement.status).toBe(200);
+    const second = await replacement.json(); expect(second.image).not.toBe(first.image);
+    expect((await call(first.image, undefined, owner)).status).toBe(404);
+    expect((await call(second.image, undefined, owner)).status).toBe(200);
+    const me = await (await call("/api/v1/me", undefined, owner)).json();
+    db.prepare('DELETE FROM "user" WHERE id=?').run(me.user.id);
+    expect(db.prepare("SELECT 1 FROM profile_photos WHERE user_id=?").get(me.user.id)).toBeUndefined();
+  });
+  it("retires GitHub polling settings but preserves automatic PR preferences for every account", async () => {
+    const owner = await signup(), other = await signup("automation-other@example.test");
+    const me = await (await call("/api/v1/me", undefined, owner)).json();
+    expect(me.automations).toEqual({ auto_pr: true });
+    expect((await call("/api/v1/me/automations", { issue_runs: true }, owner, "PUT")).status).toBe(400);
+    expect((await call("/api/v1/me/automations", { fix_checks: true }, owner, "PUT")).status).toBe(400);
+    const saved = await call("/api/v1/me/automations", { auto_pr: false }, other, "PUT");
+    expect(await saved.json()).toEqual({ automations: { auto_pr: false } });
+    expect((await (await call("/api/v1/me", undefined, owner)).json()).automations.auto_pr).toBe(true);
+  });
   it("protects GitHub device sign-in by administrator, origin and session without exposing credentials", async () => {
     let code!: (code: string) => void, approve!: (token: string) => void;
     const login = new GithubLogin(db, secret, dir, (_root, callback) => {

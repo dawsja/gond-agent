@@ -45,7 +45,7 @@ export function initials(name: string | null | undefined, email?: string | null)
   return ((parts[0]?.[0] ?? "?") + (parts[1]?.[0] ?? "")).toUpperCase()
 }
 
-const AVATAR = ["#e04e0a", "#d98a08"]
+const AVATAR = ["var(--tint-ink)", "var(--info)"]
 
 export function avatarColor(id: string): string {
   let h = 0

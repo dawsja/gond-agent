@@ -1,6 +1,6 @@
 # Gond Agent
 
-Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, GitHub automations and images.
+Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, pull requests, images and profile photos.
 
 ## Run on your server
 
@@ -31,9 +31,11 @@ Open the server root `/` to enter the application at `/agents/`. An empty instan
 
 Only administrators can start or cancel GitHub sign-in. The code is visible only to the initiating signed-in session; it expires after ten minutes. Approve only the code shown in your own workspace. GitHub CLI requests its standard scopes plus workflow access so agents can push workflow changes. Organization SSO or OAuth restrictions may require additional approval on GitHub.
 
-Approved credentials are encrypted in SQLite with `BETTER_AUTH_SECRET`. Temporary private CLI authorization files are removed on completion, cancellation, expiry and startup. GitHub API calls, HTTPS clones and pushes, pull requests and polling use command-scoped credentials; tokens are never returned to browsers, written into repository archives, or forwarded to workers. **Reconnect GitHub** replaces the connection only after approval. To revoke authorization, use GitHub's authorized OAuth app settings. Explicit service-side `GH_TOKEN` or `GH_CONFIG_DIR` credentials remain usable when no browser-managed connection exists; browser-managed credentials take precedence. Default Compose no longer mounts the host's GitHub configuration, so operators using that mount should connect through the app after updating their Compose file.
+Approved credentials are encrypted in SQLite with `BETTER_AUTH_SECRET`. Temporary private CLI authorization files are removed on completion, cancellation, expiry and startup. GitHub API calls, HTTPS clones and pushes, and pull requests use command-scoped credentials; tokens are never returned to browsers, written into repository archives, or forwarded to workers. **Reconnect GitHub** replaces the connection only after approval. To revoke authorization, use GitHub's authorized OAuth app settings. Explicit service-side `GH_TOKEN` or `GH_CONFIG_DIR` credentials remain usable when no browser-managed connection exists; browser-managed credentials take precedence. Default Compose no longer mounts the host's GitHub configuration, so operators using that mount should connect through the app after updating their Compose file.
 
 The account popup at the bottom of the sidebar contains Settings and Sign out; Settings is not a sidebar navigation item. Documentation is not linked from the workspace. Collapsed navigation uses tooltips; hover or focus the logo to expand it.
+
+The workspace uses Gond Code's default dark blue palette. The sidebar shows the logo alone, at the same readable size when expanded or collapsed. In either message composer, **Enter sends** and **Shift+Enter adds a newline**; IME composition does not submit. In **Settings → Account**, upload a PNG, JPEG or WebP profile photo (up to 2 MiB and 16 megapixels), reposition/zoom it in a circular preview and save. Photos appear in the account menu and your messages, survive restarts, and can be changed or removed. The server re-encodes them as metadata-free, circular 256px PNGs in SQLite. Photos require an authenticated session to view and only their owner can replace or remove them.
 
 ### Updates
 
@@ -91,7 +93,7 @@ The repository archive enters the run's private workspace volume over Docker's a
 
 Stop interrupts the current turn. Follow-ups continue in the same container while it is alive. Idle workers and their volumes/networks are destroyed after `RUN_IDLE_MINUTES` (30 by default); a follow-up then starts from the pushed branch. Uncommitted work is lost on shutdown. `RUN_TURN_MINUTES` defaults to 60. A service restart marks interrupted runs failed and removes orphaned Docker resources labeled with this instance's persisted identity, without touching other instances. Run history and diffs persist locally. Merging destroys the workspace. Deleting a run hides it immediately; stored history is purged after 30 days.
 
-Automations supports daily/weekly local-time schedules. The administrator can enable one-minute polling for issues labeled `gond-agent` in `GOND_AGENT_REPOSITORIES`, and retry failing checks on agent pull requests. Occurrence claims prevent duplicate issue/scheduled runs. Check fixes are limited to two consecutive attempts. Model requests go directly to the configured provider. Local usage records have no account limits or feature gates.
+Automations supports daily/weekly local-time schedules and the automatic pull-request preference. Occurrence claims prevent duplicate scheduled runs. GitHub issue/check/PR polling, issue-triggered runs and automatic check retries have been removed; there is no repository-watch environment variable. Existing run history is preserved and obsolete polling preferences are removed on upgrade. Manual pull-request creation/merge remain available; PR changes made outside Gond Agent are no longer synchronized in the background. Model requests go directly to the configured provider. Local usage records have no account limits or feature gates.
 
 ## Storage and development
 

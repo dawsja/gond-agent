@@ -58,4 +58,4 @@ Playwright, Chromium and fonts are built into the worker image. Agents test web 
 
 ## GitHub automations
 
-Set `GOND_AGENT_REPOSITORIES` to a comma-separated list of repositories that issue automations may watch. The administrator's automation settings enable one-minute polling. All accounts can schedule agents and start repository tasks.
+All accounts can schedule agents and start repository tasks. GitHub polling, issue-triggered runs and automatic check retries are not supported. Automatic pull-request creation and manual pull-request actions remain available.

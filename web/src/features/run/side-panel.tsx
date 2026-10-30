@@ -1,5 +1,5 @@
-// The run page's details panel: changes, the pull request and its checks, and logs.
-import { Check, Copy, ExternalLink, FileCode2, GitBranch, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft } from "lucide-react"
+// The run page's details panel: changes, the pull request, and logs.
+import { Copy, ExternalLink, FileCode2, GitBranch, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft } from "lucide-react"
 import { type ReactNode, useEffect, useMemo, useState } from "react"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { Card, CardContent, CardHeader, CardTitle } from "@shared/ui/card"
@@ -9,7 +9,7 @@ import { ago, repoName, runElapsed } from "@/lib/format"
 import { useCreatePull, useGithub, useMe, useMergeRun, useRunDiff } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { DiffView, type FileDiff, parseUnifiedDiff } from "@shared/diff"
-import { DiffCounts, DiffSquares, Dot, ModelMark, shortModel } from "../studio/parts"
+import { DiffCounts, DiffSquares, ModelMark, shortModel } from "../studio/parts"
 import { mono, tabs } from "../studio/theme"
 import type { Transcript } from "./transcript"
 import { Prose } from "./transcript-view"
@@ -87,28 +87,6 @@ function ChangesTab({ run, files }: { run: Run; files: FileDiff[] }) {
   )
 }
 
-function CheckRow({ name, detail, state }: { name: string; detail: string; state: "pass" | "fail" | "running" | "pending" }) {
-  return (
-    <li className="flex h-9 items-center gap-2.5 px-3 text-[13px]">
-      {state === "pass" ? (
-        <span className="grid size-4 place-items-center rounded-full bg-ready/15 text-ready">
-          <Check className="size-2.5" strokeWidth={3.5} />
-        </span>
-      ) : state === "fail" ? (
-        <Dot status="failed" size={7} className="mx-[4.5px]" />
-      ) : state === "running" ? (
-        <Dot status="working" size={7} className="mx-[4.5px]" />
-      ) : (
-        <span className="size-4 rounded-full border border-border-strong" />
-      )}
-      <span className="text-foreground">{name}</span>
-      <span className="ml-auto text-[12px] text-muted-foreground" style={mono}>
-        {detail}
-      </span>
-    </li>
-  )
-}
-
 function PullRequestTab({ run, summary }: { run: Run; summary: string }) {
   const merge = useMergeRun()
   const create = useCreatePull()
@@ -128,7 +106,6 @@ function PullRequestTab({ run, summary }: { run: Run; summary: string }) {
         ? { icon: GitPullRequest, label: "Open", cls: "bg-ready/15 text-ready" }
         : { icon: GitPullRequestDraft, label: "Not opened yet", cls: "bg-raised text-muted-foreground" }
   const Icon = badge.icon
-  const checks = run.checks === "success" ? "pass" : run.checks === "failure" ? "fail" : run.checks === "pending" ? "running" : "pending"
   return (
     <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pt-3 pb-4">
       <div className="rounded-[4px] border border-border bg-card p-4">
@@ -163,18 +140,6 @@ function PullRequestTab({ run, summary }: { run: Run; summary: string }) {
         </div>
       </div>
 
-      {run.pr_number ? (
-        <div className="overflow-hidden rounded-[4px] border border-border bg-card">
-          <div className="border-b border-border px-3 py-2 text-[12px] font-medium text-muted-foreground">Checks</div>
-          <ul className="divide-y divide-border">
-            <CheckRow
-              name="GitHub checks"
-              state={checks}
-              detail={run.checks === "success" ? "passed" : run.checks === "failure" ? "failed" : run.checks === "pending" ? "running" : "none reported"}
-            />
-          </ul>
-        </div>
-      ) : null}
 
       {open ? (
         <div className="space-y-2">
@@ -231,7 +196,7 @@ function PullRequestTab({ run, summary }: { run: Run; summary: string }) {
       ) : (
         <p className="px-1 text-[12px] leading-[1.6] text-muted-foreground">
           {busy
-            ? me?.automations?.auto_pr === false && run.source !== "issue"
+            ? me?.automations?.auto_pr === false
               ? "The agent pushes its changes to the branch when it finishes. You open the pull request."
               : "The agent opens the pull request when it finishes. Review it here or on GitHub."
             : github.data?.configured === false

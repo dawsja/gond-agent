@@ -10,7 +10,8 @@ export function openStore(data: string) {
   db.pragma("busy_timeout = 5000");
   db.exec(`CREATE TABLE IF NOT EXISTS administrators (user_id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS profiles (user_id TEXT PRIMARY KEY, issue_runs INTEGER NOT NULL DEFAULT 0, fix_checks INTEGER NOT NULL DEFAULT 0, auto_pr INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS profiles (user_id TEXT PRIMARY KEY, auto_pr INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS profile_photos (user_id TEXT PRIMARY KEY REFERENCES "user"(id) ON DELETE CASCADE, revision TEXT NOT NULL, bytes BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, repo TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS runs_owner_time ON runs(user_id,created_at);
     CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, data TEXT NOT NULL);
@@ -25,7 +26,7 @@ export function openStore(data: string) {
   db.transaction(() => {
     db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
     db.exec("DROP TABLE IF EXISTS models");
-    const allowed = new Set(["user_id", "issue_runs", "fix_checks", "auto_pr"]);
+    const allowed = new Set(["user_id", "auto_pr"]);
     for (const { name } of db.pragma("table_info(profiles)") as { name: string }[])
       if (!allowed.has(name)) db.exec(`ALTER TABLE profiles DROP COLUMN "${name.replace(/"/g, '\"\"')}"`);
   })();

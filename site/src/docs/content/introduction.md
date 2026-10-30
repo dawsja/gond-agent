@@ -8,4 +8,4 @@ Read [Self-hosting](/docs/self-hosting) to deploy the server, then create your a
 
 ## Your workspace
 
-The run page shows live messages, tool output, plans and diffs. Send follow-ups on the same run. Scheduled agents and GitHub polling are configured on Automations. Open Settings to manage model providers, sessions and OpenID Connect.
+The run page shows live messages, tool output, plans and diffs. Send follow-ups on the same run. Press Enter to send, or Shift+Enter for a new line. Configure scheduled agents and automatic pull-request creation on Automations. Open Settings to manage your profile photo, model providers, sessions and OpenID Connect.

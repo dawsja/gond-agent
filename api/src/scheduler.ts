@@ -3,8 +3,7 @@ import type { Store } from "./db";
 import type { Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { resolveModel } from "./models";
-import { validRepo, validBranch, gh } from "./github";
-import { githubEnv } from "./github-login";
+import { validRepo, validBranch } from "./github";
 import { nextRunAt, validTimezone, type Schedule } from "./lib/schedule";
 export function validateRunner(
   body: any,
@@ -101,7 +100,6 @@ export class Scheduler {
   constructor(
     private db: Store,
     private runs: Runs,
-    private secret: string,
   ) {}
   private claim(key: string) {
     return (
@@ -167,107 +165,6 @@ export class Scheduler {
         this.db
           .prepare("UPDATE runners SET data=? WHERE id=?")
           .run(JSON.stringify(r), raw.id);
-      }
-      // gh polling replaces externally hosted webhooks. Only explicitly configured repos are watched.
-      const repos = (process.env.GOND_AGENT_REPOSITORIES ?? "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(validRepo);
-      const admin = this.db
-        .prepare("SELECT user_id FROM administrators LIMIT 1")
-        .get() as { user_id: string } | undefined;
-      if (admin) {
-        const p = this.runs.profile(admin.user_id);
-        if (p.issue_runs)
-          for (const repo of repos) {
-            const issues = await gh<any[]>(
-              `repos/${repo}/issues?labels=gond-agent&state=open&per_page=100`,
-              "GET", undefined, githubEnv(this.db, this.secret),
-            );
-            for (const issue of issues.filter((x) => !x.pull_request)) {
-              const key = `issue:${repo}:${issue.number}`;
-              if (
-                this.db
-                  .prepare("SELECT 1 FROM occurrences WHERE key=?")
-                  .get(key)
-              )
-                continue;
-              const run = await this.runs.create(admin.user_id, {
-                repo,
-                model: "auto",
-                prompt: `Resolve GitHub issue #${issue.number}: ${issue.title}\n\n${issue.body ?? ""}\n\nInclude Fixes #${issue.number} in the pull request.`,
-                source: "issue",
-                issue: { number: issue.number, url: issue.html_url },
-              });
-              this.claim(key);
-              await gh(
-                `repos/${repo}/issues/${issue.number}/comments`,
-                "POST",
-                { body: `Gond Agent started work: /agents/runs/${run.id}` },
-                githubEnv(this.db, this.secret),
-              );
-            }
-          }
-        for (const r of this.runs
-          .list(admin.user_id)
-          .filter((r) => r.pr_number && r.pr_state === "open")) {
-          const pr = await gh<any>(`repos/${r.repo}/pulls/${r.pr_number}`, "GET", undefined, githubEnv(this.db, this.secret));
-          if (pr.merged) {
-            r.pr_state = "merged";
-            this.runs.status(r, "merged");
-            await this.runs.close(r.id);
-            continue;
-          }
-          if (pr.state === "closed") {
-            r.pr_state = "closed";
-            this.runs.save(r);
-            continue;
-          }
-          const checks = await gh<any>(
-            `repos/${r.repo}/commits/${pr.head.sha}/check-runs`,
-            "GET", undefined, githubEnv(this.db, this.secret),
-          );
-          const pending = checks.check_runs.some(
-            (c: any) => c.status !== "completed",
-          );
-          const failed = checks.check_runs.filter((c: any) =>
-            ["failure", "timed_out", "action_required", "cancelled"].includes(
-              c.conclusion,
-            ),
-          );
-          r.checks = pending
-            ? "pending"
-            : failed.length
-              ? "failure"
-              : "success";
-          this.runs.save(r);
-          if (
-            p.fix_checks &&
-            !pending &&
-            failed.length &&
-            r.last_check_sha !== pr.head.sha &&
-            r.check_fixes < 2 &&
-            r.status !== "working"
-          ) {
-            this.runs.enqueue(
-              r.id,
-              r.user_id,
-              `Fix these failing checks on ${pr.head.sha}:\n` +
-                failed
-                  .map(
-                    (c: any) =>
-                      `${c.name}: ${c.output?.title ?? ""}\n${c.output?.summary ?? ""}\n${c.details_url ?? ""}`,
-                  )
-                  .join("\n"),
-              [],
-              { kind: "checks", sha: pr.head.sha },
-            );
-            const latest = this.runs.get(r.id);
-            latest.last_check_sha = pr.head.sha;
-            latest.check_fixes++;
-            this.runs.save(latest);
-          }
-        }
       }
       this.db
         .prepare(

@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils"
 
-/** A flat on/off switch: 4px corners like every other control, orange when on. */
+/** A flat on/off switch using the product's primary color when on. */
 export function Switch({ checked, disabled, onChange, label }: { checked: boolean; disabled?: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
     <button

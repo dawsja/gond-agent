@@ -5,7 +5,7 @@ import { providerOf } from "@shared/providers"
 import { cn } from "@/lib/utils"
 import type { RunStatus } from "@/lib/api"
 import { Badge } from "@shared/ui/badge"
-import { STATUS, mono } from "./theme"
+import { STATUS, mono, tint } from "./theme"
 
 const statusColor: Record<RunStatus, string> = STATUS
 
@@ -167,7 +167,7 @@ export function Avatar({ initials, color, size = 24, src }: { initials: string; 
   return (
     <span
       className="inline-grid shrink-0 place-items-center rounded-full text-[11px] font-semibold"
-      style={{ width: size, height: size, background: `${color}24`, color, boxShadow: `inset 0 0 0 1px ${color}38` }}
+      style={{ width: size, height: size, background: tint(color, 14), color, boxShadow: `inset 0 0 0 1px ${tint(color, 22)}` }}
     >
       {initials}
     </span>

@@ -31,7 +31,6 @@ services:
       TRUST_PROXY: "${TRUST_PROXY:-false}"
       GOND_AGENT_DATA_DIR: /data
       GH_CONFIG_DIR: /gh
-      GOND_AGENT_REPOSITORIES: "${GOND_AGENT_REPOSITORIES:-}"
       GOND_AGENT_WORKER_IMAGE: "${GOND_AGENT_WORKER_IMAGE:-ghcr.io/dawsja/gond-agent-worker:main}"
       MAX_ACTIVE_RUNS: "${MAX_ACTIVE_RUNS:-5}"
       RUN_IDLE_MINUTES: "${RUN_IDLE_MINUTES:-30}"

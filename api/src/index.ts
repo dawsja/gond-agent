@@ -79,7 +79,7 @@ server.on("upgrade", (req, socket, head) => {
     ws.on("error", () => ws.close());
   });
 });
-const scheduler = new Scheduler(db, runs, cfg.secret);
+const scheduler = new Scheduler(db, runs);
 const timer = setInterval(() => void scheduler.tick(), 60_000);
 void scheduler.tick();
 let closing = false;

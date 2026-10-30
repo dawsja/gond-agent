@@ -243,10 +243,17 @@ describe("provider settings and request routing", () => {
   it("migrates old profile preferences without losing account or run data", () => {
     db.close();
     const old = new Database(join(dir, "gond-agent.sqlite"));
-    old.exec("ALTER TABLE profiles ADD COLUMN obsolete_preference INTEGER NOT NULL DEFAULT 0; INSERT INTO profiles(user_id,issue_runs,fix_checks,auto_pr,obsolete_preference) VALUES('u',1,1,0,1); CREATE TABLE models(id TEXT PRIMARY KEY); INSERT INTO models VALUES('obsolete-model'); INSERT INTO settings VALUES('kept','true');"); old.close();
+    old.exec("ALTER TABLE profiles ADD COLUMN obsolete_preference INTEGER NOT NULL DEFAULT 0; ALTER TABLE profiles ADD COLUMN issue_runs INTEGER NOT NULL DEFAULT 0; ALTER TABLE profiles ADD COLUMN fix_checks INTEGER NOT NULL DEFAULT 0; INSERT INTO profiles(user_id,issue_runs,fix_checks,auto_pr,obsolete_preference) VALUES('u',1,1,0,1); CREATE TABLE models(id TEXT PRIMARY KEY); INSERT INTO models VALUES('obsolete-model'); INSERT INTO settings VALUES('kept','true');");
+    const history = JSON.stringify({ id: "historical-run", source: "issue", checks: "failure", prompt: "Keep this history" });
+    const event = JSON.stringify({ type: "user", text: "Historical automated message", source: { kind: "checks", sha: "abc123" } });
+    old.prepare("INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)").run("historical-run", "u", "acme/app", "ready", 1, 1, history);
+    old.prepare("INSERT INTO events(run_id,data) VALUES(?,?)").run("historical-run", event);
+    old.close();
     db = openStore(dir);
-    expect(db.prepare("SELECT * FROM profiles WHERE user_id='u'").get()).toEqual({ user_id: "u", issue_runs: 1, fix_checks: 1, auto_pr: 0 });
+    expect(db.prepare("SELECT * FROM profiles WHERE user_id='u'").get()).toEqual({ user_id: "u", auto_pr: 0 });
     expect(db.prepare("SELECT value FROM settings WHERE key='kept'").get()).toEqual({ value: "true" });
     expect(db.prepare("SELECT 1 FROM sqlite_master WHERE name='models'").get()).toBeUndefined();
+    expect(db.prepare("SELECT data FROM runs WHERE id='historical-run'").get()).toEqual({ data: history });
+    expect(db.prepare("SELECT data FROM events WHERE run_id='historical-run'").get()).toEqual({ data: event });
   });
 });

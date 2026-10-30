@@ -46,7 +46,6 @@ export interface Run {
   pr_url: string | null;
   pr_state: string | null;
   head_sha: string | null;
-  checks: string | null;
   error: string | null;
   files: number;
   additions: number;
@@ -62,8 +61,6 @@ export interface Run {
   base_sha: string | null;
   idle_since: number;
   auto_pr: boolean;
-  check_fixes: number;
-  last_check_sha: string | null;
 }
 interface Live {
   workspace: Workspace;
@@ -178,7 +175,6 @@ export class Runs {
       prompt: string;
       images?: string[];
       source?: string;
-      issue?: { number: number; url: string };
     },
   ) {
     if (
@@ -229,7 +225,6 @@ export class Runs {
       pr_url: null,
       pr_state: null,
       head_sha: null,
-      checks: null,
       error: null,
       ...totals(emptySummary()),
       plan_done: 0,
@@ -243,8 +238,6 @@ export class Runs {
       base_sha: null,
       idle_since: now,
       auto_pr: !!profile.auto_pr,
-      check_fixes: 0,
-      last_check_sha: null,
     };
     this.validateImages(user, input.images ?? []);
     this.db.transaction(() => {
@@ -259,7 +252,6 @@ export class Runs {
       user,
       r.prompt,
       input.images ?? [],
-      input.issue ? { kind: "issue", ...input.issue } : undefined,
     );
     return this.get(id, user);
   }
@@ -270,8 +262,6 @@ export class Runs {
     return this.db
       .prepare("SELECT * FROM profiles WHERE user_id=?")
       .get(user) as {
-      issue_runs: number;
-      fix_checks: number;
       auto_pr: number;
     };
   }
@@ -297,7 +287,6 @@ export class Runs {
     user: string,
     text: string,
     images: string[] = [],
-    source?: unknown,
   ) {
     const r = this.get(id, user);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
@@ -315,7 +304,6 @@ export class Runs {
         "queue_full",
         "Wait for queued messages to finish.",
       );
-    if (source === undefined) r.check_fixes = 0;
     if (images.length) {
       this.validateImages(user, images);
       for (const image of images)
@@ -330,7 +318,6 @@ export class Runs {
       type: "user",
       text,
       images: images.map((id) => ({ id })),
-      ...(source ? { source } : {}),
     });
     const live = this.live.get(id);
     if (live) {

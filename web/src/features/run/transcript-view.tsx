@@ -1,8 +1,8 @@
 // A run's transcript on its page: messages, tools, plans and subagents (TUI language, softened).
-import { Check, GitPullRequestArrow, Workflow } from "lucide-react"
+import { Check, GitPullRequestArrow } from "lucide-react"
 import { type ReactNode, useMemo } from "react"
 import { Activity } from "@/components/workspace/activity"
-import { useSession } from "@/app/auth"
+import { ProfileAvatar } from "@/components/profile-avatar"
 import type { Run, RunStatus } from "@/lib/api"
 import { ago, avatarColor, duration, initials } from "@/lib/format"
 import { useMe, useRunImage } from "@/lib/queries"
@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
 import { Avatar, DiffCounts, Dot } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
-import { type Item, type MessageSource, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
+import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
 
 /* ───────────── transcript pieces (TUI language, softened) ───────────── */
@@ -233,7 +233,6 @@ function UserMessage({
   first,
   runId,
   images = [],
-  source,
 }: {
   text: string
   ts: number
@@ -243,19 +242,12 @@ function UserMessage({
   first: boolean
   runId: string
   images?: { id: string }[]
-  source?: MessageSource
 }) {
-  const session = useSession()
-  // Failing checks are sent by Gond Agent, not typed by the person: say so instead of showing their name.
-  if (source?.kind === "checks") {
-    author = "Gond Agent"
-    authorId = "gond-agent"
-  }
   const { data: me } = useMe()
   return (
     <div className="rounded-[4px] border border-border bg-surface p-4">
       <div className="mb-2 flex items-center gap-2 text-[12px] text-muted-foreground">
-        <Avatar initials={initials(author)} color={avatarColor(authorId)} size={20} src={authorId === me?.user?.id ? session.imageUrl : undefined} />
+        {authorId === me?.user?.id ? <ProfileAvatar src={me.user.image} size={24} label="Your profile photo" /> : <Avatar initials={initials(author)} color={avatarColor(authorId)} size={20} />}
         <span className="font-medium text-foreground">{author}</span>
         <span>· {ago(ts)}</span>
         {first && (
@@ -273,28 +265,6 @@ function UserMessage({
           {images.map((i) => (
             <MessageImage key={i.id} runId={runId} id={i.id} />
           ))}
-        </div>
-      )}
-      {source && (
-        <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border pt-3 text-[12px] text-muted-foreground">
-          <Workflow className="size-3.5" />
-          {source.kind === "issue" ? (
-            <span>
-              From GitHub issue{" "}
-              <a href={source.url} target="_blank" rel="noreferrer" className="text-foreground hover:underline">
-                #{source.number}
-              </a>{" "}
-              · Automations
-            </span>
-          ) : (
-            <span>
-              Checks failed on{" "}
-              <span className="text-foreground" style={mono}>
-                {source.sha.slice(0, 7)}
-              </span>{" "}
-              · sent by Automations
-            </span>
-          )}
         </div>
       )}
 
@@ -327,7 +297,6 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
             text={it.text}
             ts={it.ts}
             images={it.images}
-            source={it.source}
             runId={run.id}
             author={author}
             authorId={run.user_id}

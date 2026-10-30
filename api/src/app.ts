@@ -8,6 +8,7 @@ import type { Runs } from "./runs/service";
 import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnv } from "./github-login";
 import { getSetting } from "./db";
+import { photoFor, savePhoto } from "./profile-photo";
 import { ApiError } from "./wire";
 import { loadModelCatalog } from "./models";
 import { publicProviderSettings, saveProviderSettings, setupComplete } from "./providers";
@@ -126,15 +127,33 @@ export function createApp(
     const u = c.get("user"),
       p = runs.profile(u.id);
     return c.json({
-      user: u,
+      user: { ...u, ...photoFor(db, u) },
       admin: c.get("admin"),
       setup_required: !setupComplete(db),
       automations: {
-        issue_runs: !!p.issue_runs,
-        fix_checks: !!p.fix_checks,
         auto_pr: !!p.auto_pr,
       },
     });
+  });
+  app.put("/api/v1/me/photo", async c => {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(c.req.header("content-type") ?? "")) throw new ApiError(400, "photo_type", "Choose a PNG, JPEG or WebP photo.");
+    const user = c.get("user");
+    await savePhoto(db, user.id, Buffer.from(await c.req.arrayBuffer()));
+    c.header("Cache-Control", "no-store");
+    return c.json(photoFor(db, user));
+  });
+  app.delete("/api/v1/me/photo", c => {
+    const user = c.get("user");
+    db.prepare("DELETE FROM profile_photos WHERE user_id=?").run(user.id);
+    c.header("Cache-Control", "no-store");
+    return c.json(photoFor(db, user));
+  });
+  app.get("/api/v1/users/:id/photo", c => {
+    c.header("Cache-Control", "private, no-store");
+    const row = db.prepare("SELECT bytes,revision FROM profile_photos WHERE user_id=?").get(c.req.param("id")) as { bytes: Buffer; revision: string } | undefined;
+    if (!row || c.req.query("v") !== row.revision) throw new ApiError(404, "photo_not_found", "That profile photo isn't available.");
+    c.header("Content-Type", "image/png");
+    return c.body(new Uint8Array(row.bytes));
   });
   app.get("/api/v1/models", async (c) => c.json(await loadModelCatalog(db, cfg.secret, c.req.query("refresh") === "1")));
   app.get("/api/v1/settings/oidc", (c) => {
@@ -193,30 +212,12 @@ export function createApp(
     const b = await c.req.json(),
       user = c.get("user").id;
     runs.profile(user);
-    for (const key of ["issue_runs", "fix_checks", "auto_pr"])
-      if (key in b) {
-        if (typeof b[key] !== "boolean")
-          throw new ApiError(
-            400,
-            "invalid_request",
-            "Choose an automation setting.",
-          );
-        if (key !== "auto_pr" && !c.get("admin"))
-          throw new ApiError(
-            403,
-            "forbidden",
-            "Only an administrator can configure GitHub polling.",
-          );
-        db.prepare(`UPDATE profiles SET ${key}=? WHERE user_id=?`).run(
-          Number(b[key]),
-          user,
-        );
-      }
+    if (!b || typeof b !== "object" || Array.isArray(b) || Object.keys(b).some(key => key !== "auto_pr") || typeof b.auto_pr !== "boolean")
+      throw new ApiError(400, "invalid_request", "Choose an automatic pull-request setting.");
+    db.prepare("UPDATE profiles SET auto_pr=? WHERE user_id=?").run(Number(b.auto_pr), user);
     const p = runs.profile(user);
     return c.json({
       automations: {
-        issue_runs: !!p.issue_runs,
-        fix_checks: !!p.fix_checks,
         auto_pr: !!p.auto_pr,
       },
     });

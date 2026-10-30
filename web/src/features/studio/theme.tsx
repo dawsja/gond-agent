@@ -43,7 +43,7 @@ export { MONO, mono } from "@shared/theme"
 export const pickerChip =
   "group inline-flex h-8 min-w-0 shrink-0 items-center gap-2 whitespace-nowrap rounded-[4px] border border-border-strong bg-raised/40 text-[13px] text-foreground transition-colors hover:bg-raised data-[state=open]:bg-raised disabled:opacity-50"
 
-/** Tabs: a flat, squared surface list; the active tab in a soft orange tint with an orange label. */
+/** Tabs: a flat surface list; the active tab uses Gond's blue tint wash and ink. */
 export const tabs = {
   list: "rounded-[4px] border border-border bg-surface p-[3px]",
   trigger: "gap-1.5 rounded-[3px] px-3 py-1 text-[13px] [&>[data-tabs-label]]:text-link",

@@ -26,8 +26,6 @@ export interface SubAgent {
   summary: string
 }
 
-export type MessageSource = { kind: "issue"; number: number; url: string } | { kind: "checks"; sha: string }
-
 export type PlanStep = { text: string; status: "pending" | "in_progress" | "done" }
 
 export type Item =
@@ -37,8 +35,6 @@ export type Item =
       text: string
       ts: number
       images: { id: string; media_type: string }[]
-      /** Sent by Gond Agent (Automations): the task came from a GitHub issue, or checks failed on the pull request. */
-      source?: MessageSource
     }
   | { kind: "text"; key: string; text: string }
   | { kind: "explore"; key: string; tools: ToolCall[] }
@@ -86,7 +82,6 @@ export function buildTranscript(events: StreamEvent[]): Transcript {
           text: ev.text,
           ts: ev.ts,
           images: Array.isArray(ev.images) ? ev.images : [],
-          ...(ev.source?.kind === "issue" || ev.source?.kind === "checks" ? { source: ev.source as MessageSource } : {}),
         })
         break
       case "text.delta": {
