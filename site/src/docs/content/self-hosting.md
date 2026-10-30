@@ -22,11 +22,15 @@ Paste the output into `BETTER_AUTH_SECRET` in `.env`, then set `BETTER_AUTH_URL`
 ```sh
 chmod 600 .env
 docker compose config --quiet
-docker compose build worker-image gond-agent
-docker compose up -d --no-build gond-agent
+docker compose pull
+docker compose up -d
 ```
 
-Quiet validation avoids printing resolved secrets. The GitHub directory and Docker socket must already exist; the GitHub configuration is mounted read-only. SQLite and run data persist in the named `gond-agent-data` volume. The worker-image service is only an image build target; the API creates the actual run containers. For published packages, select both runtime and worker images using `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE` in `.env`, run `docker compose pull gond-agent worker-image`, then `docker compose up -d --no-build gond-agent`. Upgrade both images together, stopping the previous service first.
+Quiet validation avoids printing resolved secrets. The GitHub directory and Docker socket must already exist; the GitHub configuration is mounted read-only. SQLite and run data persist in the named `gond-agent-data` volume. Both runtime and worker images default to prebuilt GHCR packages; no source build is required. The `worker-image` helper exits successfully without starting an agent, so normal `docker compose pull` includes its image. The API creates the actual run containers.
+
+For updates, run `docker compose pull` and `docker compose up -d` again. Preserve the data volume and auth secret; do not use `down -v`. Updating interrupts active runs, which can continue later from their last pushed branch. To pin a release, select the same version tag for `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`. If your `.env` selects `:local`, replace both entries with the GHCR defaults from `.env.example`.
+
+Source builds are optional: add `-f docker-compose.yml -f docker-compose.build.yml` to both `docker compose build` and `docker compose up -d`. The override selects local runtime and worker images; the default file never builds them.
 
 Bootstrap the first account while bound to loopback, then complete model setup in the browser. Add an Anthropic Messages, OpenAI-compatible Chat Completions or OpenAI Responses connection with its API base URL, optional key and exact model IDs. Choose the default model before opening the workspace. The first account becomes the instance administrator. Additional registration is disabled by default; set `ALLOW_SIGNUP=true` when you want to allow more accounts. Put an HTTPS reverse proxy in front before exposing the instance.
 

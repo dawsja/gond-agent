@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { ContainerPool, type Workspace } from "../src/containers";
 import { command } from "../src/command";
@@ -25,6 +26,66 @@ function sse(blocks: any[]) {
 }
 
 describe.skipIf(!image)("real container workspaces", () => {
+  it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE)("starts Compose without builds, includes both images and preserves data on repeated up", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gond-agent-compose-"));
+    const root = fileURLToPath(new URL("../../", import.meta.url));
+    const project = dir.split("/").at(-1)!.toLowerCase();
+    const envFile = join(dir, "test.env");
+    const gh = join(dir, "gh");
+    await mkdir(gh);
+    await writeFile(envFile, [
+      "BETTER_AUTH_SECRET=test-only-compose-secret-at-least-32-characters",
+      "BETTER_AUTH_URL=http://localhost:8787", "PORT=0", "BIND_ADDRESS=127.0.0.1",
+      `GH_CONFIG_PATH=${gh}`,
+      `DOCKER_SOCKET_PATH=${process.env.DOCKER_SOCKET_PATH ?? "/var/run/docker.sock"}`,
+    ].join("\n"));
+    const env = { ...process.env };
+    delete env.GOND_AGENT_IMAGE;
+    delete env.GOND_AGENT_WORKER_IMAGE;
+    for (const key of ["PORT", "BIND_ADDRESS", "GH_CONFIG_PATH", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL"]) delete env[key];
+    const base = ["compose", "--project-name", project, "--project-directory", root, "--env-file", envFile, "-f", join(root, "docker-compose.yml")];
+    const docker = process.env.DOCKER_BIN ?? "docker";
+    const compose = (...args: string[]) => command(docker, [...base, ...args], { env, timeout: 90000 });
+    try {
+      const defaults = JSON.parse((await compose("config", "--format", "json")).toString());
+      expect(Object.keys(defaults.services).sort()).toEqual(["gond-agent", "worker-image"]);
+      expect(defaults.services["gond-agent"].image).toBe("ghcr.io/dawsja/gond-agent:main");
+      expect(defaults.services["worker-image"].image).toBe("ghcr.io/dawsja/gond-agent-worker:main");
+      for (const service of Object.values(defaults.services) as any[]) {
+        expect(service.build).toBeUndefined();
+        expect(service.profiles).toBeUndefined();
+      }
+      const build = JSON.parse((await compose("-f", join(root, "docker-compose.build.yml"), "config", "--format", "json")).toString());
+      expect(build.services["gond-agent"].image).toBe("gond-agent:local");
+      expect(build.services["gond-agent"].build.target).toBe("runtime");
+      expect(build.services["worker-image"].build.target).toBe("worker-image");
+      expect(build.services["gond-agent"].environment.GOND_AGENT_WORKER_IMAGE).toBe("gond-agent-worker:local");
+
+      env.GOND_AGENT_IMAGE = process.env.GOND_AGENT_RUNTIME_TEST_IMAGE!;
+      env.GOND_AGENT_WORKER_IMAGE = image!;
+      await compose("up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60");
+      const worker = (await compose("ps", "--all", "--quiet", "worker-image")).toString().trim();
+      const info = JSON.parse((await command(docker, ["inspect", worker])).toString())[0];
+      expect(info.State.Status).toBe("exited");
+      expect(info.State.ExitCode).toBe(0);
+      expect(info.Config.Entrypoint).toEqual(["/usr/bin/true"]);
+      expect(info.Mounts).toEqual([]);
+      const address = (await compose("port", "gond-agent", "8787")).toString().trim();
+      expect((await fetch(`http://${address}/health`)).ok).toBe(true);
+      const exec = (...args: string[]) => compose("exec", "-T", "gond-agent", "node", ...args);
+      await exec("-e", "require('node:fs').writeFileSync('/data/compose-check', 'preserved')");
+      const before = (await exec("-e", "console.log(require('node:fs').readFileSync('/data/container-instance', 'utf8'))")).toString().trim();
+      await compose("up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60");
+      expect((await exec("-e", "console.log(require('node:fs').readFileSync('/data/compose-check', 'utf8'))")).toString().trim()).toBe("preserved");
+      expect((await exec("-e", "console.log(require('node:fs').readFileSync('/data/container-instance', 'utf8'))")).toString().trim()).toBe(before);
+      expect((await exec("-e", "console.log(process.env.GOND_AGENT_WORKER_IMAGE)")).toString().trim()).toBe(image);
+    } finally {
+      // Only this uniquely named test project's disposable resources are removed.
+      await compose("down", "--volumes", "--remove-orphans");
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 180000);
+
   it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE)("launches sibling workers from the packaged service with no host networking or workspace bind paths", async () => {
     const script = `
       import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';

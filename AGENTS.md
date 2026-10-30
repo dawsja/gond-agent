@@ -12,7 +12,7 @@ Gond Agent is a self-hosted coding workspace. Every account has access to all fe
 - `site/`: instance landing page and docs, built at the origin root. Public marketing/docs live in the separate `gond-landing` repository at `https://gond.io/agent`; the public website does not host workspaces.
 - `shared/`: frontend code imported through `@shared`.
 - `protocol/`: model, agent and live-run event formats.
-- `Dockerfile`, `docker-compose.yml`: self-hosted runtime and worker-image targets.
+- `Dockerfile`, `docker-compose.yml`: self-hosted runtime and worker-image targets. Default Compose uses prebuilt GHCR images: `docker compose pull && docker compose up -d` updates both. The one-shot `worker-image` helper exits successfully; only the API launches actual workers. Source builds require the explicit `docker-compose.build.yml` override.
 
 ## Work rules
 

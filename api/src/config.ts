@@ -40,7 +40,7 @@ export function configFromEnv(): Config {
     signup: process.env.ALLOW_SIGNUP === "true",
     port: Number(process.env.PORT ?? 8787),
     dockerBin: process.env.DOCKER_BIN ?? "docker",
-    workerImage: process.env.GOND_AGENT_WORKER_IMAGE ?? "gond-agent-worker:local",
+    workerImage: process.env.GOND_AGENT_WORKER_IMAGE ?? "ghcr.io/dawsja/gond-agent-worker:main",
     maxRuns: Number(process.env.MAX_ACTIVE_RUNS ?? 5),
     runCPUs: Number(process.env.RUN_CPUS ?? 2),
     runMemoryMB: Number(process.env.RUN_MEMORY_MB ?? 2048),

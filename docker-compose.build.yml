@@ -1,0 +1,16 @@
+# Optional source builds; production uses docker-compose.yml alone.
+# docker compose -f docker-compose.yml -f docker-compose.build.yml build
+# docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+services:
+  worker-image:
+    image: gond-agent-worker:local
+    build:
+      context: .
+      target: worker-image
+  gond-agent:
+    image: gond-agent:local
+    build:
+      context: .
+      target: runtime
+    environment:
+      GOND_AGENT_WORKER_IMAGE: gond-agent-worker:local

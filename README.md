@@ -6,7 +6,7 @@ Self-hosted coding agents that turn repository tasks into pull requests. Every a
 
 Requirements: a Linux x86_64 host with a current Docker Engine (25+) and Docker Compose, plus at least 2 GiB RAM and disk space per active run. A normal Linux VM on Proxmox works without nested virtualization. The application runs in Docker and creates one separate non-root worker container per run.
 
-The Compose configuration is [docker-compose.yml](docker-compose.yml); supported deployment settings are documented in [.env.example](.env.example). The source build works before any registry package is published.
+The Compose configuration is [docker-compose.yml](docker-compose.yml); supported deployment settings are documented in [.env.example](.env.example). It uses prebuilt runtime and worker images from GHCR. You do not need to build the source on your server.
 
 ```sh
 cp .env.example .env
@@ -15,18 +15,40 @@ openssl rand -base64 32
 chmod 600 .env
 docker compose config --quiet
 # Sign in to GitHub on the host as described below, then:
-docker compose build worker-image gond-agent
-docker compose up -d --no-build gond-agent
+docker compose pull
+docker compose up -d
 ```
 
 Use `docker compose config --quiet` to validate without printing resolved secrets. Keep the auth secret stable across upgrades because it protects sessions and encrypted OIDC settings. `PORT` selects the published host port; update `BETTER_AUTH_URL` to match the browser origin. `GH_CONFIG_PATH` selects the read-only host GitHub login directory (blank defaults to `$HOME/.config/gh`); `DOCKER_SOCKET_PATH` selects the existing Docker socket. Missing bind sources cause a startup error instead of being silently created. The named `gond-agent-data` volume persists SQLite and run data; do not remove it during upgrades.
 
 1. Sign in on the host with `gh auth login`. The service reads a dedicated host login through a read-only configuration mount. Set `GH_CONFIG_PATH` in `.env` if needed. File-backed credentials are required: keyring-backed credentials on the host are not accessible in the container. Use `gh auth login --insecure-storage` for a dedicated service account when needed. Every instance account shares access to repositories available through this login.
 2. Copy `.env.example` to `.env`. Set `BETTER_AUTH_SECRET` (generate with `openssl rand -base64 32`) and `BETTER_AUTH_URL`. Keep this secret unchanged across restarts.
-3. Run `docker compose build worker-image gond-agent`, then `docker compose up -d --no-build gond-agent`. The build-only worker service is not a long-running Compose service: the API creates disposable workers from its image. Open `http://localhost:8787`. Create the first account while bound to loopback; that account becomes the administrator. Complete model setup in the browser. All accounts have all features; additional registration is disabled unless `ALLOW_SIGNUP=true`.
+3. Run `docker compose pull`, then `docker compose up -d`. Both images are pulled. The `worker-image` helper exits successfully without starting an agent; this is expected. The API creates disposable workers from that image when runs start. Open `http://localhost:8787`. Create the first account while bound to loopback; that account becomes the administrator. Complete model setup in the browser. All accounts have all features; additional registration is disabled unless `ALLOW_SIGNUP=true`.
 4. For remote access, put an HTTPS reverse proxy in front, set `BETTER_AUTH_URL` to the public origin, and restart. Forward WebSocket upgrades for `/ws/` and preserve the origin. Enable `TRUST_PROXY=true` only when the proxy overwrites `X-Forwarded-For`; otherwise rate limits use the direct peer address. Set `BIND_ADDRESS` only as needed. Create the first account before exposing the instance.
 
-The instance landing page and docs are at `/`, the workspace at `/agents/`, and health at `/health`. Auth routes are at `/api/auth/`. The public product site is [gond.io/agent](https://gond.io/agent), maintained separately in `gond-landing`; it does not host workspaces. CI publishes `ghcr.io/<owner>/gond-agent` and `ghcr.io/<owner>/gond-agent-worker`; private packages require registry authentication. `main`, version and SHA tags are available after their workflows succeed. Set both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`, run `docker compose pull gond-agent worker-image`, then `docker compose up -d --no-build gond-agent`. Upgrade both images together. Stop the previous service before upgrading and preserve its data volume and auth secret.
+The instance landing page and docs are at `/`, the workspace at `/agents/`, and health at `/health`. Auth routes are at `/api/auth/`. The public product site is [gond.io/agent](https://gond.io/agent), maintained separately in `gond-landing`; it does not host workspaces. CI publishes `ghcr.io/dawsja/gond-agent` and `ghcr.io/dawsja/gond-agent-worker`; `main`, version and SHA tags are available after their workflows succeed. Private packages require registry authentication.
+
+### Updates
+
+After the initial setup, update both images and recreate the changed services with:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Keep your data volume and `BETTER_AUTH_SECRET`. Do not use `down -v`. Updating the service interrupts active runs; follow-ups resume from their last pushed branch. To pin a release, set the same version tag in both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`. If your `.env` selects `:local` images, change both entries to the GHCR images in `.env.example` to use this pull-only flow.
+
+### Optional source builds
+
+For development or an unpublished change, explicitly add the build override:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+```
+
+This selects local images for both the service and its workers. The default Compose file has no build configuration.
 
 ### Container security and limits
 

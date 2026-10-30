@@ -1,18 +1,22 @@
 # Copy .env.example to .env and set BETTER_AUTH_SECRET before starting.
-# Build both images: docker compose build worker-image gond-agent
+# Install or update: docker compose pull && docker compose up -d
 name: gond-agent
 services:
   worker-image:
-    image: ${GOND_AGENT_WORKER_IMAGE:-gond-agent-worker:local}
-    build:
-      context: .
-      target: worker-image
-    profiles: [build]
+    image: ${GOND_AGENT_WORKER_IMAGE:-ghcr.io/dawsja/gond-agent-worker:main}
+    # Include the worker in ordinary pulls without starting its control process.
+    entrypoint: ["/usr/bin/true"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
   gond-agent:
-    image: ${GOND_AGENT_IMAGE:-gond-agent:local}
-    build:
-      context: .
-      target: runtime
+    image: ${GOND_AGENT_IMAGE:-ghcr.io/dawsja/gond-agent:main}
+    depends_on:
+      worker-image:
+        condition: service_completed_successfully
+        restart: true
     restart: unless-stopped
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8787}:8787"
@@ -28,7 +32,7 @@ services:
       GOND_AGENT_DATA_DIR: /data
       GH_CONFIG_DIR: /gh
       GOND_AGENT_REPOSITORIES: "${GOND_AGENT_REPOSITORIES:-}"
-      GOND_AGENT_WORKER_IMAGE: "${GOND_AGENT_WORKER_IMAGE:-gond-agent-worker:local}"
+      GOND_AGENT_WORKER_IMAGE: "${GOND_AGENT_WORKER_IMAGE:-ghcr.io/dawsja/gond-agent-worker:main}"
       MAX_ACTIVE_RUNS: "${MAX_ACTIVE_RUNS:-5}"
       RUN_IDLE_MINUTES: "${RUN_IDLE_MINUTES:-30}"
       RUN_TURN_MINUTES: "${RUN_TURN_MINUTES:-60}"

@@ -29,7 +29,7 @@ export default function Landing() {
     <section id="selfhost" className={`${wrap} grid gap-12 border-t border-(--rule) py-20 lg:grid-cols-2`}>
       <div><div className="mb-6 flex items-center gap-2 text-xs tracking-[0.13em] text-(--ink-3) uppercase"><Server className="size-4" /> Made for your server</div><h2 className="t-h2 max-w-[12ch]">The whole stack.<br />Under your roof.</h2><a href="/docs/self-hosting" className="mt-8 inline-flex items-center gap-2 text-sm underline underline-offset-4">Read the setup guide <ArrowUpRight className="size-4" /></a></div>
       <div className="space-y-0">{[
-        ["Docker deployment", "Build locally or pull the published image. Keep configuration and data in your own volumes."],
+        ["Docker deployment", "Pull the published images and start with Docker Compose. Keep configuration and data in your own volumes."],
         ["Local SQLite", "Accounts, run history, images, and usage live in one local database. Simple to back up. Yours to keep."],
         ["Sign in your way", "Email and password out of the box. Add OpenID Connect from Settings for your team’s identity provider."],
         ["Every account gets everything", "All configured models, scheduled agents, GitHub automations, images, and voice input. One consistent workspace."],

@@ -52,6 +52,24 @@ describe("Gond Agent identity", () => {
     expect(file("../../shared/brand.ts")).toContain('HELP_EMAIL = "hi@gond.io"');
   });
 
+  it("defaults to published images without hiding the worker from ordinary pulls", () => {
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-secret-with-at-least-32-characters");
+    vi.stubEnv("GOND_AGENT_WORKER_IMAGE", undefined);
+    expect(configFromEnv().workerImage).toBe("ghcr.io/dawsja/gond-agent-worker:main");
+    const compose = file("../../docker-compose.yml");
+    expect(compose).toContain("${GOND_AGENT_IMAGE:-ghcr.io/dawsja/gond-agent:main}");
+    expect(compose.match(/\$\{GOND_AGENT_WORKER_IMAGE:-ghcr.io\/dawsja\/gond-agent-worker:main\}/g)).toHaveLength(2);
+    expect(compose).not.toMatch(/^\s+(build|profiles):/m);
+    expect(compose).toContain('entrypoint: ["/usr/bin/true"]');
+    expect(compose).toContain("condition: service_completed_successfully");
+    expect(file("../../.env.example")).toContain("GOND_AGENT_IMAGE=ghcr.io/dawsja/gond-agent:main");
+    expect(file("../../.env.example")).toContain("GOND_AGENT_WORKER_IMAGE=ghcr.io/dawsja/gond-agent-worker:main");
+    const build = file("../../docker-compose.build.yml");
+    expect(build).toContain("target: runtime");
+    expect(build).toContain("target: worker-image");
+    expect(build).toContain("GOND_AGENT_WORKER_IMAGE: gond-agent-worker:local");
+  });
+
   it("describes container execution consistently in the workspace", () => {
     for (const path of ["home/home-screen.tsx", "run/run-screen.tsx"])
       expect(file(`../../web/src/features/${path}`)).toContain("Its worker container is removed.");
