@@ -1,0 +1,230 @@
+import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openStore } from "../src/db";
+import { saveProviderSettings } from "../src/providers";
+import { Runs } from "../src/runs/service";
+import type { Config } from "../src/config";
+import { gh, checkout, importBundle } from "../src/github";
+vi.mock("../src/github", async (original) => {
+  const actual = await original<typeof import("../src/github")>();
+  return {
+    ...actual,
+    gh: vi.fn(async (endpoint: string, method: string) =>
+      method === "POST"
+        ? { number: 42, html_url: "https://github.com/acme/app/pull/42" }
+        : endpoint.includes("/pulls?")
+          ? []
+          : { default_branch: "main" },
+    ),
+    checkout: vi.fn(async () => ({
+      cwd: "/fake",
+      archive: Buffer.from("repo"),
+    })),
+    importBundle: vi.fn(async () => {}),
+    git: vi.fn(async (_cwd: string, ...args: string[]) =>
+      Buffer.from(
+        args[0] === "rev-parse"
+          ? "a".repeat(40)
+          : args.includes("--numstat")
+            ? "2\t1\tsrc/app.ts\n"
+            : "diff --git a/src/app.ts b/src/app.ts\n",
+      ),
+    ),
+  };
+});
+let dir: string,
+  db: ReturnType<typeof openStore>,
+  runs: Runs,
+  log: Record<string, unknown>[],
+  events: Record<string, unknown>[],
+  destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
+let workerFailure: string | null;
+const cfg = (): Config => ({
+  data: dir,
+  origin: "http://localhost:8787",
+  secret: "a".repeat(40),
+  signup: true,
+  port: 8787,
+  dockerBin: "docker",
+  workerImage: "gond-agent-worker:test",
+  maxRuns: 2,
+  runCPUs: 2,
+  runMemoryMB: 2048,
+  idleMs: 60000,
+  turnMs: 60000,
+});
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
+  db = openStore(dir);
+  saveProviderSettings(db, cfg().secret, {
+    connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:8000/v1", apiKey: "test-provider-key", models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
+    defaultModel: "local:coder", transcription: null,
+  });
+  log = [];
+  events = [];
+  workerFailure = null;
+  destroy = vi.fn(async () => {});
+  runs = new Runs(db, cfg(), async () => ({
+    destroy,
+    rpc: async (method, args) => {
+      log.push({ method, ...args });
+      if (method === "send") {
+        const input = args?.input as any;
+        if (input.type === "interrupt")
+          events.push({
+            type: "turn.end",
+            agent_id: "main",
+            stop_reason: "interrupted",
+          });
+        else if (workerFailure)
+          events.push(
+            { type: "turn.start", agent_id: "main" },
+            { type: "turn.end", agent_id: "main", stop_reason: "error" },
+            { type: "error", agent_id: "main", message: workerFailure, retryable: false },
+          );
+        else
+          events.push(
+            { type: "turn.start", agent_id: "main" },
+            {
+              type: "text.delta",
+              agent_id: "main",
+              text: "Fixed it and tested it.",
+            },
+            { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+          );
+      }
+      if (method === "events") {
+        const batch = events.splice(0);
+        return { events: batch, alive: true } as any;
+      }
+      if (method === "snapshot")
+        return {
+          bundle: Buffer.from("bundle").toString("base64"),
+          head: "b".repeat(40),
+        } as any;
+      return true as any;
+    },
+  }));
+});
+afterEach(async () => {
+  await runs.shutdown();
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+  vi.clearAllMocks();
+});
+describe("persistent local run lifecycle", () => {
+  it("does not leave a workspace behind when shutdown races with checkout", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(checkout).mockImplementationOnce(async () => {
+      await pending;
+      return { cwd: "/fake", archive: Buffer.from("repo") };
+    });
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });
+    const stopped = runs.shutdown();
+    release();
+    await stopped;
+    expect(runs.get(r.id).status).toBe("stopped");
+    expect(runs.get(r.id).pending).toEqual([]);
+    expect(log.some((x) => x.method === "start")).toBe(false);
+  });
+  it("does not snapshot, push or open a PR when verification is blocked", async () => {
+    workerFailure = "Verification and self-review are incomplete.";
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    expect(runs.get(r.id).error).toContain("Verification");
+    expect(log.some((x) => x.method === "snapshot")).toBe(false);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(vi.mocked(gh).mock.calls.some((c) => c[1] === "POST")).toBe(false);
+  });
+  it("stores tool screenshots with run ownership and broadcasts IDs, not image bytes", async () => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Test browser" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const data = Buffer.from("jpeg fixture").toString("base64");
+    const event = runs.append(r.id, { type: "tool.images", agent_id: "main", call_id: "browser1", images: [
+      { media_type: "image/jpeg", data },
+      { media_type: "image/svg+xml", data },
+      { media_type: "image/jpeg", data: "not base64" },
+    ] });
+    expect(JSON.stringify(event)).not.toContain(data);
+    const images = (event as any).images;
+    expect(images).toHaveLength(1);
+    const row = db.prepare("SELECT user_id,run_id,bytes FROM images WHERE id=?").get(images[0].id) as any;
+    expect(row.user_id).toBe("u");
+    expect(row.run_id).toBe(r.id);
+    expect(row.bytes.toString()).toBe("jpeg fixture");
+    expect(runs.history(r.id, 0).find((e) => e.type === "tool.images").images).toEqual(images);
+  });
+  it("starts a container, streams, pushes and creates a PR without giving the worker credentials", async () => {
+    const r = await runs.create("u", {
+      repo: "acme/app",
+      model: "auto",
+      prompt: "Fix it",
+    });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(checkout).toHaveBeenCalled();
+    expect(importBundle).toHaveBeenCalledWith(
+      "/fake",
+      Buffer.from("bundle"),
+      r.branch,
+    );
+    expect(runs.get(r.id).pr_number).toBe(42);
+    expect(runs.get(r.id).files).toBe(1);
+    expect(log.some((x) => x.method === "setup")).toBe(true);
+    expect(JSON.stringify(log)).not.toMatch(
+      /test-provider-key|gh auth|BETTER_AUTH_SECRET/,
+    );
+    const replay = runs.history(r.id, 0);
+    expect(replay.some((x) => x.type === "text.delta")).toBe(true);
+    expect(replay.every((e, i) => !i || e.seq > replay[i - 1].seq)).toBe(true);
+    await runs.merge(r.id, "u");
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(runs.get(r.id).status).toBe("merged");
+  });
+  it("attaches images exactly once and supports follow-ups on the same container", async () => {
+    db.prepare(
+      "INSERT INTO images(id,user_id,media_type,bytes,created_at) VALUES(?,?,?,?,?)",
+    ).run("img_1", "u", "image/png", Buffer.from("png"), Date.now());
+    const r = await runs.create("u", {
+      repo: "acme/app",
+      model: "auto",
+      prompt: "Look at this",
+      images: ["img_1"],
+    });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    runs.enqueue(r.id, "u", "Add a test");
+    await vi.waitFor(() =>
+      expect(log.filter((x) => x.method === "send")).toHaveLength(2),
+    );
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.filter((x) => x.method === "start")).toHaveLength(1);
+    expect(
+      (
+        db.prepare("SELECT run_id FROM images WHERE id=?").get("img_1") as {
+          run_id: string;
+        }
+      ).run_id,
+    ).toBe(r.id);
+  });
+  it("marks interrupted work recoverable after a host restart and keeps history", async () => {
+    const r = await runs.create("u", {
+      repo: "acme/app",
+      model: "auto",
+      prompt: "Fix it",
+    });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    await runs.shutdown();
+    const row = runs.get(r.id);
+    row.status = "working";
+    row.phase = "agent";
+    runs.save(row);
+    await runs.recover();
+    expect(runs.get(r.id).status).toBe("failed");
+    expect(runs.get(r.id).pushed).toBe(true);
+    expect(runs.history(r.id, 0).length).toBeGreaterThan(0);
+    await runs.remove(r.id, "u");
+    expect(() => runs.get(r.id)).toThrow();
+  });
+});

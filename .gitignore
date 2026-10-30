@@ -1,0 +1,12 @@
+**/node_modules/
+**/dist/
+**/target/
+**/*.tsbuildinfo
+.env
+api/.env
+data/
+*.sqlite*
+*.ext4
+*.vmlinux
+*.log
+**/__pycache__/

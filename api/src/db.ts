@@ -1,0 +1,43 @@
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+export type Store = ReturnType<typeof openStore>;
+export function openStore(data: string) {
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  const db = new Database(join(data, "gond-agent.sqlite"));
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  db.pragma("busy_timeout = 5000");
+  db.exec(`CREATE TABLE IF NOT EXISTS administrators (user_id TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS profiles (user_id TEXT PRIMARY KEY, issue_runs INTEGER NOT NULL DEFAULT 0, fix_checks INTEGER NOT NULL DEFAULT 0, auto_pr INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, repo TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, data TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS runs_owner_time ON runs(user_id,created_at);
+    CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, data TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS events_run_seq ON events(run_id,seq);
+    CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT REFERENCES runs(id) ON DELETE CASCADE, media_type TEXT NOT NULL, bytes BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS runners (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, enabled INTEGER NOT NULL, next_run_at INTEGER NOT NULL, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS occurrences (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT, model_id TEXT NOT NULL, input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cost_micros INTEGER NOT NULL, created_at INTEGER NOT NULL);
+
+  `);
+  // Retire the old catalog and keep only current profile preferences on upgrades.
+  db.transaction(() => {
+    db.exec("DROP TABLE IF EXISTS models");
+    const allowed = new Set(["user_id", "issue_runs", "fix_checks", "auto_pr"]);
+    for (const { name } of db.pragma("table_info(profiles)") as { name: string }[])
+      if (!allowed.has(name)) db.exec(`ALTER TABLE profiles DROP COLUMN "${name.replace(/"/g, '\"\"')}"`);
+  })();
+  return db;
+}
+export function getSetting<T>(db: Store, key: string): T | null {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(key) as { value: string } | undefined;
+  return row ? (JSON.parse(row.value) as T) : null;
+}
+export function setSetting(db: Store, key: string, value: unknown) {
+  db.prepare(
+    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+  ).run(key, JSON.stringify(value));
+}
