@@ -29,10 +29,11 @@ describe("Gond Agent identity", () => {
     expect(file("../src/containers.ts")).toContain('"/home/gond-agent:rw,');
   });
 
-  it("packages only the workspace and sends documentation to the public website", () => {
+  it("packages only the workspace without documentation links", () => {
     expect(file("../../Dockerfile")).not.toMatch(/COPY site\/|site\/dist|cd .*site/);
     expect(file("../src/app.ts")).not.toContain("site/dist");
-    expect(file("../../web/src/lib/links.ts")).toContain('DOCS_URL = "https://gond.io/agent/docs"');
+    for (const path of ["../../web/src/features/studio/shell.tsx", "../../web/src/features/studio/search-dialog.tsx"])
+      expect(file(path)).not.toMatch(/DOCS_URL|gond\.io\/agent\/docs|Documentation|Gond Agent Docs/);
     for (const path of ["../../web/src/features/settings/providers.tsx", "../../web/src/lib/images.ts"])
       expect(file(path)).not.toContain("crypto.randomUUID()");
   });

@@ -33,7 +33,7 @@ Only administrators can start or cancel GitHub sign-in. The code is visible only
 
 Approved credentials are encrypted in SQLite with `BETTER_AUTH_SECRET`. Temporary private CLI authorization files are removed on completion, cancellation, expiry and startup. GitHub API calls, HTTPS clones and pushes, pull requests and polling use command-scoped credentials; tokens are never returned to browsers, written into repository archives, or forwarded to workers. **Reconnect GitHub** replaces the connection only after approval. To revoke authorization, use GitHub's authorized OAuth app settings. Explicit service-side `GH_TOKEN` or `GH_CONFIG_DIR` credentials remain usable when no browser-managed connection exists; browser-managed credentials take precedence. Default Compose no longer mounts the host's GitHub configuration, so operators using that mount should connect through the app after updating their Compose file.
 
-The account popup at the bottom of the sidebar contains Documentation and Sign out. Collapsed navigation uses tooltips; hover or focus the logo to expand it.
+The account popup at the bottom of the sidebar contains Settings and Sign out; Settings is not a sidebar navigation item. Documentation is not linked from the workspace. Collapsed navigation uses tooltips; hover or focus the logo to expand it.
 
 ### Updates
 

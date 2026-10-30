@@ -1,13 +1,12 @@
 // Search everything from the sidebar's search button: runs, pages and settings, in one dialog in the middle
 // of the screen. Styled like the composer's pickers and shared/menu.tsx: 4px corners, border-strong,
 // 32px rows, no motion. Arrows move, Enter opens, Esc closes.
-import { ArrowUpRight, Settings2, BookOpen, KeyRound, type LucideIcon, Search, Trash2 } from "lucide-react"
+import { Settings2, KeyRound, type LucideIcon, Search, Trash2 } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router"
 import type { Run } from "@/lib/api"
 import { repoName } from "@/lib/format"
-import { DOCS_URL } from "@/lib/links"
 import { cn } from "@/lib/utils"
 import { Dot } from "./parts"
 
@@ -15,22 +14,23 @@ export type SearchPage = { label: string; icon: LucideIcon; to: string }
 
 type Item = {
   id: string
-  group: "Runs" | "Pages" | "Settings" | "Help"
+  group: "Runs" | "Pages" | "Settings"
   title: string
   detail?: string
   icon: ReactNode
   keywords?: string
-  /** An app path, or a full URL opened in a new tab. */
+  /** An app path. */
   to: string
 }
 
 const SETTINGS: { title: string; to: string; icon: LucideIcon; keywords: string }[] = [
+  { title: "Settings", to: "/settings", icon: Settings2, keywords: "account profile preferences" },
   { title: "Model providers", to: "/settings#providers", icon: Settings2, keywords: "api key url anthropic openai models setup" },
   { title: "Sessions", to: "/settings#sessions", icon: KeyRound, keywords: "sign out revoke devices browsers" },
   { title: "Delete account", to: "/settings#delete", icon: Trash2, keywords: "remove erase close" },
 ]
 
-const GROUPS: Item["group"][] = ["Runs", "Pages", "Settings", "Help"]
+const GROUPS: Item["group"][] = ["Runs", "Pages", "Settings"]
 
 export function SearchDialog({
   open,
@@ -68,7 +68,6 @@ export function SearchDialog({
         keywords: s.keywords,
         to: s.to,
       })),
-      { id: "help:docs", group: "Help" as const, title: "Gond Agent Docs", icon: <BookOpen className="size-3.5" />, keywords: "help guide", to: DOCS_URL },
     ],
     [pages, runs],
   )
@@ -99,8 +98,7 @@ export function SearchDialog({
   const choose = (it: Item | undefined) => {
     if (!it) return
     change(false)
-    if (/^https?:/.test(it.to)) window.open(it.to, "_blank", "noopener")
-    else navigate(it.to)
+    navigate(it.to)
   }
 
   return (
@@ -148,7 +146,6 @@ export function SearchDialog({
                     <p className="px-2.5 pt-2 pb-1 text-[11px] font-medium text-subtle">{g}</p>
                     {rows.map((it) => {
                       const i = shown.indexOf(it)
-                      const external = /^https?:/.test(it.to)
                       return (
                         <button
                           key={it.id}
@@ -166,7 +163,6 @@ export function SearchDialog({
                           <span className="grid w-4 shrink-0 place-items-center">{it.icon}</span>
                           <span className={cn("min-w-0 flex-1 truncate", i === active && "text-foreground")}>{it.title}</span>
                           {it.detail && <span className="max-w-[40%] shrink-0 truncate text-[12px] text-subtle">{it.detail}</span>}
-                          {external && <ArrowUpRight className="size-3.5 shrink-0 text-subtle" />}
                         </button>
                       )
                     })}
