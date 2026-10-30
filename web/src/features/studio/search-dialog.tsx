@@ -25,7 +25,7 @@ type Item = {
 }
 
 const SETTINGS: { title: string; to: string; icon: LucideIcon; keywords: string }[] = [
-  { title: "Model providers", to: "/settings#providers", icon: Settings2, keywords: "api key url anthropic openai models transcription setup" },
+  { title: "Model providers", to: "/settings#providers", icon: Settings2, keywords: "api key url anthropic openai models setup" },
   { title: "Sessions", to: "/settings#sessions", icon: KeyRound, keywords: "sign out revoke devices browsers" },
   { title: "Delete account", to: "/settings#delete", icon: Trash2, keywords: "remove erase close" },
 ]

@@ -14,7 +14,7 @@ import {
   validRepo,
   validBranch,
 } from "../github";
-import { modelFor, publicModels } from "../models";
+import { resolveModel, loadModelCatalog } from "../models";
 import { modelResponse } from "../responses";
 import {
   emptySummary,
@@ -190,7 +190,7 @@ export class Runs {
         "invalid_request",
         "Choose a repository and describe the task.",
       );
-    const selectedModel = modelFor(this.db, input.model);
+    const selectedModel = await resolveModel(this.db, this.cfg.secret, input.model);
     if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
       throw new ApiError(
         429,
@@ -360,7 +360,7 @@ export class Runs {
       }
       workspace = await this.workspaceFactory(id, (req) =>
         new URL(req.url).pathname === "/v1/models"
-          ? Promise.resolve(Response.json(publicModels(this.db)))
+          ? loadModelCatalog(this.db, this.cfg.secret).then(catalog => Response.json(catalog))
           : modelResponse(this.db, this.cfg.secret, r.user_id, id, req),
       );
       r = this.get(id);

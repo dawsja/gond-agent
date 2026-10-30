@@ -32,7 +32,7 @@ export default function Landing() {
         ["Docker deployment", "Pull the published images and start with Docker Compose. Keep configuration and data in your own volumes."],
         ["Local SQLite", "Accounts, run history, images, and usage live in one local database. Simple to back up. Yours to keep."],
         ["Sign in your way", "Email and password out of the box. Add OpenID Connect from Settings for your team’s identity provider."],
-        ["Every account gets everything", "All configured models, scheduled agents, GitHub automations, images, and voice input. One consistent workspace."],
+        ["Every account gets everything", "All configured models, scheduled agents, GitHub automations and images. One consistent workspace."],
       ].map(([title,body]) => <article key={title} className="flex gap-4 border-t border-(--rule) py-5"><Check className="mt-1 size-4 shrink-0 text-(--brand)" /><div><h3 className="text-lg font-medium">{title}</h3><p className="mt-2 text-sm leading-relaxed text-(--ink-2)">{body}</p></div></article>)}</div>
     </section>
     <section id="models" className={`${wrap} border-t border-(--rule) py-20`}><h2 className="t-h2">Your task. Your model.</h2><p className="mt-6 max-w-xl text-lg text-(--ink-2)">{MODELS_NOTE}</p><div className="mt-12 grid grid-cols-2 gap-x-10 md:grid-cols-4">{MODELS.map(group => <div key={group.maker} className="border-t border-(--rule) py-5"><p className="text-xs text-(--ink-3)">{group.maker}</p><p className="mt-3 text-lg">{group.models.join(" · ")}</p></div>)}</div></section>

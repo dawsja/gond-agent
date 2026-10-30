@@ -75,7 +75,11 @@ export interface Model {
   provider: string
   display_name: string
   context_window: number
+  connection_id?: string
+  connection_name?: string
 }
+
+export interface ModelCatalog { models: Model[]; connections: { id: string; name: string; status: "ready" | "empty" | "unsupported" | "error"; message?: string }[] }
 
 export interface Repo {
   full_name: string

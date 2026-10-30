@@ -378,8 +378,8 @@ describe("local authentication and persistence", () => {
 });
 describe("provider setup access", () => {
   const settings = {
-    connections: [{ id: "anthropic", name: "Claude", format: "anthropic", baseURL: "https://api.anthropic.com/v1", apiKey: "provider-secret-value", models: [{ id: "claude-test", name: "Claude", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
-    defaultModel: "anthropic:claude-test", transcription: null,
+    connections: [{ id: "anthropic", name: "Claude", format: "anthropic", baseURL: "https://api.anthropic.com/v1", apiKey: "provider-secret-value", discover: false, models: [{ id: "claude-test", name: "Claude", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
+    defaultModel: "anthropic:claude-test",
   };
   it("requires sign-in and admin access, then completes setup without disclosing keys", async () => {
     expect((await call("/api/v1/settings/providers")).status).toBe(401);
@@ -388,7 +388,7 @@ describe("provider setup access", () => {
     expect((await (await call("/api/v1/models", undefined, other)).json()).models).toEqual([]);
     expect((await call("/api/v1/settings/providers", settings, other, "PUT")).status).toBe(403);
     expect((await call("/api/v1/settings/providers", undefined, other)).status).toBe(403);
-    expect((await call("/api/v1/settings/providers/test", { id: "anthropic" }, other)).status).toBe(403);
+    expect((await call("/api/v1/transcribe", {}, admin)).status).toBe(404);
     expect((await call("/api/v1/settings/providers", settings, admin, "PUT", "https://other.example")).status).toBe(403);
     const saved = await call("/api/v1/settings/providers", settings, admin, "PUT");
     expect(saved.status).toBe(200);

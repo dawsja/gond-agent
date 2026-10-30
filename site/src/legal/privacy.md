@@ -6,7 +6,7 @@ This Gond Agent instance is operated by its host administrator. Account details,
 
 ## Code and models
 
-Repository work runs in isolated workers. Requests to the configured model provider include the prompts and code needed for the task. Voice recordings are sent to the configured transcription service and are not retained by Gond Agent. GitHub receives branches and pull requests through the host's authenticated GitHub session.
+Repository work runs in isolated workers. Requests to the configured model provider include the prompts and code needed for the task. GitHub receives branches and pull requests through the host's authenticated GitHub session.
 
 ## Control of data
 

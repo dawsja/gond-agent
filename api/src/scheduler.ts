@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Store } from "./db";
 import type { Runs } from "./runs/service";
 import { ApiError } from "./wire";
-import { modelFor } from "./models";
+import { resolveModel } from "./models";
 import { validRepo, validBranch, gh } from "./github";
 import { nextRunAt, validTimezone, type Schedule } from "./lib/schedule";
 export function validateRunner(
@@ -57,14 +57,15 @@ export function listRunners(db: Store, user: string) {
       .all(user) as { data: string }[]
   ).map((r) => JSON.parse(r.data));
 }
-export function saveRunner(
+export async function saveRunner(
   db: Store,
+  secret: string,
   user: string,
   body: unknown,
   id?: string,
 ) {
   const input = validateRunner(body);
-  modelFor(db, input.model_id);
+  await resolveModel(db, secret, input.model_id);
   const old = id
     ? (db
         .prepare("SELECT data FROM runners WHERE id=? AND user_id=?")

@@ -1,6 +1,6 @@
 # Gond Agent
 
-Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, GitHub automations, images and voice input.
+Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, GitHub automations and images.
 
 ## Run on your server
 
@@ -62,11 +62,13 @@ Better Auth handles email/password sign-up, password hashing, cookies, sessions,
 
 ## Model providers
 
-After the first sign-in, setup connects your model APIs. An administrator can add multiple connections in **Settings → Model providers**: Anthropic Messages, OpenAI-compatible Chat Completions, or OpenAI Responses. Enter an API base URL including its prefix (for example, `https://api.anthropic.com/v1`, `https://api.openai.com/v1`, or `http://127.0.0.1:8000/v1`), an API key if required, and the exact model IDs served by that endpoint. Configure each model's context/output limits, reasoning mode and image support to match the endpoint. The selected default model powers Auto. Models without reasoning settings use the provider default.
+After the first sign-in, setup connects your model APIs. An administrator can add multiple connections in **Settings → Model providers**: Anthropic Messages, OpenAI-compatible Chat Completions, or OpenAI Responses. Give each connection a name, API base URL including its prefix (for example, `https://api.anthropic.com/v1`, `https://api.openai.com/v1`, or `http://127.0.0.1:8000/v1`) and API key if required. Save the connections to open the workspace; setup does not require selecting or entering models.
 
-Save before using **Test saved connection**, which checks `/models` and lists IDs you can add. APIs without model listing can be configured manually. Keys are encrypted in SQLite using the persistent auth secret and never returned to the browser or workers. Blank key updates preserve the saved key; explicitly clear it to remove it. Changing an endpoint URL or API format requires re-entering or clearing its saved key. Local HTTP endpoints are supported; use HTTPS for remote providers. Requests reject redirects. In Compose, `127.0.0.1` refers to the API container: use `http://host.docker.internal:8000/v1` for a host model server, or a reachable service address. The host server must listen on an interface reachable from Docker.
+When starting an agent, the model picker automatically combines available models from every saved connection, grouped by connection name. Adding another key/URL expands these choices without a separate model-configuration step. Identical model IDs from different connections remain separate options, so the selected connection supplies the correct key. **Refresh models** reloads the catalog. Auto uses the saved instance default when available, otherwise the first available model. New instances do not need to configure a default.
 
-Voice transcription is optional. Select an OpenAI-compatible connection and a transcription model ID in the same settings. The service sends the recording as a multipart file to `/audio/transcriptions` and expects `{ "text": "..." }`. Anthropic-only installations can leave transcription disabled. Provider settings apply to all accounts. Token usage is recorded locally; currency costs are not estimated for custom providers. Existing instances enter setup once after upgrading; configure the desired model APIs before starting new runs.
+Selecting Anthropic switches the built-in OpenAI URL to `https://api.anthropic.com/v1`; switching back restores the OpenAI default. Explicit custom proxy URLs are preserved. Model discovery uses the provider's `/models` endpoint with the correct authentication and bounded Anthropic pagination. Catalogs are cached briefly per connection; provider failures are shown without hiding other connections' models. Returned names, token limits and image capabilities are used when supplied. For APIs without discovery or for custom capabilities, use **Advanced model overrides** in provider settings. Missing capability information uses conservative defaults; review overrides for your endpoint as needed.
+
+Keys are encrypted in SQLite using the persistent auth secret and never returned to the browser or workers. Blank key updates preserve the saved key; explicitly clear it to remove it. Changing an endpoint URL or API format requires re-entering or clearing its saved key. Local HTTP endpoints are supported; use HTTPS for remote providers. Requests reject redirects. In Compose, `127.0.0.1` refers to the API container: use `http://host.docker.internal:8000/v1` for a host model server, or a reachable service address. The host server must listen on an interface reachable from Docker. Provider settings apply to all accounts. Token usage is recorded locally; currency costs are not estimated for custom providers.
 
 ## Runs and GitHub
 
@@ -80,7 +82,7 @@ The service uses `gh` to list repositories, clone the requested branch, push the
 
 Stop interrupts the current turn. Follow-ups continue in the same container while it is alive. Idle workers and their volumes/networks are destroyed after `RUN_IDLE_MINUTES` (30 by default); a follow-up then starts from the pushed branch. Uncommitted work is lost on shutdown. `RUN_TURN_MINUTES` defaults to 60. A service restart marks interrupted runs failed and removes orphaned Docker resources labeled with this instance's persisted identity, without touching other instances. Run history and diffs persist locally. Merging destroys the workspace. Deleting a run hides it immediately; stored history is purged after 30 days.
 
-Automations supports daily/weekly local-time schedules. The administrator can enable one-minute polling for issues labeled `gond-agent` in `GOND_AGENT_REPOSITORIES`, and retry failing checks on agent pull requests. Occurrence claims prevent duplicate issue/scheduled runs. Check fixes are limited to two consecutive attempts. Model requests go directly to the configured provider. Optional voice transcription uses an OpenAI-compatible connection that supports `/audio/transcriptions`. Local usage records have no account limits or feature gates.
+Automations supports daily/weekly local-time schedules. The administrator can enable one-minute polling for issues labeled `gond-agent` in `GOND_AGENT_REPOSITORIES`, and retry failing checks on agent pull requests. Occurrence claims prevent duplicate issue/scheduled runs. Check fixes are limited to two consecutive attempts. Model requests go directly to the configured provider. Local usage records have no account limits or feature gates.
 
 ## Storage and development
 

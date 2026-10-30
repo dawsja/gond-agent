@@ -23,6 +23,7 @@ export function openStore(data: string) {
   `);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
+    db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
     db.exec("DROP TABLE IF EXISTS models");
     const allowed = new Set(["user_id", "issue_runs", "fix_checks", "auto_pr"]);
     for (const { name } of db.pragma("table_info(profiles)") as { name: string }[])

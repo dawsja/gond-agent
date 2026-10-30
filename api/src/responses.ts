@@ -1,6 +1,6 @@
 import type { Store } from "./db";
 import { connectionFor } from "./providers";
-import { modelFor } from "./models";
+import { resolveModel } from "./models";
 import { adapterFor, callProvider } from "./adapters";
 import { parseSse, encodeEvent } from "./lib/sse";
 import { ApiError, type ResponsesRequest, type Usage } from "./wire";
@@ -41,7 +41,7 @@ export async function modelResponse(
       "invalid_request",
       "Choose a model and send a message.",
     );
-  const model = modelFor(db, body.model),
+  const model = await resolveModel(db, secret, body.model),
     adapter = adapterFor(model),
     abort = new AbortController();
   req.signal.addEventListener("abort", () => abort.abort(), { once: true });

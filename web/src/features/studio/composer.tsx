@@ -4,13 +4,12 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router"
 import { GithubMark } from "@/components/brand/github"
 import { TaskInput } from "@/components/workspace/task-input"
-import { useBranches, useCreateRun, useGithub, useModels, useRepos, useRuns } from "@/lib/queries"
+import { useBranches, useCreateRun, useGithub, useModelCatalog, useRefreshModels, useRepos, useRuns } from "@/lib/queries"
+import { Button } from "@shared/ui/button"
 import { devOpen } from "@/lib/dev-open"
-import { useDictation } from "@/lib/dictation"
 import { useImageAttachments } from "@/lib/images"
 import { cn } from "@/lib/utils"
 import { AttachButton, DropHint, ImageTray } from "./attachments"
-import { MicButton } from "@shared/mic-button"
 import { ModelMark, providerOf, PROVIDER_LABEL } from "./parts"
 import { mono, pickerChip as chip } from "./theme"
 import { prefs } from "@/lib/prefs"
@@ -30,6 +29,7 @@ export function PickerPopover({
   width = "w-80",
   name,
   align = "start",
+  footer,
 }: {
   trigger: ReactNode
   /** `group` puts items under headings (in order of first appearance); `search` is extra text to match. */
@@ -42,11 +42,13 @@ export function PickerPopover({
   width?: string
   name?: string
   align?: "start" | "end"
+  footer?: ReactNode
 }) {
   const [open, setOpen] = useState(() => !!name && devOpen(name))
   const [q, setQ] = useState("")
   const needle = q.trim().toLowerCase()
-  const shown = items.filter((i) => `${i.value} ${i.search ?? ""} ${i.group ?? ""}`.toLowerCase().includes(needle)).slice(0, 50)
+  const matches = items.filter((i) => `${i.value} ${i.search ?? ""} ${i.group ?? ""}`.toLowerCase().includes(needle))
+  const shown = matches.slice(0, 50)
   const custom = q.trim() && allowCustom?.(q.trim()) && !items.some((i) => i.value === q.trim()) ? q.trim() : null
   // Opens on the selected item (a long list, like times of day, would otherwise hide it).
   const list = useRef<HTMLUListElement>(null)
@@ -113,7 +115,9 @@ export function PickerPopover({
               </li>
             ))}
             {!custom && shown.length === 0 && <li className="px-2 py-2 text-[12px] text-muted-foreground">{empty ?? "Nothing matches"}</li>}
+            {matches.length > shown.length && <li className="px-2 py-2 text-[12px] text-muted-foreground">Showing {shown.length} of {matches.length}. Search to narrow the list.</li>}
           </ul>
+          {footer && <div className="flex items-center justify-between gap-2 border-t border-border p-2">{footer}</div>}
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
@@ -127,11 +131,10 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
   const github = useGithub()
   const connected = !!github.data?.configured
   const repos = useRepos(connected)
-  const models = useModels()
+  const models = useModelCatalog()
+  const refreshModels = useRefreshModels()
   const create = useCreateRun()
   const attach = useImageAttachments()
-  const input = useRef<{ insertText: (text: string) => void }>(null)
-  const voice = useDictation((text) => input.current?.insertText(text))
 
   const [picked, setRepo] = useState<string | null>(() => prefs.get("repo"))
   const [base, setBase] = useState<string | null>(null)
@@ -150,7 +153,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
         ? picked
         : (list?.[0]?.full_name ?? null)
 
-  const modelList = useMemo(() => models.data ?? [], [models.data])
+  const modelList = useMemo(() => models.data?.models ?? [], [models.data])
   const modelId = model && modelList.some((m) => m.id === model) ? model : (modelList[0]?.id ?? "")
   const repoInfo = repos.data?.find((r) => r.full_name === repo)
   const branches = useBranches(connected && repo ? repo : null)
@@ -249,15 +252,13 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
       <input {...attach.inputProps} />
       <TaskInput
         key={seed?.key}
-        inputRef={input}
         defaultValue={seed?.text}
         placeholder="Describe a task. An agent builds it and opens a pull request."
         busy={create.isPending || attach.busy}
-        disabled={needsGithub || !repo}
+        disabled={needsGithub || !repo || !modelInfo}
         onSubmit={submit}
         footer={<>
           <AttachButton onClick={attach.pick} count={attach.items.length} disabled={needsGithub || !repo} />
-          <MicButton state={voice.state} seconds={voice.seconds} onToggle={voice.toggle} disabled={needsGithub || !repo} />
             <PickerPopover
               name="model"
               value={modelId}
@@ -267,6 +268,8 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
               }}
               width="w-72"
               placeholder="Search models"
+              empty={models.isPending ? "Loading models…" : "No models available. Check your connections in Settings."}
+              footer={<><Button variant="ghost" size="sm" disabled={refreshModels.isPending} onClick={() => refreshModels.mutate()}>{refreshModels.isPending ? "Refreshing…" : "Refresh models"}</Button><Button asChild variant="link" size="sm"><a href="/agents/settings#providers">Providers</a></Button></>}
               items={modelList.map((m) => {
                 const provider = providerOf(m.id)
                 return {
@@ -278,14 +281,14 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
                     </span>
                   ),
 
-                  group: PROVIDER_LABEL[provider] ?? m.provider,
+                  group: m.provider === "auto" ? "Automatic" : m.connection_name ?? PROVIDER_LABEL[provider] ?? m.provider,
                   search: m.display_name,
                 }
               })}
               trigger={
-                <button type="button" className={cn(chip, "ml-0.5 gap-1.5 px-2.5")} disabled={!modelInfo}>
+                <button type="button" aria-label="Choose model" className={cn(chip, "ml-0.5 gap-1.5 px-2.5")}>
                   {modelInfo && <ModelMark id={modelInfo.id} size={15} />}
-                  <span className="max-w-[180px] truncate max-md:max-w-[120px]">{modelInfo?.display_name ?? "Loading models…"}</span>
+                  <span className="max-w-[180px] truncate max-md:max-w-[120px]">{modelInfo?.display_name ?? (models.isPending ? "Loading models…" : "No models available")}</span>
 
                   <ChevronDown className="size-3.5 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
                 </button>
@@ -293,9 +296,11 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
             />
         </>}
       ><DropHint show={attach.dragging} /><ImageTray items={attach.items} onRemove={attach.remove} className="px-4 pt-3" /></TaskInput>
-      {(voice.error ?? attach.error ?? create.error) && (
-        <p className="mt-2 px-1 text-[13px] text-failed">{voice.error ?? attach.error ?? create.error?.message}</p>
+      {(attach.error ?? create.error) && (
+        <p className="mt-2 px-1 text-[13px] text-failed">{attach.error ?? create.error?.message}</p>
       )}
+      {(models.error ?? refreshModels.error) && <p role="alert" className="mt-2 px-1 text-[13px] text-failed">{(models.error ?? refreshModels.error)?.message}</p>}
+      {models.data?.connections?.filter(c => c.message).map(c => <p key={c.id} role="status" className="mt-2 px-1 text-[12px] text-muted-foreground">{c.name}: {c.message}</p>)}
     </div>
   )
 }

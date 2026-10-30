@@ -7,12 +7,10 @@ import { runElapsed } from "@/lib/format"
 import { useDeleteRun, useMe, useModels, useRun, useSendMessage, useStopRun } from "@/lib/queries"
 import { useRunStream } from "@/lib/run-stream"
 import { devOpen } from "@/lib/dev-open"
-import { useDictation } from "@/lib/dictation"
 import { useImageAttachments } from "@/lib/images"
 import { cn } from "@/lib/utils"
 import { AttachButton, DropHint, ImageTray } from "../studio/attachments"
 import { ConfirmDialog } from "../studio/confirm-dialog"
-import { MicButton } from "@shared/mic-button"
 import { StatusPill } from "../studio/parts"
 import { Shell } from "../studio/shell"
 import { mono, tabs } from "../studio/theme"
@@ -35,7 +33,6 @@ export function RunScreen() {
   const send = useSendMessage()
   const attach = useImageAttachments()
   const [draft, setDraft] = useState("")
-  const voice = useDictation((text) => setDraft((d) => (d && !/\s$/.test(d) ? `${d} ${text}` : `${d}${text}`)))
   const t = useMemo(() => buildTranscript(stream.events), [stream.events])
   const [view, setView] = useState<"chat" | "details">(() => (devOpen("details") ? "details" : "chat"))
   // Desktop only: phones switch between the two with tabs instead.
@@ -200,18 +197,7 @@ export function RunScreen() {
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={
-              <>
-                <AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} className="text-muted-foreground" />
-                <MicButton
-                  state={voice.state}
-                  seconds={voice.seconds}
-                  onToggle={voice.toggle}
-                  disabled={r.status === "merged"}
-                  className="ml-0.5"
-                />
-              </>
-            }
+            leading={<AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} className="text-muted-foreground" />}
             placeholder={
               r.status === "merged"
                 ? "This pull request is merged"
@@ -233,8 +219,8 @@ export function RunScreen() {
               send.mutate({ id: r.id, arg: { text: p, images } }, { onSuccess: () => { attach.clear(); setDraft("") } })
             }}
           />
-          {(voice.error ?? attach.error ?? send.error) && (
-            <p className="mt-2 px-1 text-[12px] text-failed">{voice.error ?? attach.error ?? send.error?.message}</p>
+          {(attach.error ?? send.error) && (
+            <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message}</p>
           )}
         </div>
       </section>

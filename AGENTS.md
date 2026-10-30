@@ -28,6 +28,8 @@ Do not deploy to a user's server, change its data, or publish packages manually 
 
 ## Checks
 
+Provider settings manage connections, not a required model catalog. Saving name/format/URL/key must finish setup without choosing models. The agent and schedule model pickers combine live models from all saved connections, with connection-scoped IDs, short per-connection caching and isolated errors. Manual model overrides are an advanced fallback, not a setup step. Never reuse a saved key after URL/format changes without explicit replacement or clearing; never follow discovery redirects or expose keys in catalog responses. Anthropic format changes switch built-in default URLs but preserve custom proxies. Voice recording/transcription is not a supported feature; do not restore its UI, routes or settings.
+
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
 - `cd site && npm ci && npm run lint && npm run build`

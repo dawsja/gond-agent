@@ -1,14 +1,13 @@
-import { type ReactNode, type Ref, useImperativeHandle, useState } from "react"
+import { type ReactNode, useState } from "react"
 import { ArrowUp } from "lucide-react"
 import { Button } from "@shared/ui/button"
 import { Textarea } from "@shared/ui/input"
 import { cn } from "@/lib/utils"
 
-export function TaskInput({ inputRef, defaultValue = "", placeholder, disabled, busy, footer, children, onSubmit, className }: {
-  inputRef?: Ref<{ insertText: (text: string) => void }>; defaultValue?: string; placeholder: string; disabled?: boolean; busy?: boolean; footer?: ReactNode; children?: ReactNode; onSubmit: (text: string) => void; className?: string
+export function TaskInput({ defaultValue = "", placeholder, disabled, busy, footer, children, onSubmit, className }: {
+  defaultValue?: string; placeholder: string; disabled?: boolean; busy?: boolean; footer?: ReactNode; children?: ReactNode; onSubmit: (text: string) => void; className?: string
 }) {
   const [text, setText] = useState(defaultValue)
-  useImperativeHandle(inputRef, () => ({ insertText: chunk => setText(text => text + (text && !/\s$/.test(text) ? " " : "") + chunk) }), [])
   const send = () => { if (!disabled && !busy && text.trim()) onSubmit(text.trim()) }
   return <form aria-label="New agent task" onSubmit={e => { e.preventDefault(); send() }} className={cn("overflow-hidden rounded-md border border-input bg-card focus-within:border-primary", className)}>
     {children}<Textarea aria-label="Task prompt" rows={4} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send() } }} placeholder={placeholder} disabled={disabled || busy} className="border-0 px-5 pt-4 text-base focus-visible:ring-0" />

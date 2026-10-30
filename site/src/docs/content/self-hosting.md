@@ -32,15 +32,15 @@ For updates, run `docker compose pull` and `docker compose up -d` again. Preserv
 
 Source builds are optional: add `-f docker-compose.yml -f docker-compose.build.yml` to both `docker compose build` and `docker compose up -d`. The override selects local runtime and worker images; the default file never builds them.
 
-Bootstrap the first account while bound to loopback, then complete model setup in the browser. Add an Anthropic Messages, OpenAI-compatible Chat Completions or OpenAI Responses connection with its API base URL, optional key and exact model IDs. Choose the default model before opening the workspace. The first account becomes the instance administrator. Additional registration is disabled by default; set `ALLOW_SIGNUP=true` when you want to allow more accounts. Put an HTTPS reverse proxy in front before exposing the instance.
+Bootstrap the first account while bound to loopback, then connect a provider in the browser. Add an Anthropic Messages, OpenAI-compatible Chat Completions or OpenAI Responses connection with a name, API base URL and optional key. Save to open the workspace; available models are discovered in the agent model picker. The first account becomes the instance administrator. Additional registration is disabled by default; set `ALLOW_SIGNUP=true` when you want to allow more accounts. Put an HTTPS reverse proxy in front before exposing the instance.
 
 ## Model connections
 
-An administrator can manage multiple API connections in Settings → Model providers. Include the API prefix in each base URL, such as `https://api.openai.com/v1`, `https://api.anthropic.com/v1` or a local server's `http://127.0.0.1:8000/v1`. The URL must be reachable from the Gond Agent host. Configure token limits, image support and reasoning for each model. Auto uses the selected default model. Save before testing the connection; the test lists models when the API supports `/models`, and model IDs can always be entered manually.
+An administrator can manage multiple API connections in Settings → Model providers. Include the API prefix in each base URL, such as `https://api.openai.com/v1`, `https://api.anthropic.com/v1` or a local server's `http://127.0.0.1:8000/v1`. Selecting Anthropic changes the built-in default URL; custom proxy URLs stay intact. The URL must be reachable from the Gond Agent host. Models from all saved keys/URLs appear together when choosing a model for a new agent, grouped by connection. Refresh the picker to reload choices. Auto uses the saved instance default if available, otherwise the first available model.
 
 API keys are encrypted in SQLite and never sent to the browser or workers. Leave a saved key blank to retain it, or explicitly clear it. Re-enter or clear the key when changing its URL or API format. Keep `BETTER_AUTH_SECRET` stable, including when restoring a backup. All accounts use these instance connections; only administrators can edit them. In Compose, use `host.docker.internal` instead of `127.0.0.1` for a provider running on the Docker host, and make that server reachable from Docker.
 
-Voice transcription can use an OpenAI-compatible connection and transcription model via `/audio/transcriptions`. Leave it disabled if your endpoint does not support audio. Model APIs are configured in the browser rather than environment variables. Custom provider costs are not estimated; token usage remains available.
+Model APIs are configured in the browser rather than environment variables. Use **Advanced model overrides** only when listing is unsupported or you need to customize model limits/capabilities. Custom provider costs are not estimated; token usage remains available.
 
 ## Authentication
 

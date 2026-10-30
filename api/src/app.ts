@@ -7,8 +7,8 @@ import type { Authentication } from "./auth";
 import type { Runs } from "./runs/service";
 import { gh, githubStatus, validRepo } from "./github";
 import { ApiError } from "./wire";
-import { publicModels } from "./models";
-import { publicProviderSettings, saveProviderSettings, setupComplete, testProvider, transcribe } from "./providers";
+import { loadModelCatalog } from "./models";
+import { publicProviderSettings, saveProviderSettings, setupComplete } from "./providers";
 import { listRunners, saveRunner } from "./scheduler";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { join } from "node:path";
@@ -133,7 +133,7 @@ export function createApp(
       },
     });
   });
-  app.get("/api/v1/models", (c) => c.json(publicModels(db)));
+  app.get("/api/v1/models", async (c) => c.json(await loadModelCatalog(db, cfg.secret, c.req.query("refresh") === "1")));
   app.get("/api/v1/settings/oidc", (c) => {
     if (!c.get("admin"))
       throw new ApiError(
@@ -185,12 +185,6 @@ export function createApp(
   app.put("/api/v1/settings/providers", async (c) => {
     if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage model providers.");
     return c.json(saveProviderSettings(db, cfg.secret, await c.req.json()));
-  });
-  app.post("/api/v1/settings/providers/test", async (c) => {
-    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage model providers.");
-    const body = await c.req.json();
-    if (typeof body.id !== "string") throw new ApiError(400, "invalid_provider", "Choose a saved provider.");
-    return c.json(await testProvider(db, cfg.secret, body.id));
   });
   app.put("/api/v1/me/automations", async (c) => {
     const b = await c.req.json(),
@@ -269,10 +263,6 @@ export function createApp(
     ).run(id, c.get("user").id, type, bytes, Date.now());
     return c.json({ id }, 201);
   });
-  app.post("/api/v1/transcribe", async (c) => c.json(await transcribe(
-    db, cfg.secret, await c.req.arrayBuffer(),
-    (c.req.header("content-type") ?? "audio/wav").split(";")[0], c.req.query("lang"),
-  )));
   app.post("/api/v1/runs", async (c) =>
     c.json(await runs.create(c.get("user").id, await c.req.json()), 201),
   );
@@ -342,11 +332,11 @@ export function createApp(
     c.json({ runners: listRunners(db, c.get("user").id) }),
   );
   app.post("/api/v1/runners", async (c) =>
-    c.json(saveRunner(db, c.get("user").id, await c.req.json()), 201),
+    c.json(await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json()), 201),
   );
   app.put("/api/v1/runners/:id", async (c) =>
     c.json(
-      saveRunner(db, c.get("user").id, await c.req.json(), c.req.param("id")),
+      await saveRunner(db, cfg.secret, c.get("user").id, await c.req.json(), c.req.param("id")),
     ),
   );
   app.put("/api/v1/runners/:id/enabled", async (c) => {
@@ -356,8 +346,9 @@ export function createApp(
     if (!row)
       throw new ApiError(404, "not_found", "That schedule doesn't exist.");
     return c.json(
-      saveRunner(
+      await saveRunner(
         db,
+        cfg.secret,
         c.get("user").id,
         { ...row, ...(await c.req.json()) },
         row.id,

@@ -1,12 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { api, type GithubStatus, type Me, type Model, type Repo, type Run, type Runner } from "./api"
+import { api, type GithubStatus, type Me, type ModelCatalog, type Repo, type Run, type Runner } from "./api"
 
 const LIVE: Run["status"][] = ["queued", "working"]
 
 export const useMe = () => useQuery({ queryKey: ["me"], queryFn: () => api<Me>("/v1/me"), staleTime: 30_000, refetchInterval: q => q.state.data?.setup_required ? 5000 : false })
 
-export const useModels = () =>
-  useQuery({ queryKey: ["models"], queryFn: () => api<{ models: Model[] }>("/v1/models").then((r) => r.models), staleTime: 60_000 })
+const modelCatalogOptions = { queryKey: ["models"], queryFn: () => api<ModelCatalog>("/v1/models"), staleTime: 60_000 }
+export const useModelCatalog = () => useQuery(modelCatalogOptions)
+export const useModels = () => useQuery({ ...modelCatalogOptions, select: (catalog: ModelCatalog) => catalog.models })
+export function useRefreshModels() {
+  const qc = useQueryClient()
+  return useMutation({ mutationFn: () => api<ModelCatalog>("/v1/models?refresh=1"), onSuccess: catalog => qc.setQueryData(["models"], catalog) })
+}
 
 /** Every run in the workspace (newest first). Polls while any run is still working. */
 export const useRuns = () =>

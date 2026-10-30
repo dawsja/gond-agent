@@ -59,8 +59,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
   db = openStore(dir);
   saveProviderSettings(db, cfg().secret, {
-    connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:8000/v1", apiKey: "test-provider-key", models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
-    defaultModel: "local:coder", transcription: null,
+    connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:8000/v1", apiKey: "test-provider-key", discover: false, models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
+    defaultModel: "local:coder",
   });
   log = [];
   events = [];
