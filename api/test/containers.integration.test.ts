@@ -207,7 +207,11 @@ describe.skipIf(!image)("real container workspaces", () => {
       await writeFile(join(repo,"index.html"),"<title>Container fixture</title><button onclick=\"this.textContent='Saved'\">Save</button>");
       await writeFile(join(repo,"app.ts"),"export function greet() { return 'hello'; }\ngreet();\n");
       for(const args of [["init"],["add","."],["-c","user.name=Test","-c","user.email=test@localhost","commit","-m","fixture"]]) await command("git",args,{cwd:repo});
-      const archive = await command("tar",["-czf","-","-C",repo,"."]);
+      // Exercise the same depth-one Git metadata now supplied by service checkout.
+      const shallow = join(dir, "shallow");
+      await command("git", ["clone", "--depth", "1", `file://${repo}`, shallow]);
+      expect((await command("git", ["rev-parse", "--is-shallow-repository"], { cwd: shallow })).toString().trim()).toBe("true");
+      const archive = await command("tar",["-czf","-","-C",shallow,"."]);
       workspace = await pool.start(id,handler);
       await expect(pool.start("run_"+"b".repeat(24),handler)).rejects.toThrow("slots");
       const container = (await docker("ps","-q","--filter",`label=io.gond-agent.run=${id}`)).toString().trim();

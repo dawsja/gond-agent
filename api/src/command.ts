@@ -7,6 +7,8 @@ export function command(
     input?: Buffer | string;
     timeout?: number;
     env?: NodeJS.ProcessEnv;
+    maxBuffer?: number;
+    onStderr?: (text: string) => void;
   } = {},
 ): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -16,7 +18,7 @@ export function command(
       {
         cwd: options.cwd,
         timeout: options.timeout ?? 120_000,
-        maxBuffer: 256 * 1024 * 1024,
+        maxBuffer: options.maxBuffer ?? 256 * 1024 * 1024,
         env: options.env ?? process.env,
         encoding: "buffer",
       },
@@ -32,6 +34,7 @@ export function command(
         } else resolve(out);
       },
     );
+    if (options.onStderr) child.stderr?.on("data", (chunk: Buffer) => options.onStderr!(chunk.toString()));
     child.stdin?.end(options.input);
   });
 }

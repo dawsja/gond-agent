@@ -347,7 +347,7 @@ export class Runs {
       let r = this.get(id);
       r.phase = "booting";
       r.started_at ??= Date.now();
-      this.status(r, "working", "Starting a workspace container");
+      this.status(r, "working", "Cloning repository");
       const checked = await checkout(
         this.cfg.data,
         id,
@@ -356,10 +356,17 @@ export class Runs {
         r.branch,
         r.pushed,
         githubEnv(this.db, this.cfg.secret),
+        step => {
+          const current = this.get(id);
+          if (!this.shuttingDown && current.status !== "stopped" && current.step !== step) this.status(current, "working", step);
+        },
+        r.base_sha ?? undefined,
       );
-      if (this.shuttingDown) {
+      r = this.get(id);
+      if (this.shuttingDown || r.status === "stopped") {
         r = this.get(id); r.phase = "idle"; r.pending = []; this.status(r, "stopped"); return;
       }
+      this.status(r, "working", "Starting a workspace container");
       workspace = await this.workspaceFactory(id, (req) =>
         new URL(req.url).pathname === "/v1/models"
           ? loadModelCatalog(this.db, this.cfg.secret).then(catalog => Response.json(catalog))
@@ -371,7 +378,11 @@ export class Runs {
         this.save(r);
         return await workspace.destroy();
       }
+      this.status(r, "working", "Loading repository into the workspace");
       await workspace.rpc("setup", { archive: checked.archive.toString("base64") });
+      r = this.get(id);
+      if (this.shuttingDown || r.status === "stopped") return await workspace.destroy();
+      this.status(r, "working", "Starting the agent");
       await workspace.rpc("start", { model: r.model_id });
       if (this.shuttingDown) return await workspace.destroy();
       const live: Live = {
@@ -609,7 +620,7 @@ export class Runs {
         r,
         "failed",
         null,
-        "The run couldn't continue. Check the host logs, then send a follow-up to retry.",
+        error instanceof ApiError ? error.message : "The run couldn't continue. Check the host logs, then send a follow-up to retry.",
       );
     } catch {}
     await this.close(id);

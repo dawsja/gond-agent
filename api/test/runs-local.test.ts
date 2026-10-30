@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openStore } from "../src/db";
 import { setSetting } from "../src/db";
 import { seal } from "../src/auth";
+import { ApiError } from "../src/wire";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
@@ -117,6 +118,32 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("shows checkout progress before container startup and does not revive a stopped run", async () => {
+    let release!: () => void, report!: (step: string) => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(checkout).mockImplementationOnce(async (...args) => {
+      report = args[7]!; report("Downloading repository (25%)");
+      await pending; report("Packing repository for the workspace");
+      return { cwd: "/fake", archive: Buffer.from("repo") };
+    });
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
+    await vi.waitFor(() => expect(runs.get(r.id).step).toBe("Downloading repository (25%)"));
+    expect(log).toEqual([]);
+    await runs.stop(r.id, "u");
+    report("Downloading repository (50%)");
+    expect(runs.get(r.id).status).toBe("stopped");
+    release(); await runs.shutdown();
+    expect(log).toEqual([]);
+    expect(runs.get(r.id).status).toBe("stopped");
+  });
+  it("shows checkout failures without pretending container startup was reached", async () => {
+    vi.mocked(checkout).mockRejectedValueOnce(new ApiError(502, "checkout_failed", "Couldn't download the repository. Check GitHub access and retry."));
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    expect(runs.get(r.id).error).toContain("Couldn't download the repository");
+    expect(log).toEqual([]);
+    expect(runs.history(r.id, 0).filter(event => event.type === "run.status").some(event => event.step === "Starting a workspace container")).toBe(false);
+  });
   it("does not leave a workspace behind when shutdown races with checkout", async () => {
     let release!: () => void;
     const pending = new Promise<void>((resolve) => { release = resolve; });
