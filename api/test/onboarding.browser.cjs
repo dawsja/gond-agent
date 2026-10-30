@@ -102,7 +102,12 @@ const key = 'fixture-only-provider-key';
       await expect(page.getByRole('menuitem', { name: 'Sign out', exact: true })).toBeVisible();
       await capture('account-menu-collapsed');
       await page.keyboard.press('Escape');
+      // Radix restores focus to the menu trigger asynchronously on close. Wait for
+      // that restoration before moving focus, or it can steal focus back in CI.
+      await expect(page.getByRole('menu')).toHaveCount(0);
+      await expect(page.getByRole('button', { name: 'Account menu', exact: true })).toBeFocused();
       await expand.focus();
+      await expect(expand).toBeFocused();
       await expect(expand.locator('svg').last()).toHaveCSS('opacity', '1');
       await page.keyboard.press('Enter');
       await expect(page.getByRole('button', { name: 'Collapse sidebar', exact: true })).toBeVisible();
