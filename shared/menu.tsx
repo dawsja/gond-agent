@@ -7,6 +7,7 @@ import { cn } from "./utils"
 
 export const Menu = DropdownMenu.Root
 export const MenuTrigger = DropdownMenu.Trigger
+export const MenuGroup = DropdownMenu.Group
 export const MenuSub = DropdownMenu.Sub
 
 const surface = "z-50 min-w-[8rem] overflow-hidden rounded-[4px] border border-border-strong bg-popover p-1 text-foreground outline-none"

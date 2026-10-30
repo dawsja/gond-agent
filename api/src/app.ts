@@ -6,6 +6,8 @@ import type { Config } from "./config";
 import type { Authentication } from "./auth";
 import type { Runs } from "./runs/service";
 import { gh, githubStatus, validRepo } from "./github";
+import { GithubLogin, githubEnv } from "./github-login";
+import { getSetting } from "./db";
 import { ApiError } from "./wire";
 import { loadModelCatalog } from "./models";
 import { publicProviderSettings, saveProviderSettings, setupComplete } from "./providers";
@@ -22,6 +24,7 @@ export function createApp(
   cfg: Config,
   authentication: Authentication,
   runs: Runs,
+  githubLogin = new GithubLogin(db, cfg.secret, cfg.data),
 ) {
   const app = new Hono<{
     Variables: {
@@ -218,12 +221,32 @@ export function createApp(
       },
     });
   });
-  app.get("/api/v1/github", async (c) => c.json(await githubStatus()));
+  const credentials = () => githubEnv(db, cfg.secret);
+  app.get("/api/v1/github", async (c) => {
+    c.header("Cache-Control", "no-store");
+    return c.json({ ...await githubStatus(credentials()), managed: !!getSetting(db, "github") });
+  });
+  app.use("/api/v1/github/login", async (c, next) => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can connect GitHub.");
+    c.header("Cache-Control", "no-store");
+    await next();
+  });
+  app.get("/api/v1/github/login", c => c.json(githubLogin.state(c.get("session").token)));
+  app.post("/api/v1/github/login", c => c.json(githubLogin.start(c.get("session").token, async () => {
+    const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+    return !!current && !!db.prepare("SELECT 1 FROM administrators WHERE user_id=?").get(current.user.id);
+  })));
+  app.delete("/api/v1/github/login", async c => {
+    const body = await c.req.json();
+    if (typeof body.id !== "string") throw new ApiError(400, "github_flow", "Choose the current GitHub sign-in.");
+    return c.json(githubLogin.cancel(c.get("session").token, body.id));
+  });
   app.get("/api/v1/github/repos", async (c) => {
     const repos: any[] = [];
     for (let page = 1; page <= 10; page++) {
       const batch = await gh<any[]>(
         `user/repos?per_page=100&sort=pushed&page=${page}`,
+        "GET", undefined, credentials(),
       );
       repos.push(...batch);
       if (batch.length < 100) break;
@@ -243,6 +266,7 @@ export function createApp(
       throw new ApiError(400, "invalid_repo", "Choose a repository.");
     const branches = await gh<{ name: string }[]>(
       `repos/${repo}/branches?per_page=100`,
+      "GET", undefined, credentials(),
     );
     return c.json({ branches: branches.map((r) => r.name) });
   });
@@ -423,5 +447,5 @@ export function createApp(
     }),
   );
   app.get("/", (c) => c.redirect("/agents/"));
-  return { app, tickets };
+  return { app, tickets, githubLogin };
 }

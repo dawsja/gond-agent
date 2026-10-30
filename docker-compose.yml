@@ -48,12 +48,6 @@ services:
         target: /var/run/docker.sock
         bind:
           create_host_path: false
-      - type: bind
-        source: ${GH_CONFIG_PATH:-${HOME}/.config/gh}
-        target: /gh
-        read_only: true
-        bind:
-          create_host_path: false
     stop_grace_period: 30s
 
 volumes:

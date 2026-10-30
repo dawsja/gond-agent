@@ -14,19 +14,26 @@ openssl rand -base64 32
 # Paste the output into BETTER_AUTH_SECRET in .env; set your browser origin.
 chmod 600 .env
 docker compose config --quiet
-# Sign in to GitHub on the host as described below, then:
 docker compose pull
 docker compose up -d
 ```
 
-Use `docker compose config --quiet` to validate without printing resolved secrets. Keep the auth secret stable across upgrades because it protects sessions and encrypted OIDC settings. `PORT` selects the published host port; update `BETTER_AUTH_URL` to match the browser origin. `GH_CONFIG_PATH` selects the read-only host GitHub login directory (blank defaults to `$HOME/.config/gh`); `DOCKER_SOCKET_PATH` selects the existing Docker socket. Missing bind sources cause a startup error instead of being silently created. The named `gond-agent-data` volume persists SQLite and run data; do not remove it during upgrades.
+Use `docker compose config --quiet` to validate without printing resolved secrets. Keep the auth secret stable across upgrades because it protects sessions and encrypted connections. `PORT` selects the published host port; update `BETTER_AUTH_URL` to match the browser origin. `DOCKER_SOCKET_PATH` selects the existing Docker socket. A missing socket causes a startup error instead of being silently created. The named `gond-agent-data` volume persists SQLite and run data; do not remove it during upgrades.
 
-1. Sign in on the host with `gh auth login`. The service reads a dedicated host login through a read-only configuration mount. Set `GH_CONFIG_PATH` in `.env` if needed. File-backed credentials are required: keyring-backed credentials on the host are not accessible in the container. Use `gh auth login --insecure-storage` for a dedicated service account when needed. Every instance account shares access to repositories available through this login.
-2. Copy `.env.example` to `.env`. Set `BETTER_AUTH_SECRET` (generate with `openssl rand -base64 32`) and `BETTER_AUTH_URL`. Keep this secret unchanged across restarts.
-3. Run `docker compose pull`, then `docker compose up -d`. Both images are pulled. The `worker-image` helper exits successfully without starting an agent; this is expected. The API creates disposable workers from that image when runs start. Open `http://localhost:8787`. Create the first account while bound to loopback; that account becomes the administrator. Complete model setup in the browser. All accounts have all features; additional registration is disabled unless `ALLOW_SIGNUP=true`.
+1. Copy `.env.example` to `.env`. Set `BETTER_AUTH_SECRET` (generate with `openssl rand -base64 32`) and `BETTER_AUTH_URL`. Keep this secret unchanged across restarts.
+2. Run `docker compose pull`, then `docker compose up -d`. Both images are pulled. The `worker-image` helper exits successfully without starting an agent; this is expected. The API creates disposable workers from that image when runs start. Open `http://localhost:8787`. Create the first account while bound to loopback; that account becomes the administrator. Complete model setup in the browser. All accounts have all features; additional registration is disabled unless `ALLOW_SIGNUP=true`.
+3. Open **Plugins → Connections → Sign in to GitHub**. Copy the one-time code and follow **Continue on GitHub** to approve it. The runtime already includes GitHub CLI; no download, host login or credential-directory mount is required. Use a dedicated GitHub account where appropriate: every instance account shares its repository access.
 4. For remote access, put an HTTPS reverse proxy in front, set `BETTER_AUTH_URL` to the public origin, and restart. Forward WebSocket upgrades for `/ws/` and preserve the origin. Enable `TRUST_PROXY=true` only when the proxy overwrites `X-Forwarded-For`; otherwise rate limits use the direct peer address. Set `BIND_ADDRESS` only as needed. Create the first account before exposing the instance.
 
 Open the server root `/` to enter the application at `/agents/`. An empty instance opens administrator account creation, followed by model-provider setup. Existing instances open sign-in or the workspace. The container contains no marketing frontend or same-origin docs. Documentation lives at [gond.io/agent/docs](https://gond.io/agent/docs), maintained separately in `gond-landing`. Health is at `/health`; auth routes are at `/api/auth/`. CI publishes `ghcr.io/dawsja/gond-agent` and `ghcr.io/dawsja/gond-agent-worker`; `main`, version and SHA tags are available after their workflows succeed. Private packages require registry authentication.
+
+### GitHub connection
+
+Only administrators can start or cancel GitHub sign-in. The code is visible only to the initiating signed-in session; it expires after ten minutes. Approve only the code shown in your own workspace. GitHub CLI requests its standard scopes plus workflow access so agents can push workflow changes. Organization SSO or OAuth restrictions may require additional approval on GitHub.
+
+Approved credentials are encrypted in SQLite with `BETTER_AUTH_SECRET`. Temporary private CLI authorization files are removed on completion, cancellation, expiry and startup. GitHub API calls, HTTPS clones and pushes, pull requests and polling use command-scoped credentials; tokens are never returned to browsers, written into repository archives, or forwarded to workers. **Reconnect GitHub** replaces the connection only after approval. To revoke authorization, use GitHub's authorized OAuth app settings. Explicit service-side `GH_TOKEN` or `GH_CONFIG_DIR` credentials remain usable when no browser-managed connection exists; browser-managed credentials take precedence. Default Compose no longer mounts the host's GitHub configuration, so operators using that mount should connect through the app after updating their Compose file.
+
+The account popup at the bottom of the sidebar contains Documentation and Sign out. Collapsed navigation uses tooltips; hover or focus the logo to expand it.
 
 ### Updates
 

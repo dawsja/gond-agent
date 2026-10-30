@@ -14,7 +14,7 @@ const cfg = configFromEnv(),
 await pool.recover();
 const runs = new Runs(db, cfg, (id, handler) => pool.start(id, handler));
 await runs.recover();
-const { app, tickets } = createApp(db, cfg, auth, runs);
+const { app, tickets, githubLogin } = createApp(db, cfg, auth, runs);
 const server = serve({
   fetch: (request, env) => {
     const headers = new Headers(request.headers);
@@ -79,7 +79,7 @@ server.on("upgrade", (req, socket, head) => {
     ws.on("error", () => ws.close());
   });
 });
-const scheduler = new Scheduler(db, runs);
+const scheduler = new Scheduler(db, runs, cfg.secret);
 const timer = setInterval(() => void scheduler.tick(), 60_000);
 void scheduler.tick();
 let closing = false;
@@ -87,6 +87,7 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   clearInterval(timer);
+  await githubLogin.close();
   sockets.clients.forEach((s) => s.close());
   await runs.shutdown();
   server.close(() => {

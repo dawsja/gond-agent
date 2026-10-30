@@ -1,6 +1,7 @@
 // Runs inside the worker image against the real packaged service, never API/browser mocks.
 const { chromium, expect } = require('@playwright/test');
 const { createServer } = require('node:http');
+const { writeFileSync, unlinkSync } = require('node:fs');
 const width = Number(process.env.WIDTH);
 const origin = 'http://gond-agent:8787';
 const screenshots = [];
@@ -76,6 +77,42 @@ const key = 'fixture-only-provider-key';
       expect(JSON.stringify(settings)).not.toContain(key);
     }
     await expect(page.getByRole('heading', { level: 1 })).toContainText(', Test');
+    await expect(page.getByRole('button', { name: 'Sign out', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('link', { name: 'Documentation', exact: true })).toHaveCount(0);
+    if (width === 1440) {
+      await page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click();
+      const expand = page.getByRole('button', { name: 'Expand sidebar', exact: true });
+      await page.mouse.move(500, 300);
+      await expect(expand.locator('svg').last()).toHaveCSS('opacity', '0');
+      await expect(expand.locator('svg').first()).toHaveCSS('opacity', '1');
+      await expand.hover();
+      await expect(expand.locator('svg').last()).toHaveCSS('opacity', '1');
+      await expect(page.getByRole('tooltip')).toHaveText('Expand sidebar');
+      await capture('sidebar-logo-hover');
+      for (const name of ['New agent', 'Search', 'Home', 'Usage', 'Plugins', 'Automations', 'Settings']) {
+        const target = ['Home', 'Usage', 'Plugins', 'Automations', 'Settings'].includes(name) ? page.getByRole('link', { name, exact: true }) : page.getByRole('button', { name, exact: true }).first();
+        await target.hover();
+        await expect(page.getByRole('tooltip')).toHaveText(name);
+      }
+      await capture('sidebar-tooltip');
+      await page.getByRole('button', { name: 'Account menu', exact: true }).hover();
+      await expect(page.getByRole('tooltip')).toHaveText('Account');
+      await page.getByRole('button', { name: 'Account menu', exact: true }).click();
+      await expect(page.getByRole('menuitem', { name: 'Documentation', exact: true })).toBeVisible();
+      await expect(page.getByRole('menuitem', { name: 'Sign out', exact: true })).toBeVisible();
+      await capture('account-menu-collapsed');
+      await page.keyboard.press('Escape');
+      await expand.focus();
+      await expect(expand.locator('svg').last()).toHaveCSS('opacity', '1');
+      await page.keyboard.press('Enter');
+      await expect(page.getByRole('button', { name: 'Collapse sidebar', exact: true })).toBeVisible();
+    } else await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Account menu', exact: true }).filter({ visible: true }).click();
+    await expect(page.getByRole('menuitem', { name: 'Documentation', exact: true })).toHaveAttribute('href', 'https://gond.io/agent/docs');
+    await expect(page.getByRole('menuitem', { name: 'Sign out', exact: true })).toBeVisible();
+    await capture('account-menu');
+    await page.keyboard.press('Escape');
+    if (width !== 1440) await page.keyboard.press('Escape');
     const me = await (await page.request.get(origin + '/api/v1/me')).json();
     expect(me.admin).toBe(true); expect(me.setup_required).toBe(false);
     await expect(page.getByRole('button', { name: /Voice input|Turning your voice/ })).toHaveCount(0);
@@ -114,7 +151,35 @@ const key = 'fixture-only-provider-key';
       await page.goto(origin + '/agents/settings');
     }
     await capture('settings-' + (process.env.PHASE || 'bootstrap'));
-    await page.getByRole('button', { name: 'Sign out', exact: true }).first().click();
+    await page.goto(origin + '/agents/plugins');
+    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
+    if (!returning) {
+      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
+      await expect(page.getByRole('link', { name: 'Continue on GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
+      await capture('github-device-login');
+      await page.getByRole('button', { name: 'Cancel sign-in', exact: true }).click();
+      await expect(page.getByText('GitHub sign-in cancelled.', { exact: true })).toBeVisible();
+      await expect(page.getByLabel('One-time code', { exact: true })).toHaveCount(0);
+      writeFileSync('/fixture/fail', 'yes');
+      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await expect(page.getByText(/GitHub sign-in didn't finish/)).toBeVisible();
+      await capture('github-login-error');
+      unlinkSync('/fixture/fail');
+      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
+      writeFileSync('/fixture/approve', 'yes');
+    }
+    await expect(page.getByText('Signed in as fixture-operator', { exact: true })).toBeVisible();
+    const github = await (await page.request.get(origin + '/api/v1/github')).json();
+    expect(github).toEqual({ configured: true, login: 'fixture-operator', managed: true });
+    const repos = await (await page.request.get(origin + '/api/v1/github/repos')).json();
+    expect(repos.repos[0].full_name).toBe('acme/app');
+    expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
+    await capture(returning ? 'github-after-restart' : 'github-connected');
+    if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Account menu', exact: true }).filter({ visible: true }).click();
+    await page.getByRole('menuitem', { name: 'Sign out', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Sign in to Gond Agent', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Create an account', exact: true })).toHaveCount(0);
     expect(errors).toEqual([]);

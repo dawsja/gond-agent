@@ -88,7 +88,8 @@ export interface Repo {
   pushed_at: string | null
 }
 
-export interface GithubStatus { configured: boolean; login: string | null }
+export interface GithubStatus { configured: boolean; login: string | null; managed: boolean }
+export interface GithubLogin { id?: string; status: "idle" | "starting" | "pending" | "connected" | "expired" | "cancelled" | "error" | "busy"; code?: string; url?: string; expiresAt?: number; message?: string }
 
 export class ApiError extends Error {
   readonly status: number

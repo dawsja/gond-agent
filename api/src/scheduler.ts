@@ -4,6 +4,7 @@ import type { Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { resolveModel } from "./models";
 import { validRepo, validBranch, gh } from "./github";
+import { githubEnv } from "./github-login";
 import { nextRunAt, validTimezone, type Schedule } from "./lib/schedule";
 export function validateRunner(
   body: any,
@@ -100,6 +101,7 @@ export class Scheduler {
   constructor(
     private db: Store,
     private runs: Runs,
+    private secret: string,
   ) {}
   private claim(key: string) {
     return (
@@ -180,6 +182,7 @@ export class Scheduler {
           for (const repo of repos) {
             const issues = await gh<any[]>(
               `repos/${repo}/issues?labels=gond-agent&state=open&per_page=100`,
+              "GET", undefined, githubEnv(this.db, this.secret),
             );
             for (const issue of issues.filter((x) => !x.pull_request)) {
               const key = `issue:${repo}:${issue.number}`;
@@ -201,13 +204,14 @@ export class Scheduler {
                 `repos/${repo}/issues/${issue.number}/comments`,
                 "POST",
                 { body: `Gond Agent started work: /agents/runs/${run.id}` },
+                githubEnv(this.db, this.secret),
               );
             }
           }
         for (const r of this.runs
           .list(admin.user_id)
           .filter((r) => r.pr_number && r.pr_state === "open")) {
-          const pr = await gh<any>(`repos/${r.repo}/pulls/${r.pr_number}`);
+          const pr = await gh<any>(`repos/${r.repo}/pulls/${r.pr_number}`, "GET", undefined, githubEnv(this.db, this.secret));
           if (pr.merged) {
             r.pr_state = "merged";
             this.runs.status(r, "merged");
@@ -221,6 +225,7 @@ export class Scheduler {
           }
           const checks = await gh<any>(
             `repos/${r.repo}/commits/${pr.head.sha}/check-runs`,
+            "GET", undefined, githubEnv(this.db, this.secret),
           );
           const pending = checks.check_runs.some(
             (c: any) => c.status !== "completed",

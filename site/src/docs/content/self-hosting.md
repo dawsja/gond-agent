@@ -4,7 +4,7 @@ Use a Linux x86_64 host with Docker Engine 25+ and Docker Compose, plus enough d
 
 ## Prepare the host
 
-Sign in with `gh auth login` on the host. Make the host's GitHub configuration available through the read-only mount in `docker-compose.yml`. If credentials are held in a desktop keyring, use a dedicated file-backed service login with `gh auth login --insecure-storage`.
+After workspace setup, an administrator connects GitHub in **Plugins → Connections**. Copy the one-time code, open the GitHub approval link and approve the code. GitHub CLI is already installed in the runtime; no host CLI login or credential mount is required. All instance accounts share this connection's repository access. Approved credentials are encrypted on the server and never sent to workers. Codes expire after ten minutes and sign-in can be cancelled.
 
 The service needs access to the Docker socket to create per-run containers, networks and workspace volumes. This grants control of the Docker host: use a dedicated trusted machine or Linux VM. Agent containers never receive the socket or host credentials. Containers share the host kernel; their networks permit outbound access, including reachable host/LAN services. Apply host firewall/egress policy if needed.
 
@@ -17,7 +17,7 @@ cp .env.example .env
 openssl rand -base64 32
 ```
 
-Paste the output into `BETTER_AUTH_SECRET` in `.env`, then set `BETTER_AUTH_URL`. Keep the secret unchanged across restarts and upgrades. `BETTER_AUTH_URL` is the browser origin, without `/agents`; match the published `PORT` when connecting directly. Set `DOCKER_SOCKET_PATH` and `GH_CONFIG_PATH` if the defaults do not match your host.
+Paste the output into `BETTER_AUTH_SECRET` in `.env`, then set `BETTER_AUTH_URL`. Keep the secret unchanged across restarts and upgrades; it also protects saved GitHub credentials. `BETTER_AUTH_URL` is the browser origin, without `/agents`; match the published `PORT` when connecting directly. Set `DOCKER_SOCKET_PATH` if the default does not match your host.
 
 ```sh
 chmod 600 .env

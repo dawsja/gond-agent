@@ -30,16 +30,24 @@ describe.skipIf(!image)("real container workspaces", () => {
     const dir = await mkdtemp(join(tmpdir(), "gond-agent-onboarding-"));
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const project = dir.split("/").at(-1)!.toLowerCase();
-    await mkdir(join(dir, "gh"));
+    const fixture = join(dir, "fixture"); await mkdir(fixture);
+    const fakeGh = join(dir, "gh.cjs");
+    await writeFile(fakeGh, await readFile(new URL("./fixtures/gh.cjs", import.meta.url)), { mode: 0o755 });
+    const override = join(dir, "compose.test.json");
+    await writeFile(override, JSON.stringify({ services: { "gond-agent": { environment: { GOND_AGENT_GH_FIXTURE_DIR: "/fixture" }, volumes: [
+      { type: "bind", source: fakeGh, target: "/usr/local/bin/gh", read_only: true },
+      { type: "bind", source: fixture, target: "/fixture" },
+    ] } } }));
     const env = { ...process.env, BETTER_AUTH_SECRET: "test-only-browser-setup-secret-at-least-32-characters",
       BETTER_AUTH_URL: "http://gond-agent:8787", ALLOW_SIGNUP: "false", PORT: "0", BIND_ADDRESS: "127.0.0.1",
-      GH_CONFIG_PATH: join(dir, "gh"), GOND_AGENT_IMAGE: process.env.GOND_AGENT_RUNTIME_TEST_IMAGE!, GOND_AGENT_WORKER_IMAGE: image! };
+      GOND_AGENT_IMAGE: process.env.GOND_AGENT_RUNTIME_TEST_IMAGE!, GOND_AGENT_WORKER_IMAGE: image! };
     const docker = process.env.DOCKER_BIN ?? "docker";
-    const compose = (...args: string[]) => command(docker, ["compose", "--project-name", project, "--env-file", "/dev/null", "-f", join(root, "docker-compose.yml"), ...args], { env, timeout: 90000 });
+    const compose = (...args: string[]) => command(docker, ["compose", "--project-name", project, "--env-file", "/dev/null", "-f", join(root, "docker-compose.yml"), "-f", override, ...args], { env, timeout: 90000 });
     const browser = async (phase: string) => {
       const script = await readFile(new URL("./onboarding.browser.cjs", import.meta.url), "utf8");
       const result = JSON.parse((await command(docker, ["run", "--rm", "--network", `${project}_default`, "--network-alias", "provider-fixture",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges=true", "--shm-size", "256m",
+        "--mount", `type=bind,source=${fixture},target=/fixture`,
         "--env", `WIDTH=${width}`, "--env", `PHASE=${phase}`, "--entrypoint", "node", image!, "-e", script], { timeout: 90000 })).toString());
       const evidence = process.env.GOND_AGENT_BROWSER_ARTIFACTS ?? join(dir, "evidence");
       await mkdir(evidence, { recursive: true });
@@ -64,18 +72,15 @@ describe.skipIf(!image)("real container workspaces", () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const project = dir.split("/").at(-1)!.toLowerCase();
     const envFile = join(dir, "test.env");
-    const gh = join(dir, "gh");
-    await mkdir(gh);
     await writeFile(envFile, [
       "BETTER_AUTH_SECRET=test-only-compose-secret-at-least-32-characters",
       "BETTER_AUTH_URL=http://localhost:8787", "PORT=0", "BIND_ADDRESS=127.0.0.1",
-      `GH_CONFIG_PATH=${gh}`,
       `DOCKER_SOCKET_PATH=${process.env.DOCKER_SOCKET_PATH ?? "/var/run/docker.sock"}`,
     ].join("\n"));
     const env = { ...process.env };
     delete env.GOND_AGENT_IMAGE;
     delete env.GOND_AGENT_WORKER_IMAGE;
-    for (const key of ["PORT", "BIND_ADDRESS", "GH_CONFIG_PATH", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL"]) delete env[key];
+    for (const key of ["PORT", "BIND_ADDRESS", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL"]) delete env[key];
     const base = ["compose", "--project-name", project, "--project-directory", root, "--env-file", envFile, "-f", join(root, "docker-compose.yml")];
     const docker = process.env.DOCKER_BIN ?? "docker";
     const compose = (...args: string[]) => command(docker, [...base, ...args], { env, timeout: 90000 });
@@ -84,6 +89,7 @@ describe.skipIf(!image)("real container workspaces", () => {
       expect(Object.keys(defaults.services).sort()).toEqual(["gond-agent", "worker-image"]);
       expect(defaults.services["gond-agent"].image).toBe("ghcr.io/dawsja/gond-agent:main");
       expect(defaults.services["worker-image"].image).toBe("ghcr.io/dawsja/gond-agent-worker:main");
+      expect(defaults.services["gond-agent"].volumes.some((v: { target: string }) => v.target === "/gh")).toBe(false);
       for (const service of Object.values(defaults.services) as any[]) {
         expect(service.build).toBeUndefined();
         expect(service.profiles).toBeUndefined();

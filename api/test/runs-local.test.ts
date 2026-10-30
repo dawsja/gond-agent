@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../src/db";
+import { setSetting } from "../src/db";
+import { seal } from "../src/auth";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
@@ -158,6 +160,7 @@ describe("persistent local run lifecycle", () => {
     expect(runs.history(r.id, 0).find((e) => e.type === "tool.images").images).toEqual(images);
   });
   it("starts a container, streams, pushes and creates a PR without giving the worker credentials", async () => {
+    setSetting(db, "github", { token: seal(cfg().secret, "test-managed-github-token") });
     const r = await runs.create("u", {
       repo: "acme/app",
       model: "auto",
@@ -165,21 +168,24 @@ describe("persistent local run lifecycle", () => {
     });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(checkout).toHaveBeenCalled();
-    expect(importBundle).toHaveBeenCalledWith(
+    expect(vi.mocked(importBundle).mock.calls[0]?.slice(0, 3)).toEqual([
       "/fake",
       Buffer.from("bundle"),
       r.branch,
-    );
+    ]);
     expect(runs.get(r.id).pr_number).toBe(42);
     expect(runs.get(r.id).files).toBe(1);
     expect(log.some((x) => x.method === "setup")).toBe(true);
     expect(JSON.stringify(log)).not.toMatch(
-      /test-provider-key|gh auth|BETTER_AUTH_SECRET/,
+      /test-provider-key|test-managed-github-token|gh auth|BETTER_AUTH_SECRET/,
     );
     const replay = runs.history(r.id, 0);
     expect(replay.some((x) => x.type === "text.delta")).toBe(true);
     expect(replay.every((e, i) => !i || e.seq > replay[i - 1].seq)).toBe(true);
     await runs.merge(r.id, "u");
+    expect(vi.mocked(gh).mock.calls.every(call => call[3]?.GH_TOKEN === "test-managed-github-token")).toBe(true);
+    expect(vi.mocked(checkout).mock.calls[0]?.[6]?.GH_TOKEN === "test-managed-github-token").toBe(true);
+    expect(vi.mocked(importBundle).mock.calls[0]?.[3]?.GH_TOKEN === "test-managed-github-token").toBe(true);
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(runs.get(r.id).status).toBe("merged");
   });

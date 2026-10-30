@@ -15,6 +15,7 @@ import {
   validBranch,
 } from "../github";
 import { resolveModel, loadModelCatalog } from "../models";
+import { githubEnv } from "../github-login";
 import { modelResponse } from "../responses";
 import {
   emptySummary,
@@ -197,7 +198,7 @@ export class Runs {
         "run_limit",
         "All workspaces are busy. Wait for a run to finish.",
       );
-    const info = await gh<{ default_branch: string }>(`repos/${input.repo}`),
+    const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnv(this.db, this.cfg.secret)),
       base = input.base_branch || info.default_branch;
     if (!validBranch(base))
       throw new ApiError(
@@ -354,6 +355,7 @@ export class Runs {
         r.base_branch,
         r.branch,
         r.pushed,
+        githubEnv(this.db, this.cfg.secret),
       );
       if (this.shuttingDown) {
         r = this.get(id); r.phase = "idle"; r.pending = []; this.status(r, "stopped"); return;
@@ -473,6 +475,7 @@ export class Runs {
       live.cwd,
       Buffer.from(snapshot.bundle, "base64"),
       r.branch,
+      githubEnv(this.db, this.cfg.secret),
     );
     r = this.get(id);
     r.pushed = true;
@@ -524,10 +527,11 @@ export class Runs {
       (r.summary.text || r.prompt) +
       `\n\nOpened by [Gond Agent](${this.cfg.origin}/agents/runs/${id}).`;
     if (r.pr_number)
-      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body });
+      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnv(this.db, this.cfg.secret));
     else {
       const existing = await gh<{ number: number; html_url: string }[]>(
         `repos/${r.repo}/pulls?head=${encodeURIComponent(r.repo.split("/")[0] + ":" + r.branch)}&state=open`,
+        "GET", undefined, githubEnv(this.db, this.cfg.secret),
       );
       const pr =
         existing[0] ??
@@ -535,6 +539,7 @@ export class Runs {
           `repos/${r.repo}/pulls`,
           "POST",
           { head: r.branch, base: r.base_branch, title: r.title, body },
+          githubEnv(this.db, this.cfg.secret),
         ));
       r.pr_number = pr.number;
       r.pr_url = pr.html_url;
@@ -551,7 +556,7 @@ export class Runs {
     await gh(`repos/${r.repo}/pulls/${r.pr_number}/merge`, "PUT", {
       merge_method: "squash",
       sha: r.head_sha,
-    });
+    }, githubEnv(this.db, this.cfg.secret));
     r.pr_state = "merged";
     r.phase = "idle";
     this.status(r, "merged");

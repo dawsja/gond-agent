@@ -15,6 +15,7 @@ export async function gh<T>(
   endpoint: string,
   method = "GET",
   body?: unknown,
+  env?: NodeJS.ProcessEnv,
 ): Promise<T> {
   const args = ["api", endpoint, "--method", method];
   if (body !== undefined) args.push("--input", "-");
@@ -22,19 +23,20 @@ export async function gh<T>(
     (
       await command("gh", args, {
         input: body === undefined ? undefined : JSON.stringify(body),
+        env,
       })
     ).toString(),
   ) as T;
 }
-export async function githubStatus() {
+export async function githubStatus(env?: NodeJS.ProcessEnv) {
   try {
-    const u = await gh<{ login: string }>("user");
+    const u = await gh<{ login: string }>("user", "GET", undefined, env);
     return { configured: true, login: u.login };
   } catch {
     return { configured: false, login: null };
   }
 }
-export const git = (cwd: string, ...args: string[]) =>
+const gitEnv = (env: NodeJS.ProcessEnv, cwd: string, args: string[], timeout = 120_000) =>
   command(
     "git",
     [
@@ -46,13 +48,17 @@ export const git = (cwd: string, ...args: string[]) =>
     ],
     {
       cwd,
+      timeout,
       env: {
-        ...process.env,
+        ...env,
         GIT_TERMINAL_PROMPT: "0",
         GIT_CONFIG_NOSYSTEM: "1",
       },
     },
   );
+export const git = (cwd: string, ...args: string[]) => gitEnv(process.env, cwd, args);
+const authenticatedGit = (env: NodeJS.ProcessEnv, cwd: string, ...args: string[]) => gitEnv(env, cwd,
+  ["-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", ...args], args[0] === "clone" ? 600_000 : 120_000);
 export async function checkout(
   data: string,
   id: string,
@@ -60,18 +66,15 @@ export async function checkout(
   base: string,
   branch: string,
   resume: boolean,
+  env: NodeJS.ProcessEnv = process.env,
 ) {
   if (!validRepo(repo) || !validBranch(base) || !validBranch(branch))
     throw new Error("Invalid repository or branch");
   const cwd = join(data, "checkouts", id);
   await rm(cwd, { recursive: true, force: true });
   await mkdir(join(data, "checkouts"), { recursive: true, mode: 0o700 });
-  // gh obtains credentials from the mounted host configuration. No token enters an archive or worker.
-  await command(
-    "gh",
-    ["repo", "clone", repo, cwd, "--", "--branch", resume ? branch : base],
-    { timeout: 600_000 },
-  );
+  // Command-scoped helper and HTTPS remote: no credentials are written into the repository.
+  await authenticatedGit(env, data, "clone", "--branch", resume ? branch : base, `https://github.com/${repo}.git`, cwd);
   await git(cwd, "config", "user.name", "Gond Agent");
   await git(cwd, "config", "user.email", "agent@localhost");
   if (!resume) await git(cwd, "checkout", "-b", branch);
@@ -82,15 +85,14 @@ export async function importBundle(
   cwd: string,
   bundle: Buffer,
   branch: string,
+  env: NodeJS.ProcessEnv = process.env,
 ) {
   const path = join(cwd, ".git", "gond-agent.bundle");
   await writeFile(path, bundle, { mode: 0o600 });
   try {
     await git(cwd, "fetch", "--no-tags", path, "HEAD");
     await git(cwd, "reset", "--hard", "FETCH_HEAD");
-    // The branch was validated on creation; git uses the host gh credential helper.
-    await command("gh", ["auth", "setup-git"]);
-    await git(cwd, "push", "origin", `HEAD:refs/heads/${branch}`);
+    await authenticatedGit(env, cwd, "push", "origin", `HEAD:refs/heads/${branch}`);
   } finally {
     await rm(path, { force: true });
   }

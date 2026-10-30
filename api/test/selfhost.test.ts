@@ -10,6 +10,8 @@ import { Runs } from "../src/runs/service";
 import { containerArguments } from "../src/containers";
 import { validRepo, validBranch } from "../src/github";
 import { validateRunner } from "../src/scheduler";
+import { GithubLogin } from "../src/github-login";
+import { getSetting } from "../src/db";
 import type { Config } from "../src/config";
 let dir: string,
   db: ReturnType<typeof openStore>,
@@ -75,6 +77,30 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 describe("local authentication and persistence", () => {
+  it("protects GitHub device sign-in by administrator, origin and session without exposing credentials", async () => {
+    let code!: (code: string) => void, approve!: (token: string) => void;
+    const login = new GithubLogin(db, secret, dir, (_root, callback) => {
+      code = callback;
+      return { token: new Promise<string>(resolve => { approve = resolve; }), cancel: () => {} };
+    });
+    app = createApp(db, cfg(), auth, runs, login).app;
+    const admin = await signup(), other = await signup("other@example.test");
+    expect((await call("/api/v1/github/login")).status).toBe(401);
+    for (const method of ["GET", "POST", "DELETE"]) expect((await call("/api/v1/github/login", method === "GET" ? undefined : {}, other, method)).status).toBe(403);
+    expect((await call("/api/v1/github/login", {}, admin, "POST", "https://elsewhere.test")).status).toBe(403);
+    const begun = await call("/api/v1/github/login", {}, admin);
+    expect(begun.headers.get("cache-control")).toBe("no-store");
+    code("ABCD-1234");
+    const pending = await (await call("/api/v1/github/login", undefined, admin)).json();
+    expect(pending).toMatchObject({ code: "ABCD-1234", url: "https://github.com/login/device" });
+    expect(Object.keys(pending).sort()).toEqual(["code", "expiresAt", "id", "status", "url"]);
+    const session = await auth.current.api.getSession({ headers: new Headers({ cookie: admin }) });
+    await call("/api/auth/sign-out", {}, admin);
+    approve("credential-after-signout");
+    await vi.waitFor(() => expect(login.state(session!.session.token).status).toBe("cancelled"));
+    await login.close();
+    expect(getSetting(db, "github")).toBeNull();
+  });
   it("opens the app at the instance root without serving a marketing site", async () => {
     const root = await call("/");
     expect(root.status).toBe(302);
