@@ -10,3 +10,4 @@ data/
 *.vmlinux
 *.log
 **/__pycache__/
+api/test-artifacts/

@@ -29,6 +29,14 @@ describe("Gond Agent identity", () => {
     expect(file("../src/containers.ts")).toContain('"/home/gond-agent:rw,');
   });
 
+  it("packages only the workspace and sends documentation to the public website", () => {
+    expect(file("../../Dockerfile")).not.toMatch(/COPY site\/|site\/dist|cd .*site/);
+    expect(file("../src/app.ts")).not.toContain("site/dist");
+    expect(file("../../web/src/lib/links.ts")).toContain('DOCS_URL = "https://gond.io/agent/docs"');
+    for (const path of ["../../web/src/features/settings/providers.tsx", "../../web/src/lib/images.ts"])
+      expect(file(path)).not.toContain("crypto.randomUUID()");
+  });
+
   it("uses the canonical faceless cloud in both frontends", () => {
     const canonical = file("../../shared/brand-mark.ts").match(/CLOUD_PATH = "([^"]+)"/)![1];
     expect(canonical).toBe("M29 79 A17 17 0 0 1 26.46 45.19 A3 3 0 0 0 29.01 42.32 A21 21 0 0 1 70.55 38.67 A3 3 0 0 0 73.28 41.04 A19 19 0 0 1 72 79 Z");

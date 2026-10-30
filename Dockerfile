@@ -2,12 +2,10 @@
 FROM node:24.22.1-bookworm AS frontend
 WORKDIR /src
 COPY web/package*.json web/
-COPY site/package*.json site/
-RUN cd web && npm ci && cd ../site && npm ci
+RUN cd web && npm ci
 COPY shared/ shared/
 COPY web/ web/
-COPY site/ site/
-RUN cd web && npm run build && cd ../site && npm run build
+RUN cd web && npm run build
 
 FROM rust:1.99.1-bookworm AS worker-build
 WORKDIR /src
@@ -52,7 +50,6 @@ COPY --from=api-deps /app/api/node_modules ./node_modules
 COPY api/src/ ./src/
 COPY api/package.json ./
 COPY --from=frontend /src/web/dist/ /app/web/dist/
-COPY --from=frontend /src/site/dist/ /app/site/dist/
 ENV NODE_ENV=production GOND_AGENT_DATA_DIR=/data GH_CONFIG_DIR=/gh PORT=8787
 VOLUME ["/data"]
 EXPOSE 8787

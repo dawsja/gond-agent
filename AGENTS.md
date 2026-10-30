@@ -4,12 +4,12 @@ Gond Agent is a self-hosted coding workspace. Every account has access to all fe
 
 ## Layout
 
-- `api/`: Node 24, Hono, Better Auth, local SQLite through better-sqlite3. The process serves both static frontends, handles sessions and OIDC, coordinates runs, and polls GitHub.
+- `api/`: Node 24, Hono, Better Auth, local SQLite through better-sqlite3. The process serves the workspace, handles sessions and OIDC, coordinates runs, and polls GitHub. `/` redirects to `/agents/`: empty instances show administrator registration, then model setup; configured instances show sign-in or the workspace.
 - `runner/`: internal Rust worker used inside per-run Docker containers. Its only transport is the JSON event protocol. A loopback model relay multiplexes requests over Docker's attached stdio to the service.
 - Worker tools include Universal Ctags symbol navigation, bounded read-only batches and container Playwright browser tests. Persistent agent memory is not supported; keep repository instructions. Coding turns require current verification evidence and self-review through `finish_review`; web apps also require wide/phone browser evidence. Do not describe self-review as human approval.
 - `containers/`: non-root worker control service, browser dependencies and image smoke tests. `api/src/containers.ts` owns Docker lifecycle and the scoped model relay.
 - `web/`: React workspace, built at `/agents/`; API requests use `/api/` on the same origin.
-- `site/`: instance landing page and docs, built at the origin root. Public marketing/docs live in the separate `gond-landing` repository at `https://gond.io/agent`; the public website does not host workspaces.
+- `site/`: standalone site source, not built or served by the self-hosted runtime. Public marketing/docs live in the separate `gond-landing` repository at `https://gond.io/agent`; the public website does not host workspaces. Never bundle a marketing frontend into the application image.
 - `shared/`: frontend code imported through `@shared`.
 - `protocol/`: model, agent and live-run event formats.
 - `Dockerfile`, `docker-compose.yml`: self-hosted runtime and worker-image targets. Default Compose uses prebuilt GHCR images: `docker compose pull && docker compose up -d` updates both. The one-shot `worker-image` helper exits successfully; only the API launches actual workers. Source builds require the explicit `docker-compose.build.yml` override.
@@ -33,8 +33,9 @@ Do not deploy to a user's server, change its data, or publish packages manually 
 - `cd site && npm ci && npm run lint && npm run build`
 - `cd runner && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
 - `python3 -m py_compile containers/agent.py` and `python3 -m unittest discover -s containers -p 'test_*.py'`
-- Build `runtime` and `worker-image` Docker targets. Then `cd api && GOND_AGENT_CONTAINER_TEST_IMAGE=gond-agent-worker:local npm test -- test/containers.integration.test.ts` to exercise real Docker lifecycle, streamed model relay, Git export, follow-ups, interruption, cleanup, recovery and browser screenshots. Do not claim container lifecycle verification from mocks alone.
+- Build `runtime` and `worker-image` Docker targets as `gond-agent:local` and `gond-agent-worker:local`. Then `cd api && GOND_AGENT_CONTAINER_TEST_IMAGE=gond-agent-worker:local GOND_AGENT_RUNTIME_TEST_IMAGE=gond-agent:local npm test -- test/containers.integration.test.ts` to exercise real Docker lifecycle, streamed model relay, Git export, follow-ups, interruption, cleanup, recovery and browser onboarding. Do not claim container lifecycle verification from mocks alone. CI saves onboarding screenshots as an artifact.
 - Worker-image builds run real Chromium interaction/screenshot/error tests and `containers/smoke-worker.py` (real worker tools against a scripted model). Keep `containers/browser/package-lock.json` and the installed browser version in sync.
-- Render the landing and workspace at a wide and phone viewport after UI changes. Shared imports resolve from each frontend's dependencies; preserve Vite and TS aliases.
+- Render account creation, provider setup and the workspace at wide and phone viewports after UI changes. Shared imports resolve from each frontend's dependencies; preserve Vite and TS aliases.
+- Verify first-account registration → provider setup → workspace with the real packaged API and SQLite at wide/phone sizes on a non-loopback HTTP origin. UI IDs must use `crypto.getRandomValues`, not secure-context-only `crypto.randomUUID`.
 
 Update this guide, README and protocol when behavior changes.

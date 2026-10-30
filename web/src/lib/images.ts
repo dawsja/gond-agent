@@ -3,6 +3,7 @@
 // uploaded as is; messages carry only the uploaded image's id.
 import { type ClipboardEvent, type DragEvent, useEffect, useRef, useState } from "react"
 import { api } from "./api"
+import { randomId } from "./id"
 
 export interface UploadedImage {
   id: string
@@ -79,7 +80,7 @@ export function useImageAttachments() {
           ? `Attach up to ${MAX_IMAGES} images per message.`
           : null,
     )
-    const added = images.slice(0, Math.max(0, room)).map((f) => ({ id: crypto.randomUUID(), name: f.name || "Pasted image", url: URL.createObjectURL(f), file: f }))
+    const added = images.slice(0, Math.max(0, room)).map((f) => ({ id: randomId(), name: f.name || "Pasted image", url: URL.createObjectURL(f), file: f }))
     if (!added.length) return
     update([...current.current, ...added.map(({ file: _, ...a }) => a)])
     for (const a of added) {

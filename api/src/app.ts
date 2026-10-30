@@ -74,6 +74,11 @@ export function createApp(
   app.get("/api/auth/providers", (c) =>
     c.json({ providers: authentication.providers() }),
   );
+  app.get("/api/auth/bootstrap", (c) => {
+    const firstAccount = !db.prepare('SELECT 1 FROM "user" LIMIT 1').get();
+    c.header("Cache-Control", "no-store");
+    return c.json({ firstAccount, signupAllowed: firstAccount || cfg.signup, providers: authentication.providers() });
+  });
   let signupQueue: Promise<unknown> = Promise.resolve();
   app.on(["GET", "POST"], "/api/auth/*", (c) => {
     if (c.req.path === "/api/auth/sign-up/email" && c.req.method === "POST") {
@@ -426,15 +431,6 @@ export function createApp(
       path: join(import.meta.dirname, "../../web/dist/index.html"),
     }),
   );
-  app.get(
-    "*",
-    serveStatic({ root: join(import.meta.dirname, "../../site/dist") }),
-  );
-  app.get(
-    "*",
-    serveStatic({
-      path: join(import.meta.dirname, "../../site/dist/index.html"),
-    }),
-  );
+  app.get("/", (c) => c.redirect("/agents/"));
   return { app, tickets };
 }

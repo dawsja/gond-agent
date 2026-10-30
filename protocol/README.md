@@ -26,6 +26,8 @@ On stdin EOF or termination, the controller stops its worker. Cleanup removes co
 
 ## Workspace API
 
-The browser authenticates with Better Auth same-origin cookies. Email/password flows and OIDC callbacks use `/api/auth/*`. Instance configuration and run actions use `/api/v1/*`; state-changing actions require the configured Origin. OIDC settings are administrator-only and omit secrets from reads.
+The server root redirects to `/agents/`; only the workspace frontend is packaged and served. Public `GET /api/auth/bootstrap` returns `{firstAccount,signupAllowed,providers}` with `Cache-Control: no-store`. An empty instance shows first-administrator registration, then authenticated provider setup; existing instances show sign-in or their workspace. This public hint does not authorize registration: the serialized signup handler and database hooks enforce first-account-only registration when signup is closed.
+
+The browser authenticates with Better Auth same-origin cookies. Email/password flows and OIDC callbacks use `/api/auth/*`. Instance configuration and run actions use `/api/v1/*`; state-changing actions require the configured Origin. OIDC settings are administrator-only and omit secrets from reads. Provider connection IDs are non-secret random UI identifiers generated with `crypto.getRandomValues`, which is available during private HTTP bootstrap.
 
 A run starts with `POST /api/v1/runs {repo,base_branch?,model,prompt,images?}`. Messages, stop, pull creation, merge and deletion are scoped to the authenticated owner. Upload images first to `/api/v1/images`. Run status: queued, working, ready, failed, stopped, merged. A one-use ticket from `POST /api/v1/runs/:id/ticket` opens `/ws/runs/:id?ticket=...&after=<seq>`. Replay resumes after a persisted sequence number. Events carry seq and ts; run.info describes live status without becoming a transcript row. A ping gets a pong. Tickets expire after one minute and are consumed on use.

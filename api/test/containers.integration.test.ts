@@ -1,6 +1,6 @@
 // Real Docker + control relay + Rust worker + Chromium. Opt in locally; Docker CI always runs this.
 import { describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,39 @@ function sse(blocks: any[]) {
 }
 
 describe.skipIf(!image)("real container workspaces", () => {
+  it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE).each([1440, 390])("completes first-account and provider setup on HTTP at %ipx and survives restart", async (width) => {
+    const dir = await mkdtemp(join(tmpdir(), "gond-agent-onboarding-"));
+    const root = fileURLToPath(new URL("../../", import.meta.url));
+    const project = dir.split("/").at(-1)!.toLowerCase();
+    await mkdir(join(dir, "gh"));
+    const env = { ...process.env, BETTER_AUTH_SECRET: "test-only-browser-setup-secret-at-least-32-characters",
+      BETTER_AUTH_URL: "http://gond-agent:8787", ALLOW_SIGNUP: "false", PORT: "0", BIND_ADDRESS: "127.0.0.1",
+      GH_CONFIG_PATH: join(dir, "gh"), GOND_AGENT_IMAGE: process.env.GOND_AGENT_RUNTIME_TEST_IMAGE!, GOND_AGENT_WORKER_IMAGE: image! };
+    const docker = process.env.DOCKER_BIN ?? "docker";
+    const compose = (...args: string[]) => command(docker, ["compose", "--project-name", project, "--env-file", "/dev/null", "-f", join(root, "docker-compose.yml"), ...args], { env, timeout: 90000 });
+    const browser = async (phase: string) => {
+      const script = await readFile(new URL("./onboarding.browser.cjs", import.meta.url), "utf8");
+      const result = JSON.parse((await command(docker, ["run", "--rm", "--network", `${project}_default`, "--network-alias", "provider-fixture",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges=true", "--shm-size", "256m",
+        "--env", `WIDTH=${width}`, "--env", `PHASE=${phase}`, "--entrypoint", "node", image!, "-e", script], { timeout: 90000 })).toString());
+      const evidence = process.env.GOND_AGENT_BROWSER_ARTIFACTS ?? join(dir, "evidence");
+      await mkdir(evidence, { recursive: true });
+      for (const shot of result.screenshots ?? []) await writeFile(join(evidence, shot.name), Buffer.from(shot.data, "base64"));
+      expect(result.error).toBeUndefined();
+      expect(result.passed).toBe(true);
+    };
+    try {
+      await compose("up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60");
+      await compose("exec", "-T", "gond-agent", "node", "-e", "if(require('node:fs').existsSync('/app/site'))process.exit(1)");
+      await browser("bootstrap");
+      await compose("up", "-d", "--no-build", "--pull", "never", "--force-recreate", "--wait", "--wait-timeout", "60");
+      await browser("returning");
+    } finally {
+      await compose("down", "--volumes", "--remove-orphans");
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 240000);
+
   it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE)("starts Compose without builds, includes both images and preserves data on repeated up", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gond-agent-compose-"));
     const root = fileURLToPath(new URL("../../", import.meta.url));

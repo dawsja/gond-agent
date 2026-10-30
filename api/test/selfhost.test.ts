@@ -75,6 +75,29 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 describe("local authentication and persistence", () => {
+  it("opens the app at the instance root without serving a marketing site", async () => {
+    const root = await call("/");
+    expect(root.status).toBe(302);
+    expect(root.headers.get("location")).toBe("/agents/");
+    for (const path of ["/docs", "/pricing", "/terms", "/privacy", "/missing"]) {
+      expect((await call(path)).status).toBe(404);
+    }
+  });
+
+  it("reports first-account bootstrap publicly without opening further registration", async () => {
+    const config = { ...cfg(), signup: false };
+    const closed = await createAuthentication(db, config);
+    app = createApp(db, config, closed, runs).app;
+    const initial = await call("/api/auth/bootstrap");
+    expect(initial.headers.get("cache-control")).toBe("no-store");
+    expect(await initial.json()).toEqual({ firstAccount: true, signupAllowed: true, providers: [] });
+    await signup();
+    expect(await (await call("/api/auth/bootstrap")).json()).toEqual({ firstAccount: false, signupAllowed: false, providers: [] });
+    expect((await call("/api/auth/sign-up/email", { name: "Other", email: "other@example.test", password: "test-password-only-123456" })).status).toBeGreaterThanOrEqual(400);
+    app = createApp(db, { ...config, signup: true }, auth, runs).app;
+    expect(await (await call("/api/auth/bootstrap")).json()).toEqual({ firstAccount: false, signupAllowed: true, providers: [] });
+  });
+
   it("registers, stores a hashed password, signs out and signs back in", async () => {
     const cookie = await signup();
     const me = await (await call("/api/v1/me", undefined, cookie)).json();

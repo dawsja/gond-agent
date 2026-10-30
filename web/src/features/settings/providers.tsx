@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useState } from "react"
 import { api } from "@/lib/api"
+import { randomId } from "@/lib/id"
 import { Button } from "@shared/ui/button"
 import { Input, NativeSelect } from "@shared/ui/input"
 import { Field, FieldGroup, FieldLabel, FieldSet, FieldLegend } from "@shared/ui/field"
@@ -34,7 +35,7 @@ function ProviderForm({ initial, setup }: { initial: Settings; setup: boolean })
     },
   })
   const test = useMutation({ mutationFn: (id: string) => api<{ models: string[] }>("/v1/settings/providers/test", { body: { id } }) })
-  const add = () => update({ ...value, connections: [...value.connections, { id: crypto.randomUUID(), name: "My provider", format: "openai", baseURL: "https://api.openai.com/v1", hasKey: false, models: [newModel()] }] })
+  const add = () => update({ ...value, connections: [...value.connections, { id: randomId(), name: "My provider", format: "openai", baseURL: "https://api.openai.com/v1", hasKey: false, models: [newModel()] }] })
   const transcriptionConnections = value.connections.filter(c => c.format !== "anthropic")
   return <form onSubmit={e => { e.preventDefault(); save.mutate() }} className="border-t border-border p-5">
     <FieldGroup>
