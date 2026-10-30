@@ -13,6 +13,7 @@ interface CatalogEntry {
   pending?: Promise<void>;
 }
 const catalogs = new WeakMap<Store, Map<string, CatalogEntry>>();
+export function clearModelCatalog(db: Store) { catalogs.delete(db); }
 const fingerprint = (c: ProviderConnection) => createHash("sha256").update(JSON.stringify([c.format, c.baseURL, c.secret, c.discover])).digest("hex");
 const cached = (db: Store, c: ProviderConnection) => {
   const entry = catalogs.get(db)?.get(c.id);

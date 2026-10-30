@@ -32,6 +32,21 @@ export function openStore(data: string) {
   })();
   return db;
 }
+// Better Auth creates the user table at startup. Install this afterwards so its
+// deletion and our account data cleanup are one atomic SQLite operation.
+export function installAccountCleanup(db: Store) {
+  db.exec(`CREATE TRIGGER IF NOT EXISTS gond_agent_delete_account AFTER DELETE ON "user" BEGIN
+    DELETE FROM occurrences WHERE EXISTS (SELECT 1 FROM runners r WHERE r.user_id=OLD.id AND occurrences.key GLOB 'schedule:' || r.id || ':*');
+    DELETE FROM runners WHERE user_id=OLD.id;
+    DELETE FROM usage WHERE user_id=OLD.id;
+    DELETE FROM images WHERE user_id=OLD.id;
+    DELETE FROM runs WHERE user_id=OLD.id;
+    DELETE FROM profiles WHERE user_id=OLD.id;
+    DELETE FROM administrators WHERE user_id=OLD.id;
+    DELETE FROM settings WHERE key IN ('providers','oidc','github') AND NOT EXISTS (SELECT 1 FROM "user");
+    DELETE FROM occurrences WHERE NOT EXISTS (SELECT 1 FROM "user");
+  END`);
+}
 export function getSetting<T>(db: Store, key: string): T | null {
   const row = db
     .prepare("SELECT value FROM settings WHERE key = ?")

@@ -8,7 +8,7 @@ import {
   randomBytes,
 } from "node:crypto";
 import type { Config } from "./config";
-import { getSetting, setSetting, type Store } from "./db";
+import { getSetting, installAccountCleanup, setSetting, type Store } from "./db";
 
 export interface OIDC {
   enabled: boolean;
@@ -45,7 +45,7 @@ export function unseal(secret: string, value: string): string {
   ]).toString();
 }
 export async function createAuthentication(db: Store, cfg: Config) {
-  const build = () => {
+  const build = (beforeDelete?: (user: { id: string }) => Promise<void>) => {
     const oidc = getSetting<OIDC>(db, "oidc");
     return betterAuth({
       appName: "Gond Agent",
@@ -61,6 +61,8 @@ export async function createAuthentication(db: Store, cfg: Config) {
       },
       session: { expiresIn: 60 * 60 * 24 * 7, updateAge: 60 * 60 * 24 },
       account: { accountLinking: { enabled: false } },
+      // HTTP deletion stays disabled. Only the confirmed workspace action enables it.
+      user: { deleteUser: { enabled: !!beforeDelete, beforeDelete } },
       rateLimit: { enabled: true, storage: "database", window: 60, max: 60 },
       advanced: {
         ipAddress: { ipAddressHeaders: ["x-gond-agent-client-ip"] },
@@ -115,10 +117,15 @@ export async function createAuthentication(db: Store, cfg: Config) {
   };
   let auth = build();
   await (await getMigrations(auth.options)).runMigrations();
+  installAccountCleanup(db);
   return {
     get current() {
       return auth;
     },
+    deleteAccount(headers: Headers, password: string | undefined, beforeDelete: (user: { id: string }) => Promise<void>) {
+      return build(beforeDelete).api.deleteUser({ headers, body: { password }, asResponse: true });
+    },
+    reload() { auth = build(); },
     providers() {
       const o = getSetting<OIDC>(db, "oidc");
       return o?.enabled ? [{ id: "oidc", name: o.name }] : [];

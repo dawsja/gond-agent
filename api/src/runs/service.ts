@@ -76,11 +76,33 @@ export class Runs {
   private booting = new Set<string>();
   private launches = new Map<string, Promise<void>>();
   private shuttingDown = false;
+  private deletingAccounts = new Set<string>();
   constructor(
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
   ) {}
+  assertAccount(user: string) {
+    if (this.deletingAccounts.has(user)) throw new ApiError(409, "account_deleting", "Your account is being deleted.");
+    if (!this.db.prepare('SELECT 1 FROM "user" WHERE id=?').get(user)) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
+  }
+  async withAccountDeletion<T>(user: string, action: (prepare: () => Promise<void>) => Promise<T>) {
+    this.assertAccount(user);
+    this.deletingAccounts.add(user);
+    try {
+      return await action(async () => {
+        const rows = this.db.prepare("SELECT id,status FROM runs WHERE user_id=?").all(user) as { id: string; status: string }[];
+        if (rows.some(r => ["queued", "working"].includes(r.status) || this.booting.has(r.id) || this.launches.has(r.id) || this.live.get(r.id)?.busy))
+          throw new ApiError(409, "active_runs", "Stop your active runs and wait for them to finish before deleting your account.");
+        for (const row of rows) {
+          const live = this.live.get(row.id);
+          try { await this.close(row.id); }
+          catch (error) { if (live) this.live.set(row.id, live); throw error; }
+          await rm(join(this.cfg.data, "checkouts", row.id), { recursive: true, force: true });
+        }
+      });
+    } finally { this.deletingAccounts.delete(user); }
+  }
   get(id: string, user?: string): Run {
     const r = this.db
       .prepare(
@@ -177,6 +199,7 @@ export class Runs {
       source?: string;
     },
   ) {
+    this.assertAccount(user);
     if (
       !validRepo(input.repo) ||
       !input.prompt?.trim() ||
@@ -205,6 +228,7 @@ export class Runs {
     const id = `run_${randomBytes(12).toString("hex")}`,
       title = titleFrom(input.prompt),
       now = Date.now();
+    this.assertAccount(user);
     const profile = this.profile(user);
     const r: Run = {
       id,
@@ -288,6 +312,7 @@ export class Runs {
     text: string,
     images: string[] = [],
   ) {
+    this.assertAccount(user);
     const r = this.get(id, user);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged")

@@ -36,19 +36,20 @@ describe("GitHub browser authorization", () => {
     await login.close(); db.close(); db = openStore(dir);
     expect(githubEnv(db, secret).GH_TOKEN === "fixture-token").toBe(true);
   });
-  it.each(["cancel", "expire", "signout", "shutdown"])("never persists late approval after %s", async mode => {
+  it.each(["cancel", "expire", "signout", "shutdown", "reset"])("never persists late approval after %s", async mode => {
     const job = deferred(); login = new GithubLogin(db, secret, dir, job.driver);
     setSetting(db, "github", { token: seal(secret, "old-credential") });
     vi.useFakeTimers();
     const flow = login.start("owner", async () => mode !== "signout"); job.code("ABCD-1234");
     if (mode === "cancel") login.cancel("owner", flow.id!);
+    if (mode === "reset") login.reset();
     if (mode === "expire") await vi.advanceTimersByTimeAsync(10 * 60000);
     const closed = mode === "shutdown" ? login.close() : undefined;
     job.resolve("late-credential");
     await Promise.resolve(); await Promise.resolve(); await closed;
     expect(githubEnv(db, secret).GH_TOKEN === "old-credential").toBe(true);
     expect(login.state("owner")).not.toHaveProperty("code");
-    expect(login.state("owner").status).toBe(mode === "expire" ? "expired" : "cancelled");
+    expect(login.state("owner").status).toBe(mode === "reset" ? "idle" : mode === "expire" ? "expired" : "cancelled");
   });
   it("does not leak upstream errors and rejects stale cancellation IDs", async () => {
     const job = deferred(); login = new GithubLogin(db, secret, dir, job.driver);

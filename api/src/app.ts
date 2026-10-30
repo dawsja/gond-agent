@@ -10,7 +10,8 @@ import { GithubLogin, githubEnv } from "./github-login";
 import { getSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
 import { ApiError } from "./wire";
-import { loadModelCatalog } from "./models";
+import { clearModelCatalog, loadModelCatalog } from "./models";
+import { deletionPolicy } from "./account";
 import { publicProviderSettings, saveProviderSettings, setupComplete } from "./providers";
 import { listRunners, saveRunner } from "./scheduler";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -83,16 +84,15 @@ export function createApp(
     c.header("Cache-Control", "no-store");
     return c.json({ firstAccount, signupAllowed: firstAccount || cfg.signup, providers: authentication.providers() });
   });
-  let signupQueue: Promise<unknown> = Promise.resolve();
+  let accountQueue: Promise<unknown> = Promise.resolve();
+  const changeAccounts = <T>(action: () => Promise<T>) => {
+    const result = accountQueue.then(action);
+    accountQueue = result.catch(() => {});
+    return result;
+  };
   app.on(["GET", "POST"], "/api/auth/*", (c) => {
-    if (c.req.path === "/api/auth/sign-up/email" && c.req.method === "POST") {
-      const result = signupQueue.then(() =>
-        authentication.current.handler(c.req.raw),
-      );
-      signupQueue = result.catch(() => {});
-      return result;
-    }
-    return authentication.current.handler(c.req.raw);
+    // User creation (including OIDC callbacks) must not race the last account's deletion.
+    return changeAccounts(() => authentication.current.handler(c.req.raw));
   });
   app.use("/api/v1/*", async (c, next) => {
     if (
@@ -113,6 +113,7 @@ export function createApp(
         "unauthorized",
         "You're signed out. Sign in again.",
       );
+    runs.assertAccount(session.user.id);
     c.set("user", session.user);
     c.set("session", session.session);
     c.set(
@@ -135,6 +136,55 @@ export function createApp(
       },
     });
   });
+  app.get("/api/v1/me/deletion", c => {
+    c.header("Cache-Control", "no-store");
+    return c.json(deletionPolicy(db, c.get("user").id));
+  });
+  const deletionAttempts = new Map<string, { count: number; reset: number }>();
+  app.delete("/api/v1/me", c => changeAccounts(async () => {
+    const session = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+    if (!session) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
+    const user = session.user, body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body) || body.confirmation !== user.email)
+      throw new ApiError(400, "confirmation_required", "Type your email address to confirm account deletion.");
+    const policy = deletionPolicy(db, user.id);
+    if (policy.blocked_reason) throw new ApiError(409, "administrator_required", policy.blocked_reason);
+    if (policy.has_password && (typeof body.password !== "string" || !body.password || body.password.length > 128))
+      throw new ApiError(400, "password_required", "Enter your current password to delete your account.");
+    if (!policy.has_password && Date.now() - new Date(session.session.createdAt).getTime() >= 15 * 60000)
+      throw new ApiError(403, "fresh_signin_required", "Sign out and sign in again before deleting your account.");
+    let attempts = deletionAttempts.get(user.id);
+    if (!attempts || attempts.reset <= Date.now()) {
+      attempts = { count: 0, reset: Date.now() + 15 * 60000 };
+      deletionAttempts.set(user.id, attempts);
+    }
+    if (++attempts.count > 5) throw new ApiError(429, "deletion_limit", "Too many attempts. Wait 15 minutes before trying again.");
+    return runs.withAccountDeletion(user.id, async prepare => {
+      let preparationError: unknown;
+      const result = await authentication.deleteAccount(c.req.raw.headers, policy.has_password ? body.password : undefined, async target => {
+        if (target.id !== user.id) throw new ApiError(403, "forbidden", "You can only delete your own account.");
+        try { await prepare(); } catch (error) { preparationError = error; throw error; }
+      });
+      if (preparationError) throw preparationError;
+      if (!result.ok) {
+        const error = await result.json().catch(() => ({}));
+        if (error.code === "INVALID_PASSWORD") throw new ApiError(400, "invalid_password", "Your current password is incorrect.");
+        if (error.code === "SESSION_EXPIRED") throw new ApiError(403, "fresh_signin_required", "Sign out and sign in again before deleting your account.");
+        throw new ApiError(400, "delete_failed", "Couldn't delete your account. Sign in again and retry.");
+      }
+      const reset = !db.prepare('SELECT 1 FROM "user" LIMIT 1').get();
+      deletionAttempts.delete(user.id);
+      for (const [key, ticket] of tickets) if (ticket.user === user.id) tickets.delete(key);
+      if (reset) {
+        githubLogin.reset();
+        clearModelCatalog(db);
+        authentication.reload();
+      }
+      const headers = new Headers(result.headers);
+      headers.set("Cache-Control", "no-store");
+      return new Response(JSON.stringify({ ok: true, setup_reset: reset }), { headers });
+    });
+  }));
   app.put("/api/v1/me/photo", async c => {
     if (!["image/png", "image/jpeg", "image/webp"].includes(c.req.header("content-type") ?? "")) throw new ApiError(400, "photo_type", "Choose a PNG, JPEG or WebP photo.");
     const user = c.get("user");

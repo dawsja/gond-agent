@@ -9,3 +9,5 @@ Read [Self-hosting](/docs/self-hosting) to deploy the server, then create your a
 ## Your workspace
 
 The run page shows live messages, tool output, plans and diffs. Send follow-ups on the same run. Press Enter to send, or Shift+Enter for a new line. Configure scheduled agents and automatic pull-request creation on Automations. Open Settings to manage your profile photo, model providers, sessions and OpenID Connect.
+
+Settings also contains account deletion, with an extra confirmation. Deleting the final account clears saved connections and restarts administrator registration and model setup; work pushed to GitHub is not removed.

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../src/db";
 import { setSetting } from "../src/db";
-import { seal } from "../src/auth";
+import { createAuthentication, seal } from "../src/auth";
 import { ApiError } from "../src/wire";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
@@ -58,9 +58,11 @@ const cfg = (): Config => ({
   idleMs: 60000,
   turnMs: 60000,
 });
-beforeEach(() => {
+beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
   db = openStore(dir);
+  await createAuthentication(db, cfg());
+  db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("u", "User", "user@example.test", 0, Date.now(), Date.now());
   saveProviderSettings(db, cfg().secret, {
     connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:8000/v1", apiKey: "test-provider-key", discover: false, models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
     defaultModel: "local:coder",
@@ -118,6 +120,33 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("closes an idle workspace before deleting its account records", async () => {
+    const run = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    await runs.withAccountDeletion("u", async prepare => {
+      await prepare();
+      expect(destroy).toHaveBeenCalledTimes(1);
+      db.prepare('DELETE FROM "user" WHERE id=?').run("u");
+    });
+    expect(db.prepare("SELECT 1 FROM runs WHERE id=?").get(run.id)).toBeUndefined();
+    expect(() => runs.get(run.id)).toThrow("doesn't exist");
+  });
+  it("does not resurrect account data when an in-flight run creation finishes after deletion", async () => {
+    let release!: (value: { default_branch: string }) => void;
+    const pending = new Promise<{ default_branch: string }>(resolve => { release = resolve; });
+    vi.mocked(gh).mockImplementationOnce(async () => await pending as any);
+    const creating = runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
+    await vi.waitFor(() => expect(gh).toHaveBeenCalled());
+    await runs.withAccountDeletion("u", async prepare => {
+      await prepare();
+      db.prepare('DELETE FROM "user" WHERE id=?').run("u");
+      release({ default_branch: "main" });
+      await expect(creating).rejects.toThrow("being deleted");
+    });
+    expect(db.prepare("SELECT count(*) AS n FROM runs").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT 1 FROM profiles WHERE user_id='u'").get()).toBeUndefined();
+    expect(checkout).not.toHaveBeenCalled();
+  });
   it("shows checkout progress before container startup and does not revive a stopped run", async () => {
     let release!: () => void, report!: (step: string) => void;
     const pending = new Promise<void>(resolve => { release = resolve; });

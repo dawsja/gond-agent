@@ -37,6 +37,8 @@ The account popup at the bottom of the sidebar contains Settings and Sign out; S
 
 The workspace uses Gond Code's default dark blue palette. The sidebar shows the logo alone, at the same readable size when expanded or collapsed. In either message composer, **Enter sends** and **Shift+Enter adds a newline**; IME composition does not submit. In **Settings → Account**, upload a PNG, JPEG or WebP profile photo (up to 2 MiB and 16 megapixels), reposition/zoom it in a circular preview and save. Photos appear in the account menu and your messages, survive restarts, and can be changed or removed. The server re-encodes them as metadata-free, circular 256px PNGs in SQLite. Photos require an authenticated session to view and only their owner can replace or remove them.
 
+The sidebar uses a compact 28px logo in a 48px header: aligned with navigation icons when expanded, centered when collapsed. **Settings → Delete account** permanently removes your local account, sessions, photos, schedules, runs, images and usage records. Search opens that section, not a deletion action. An extra confirmation asks for your email and current password; passwordless accounts require a sign-in within the last 15 minutes. Stop active runs before deleting. You cannot delete the only administrator while other accounts remain. Deleting the final account also clears saved provider, GitHub and single sign-on connections and returns the server to administrator registration and model setup, even when general registration is closed. Work pushed to GitHub is not deleted.
+
 ### Updates
 
 After the initial setup, update both images and recreate the changed services with:

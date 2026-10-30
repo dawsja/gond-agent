@@ -129,6 +129,10 @@ export class GithubLogin {
     this.stop("cancelled");
     return this.state(session);
   }
+  reset() {
+    this.stop("cancelled");
+    this.flow = undefined;
+  }
   async close() {
     this.closed = true;
     this.stop("cancelled");

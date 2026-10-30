@@ -6,6 +6,7 @@ import { OIDCSettings } from "./oidc"
 import { ProviderSettings } from "./providers"
 import { SessionsSection } from "./sessions"
 import { ProfilePhoto } from "./profile-photo"
+import { DeleteAccount } from "./delete-account"
 import { Row, Section } from "../studio/section"
 import { Shell } from "../studio/shell"
 export function SettingsScreen() {
@@ -17,5 +18,6 @@ export function SettingsScreen() {
     {me?.admin && <><div id="providers"><ProviderSettings /></div><div id="oidc"><OIDCSettings /></div></>}
     <div id="sessions"><SessionsSection /></div>
     <Section title="Storage" description="Account data, run history, images and usage are stored on this server. Each run works in a dedicated container. Idle containers and their workspace volumes are removed after the configured timeout; pushed work stays on GitHub." />
+    <div id="delete"><DeleteAccount /></div>
   </div></Shell>
 }

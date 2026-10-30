@@ -35,8 +35,8 @@ export function Shell({ active, activeRun, crumbs, actions, children, contentCla
   const toggle = () => { prefs.set("sidebar", collapsed ? "open" : "collapsed"); setCollapsed(!collapsed) }
   const go = (path: string) => { setMobile(false); navigate(path) }
   const navigation = (compact: boolean) => <>
-    <div className={cn("flex items-center py-3", compact ? "justify-center" : "px-2")}>
-      {compact ? <SidebarTip label="Expand sidebar"><button type="button" onClick={toggle} aria-label="Expand sidebar" className="group relative grid size-11 shrink-0 place-items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"><GondAgentMark size={40} className="group-hover:opacity-0 group-focus:opacity-0" /><PanelLeft className="absolute size-6 opacity-0 group-hover:opacity-100 group-focus:opacity-100" /></button></SidebarTip> : <span aria-label="Gond Agent" className="grid size-11 shrink-0 place-items-center"><GondAgentMark size={40} /></span>}
+    <div className={cn("flex h-12 shrink-0 items-center", compact ? "w-full justify-center" : "px-1.5")}>
+      {compact ? <SidebarTip label="Expand sidebar"><button type="button" onClick={toggle} aria-label="Expand sidebar" className="group relative grid size-9 shrink-0 place-items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"><GondAgentMark size={28} className="group-hover:opacity-0 group-focus:opacity-0" /><PanelLeft className="absolute size-4 opacity-0 group-hover:opacity-100 group-focus:opacity-100" /></button></SidebarTip> : <span aria-label="Gond Agent" className="grid size-9 shrink-0 place-items-center"><GondAgentMark size={28} /></span>}
       {!compact && <SidebarTip label="Collapse sidebar"><Button size="icon" variant="ghost" className="ml-auto max-md:hidden" onClick={toggle} aria-label="Collapse sidebar"><PanelLeft /></Button></SidebarTip>}
     </div>
     <SidebarTip label="New agent" enabled={compact}><Button variant="outline" size={compact ? "icon" : "default"} onClick={() => go("/")} aria-label="New agent"><Plus data-icon="inline-start" />{!compact && "New agent"}</Button></SidebarTip>

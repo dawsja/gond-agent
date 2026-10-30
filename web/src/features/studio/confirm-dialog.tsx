@@ -1,4 +1,5 @@
 import { LoaderCircle } from "lucide-react"
+import type { ReactNode } from "react"
 import { AlertDialog as Dialog } from "radix-ui"
 import { Button } from "@shared/ui/button"
 
@@ -12,6 +13,8 @@ export function ConfirmDialog({
   error,
   onConfirm,
   onCancel,
+  children,
+  confirmDisabled,
 }: {
   open: boolean
   title: string
@@ -21,6 +24,8 @@ export function ConfirmDialog({
   error?: string | null
   onConfirm: () => void
   onCancel: () => void
+  children?: ReactNode
+  confirmDisabled?: boolean
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && !busy && onCancel()}>
@@ -30,14 +35,15 @@ export function ConfirmDialog({
           onClick={(e) => e.stopPropagation()}
         />
         <Dialog.Content
-                    onClick={(e) => e.stopPropagation()}
-          className="fixed top-1/2 left-1/2 z-50 w-[380px] max-w-[calc(100vw-32px)] -translate-x-1/2 -translate-y-1/2 rounded-[4px] border border-border-strong bg-surface p-5 text-foreground"
+          onClick={(e) => e.stopPropagation()}
+          className="fixed top-1/2 left-1/2 z-50 max-h-[calc(100dvh-32px)] w-[380px] max-w-[calc(100vw-32px)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-[4px] border border-border-strong bg-surface p-5 text-foreground"
         >
           <Dialog.Title className="text-[15px] font-semibold">
             {title}
           </Dialog.Title>
           <Dialog.Description className="mt-1.5 text-[13px] text-muted-foreground">{body}</Dialog.Description>
-          {error && <p className="mt-2 text-[13px] text-failed">{error}</p>}
+          {children}
+          {error && <p role="alert" className="mt-2 text-[13px] text-failed">{error}</p>}
           <div className="mt-4 flex justify-end gap-2">
             <Button
               variant="outline"
@@ -49,7 +55,7 @@ export function ConfirmDialog({
             </Button>
             <Button
               variant="destructive"
-              disabled={busy}
+              disabled={busy || confirmDisabled}
               onClick={onConfirm}
             >
               {busy && <LoaderCircle className="size-3.5 animate-spin" />}
