@@ -32,7 +32,7 @@ For updates, run `docker compose pull` and `docker compose up -d` again. Preserv
 
 Source builds are optional: add `-f docker-compose.yml -f docker-compose.build.yml` to both `docker compose build` and `docker compose up -d`. The override selects local runtime and worker images; the default file never builds them.
 
-Bootstrap the first account while bound to loopback, then connect a provider in the browser. Choose OpenAI Compatible API or Anthropic and add a name, API base URL and optional key. OpenAI protocol selection is available under Advanced settings when needed. Save to open the workspace; available models are discovered in the agent model picker. The first account becomes the instance administrator. Additional registration is disabled by default; set `ALLOW_SIGNUP=true` when you want to allow more accounts. Put an HTTPS reverse proxy in front before exposing the instance.
+Bootstrap the first account while bound to loopback, then connect a provider in the browser. Choose OpenAI or Anthropic and add a key if required. URLs are filled in automatically; use Edit URL for custom endpoints. Connection names and OpenAI protocol selection are available under Advanced settings when needed. Save to open the workspace; available models are discovered in the agent model picker. The first account becomes the instance administrator. Additional registration is disabled by default; set `ALLOW_SIGNUP=true` when you want to allow more accounts. Put an HTTPS reverse proxy in front before exposing the instance.
 
 ## Model connections
 
