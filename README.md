@@ -95,6 +95,8 @@ Better Auth handles email/password sign-up, password hashing, cookies, sessions,
 
 ## Model providers
 
+Model pickers show versioned names from provider catalogs and native CLI resolution metadata, without a hardcoded version list. Hover a model to see its exact reported ID, or search by that ID. Claude subscription aliases keep their native routing behavior. After updating, use **Refresh models** to refresh saved subscription labels; no sign-in change is needed.
+
 Claude Code and Codex subscription sign-ins work without an API provider. To remove unused API connections, open **Settings → Model providers → Advanced settings → Remove provider**, then **Save changes**. You can remove the final API connection. API connection warnings appear only for the selected API connection, or when no models are available.
 
 New tasks and follow-ups place image attachments first, then the model and thinking effort selectors. Model and thinking menus share the same style and control height; API and subscription models show their brand marks. Follow-ups offer models from the current run's backend.

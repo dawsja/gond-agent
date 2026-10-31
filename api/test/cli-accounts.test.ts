@@ -6,6 +6,26 @@ import { openStore,setSetting } from "../src/db";
 import { CLIAccounts } from "../src/cli-accounts";
 import { CLIRuntimes } from "../src/cli-runtime";
 import type { Config } from "../src/config";
+import { seal } from "../src/auth";
+import { Runs } from "../src/runs/service";
+it("refreshes exact native model metadata without changing saved alias IDs",async()=>{
+ const dir=await mkdtemp(join(tmpdir(),"gond-cli-models-")),db=openStore(dir),secret="s".repeat(32);
+ db.exec('CREATE TABLE "user" (id TEXT PRIMARY KEY); INSERT INTO "user" VALUES (\'a\');');
+ setSetting(db,"runtime:claude-code",{backend:"claude-code",volume:"test",version:"test"});
+ db.prepare("INSERT INTO cli_accounts(user_id,backend,credentials,models) VALUES(?,?,?,?)").run("a","claude-code",seal(secret,"{}"),JSON.stringify([{id:"opus",name:"Opus",efforts:["high"]}]));
+ const cfg={secret} as Config;
+ const models=[{id:"opus",name:"Opus",resolved_model:"claude-opus-8-12",efforts:["high"]}];
+ const runs=new Runs(db,cfg,async()=>({rpc:async(method:string)=>{
+   if(method==='events')return {alive:true,events:[{type:'cli.catalog',models}]} as never;
+   if(method==='cli_state')return {credentials:{},files:{}} as never;
+   return true as never;
+ },destroy:async()=>{}}));
+ try{
+   const catalog=await runs.catalog("a",true);
+   expect(catalog.models[0]).toMatchObject({id:"cli-claude-code:opus",display_name:"Claude Opus 8.12 · Claude Code",resolved_model:"claude-opus-8-12"});
+   expect(runs.cliAccounts.models("a")[0]).toMatchObject(models[0]);
+ }finally{await runs.shutdown();db.close();await rm(dir,{recursive:true,force:true});}
+});
 it("subscription flows belong to their account and initiating session; credentials stay encrypted",async()=>{
  const dir=await mkdtemp(join(tmpdir(),"gond-cli-account-")),db=openStore(dir),secret="s".repeat(32);
  db.exec('CREATE TABLE "user" (id TEXT PRIMARY KEY); INSERT INTO "user" VALUES (\'a\'),(\'b\');');

@@ -273,6 +273,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             models: catalog.models.map((m) => ({
               id: m.id,
               name: m.display_name,
+              resolved_model: m.resolved_model,
               provider: m.provider,
               connection_name: m.connection_name,
               backend: "backend" in m ? m.backend : "api",

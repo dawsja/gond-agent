@@ -4,6 +4,7 @@ import type { ModelRow } from "./adapters/types";
 import { discoverProviderModels, modelId, providerSettings, type ProviderConnection, type ProviderModel } from "./providers";
 import { knownReasoning, supportedEfforts } from "./effort";
 import { ApiError } from "./wire";
+import { modelDisplayName } from "../../shared/model-names";
 
 interface CatalogEntry {
   fingerprint: string;
@@ -27,7 +28,7 @@ export function modelRows(db: Store): ModelRow[] {
   return providerSettings(db).connections.flatMap(c => modelsForConnection(db, c).map(m => ({
     id: modelId(c.id, m.id), connection_id: c.id, format: c.format,
     provider: c.format === "anthropic" ? "anthropic" as const : "openai" as const,
-    upstream_id: m.id, display_name: `${m.name} · ${c.name}`,
+    upstream_id: m.id, display_name: `${modelDisplayName(m.name,m.id)} · ${c.name}`,
     context_window: m.contextWindow, max_output: m.maxOutput,
     capabilities: { reasoning: m.reasoning, images: m.images, efforts: m.efforts },
     input_micros: 0, output_micros: 0, cache_read_micros: 0, cache_write_micros: 0,
@@ -47,6 +48,7 @@ export function publicModels(db: Store) {
   return {
     models: [...(auto ? [{ ...auto, id: "auto", provider: "auto" as const, display_name: "Auto" }] : []), ...rows].map(m => ({
       id: m.id, provider: m.provider, display_name: m.display_name,
+      resolved_model: m.upstream_id,
       connection_id: m.connection_id, connection_name: settings.connections.find(c => c.id === m.connection_id)?.name,
       context_window: m.context_window, max_output: m.max_output, capabilities: m.capabilities, efforts: supportedEfforts(m),
     })),

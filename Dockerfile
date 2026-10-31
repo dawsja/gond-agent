@@ -50,6 +50,7 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app/api
 COPY --from=api-deps /app/api/node_modules ./node_modules
 COPY api/src/ ./src/
+COPY shared/model-names.ts /app/shared/model-names.ts
 COPY api/package.json ./
 COPY --from=frontend /src/web/dist/ /app/web/dist/
 ENV NODE_ENV=production GOND_AGENT_DATA_DIR=/data GH_CONFIG_DIR=/gh PORT=8787

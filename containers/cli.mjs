@@ -95,7 +95,7 @@ async function setupClaude() {
   })();
   pump.catch(fail);
   const models = await agent.supportedModels();
-  emit('cli.catalog', { models: models.map(m => ({ id: m.value, name: m.displayName, efforts: m.supportedEffortLevels ?? [] })) });
+  emit('cli.catalog', { models: models.map(m => ({ id: m.value, name: m.displayName, resolved_model: m.resolvedModel, efforts: m.supportedEffortLevels ?? [] })) });
   emit('cli.account', { account: await agent.accountInfo() });
 }
 let serial = 0;
@@ -147,7 +147,7 @@ async function setupCodex() {
   const models = [];
   let cursor;
   do { const r = await rpc('model/list', {limit:100,...(cursor ? {cursor} : {})}); models.push(...r.data); cursor=r.nextCursor; } while(cursor && models.length<500);
-  emit('cli.catalog',{models:models.map(m=>({id:m.model,name:m.displayName,efforts:m.supportedReasoningEfforts.map(e=>e.reasoningEffort)}))});
+  emit('cli.catalog',{models:models.map(m=>({id:m.model,name:m.displayName,resolved_model:m.model,efforts:m.supportedReasoningEfforts.map(e=>e.reasoningEffort)}))});
   emit('cli.account', {account:await rpc('account/read')});
   const r = await rpc(session ? 'thread/resume':'thread/start', { ...(session ? {threadId:session} : {}), model:config.model, cwd:process.cwd(), approvalPolicy:'never', sandbox:'danger-full-access', developerInstructions:instructions });
   session=r.thread.id;saveSession();

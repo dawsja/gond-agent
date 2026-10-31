@@ -70,6 +70,7 @@ export interface Runner {
 
 export interface Model {
   id: string
+  resolved_model?: string
   provider: string
   display_name: string
   context_window: number

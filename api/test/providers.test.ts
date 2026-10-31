@@ -58,6 +58,12 @@ const settings = (format = "openai", baseURL = origin + "/custom/v1") => ({
   defaultModel: modelId("local", model.id),
 });
 describe("provider settings and request routing", () => {
+  it("shows versioned names and exact IDs from API metadata without changing routing IDs", () => {
+    const input=settings();input.defaultModel="";
+    input.connections[0].models=[{...model,id:"claude-sonnet-8-12",name:"Sonnet"}];
+    saveProviderSettings(db,secret,input);
+    expect(publicModels(db).models.find(m=>m.id!=="auto")).toMatchObject({id:"local:claude-sonnet-8-12",display_name:"Claude Sonnet 8.12 · Local",resolved_model:"claude-sonnet-8-12"});
+  });
   it("removes the last API connection without creating a replacement", async () => {
     saveProviderSettings(db, secret, settings());
     expect(saveProviderSettings(db, secret, { connections: [], defaultModel: "" })).toEqual({ connections: [], defaultModel: "" });

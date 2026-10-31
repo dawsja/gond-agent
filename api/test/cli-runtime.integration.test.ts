@@ -39,7 +39,9 @@ test.skipIf(!process.env.GOND_AGENT_CONTAINER_TEST_IMAGE)("installs official CLI
           if(discovery.some(e=>e.type==='cli.catalog')||!batch.alive)break;
           await new Promise(r=>setTimeout(r,500));
         }
-        expect(discovery.find(e=>e.type==='cli.catalog')?.models).toBeInstanceOf(Array);
+        const models=discovery.find(e=>e.type==='cli.catalog')?.models;
+        expect(models).toBeInstanceOf(Array);
+        expect(models.some((m:{resolved_model?:string})=>typeof m.resolved_model==='string' && m.resolved_model.length>0)).toBe(true);
 
       }finally{await workspace.destroy();}
       await runtimes.uninstall(backend);

@@ -60,9 +60,9 @@ const key = 'fixture-only-provider-key';
     const efforts = ['low', 'medium', 'high'];
     const models = [
       { id: 'fixture:gpt-5.4', display_name: 'GPT-5.4 · API', provider: 'openai', efforts },
-      { id: 'fixture:claude-sonnet-4-6', display_name: 'Claude Sonnet · API', provider: 'anthropic', efforts },
+      { id: 'fixture:claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6 · API', resolved_model: 'claude-sonnet-4-6', provider: 'anthropic', efforts },
       { id: 'cli-codex:default', display_name: 'Codex · Subscription', provider: 'openai', backend: 'codex', efforts },
-      { id: 'cli-claude-code:sonnet', display_name: 'Sonnet · Subscription', provider: 'anthropic', backend: 'claude-code', efforts },
+      { id: 'cli-claude-code:sonnet', display_name: 'Claude Sonnet 8.12 · Subscription', resolved_model: 'claude-sonnet-8-12', provider: 'anthropic', backend: 'claude-code', efforts },
     ].map(model => ({ ...model, context_window: 200000, ...(!model.backend ? { connection_id: model.provider } : {}) }));
     const connections = [
       { id: 'openai', name: 'Provider 1', status: 'error', message: 'OpenAI API connection unavailable.' },
@@ -105,6 +105,14 @@ const key = 'fixture-only-provider-key';
         await page.getByRole('button', { name: 'Choose model', exact: true }).click();
         await page.getByRole('button', { name: model.display_name, exact: true }).click();
         await expect(page.getByRole('button', { name: 'Choose model', exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+        if (model.resolved_model) await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toHaveAttribute('title', model.resolved_model);
+        const version = model.display_name.match(/\d+(?:\.\d+)*/)?.[0];
+        if (version) expect(await page.getByRole('button', { name: 'Choose model', exact: true }).locator(':scope > span.truncate').evaluate((element, version) => {
+          const start = element.textContent.indexOf(version);
+          const range = document.createRange();
+          range.setStart(element.firstChild, start); range.setEnd(element.firstChild, start + version.length);
+          return range.getBoundingClientRect().right <= element.getBoundingClientRect().right + 1;
+        }, version)).toBe(true);
         for (const connection of connections) {
           await expect(page.getByText(`${connection.name}: ${connection.message}`, { exact: true })).toHaveCount(!model.backend && model.connection_id === connection.id ? 1 : 0);
         }
@@ -122,7 +130,7 @@ const key = 'fixture-only-provider-key';
         current = model;
         await page.goto(origin + '/agents/runs/composer-fixture');
         const picker = page.getByRole('button', { name: 'Follow-up model', exact: true });
-        await expect(picker).toContainText(model.display_name);
+        await expect(picker).toContainText(model.display_name.replace(/^Claude /, ''));
         await expect(picker.locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
         await layout('Follow-up model');
         await picker.click();

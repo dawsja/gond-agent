@@ -42,6 +42,8 @@ Provider settings manage connections, not a required model catalog. Use the appr
 
 Subscription-only accounts need no API connection. Allow administrators to remove and save the final API provider; Settings must preserve an empty list after reload. Only first-time API setup seeds an unsaved connection. Composer API warnings apply only to the selected API connection, or to discovery failures when no model is available; never show them for subscription selections.
 
+Model names must use live provider/native metadata, including Claude SDK `resolvedModel`; do not maintain alias-to-version tables. Keep native selection IDs stable and expose optional `resolved_model` separately. Never invent a version when metadata is missing. The packaged API imports `shared/model-names.ts`; keep that module included in the runtime image.
+
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
 - `cd site && npm ci && npm run lint && npm run build`

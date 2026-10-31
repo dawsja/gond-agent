@@ -4,7 +4,7 @@ import type { Store } from "./db";
 import type { Workspace, WorkspaceFactory } from "./containers";
 import { CLIRuntimes, type CLI } from "./cli-runtime";
 import { ApiError } from "./wire";
-export interface CLIModel { id: string; name: string; efforts: string[] }
+export interface CLIModel { id: string; name: string; resolved_model?: string; efforts: string[] }
 export interface CLIState { credentials: Record<string,string>; files: Record<string,string>; session?: string }
 interface Flow { owner: string; session: string; workspace: Workspace; state: Record<string,unknown>; cursor: number; expires: number; closed: boolean }
 export class CLIAccounts {

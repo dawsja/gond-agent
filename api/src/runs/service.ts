@@ -31,6 +31,7 @@ import { CLIAccounts, type CLIState } from "../cli-accounts";
 import { seal, unseal } from "../auth";
 import { validateEffort } from "../effort";
 import { ApiError } from "../wire";
+import { modelDisplayName } from "../../../shared/model-names";
 
 export interface Run {
   id: string;
@@ -98,7 +99,7 @@ export class Runs {
   async catalog(user: string, refresh = false) {
     const catalog = await loadModelCatalog(this.db,this.cfg.secret,refresh);
     await Promise.all((["claude-code","codex"] as CLI[]).map(backend=>this.cliAccounts.refresh(user,backend,refresh)));
-    const own = this.cliAccounts.models(user).map(m => ({id:`cli-${m.backend}:${encodeURIComponent(m.id)}`,provider:m.backend === "codex" ? "openai" : "anthropic",display_name:`${m.name} · ${m.backend === "codex" ? "Codex" : "Claude Code"}`,connection_id:`cli-${m.backend}`,connection_name:m.backend === "codex" ? "Codex subscription" : "Claude subscription",context_window:200000,max_output:8192,capabilities:{images:true,reasoning:"effort" as const},efforts:m.efforts,backend:m.backend}));
+    const own = this.cliAccounts.models(user).map(m => ({id:`cli-${m.backend}:${encodeURIComponent(m.id)}`,provider:m.backend === "codex" ? "openai" : "anthropic",display_name:`${modelDisplayName(m.name,m.id,m.resolved_model)} · ${m.backend === "codex" ? "Codex" : "Claude Code"}`,resolved_model:m.resolved_model,connection_id:`cli-${m.backend}`,connection_name:m.backend === "codex" ? "Codex subscription" : "Claude subscription",context_window:200000,max_output:8192,capabilities:{images:true,reasoning:"effort" as const},efforts:m.efforts,backend:m.backend}));
     return {...catalog,models:[...catalog.models,...own]};
   }
   async resolveSelection(user:string,id:string) {
