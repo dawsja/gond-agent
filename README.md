@@ -91,6 +91,8 @@ Containers share the host kernel and are not a boundary for hostile multi-tenant
 
 ## Authentication and OIDC
 
+Settings are grouped under large headings for Personal settings, Models, Security, Agent access and Account management. Administrator-only provider and single sign-on controls remain in their respective groups.
+
 Better Auth handles email/password sign-up, password hashing, cookies, sessions, CSRF checks and rate limiting. Passwords need at least 12 characters. Settings lists and revokes active sessions. An administrator can configure an OIDC issuer, client ID and secret in Settings; the page shows the redirect URI to register with the provider. Discovery, PKCE and verified ID tokens are required. Password sign-in remains enabled. OIDC changes require a sign-in within the last ten minutes. Client secrets are encrypted in SQLite and never returned to the browser. Set `ALLOW_SIGNUP=true` to permit new users, including new OIDC users. Account linking by matching emails is disabled.
 
 ## Model providers

@@ -307,6 +307,21 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('menuitem', { name: 'Settings', exact: true }).click();
     await expect(page).toHaveURL(origin + '/agents/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+    const categoryNames = ['Personal settings', 'Models', 'Security', 'Agent access', 'Account management'];
+    await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
+    for (const name of categoryNames) {
+      const heading = page.getByRole('heading', { name, exact: true, level: 2 });
+      await heading.scrollIntoViewIfNeeded();
+      const category = heading.locator('..');
+      const firstCard = category.locator('[data-slot="card"]').first();
+      await expect(firstCard.locator('[data-slot="card-title"]')).toHaveJSProperty('tagName', 'H3');
+      const style = await heading.evaluate(element => ({ size: parseFloat(getComputedStyle(element).fontSize), color: getComputedStyle(element).color, left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right }));
+      expect(style.size).toBeGreaterThanOrEqual(22);
+      expect(style.color).toBe('rgb(237, 237, 237)');
+      expect(style.right).toBeLessThanOrEqual(width);
+      expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
+      await capture('settings-category-' + name.toLowerCase().replaceAll(' ', '-'));
+    }
     expect(await page.locator('#subscription-agents').evaluate(element => element.nextElementSibling.id)).toBe('providers');
     const mcp = page.locator('#mcp');
     await mcp.scrollIntoViewIfNeeded();

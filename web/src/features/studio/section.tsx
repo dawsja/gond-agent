@@ -1,7 +1,9 @@
-import type { ReactNode } from "react"
+import { createContext, useContext, type ReactNode } from "react"
 import { cn } from "@/lib/utils"
 import { T } from "./theme"
 import { Card, CardHeader, CardTitle, CardDescription } from "@shared/ui/card"
+
+export const SectionHeadingLevel = createContext<"h2" | "h3">("h2")
 
 /** A bordered card with a title, a line of description and an optional action on the right. */
 export function Section({
@@ -20,13 +22,14 @@ export function Section({
   /** Keep the action to the right on phones too (a small control like a switch), instead of below. */
   actionBeside?: boolean
 }) {
+  const heading = useContext(SectionHeadingLevel)
   return (
     <Card>
       <CardHeader className={cn("flex-row items-start justify-between gap-4 px-5 pt-4 pb-3 max-md:px-4", !actionBeside && "max-md:flex-col max-md:gap-3")}>
         <div className="flex items-start gap-3">
           {icon}
           <div>
-            <CardTitle className={cn(T.title, "text-foreground")}>{title}</CardTitle>
+            <CardTitle as={heading} className={cn(T.title, "text-foreground")}>{title}</CardTitle>
             <CardDescription className="max-w-[60ch]">{description}</CardDescription>
           </div>
         </div>

@@ -44,6 +44,8 @@ Subscription-only accounts need no API connection. Allow administrators to remov
 
 Model names must use live provider/native metadata, including Claude SDK `resolvedModel`; do not maintain alias-to-version tables. Keep native selection IDs stable and expose optional `resolved_model` separately. Never invent a version when metadata is missing. The packaged API imports `shared/model-names.ts`; keep that module included in the runtime image.
 
+Settings use larger near-white category headings for Personal settings, Models, Security, Agent access and Account management, with more space between categories than between related cards. Keep category headings at level 2 and nested card headings at level 3; retain existing hash targets and subscription/API adjacency.
+
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
 - `cd site && npm ci && npm run lint && npm run build`
