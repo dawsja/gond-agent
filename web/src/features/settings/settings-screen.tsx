@@ -1,4 +1,5 @@
 import { CLIAgents } from "./cli-agents"
+import { MCPAccess } from "./mcp-access"
 import { useEffect } from "react"
 import { useLocation } from "react-router"
 import { useMe } from "@/lib/queries"
@@ -18,6 +19,7 @@ export function SettingsScreen() {
     <div id="subscription-agents"><CLIAgents /></div>
     {me?.admin && <><div id="providers"><ProviderSettings /></div><div id="oidc"><OIDCSettings /></div></>}
     <div id="sessions"><SessionsSection /></div>
+    <div id="mcp"><MCPAccess /></div>
     <div id="delete"><DeleteAccount /></div>
   </div></Shell>
 }

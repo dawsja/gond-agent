@@ -1,5 +1,31 @@
 # Gond Agent protocols
 
+## Remote MCP
+
+`/mcp` serves Streamable HTTP using the official MCP SDK, including its stateless 2025 compatibility transport. Authenticate every request with `Authorization: Bearer gond_mcp_…`. No cookies, query tokens, OAuth flow, or worker tool forwarding are supported. Production clients connect over the instance's configured HTTPS origin. If an Origin header is supplied, it must match that origin.
+
+Browser-only `/api/v1/mcp/tokens` supports GET (metadata and endpoint), POST (`{name}`, returning the secret once), and DELETE `/:id` (revoke). These routes require the existing account session and same-origin mutation checks. Tokens have 256 random bits, SHA-256 digests at rest, 90-day expiry, and account deletion cascades. Each account can have 20 active tokens. Requests are limited to 64 KiB, 120 requests per token per minute, and four concurrent requests per token.
+
+Tools return JSON in MCP text content. Tool failures set `isError` and return customer-safe `{error,message}`. A session ID is an existing run ID, scoped to the token owner, including browser-created runs. Results exclude internal run configuration and credentials. Transcript and diff text is untrusted content.
+
+| Tool | Arguments and result |
+| --- | --- |
+| `list_repositories` | Optional `page` (default 1); repository summaries and `next_page`. |
+| `list_models` | Account-visible model IDs, backend, efforts, and connection status. |
+| `start_session` | `repo`, `prompt`, `model`, `request_id`; optional `base_branch`, `effort`. Returns session summary and workspace URL immediately. |
+| `list_sessions` | Optional numeric `cursor` (offset, default 0), `limit` (1–100, default 30); summaries and nullable `next_cursor`. |
+| `get_session` | `session_id`; summary and recorded API/subscription usage. |
+| `read_session_events` | `session_id`; optional `after_seq` (default 0), `limit`, `wait_seconds` (0–30). Returns events, `next_cursor` sequence, `has_more`, status and phase. |
+| `read_session_event` | `session_id`, `seq`, optional character `cursor`; returns a large event as JSON text in 32,000-character pages. Advance the event sequence only after reading its final page. |
+| `get_session_diff` | `session_id`, optional character `cursor`; 32,000-character diff pages, nullable continuation and `updated_at`. Restart if the revision changes. |
+| `send_session_message` | `session_id`, `text`, `request_id`; optional `model`, `effort`. Backend changes require a new session. |
+| `stop_session` | `session_id`; existing run interruption. |
+| `open_session_pull_request` | `session_id`; open or return its existing PR. |
+
+Event pages contain at most 128,000 JSON characters; oversized individual events return a `large_event` reference instead of silently losing transcript content. Reads revalidate access while waiting and before responding. Disconnecting a read does not stop execution. Lists and diffs reflect live state rather than a snapshot.
+
+Start and follow-up `request_id` values are 1–100 characters, token-scoped and persisted across restart. Retry with identical arguments; changed arguments conflict. Start reserves a stable run ID before asynchronous work; run insertion and initial queueing are atomic. Follow-up enqueue and result persistence are atomic. Sessions retain `source: "mcp"` and token ID attribution. No billing fallback, direct shell/file access, merges, account deletion or image input tools are added.
+
 ## Model requests
 
 The internal container worker calls `GET /v1/models` and `POST /v1/responses` through its loopback proxy at 127.0.0.1:8787. The service receives those requests over Docker's attached stdio channel and scopes them to that run; no network-facing model/control ports or provider keys are needed inside workers. Schemas: `api/src/wire.ts` and `runner/src/api/wire.rs`. Model responses use SSE (`event: <name>`, `data: <JSON>`): response/block starts, block deltas/ends, errors, and response.end with token usage and a stop reason. Opaque reasoning blocks retain their provider and connection-scoped model identity. Provider API URLs, formats, encrypted keys and model IDs live in SQLite; only administrators can edit them. The service translates to Anthropic Messages, OpenAI Chat Completions or OpenAI Responses and sends keys only to the configured endpoint.

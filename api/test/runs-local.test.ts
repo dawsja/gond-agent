@@ -10,6 +10,8 @@ import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
 import { gh, checkout, importBundle } from "../src/github";
+import { createMcp, createToken } from "../src/mcp";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 vi.mock("../src/github", async (original) => {
   const actual = await original<typeof import("../src/github")>();
   return {
@@ -121,6 +123,69 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("does not resume a stopped workspace when all slots are occupied", async () => {
+    const first=await runs.create("u",{repo:"acme/app",model:"local:coder",prompt:"First"});
+    await vi.waitFor(()=>expect(runs.get(first.id).status).toBe("ready"));
+    await runs.stop(first.id,"u");
+    await runs.close(first.id);
+    for(const prompt of ["Second","Third"]){
+      const run=await runs.create("u",{repo:"acme/app",model:"local:coder",prompt});
+      await vi.waitFor(()=>expect(runs.get(run.id).status).toBe("ready"));
+    }
+    const before=runs.history(first.id,0).length;
+    expect(()=>runs.enqueue(first.id,"u","Continue")).toThrow(/All workspaces are busy/);
+    expect(runs.get(first.id).pending).toHaveLength(0);
+    expect(runs.history(first.id,0)).toHaveLength(before);
+  });
+  it("enforces capacity when concurrent starts finish repository lookup together", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const original = vi.mocked(gh).getMockImplementation()!;
+    vi.mocked(gh).mockImplementation(async (...args) => {
+      if (args[0] === "repos/acme/app") await gate;
+      return original(...args);
+    });
+    const outcomes = Promise.allSettled(Array.from({ length: 3 }, () => runs.create("u", { repo: "acme/app", model: "local:coder", prompt: "Fix it" })));
+    await vi.waitFor(() => expect(vi.mocked(gh).mock.calls.filter(args => args[0] === "repos/acme/app")).toHaveLength(3));
+    release();
+    const results = await outcomes;
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(2);
+    const rejected = results.find(result => result.status === "rejected") as PromiseRejectedResult;
+    expect(rejected.reason.code).toBe("run_limit");
+    expect(runs.list("u")).toHaveLength(2);
+    vi.mocked(gh).mockImplementation(original);
+  });
+  it("starts through MCP with durable retry results and token attribution", async () => {
+    const token=createToken(db,"u","Lifecycle test");
+    let mcp=createMcp(db,cfg(),runs);
+    const client=new Client({name:"lifecycle",version:"1"});
+    await client.connect(new StreamableHTTPClientTransport(new URL(cfg().origin+"/mcp"),{
+      requestInit:{headers:{Authorization:`Bearer ${token.token}`}},
+      fetch:async(input,init)=>mcp.fetch(new Request(input,init)),
+    }));
+    const call=async(name:string,args:Record<string,unknown>)=>{
+      const result=await client.callTool({name,arguments:args});
+      expect(result.isError).not.toBe(true);
+      return JSON.parse((result.content as {text:string}[])[0].text);
+    };
+    try {
+      const args={repo:"acme/app",prompt:"Fix it",model:"local:coder",request_id:"first"};
+      const started=await call("start_session",args);
+      await vi.waitFor(()=>expect(runs.get(started.id,"u").status).toBe("ready"));
+      expect(runs.get(started.id,"u").mcp_token_id).toBe(token.id);
+      expect(runs.get(started.id,"u").source).toBe("mcp");
+      await mcp.close();mcp=createMcp(db,cfg(),runs);
+      expect((await call("start_session",args)).id).toBe(started.id);
+      expect(db.prepare("SELECT count(*) AS n FROM runs").get()).toEqual({n:1});
+      const message={session_id:started.id,text:"Continue",request_id:"followup"};
+      await call("send_session_message",message);
+      await call("send_session_message",message);
+      expect(runs.history(started.id,0).filter(e=>e.type==="user" && e.text==="Continue")).toHaveLength(1);
+      await vi.waitFor(()=>expect(runs.get(started.id,"u").status).toBe("ready"));
+      expect((await call("open_session_pull_request",{session_id:started.id})).url).toContain("github.com");
+      await call("stop_session",{session_id:started.id});
+    } finally {await client.close();await mcp.close();}
+  });
   it("closes an idle workspace before deleting its account records", async () => {
     const run = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
     await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));

@@ -10,6 +10,9 @@ export function openStore(data: string) {
   db.pragma("busy_timeout = 5000");
   db.exec(`CREATE TABLE IF NOT EXISTS administrators (user_id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS mcp_tokens (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE, digest TEXT NOT NULL UNIQUE, name TEXT NOT NULL, prefix TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER);
+    CREATE INDEX IF NOT EXISTS mcp_tokens_owner ON mcp_tokens(user_id);
+    CREATE TABLE IF NOT EXISTS mcp_requests (token_id TEXT NOT NULL REFERENCES mcp_tokens(id) ON DELETE CASCADE, request_id TEXT NOT NULL, tool TEXT NOT NULL, fingerprint TEXT NOT NULL, run_id TEXT NOT NULL, result TEXT, PRIMARY KEY(token_id,request_id));
     CREATE TABLE IF NOT EXISTS profiles (user_id TEXT PRIMARY KEY, auto_pr INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE IF NOT EXISTS profile_photos (user_id TEXT PRIMARY KEY REFERENCES "user"(id) ON DELETE CASCADE, revision TEXT NOT NULL, bytes BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, repo TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, data TEXT NOT NULL);

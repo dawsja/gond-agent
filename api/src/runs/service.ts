@@ -62,6 +62,7 @@ export interface Run {
   plan_done: number;
   plan_total: number;
   source: string;
+  mcp_token_id?: string;
   phase: string;
   pushed: boolean;
   diff: string;
@@ -221,6 +222,10 @@ export class Runs {
       );
     }
   }
+  private checkCapacity() {
+    if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
+      throw new ApiError(429, "run_limit", "All workspaces are busy. Wait for a run to finish.");
+  }
   async create(
     user: string,
     input: {
@@ -232,6 +237,7 @@ export class Runs {
       images?: string[];
       source?: string;
     },
+    attribution?: { id: string; tokenId: string; authorize?: () => void },
   ) {
     this.assertAccount(user);
     if (
@@ -245,12 +251,7 @@ export class Runs {
         "Choose a repository and describe the task.",
       );
     const selectedModel = await this.resolveSelection(user,input.model);
-    if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
-      throw new ApiError(
-        429,
-        "run_limit",
-        "All workspaces are busy. Wait for a run to finish.",
-      );
+    this.checkCapacity();
     const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnv(this.db, this.cfg.secret)),
       base = input.base_branch || info.default_branch;
     if (!validBranch(base))
@@ -259,7 +260,7 @@ export class Runs {
         "invalid_branch",
         "That branch name isn't valid.",
       );
-    const id = `run_${randomBytes(12).toString("hex")}`,
+    const id = attribution?.id ?? `run_${randomBytes(12).toString("hex")}`,
       title = titleFrom(input.prompt),
       now = Date.now();
     this.assertAccount(user);
@@ -290,6 +291,7 @@ export class Runs {
       plan_done: 0,
       plan_total: 0,
       source: input.source ?? "web",
+      ...(attribution ? { mcp_token_id: attribution.tokenId } : {}),
       phase: "idle",
       pushed: false,
       diff: "",
@@ -300,19 +302,23 @@ export class Runs {
       auto_pr: !!profile.auto_pr,
     };
     this.validateImages(user, input.images ?? []);
+    attribution?.authorize?.();
     this.db.transaction(() => {
+      // Repository/model lookups yield: simultaneous requests may have filled
+      // the remaining slots before this run reserves one through enqueue.
+      this.checkCapacity();
       this.db
         .prepare(
           "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)",
         )
         .run(id, user, r.repo, r.status, now, now, JSON.stringify(r));
+      this.enqueue(
+        id,
+        user,
+        r.prompt,
+        input.images ?? [],
+      );
     })();
-    this.enqueue(
-      id,
-      user,
-      r.prompt,
-      input.images ?? [],
-    );
     return this.get(id, user);
   }
   profile(user: string) {
@@ -367,6 +373,7 @@ export class Runs {
         "queue_full",
         "Wait for queued messages to finish.",
       );
+    if (!this.live.has(id) && !this.booting.has(id)) this.checkCapacity();
     if (images.length) {
       this.validateImages(user, images);
       for (const image of images)

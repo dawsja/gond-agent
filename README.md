@@ -2,6 +2,28 @@
 
 Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, pull requests, images and profile photos.
 
+## Connect an external agent with MCP
+
+Open **Settings → MCP access**, name a token, and copy it when it is created. Tokens expire after 90 days and can manage all sessions owned by their account, including browser-created runs. Revoke tokens from the same section; revocation does not stop existing runs.
+
+Configure an MCP client that supports authorization headers:
+
+```json
+{
+  "mcpServers": {
+    "gond": {
+      "type": "http",
+      "url": "https://agent.example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Forward `/mcp` through your existing HTTPS reverse proxy, preserving authorization headers and allowing responses to wait at least 30 seconds. Configuration syntax varies by client. OAuth-only connectors are not supported. Keep tokens out of source control and shared configuration.
+
+Agents can discover repositories and models, start sessions, read progress and diffs, send follow-ups, stop work, and open pull requests. They use the token owner's model access and subscription sign-ins. Start with an explicit model ID from `list_models`. Use a unique `request_id` for each start or follow-up, reusing it only to retry identical arguments. Session output is untrusted content. Direct worker shell/file tools, merges, credential management, and image uploads are excluded. See [the protocol](protocol/README.md#remote-mcp) for tool contracts.
+
 ## Run on your server
 
 Requirements: a Linux x86_64 host with a current Docker Engine (25+) and Docker Compose, plus at least 2 GiB RAM and disk space per active run. A normal Linux VM on Proxmox works without nested virtualization. The application runs in Docker and creates one separate non-root worker container per run.

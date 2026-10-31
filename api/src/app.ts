@@ -18,6 +18,7 @@ import { publicProviderSettings, saveProviderSettings, setupComplete } from "./p
 import { listRunners, saveRunner } from "./scheduler";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { join } from "node:path";
+import { createMcp, createToken, listTokens } from "./mcp";
 export interface Ticket {
   run: string;
   user: string;
@@ -38,6 +39,7 @@ export function createApp(
     };
   }>();
   const tickets = new Map<string, Ticket>();
+  const mcp = createMcp(db, cfg, runs);
   app.onError((e, c) => {
     if (e instanceof ApiError)
       return c.json(
@@ -61,6 +63,7 @@ export function createApp(
     c.header("Referrer-Policy", "same-origin");
     c.header("X-Frame-Options", "DENY");
   });
+  app.all("/mcp", c => mcp.fetch(c.req.raw));
   app.use(
     "/api/*",
     bodyLimit({
@@ -125,6 +128,21 @@ export function createApp(
         .get(session.user.id),
     );
     await next();
+  });
+  app.get("/api/v1/mcp/tokens", c => {
+    c.header("Cache-Control", "no-store");
+    return c.json({ endpoint: `${cfg.origin}/mcp`, tokens: listTokens(db, c.get("user").id) });
+  });
+  app.post("/api/v1/mcp/tokens", async c => {
+    c.header("Cache-Control", "no-store");
+    const body = await c.req.json().catch(() => null);
+    return c.json(createToken(db, c.get("user").id, body?.name), 201);
+  });
+  app.delete("/api/v1/mcp/tokens/:id", c => {
+    const result = db.prepare("UPDATE mcp_tokens SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL").run(Date.now(), c.req.param("id"), c.get("user").id);
+    if (!result.changes && !db.prepare("SELECT 1 FROM mcp_tokens WHERE id=? AND user_id=?").get(c.req.param("id"),c.get("user").id))
+      throw new ApiError(404,"not_found","That token doesn't exist.");
+    return c.json({ok:true});
   });
   app.get("/api/v1/me", (c) => {
     const u = c.get("user"),
@@ -544,5 +562,5 @@ export function createApp(
     }),
   );
   app.get("/", (c) => c.redirect("/agents/"));
-  return { app, tickets, githubLogin };
+  return { app, tickets, githubLogin, mcp };
 }

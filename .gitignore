@@ -11,3 +11,4 @@ data/
 *.log
 **/__pycache__/
 api/test-artifacts/
+test-artifacts/

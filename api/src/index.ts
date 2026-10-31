@@ -14,7 +14,7 @@ const cfg = configFromEnv(),
 await pool.recover();
 const runs = new Runs(db, cfg, (id, handler, volume) => pool.start(id, handler, volume));
 await runs.recover();
-const { app, tickets, githubLogin } = createApp(db, cfg, auth, runs);
+const { app, tickets, githubLogin, mcp } = createApp(db, cfg, auth, runs);
 const server = serve({
   fetch: (request, env) => {
     const headers = new Headers(request.headers);
@@ -87,6 +87,7 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   clearInterval(timer);
+  await mcp.close();
   await githubLogin.close();
   sockets.clients.forEach((s) => s.close());
   await runs.shutdown();

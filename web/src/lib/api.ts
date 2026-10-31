@@ -28,7 +28,7 @@ export interface Run {
   pr_url: string | null
   pr_state: "open" | "closed" | "merged" | null
   error: string | null
-  source?: "web" | "runner" | null
+  source?: "web" | "runner" | "mcp" | null
   created_at: number
   started_at: number | null
   finished_at: number | null

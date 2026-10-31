@@ -27,7 +27,7 @@ const key = 'fixture-only-provider-key';
   const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
-  const capture = async name => screenshots.push({ name: `${name}-${width}.png`, data: (await page.screenshot({ fullPage: true })).toString('base64') });
+  const capture = async name => screenshots.push({ name: `${name}-${width}.png`, data: (await page.screenshot({ fullPage: true, mask: [page.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
   const settingsURL = origin + '/api/v1/settings/providers';
   const save = async button => {
     const response = page.waitForResponse(r => r.url() === settingsURL && r.request().method() === 'PUT');
@@ -257,6 +257,34 @@ const key = 'fixture-only-provider-key';
     await expect(page).toHaveURL(origin + '/agents/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     expect(await page.locator('#subscription-agents').evaluate(element => element.nextElementSibling.id)).toBe('providers');
+    const mcp = page.locator('#mcp');
+    await mcp.scrollIntoViewIfNeeded();
+    if (!returning) {
+      await expect(mcp.getByText('Create a token to connect your first agent.', { exact: true })).toBeVisible();
+      await capture('mcp-empty');
+      await mcp.getByLabel('Token name', { exact: true }).fill('Browser MCP test');
+      await mcp.getByRole('button', { name: 'Create token', exact: true }).click();
+      const tokenField = mcp.getByLabel('New MCP token', { exact: true });
+      await expect(tokenField).toBeVisible();
+      const bearer = await tokenField.inputValue();
+      expect(bearer).toMatch(/^gond_mcp_/);
+      await capture('mcp-created');
+      const listed = await (await page.request.get(origin + '/api/v1/mcp/tokens')).json();
+      expect(JSON.stringify(listed)).not.toContain(bearer);
+      await page.reload();
+      await expect(mcp.getByText('Browser MCP test', { exact: true })).toBeVisible();
+      await expect(mcp.getByLabel('New MCP token', { exact: true })).toHaveCount(0);
+      await mcp.getByRole('button', { name: 'Revoke', exact: true }).click();
+      await expect(mcp.getByText(/Revoked/)).toBeVisible();
+      const revoked = await page.request.post(origin + '/mcp', { headers: { Authorization: `Bearer ${bearer}` }, data: {} });
+      expect(revoked.status()).toBe(401);
+      await mcp.scrollIntoViewIfNeeded();
+      await capture('mcp-revoked');
+    } else {
+      await expect(mcp.getByText('Browser MCP test', { exact: true })).toBeVisible();
+      await expect(mcp.getByText(/Revoked/)).toBeVisible();
+      await expect(mcp.getByLabel('New MCP token', { exact: true })).toHaveCount(0);
+    }
     await page.goto(origin + '/agents/');
     if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
     await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
