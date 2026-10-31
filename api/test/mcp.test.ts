@@ -141,6 +141,27 @@ async function call(
   const content = result.content as { type: string; text: string }[];
   return { result, body: JSON.parse(content[0].text) };
 }
+async function withWaitingReads(client: Client, sessionId: string, afterSeq: number, action: () => void | Promise<void>, count = 4) {
+  const waits = Array.from({ length: count }, () => call(client, "read_session_events", {
+    session_id: sessionId, after_seq: afterSeq, wait_seconds: 30,
+  }));
+  let results: Awaited<ReturnType<typeof call>>[] = [];
+  try {
+    // The public capacity response confirms the reads have entered their wait;
+    // a fixed sleep can revoke a token before a slow request even arrives.
+    await vi.waitFor(async () => {
+      const blocked = await app.request(cfg.origin + "/mcp", {
+        headers: { Authorization: `Bearer ${token.token}` },
+      });
+      expect(blocked.status).toBe(429);
+    }, { timeout: 2000, interval: 50 });
+    await action();
+  } finally {
+    runs.append(sessionId, { type: "text", text: "Release waiting reads" });
+    results = await Promise.all(waits);
+  }
+  return results;
+}
 it("supports the stateless 2025 HTTP client", async () => {
   seed();
   const client = await connect(true);
@@ -153,18 +174,7 @@ it.each([false, true])(
   async (legacy) => {
     seed();
     const client = await connect(legacy);
-    const waits = Array.from({ length: 4 }, () =>
-      call(client, "read_session_events", {
-        session_id: "run_test",
-        wait_seconds: 1,
-      }),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const blocked = await app.request(cfg.origin + "/mcp", {
-      headers: { Authorization: `Bearer ${token.token}` },
-    });
-    expect(blocked.status).toBe(429);
-    await Promise.all(waits);
+    await withWaitingReads(client, "run_test", 0, () => {});
     expect(
       (await call(client, "get_session", { session_id: "run_test" })).body.id,
     ).toBe("run_test");
@@ -201,8 +211,13 @@ it("negotiates with the official HTTP client and reads only owned browser runs",
   seed(other, "other_run");
   const client = await connect();
   const tools = await client.listTools();
-  expect(tools.tools).toHaveLength(11);
-  expect(tools.tools.map((t) => t.name)).not.toContain("shell");
+  // This is the public capability boundary, rather than an arbitrary tool count:
+  // adding a shell or an administrator tool must require an intentional review.
+  expect(tools.tools.map(t => t.name).sort()).toEqual([
+    "list_models", "list_repositories", "start_session", "list_sessions", "get_session",
+    "read_session_events", "read_session_event", "get_session_diff", "send_session_message",
+    "stop_session", "open_session_pull_request",
+  ].sort());
   const list = await call(client, "list_sessions");
   expect(list.body.sessions.map((r: Run) => r.id)).toEqual(["run_test"]);
   expect(JSON.stringify(list)).not.toContain("private-volume");
@@ -302,12 +317,14 @@ it("creates tokens once, hides secrets in listings, enforces CSRF and cascades a
     db.prepare("SELECT 1 FROM mcp_tokens WHERE user_id=?").get(owner),
   ).toBeUndefined();
 });
-it("deduplicates creation and follow-ups across clients, and rejects changed retry arguments", async () => {
+it("deduplicates concurrent starts and rejects changed retry arguments and backend switches", async () => {
   seed();
   const client = await connect();
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
   vi.spyOn(runs, "create").mockImplementation(
     async (user, input, attribution) => {
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await pending;
       return seed(user, attribution!.id);
     },
   );
@@ -317,25 +334,26 @@ it("deduplicates creation and follow-ups across clients, and rejects changed ret
     model: "model",
     prompt: "Fix this",
   };
-  const [a, b] = await Promise.all([
+  const starts = Promise.all([
     call(client, "start_session", args),
     call(client, "start_session", args),
   ]);
+  let results: Awaited<ReturnType<typeof call>>[] = [];
+  try {
+    // Two waiting reads fill the remaining slots, proving both starts have
+    // entered the server before the first creation is allowed to finish.
+    await withWaitingReads(client, "run_test", 0, () => {}, 2);
+  } finally {
+    release();
+    results = await starts;
+  }
+  const [a, b] = results;
   expect(a.body.id).toBe(b.body.id);
   expect(runs.create).toHaveBeenCalledTimes(1);
   expect(
     (await call(client, "start_session", { ...args, prompt: "Different" })).body
       .error,
   ).toBe("request_conflict");
-  vi.spyOn(runs, "enqueue").mockImplementation(() => {});
-  const msg = {
-    session_id: "run_test",
-    text: "Continue",
-    request_id: "message-1",
-  };
-  await call(client, "send_session_message", msg);
-  await call(client, "send_session_message", msg);
-  expect(runs.enqueue).toHaveBeenCalledTimes(1);
   const backend = vi.spyOn(runs, "resolveSelection").mockResolvedValue({
     id: "cli",
     backend: "codex",
@@ -345,7 +363,8 @@ it("deduplicates creation and follow-ups across clients, and rejects changed ret
   expect(
     (
       await call(client, "send_session_message", {
-        ...msg,
+        session_id: "run_test",
+        text: "Continue",
         request_id: "message-2",
         model: "cli",
       })
@@ -378,15 +397,8 @@ it("paginates events, reports large events and releases waiting reads on revoke"
     seq: huge.seq,
   });
   expect(chunk.body.text).toHaveLength(32000);
-  const waiting = call(client, "read_session_events", {
-    session_id: "run_test",
-    after_seq: huge.seq,
-    wait_seconds: 30,
+  const waiting = await withWaitingReads(client, "run_test", huge.seq, () => {
+    db.prepare("UPDATE mcp_tokens SET revoked_at=? WHERE id=?").run(Date.now(), token.id);
   });
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  db.prepare("UPDATE mcp_tokens SET revoked_at=? WHERE id=?").run(
-    Date.now(),
-    token.id,
-  );
-  expect((await waiting).body.error).toBe("invalid_token");
+  for (const result of waiting) expect(result.body.error).toBe("invalid_token");
 });

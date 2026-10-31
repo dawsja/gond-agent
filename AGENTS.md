@@ -36,7 +36,24 @@ GitHub access is an instance-wide connection. Administrators sign in through gh'
 
 Do not deploy to a user's server, change its data, or publish packages manually unless requested. Source commits go directly to `main`. After checks pass, CI builds and publishes runtime and worker Docker packages on pushes to main and version tags.
 
+## Testing Policy
+
+Prioritize development velocity without sacrificing meaningful correctness.
+
+- Do not generate tests automatically for every function or change.
+- Add tests when they protect important behavior, prevent realistic regressions, or validate meaningful edge cases.
+- Prefer a small number of high-value behavioral tests over exhaustive variations.
+- Avoid redundant tests, excessive mocking, and tests that merely duplicate implementation details.
+- During development, run only tests relevant to modified code.
+- Do not repeatedly execute the full test suite after minor edits.
+- Run the full relevant suite before finalizing substantial changes.
+- Never modify or delete existing tests simply to make a failing implementation pass.
+- Keep tests deterministic, fast, and maintainable.
+- Prioritize working, correct software over test counts and coverage percentages.
+
 ## Checks
+
+Select the checks below for the affected code; this is not a requirement to rerun every suite after each edit. Keep the full CI checks as the release gate.
 
 Provider settings manage connections, not a required model catalog. Use the approved C layout with OpenAI and Anthropic logo buttons, prefilled URLs and an optional Edit URL action. OpenAI supports compatible endpoints. Start empty instances with one ready-to-edit connection; put connection names, OpenAI protocol selection and manual model overrides under Advanced settings, preserving saved formats. Clear key is a text action that marks removal for the next save, with Undo; entering a replacement cancels removal. Subscription agents sit directly above API providers in both Settings and initial setup. Saving a provider and optional key must finish setup without choosing models. The agent and schedule model pickers combine live models from all saved connections, with connection-scoped IDs, short per-connection caching and isolated errors. Manual model overrides are an advanced fallback, not a setup step. Never reuse a saved key after URL/format changes without explicit replacement or clearing; never follow discovery redirects or expose keys in catalog responses. Anthropic format changes switch built-in default URLs but preserve custom proxies. Voice recording/transcription is not a supported feature; do not restore its UI, routes or settings.
 
