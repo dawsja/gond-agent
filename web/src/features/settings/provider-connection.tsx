@@ -8,15 +8,16 @@ export function ProviderConnection({ value: c, onChange, onRemove, disabled }: {
     <FieldLegend className="max-w-full truncate px-1 text-sm font-medium">{c.name || "Provider"}</FieldLegend>
     <FieldGroup className="grid sm:grid-cols-2">
       <Field><FieldLabel className="min-w-0 text-sm">Connection name<Input required maxLength={80} value={c.name} onChange={e => onChange({ name: e.target.value })} /></FieldLabel></Field>
-      <Field><FieldLabel className="min-w-0 text-sm">API format<NativeSelect aria-label="API format" value={c.format} onChange={e => onChange(changeFormat(c, e.target.value as Format))}><option value="openai">OpenAI-compatible Chat Completions</option><option value="anthropic">Anthropic Messages</option><option value="openai-responses">OpenAI Responses</option></NativeSelect></FieldLabel></Field>
+      <Field><FieldLabel className="min-w-0 text-sm">Provider type<NativeSelect aria-label="Provider type" value={c.format === "anthropic" ? "anthropic" : "openai"} onChange={e => onChange(changeFormat(c, e.target.value as Format))}><option value="openai">OpenAI Compatible API</option><option value="anthropic">Anthropic</option></NativeSelect></FieldLabel></Field>
     </FieldGroup>
     <Field><FieldLabel className="block text-sm">API base URL<Input required type="url" placeholder={DEFAULT_URLS[c.format]} value={c.baseURL} onChange={e => onChange({ baseURL: e.target.value, apiKey: "", clearKey: false })} /></FieldLabel></Field>
-    <p className="text-xs text-muted-foreground">Include the API prefix, such as /v1. Custom URLs are kept when changing formats. Use an address reachable from this server.</p>
+    <p className="text-xs text-muted-foreground">Include the API prefix, such as /v1. Custom URLs are kept when changing providers. Use an address reachable from this server.</p>
     <Field><FieldLabel className="block text-sm">API key<Input type="password" autoComplete="new-password" placeholder={c.hasKey ? "Saved — leave blank to keep" : "Optional for unauthenticated local APIs"} value={c.apiKey ?? ""} onChange={e => onChange({ apiKey: e.target.value, clearKey: false })} /></FieldLabel></Field>
     {c.hasKey && <Field><FieldLabel className="flex-row items-center gap-2 text-xs"><input type="checkbox" checked={!!c.clearKey} onChange={e => onChange({ clearKey: e.target.checked, apiKey: "" })} /> Clear saved API key</FieldLabel></Field>}
     <details>
-      <summary className="cursor-pointer text-xs text-muted-foreground">Advanced model overrides (optional)</summary>
+      <summary className="cursor-pointer text-xs text-muted-foreground">Advanced settings (optional)</summary>
       <FieldGroup className="mt-3">
+        {c.format !== "anthropic" && <Field><FieldLabel className="text-sm">OpenAI API protocol<NativeSelect aria-label="OpenAI API protocol" value={c.format} onChange={e => onChange(changeFormat(c, e.target.value as Format))}><option value="openai">Chat Completions (default)</option><option value="openai-responses">Responses</option></NativeSelect></FieldLabel><p className="text-xs text-muted-foreground">Choose Responses if your provider requires it.</p></Field>}
         <Field><FieldLabel className="flex-row items-center gap-2 text-sm"><input type="checkbox" checked={c.discover} onChange={e => onChange({ discover: e.target.checked })} /> Discover available models automatically</FieldLabel></Field>
         <p className="text-xs text-muted-foreground">Models appear in the agent's model picker. Add manual IDs only if this endpoint cannot list models, or to override a model's capabilities.</p>
         {c.models.map((m, i) => {

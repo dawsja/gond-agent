@@ -53,7 +53,7 @@ export function ProfilePhoto() {
   const remove = useMutation({ mutationFn: () => api<Pick<NonNullable<Me["user"]>, "image" | "has_photo">>("/v1/me/photo", { method: "DELETE" }), onSuccess: () => { refresh(); setNotice("Profile photo removed.") } })
   return <div className="flex flex-col gap-3 border-t border-border p-5">
     <div className="flex items-center gap-4"><ProfileAvatar src={me?.user?.image} size={64} /><div className="flex flex-col gap-2"><span className="text-sm font-medium">Profile photo</span><div className="flex flex-wrap gap-2"><Button variant="outline" size="sm" disabled={remove.isPending} onClick={() => input.current?.click()}>{me?.user?.has_photo ? "Change photo" : "Upload photo"}</Button>{me?.user?.has_photo && <Button variant="ghost" size="sm" disabled={remove.isPending} onClick={() => { setNotice(""); remove.mutate() }}>{remove.isPending ? "Removing…" : "Remove photo"}</Button>}</div></div></div>
-    <p className="text-xs text-muted-foreground">PNG, JPEG or WebP, up to 2 MiB. Your photo is cropped to a circle and saved on this server.</p>
+    <p className="text-xs text-muted-foreground">PNG, JPEG or WebP, up to 2 MiB.</p>
     <input ref={input} aria-label="Choose profile photo" type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" tabIndex={-1} onChange={e => {
       const chosen = e.target.files?.[0]; e.target.value = ""; setError(null); setNotice("")
       if (!chosen) return

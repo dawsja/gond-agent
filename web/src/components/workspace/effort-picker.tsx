@@ -1,8 +1,13 @@
-import { NativeSelect } from "@shared/ui/input"
+import { ChevronDown } from "lucide-react"
+import { PickerPopover } from "./picker-popover"
+import { pickerChip } from "@/features/studio/theme"
+import { cn } from "@/lib/utils"
 import type { Model } from "@/lib/api"
 export function effortFor(model: Model | undefined, value: string) {
   return model?.efforts?.includes(value) ? value : "default"
 }
-export function EffortPicker({ model, value, onChange }: { model?: Model; value: string; onChange: (value: string) => void }) {
-  return <NativeSelect aria-label="Reasoning effort" value={effortFor(model, value)} onChange={e => onChange(e.target.value)} disabled={!model?.efforts?.length} className="w-auto"><option value="default">Default effort</option>{model?.efforts?.map(e => <option key={e} value={e}>{e === "off" ? "Off" : e.charAt(0).toUpperCase() + e.slice(1)}</option>)}</NativeSelect>
+const effortLabel = (value: string) => value === "default" ? "Default effort" : value.charAt(0).toUpperCase() + value.slice(1)
+export function EffortPicker({ model, value, onChange, disabled }: { model?: Model; value: string; onChange: (value: string) => void; disabled?: boolean }) {
+  const selected = effortFor(model, value)
+  return <PickerPopover value={selected} onSelect={onChange} placeholder="Search thinking levels" width="w-48" items={["default", ...(model?.efforts ?? [])].filter((effort, index, efforts) => efforts.indexOf(effort) === index).map(effort => ({ value: effort, label: effortLabel(effort), search: effortLabel(effort) }))} trigger={<button type="button" aria-label="Reasoning effort" disabled={disabled || !model?.efforts?.length} className={cn(pickerChip, "gap-1.5 px-2.5")}><span>{selected === "default" ? "Default" : effortLabel(selected)}</span><ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" /></button>} />
 }

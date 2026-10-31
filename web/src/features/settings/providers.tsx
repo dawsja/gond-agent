@@ -10,7 +10,7 @@ import { ProviderConnection } from "./provider-connection"
 
 export function ProviderSettings({ setup = false }: { setup?: boolean }) {
   const query = useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderSettingsValue>("/v1/settings/providers") })
-  return <Section title={setup ? "Connect your models" : "Model providers"} description="Use Anthropic Messages, OpenAI-compatible Chat Completions, or OpenAI Responses. Connections are shared by every account on this server.">
+  return <Section title={setup ? "Connect your models" : "Model providers"} description="Connect an OpenAI compatible API or Anthropic. Connections are shared by every account on this server.">
     {query.isPending ? <p className="p-5 text-sm">Loading…</p> : query.isError ? <p role="alert" className="p-5 text-sm text-failed">{query.error.message}</p> : <ProviderForm initial={query.data} setup={setup} />}
   </Section>
 }

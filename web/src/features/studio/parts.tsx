@@ -1,6 +1,7 @@
-import { GitMerge, GitPullRequest, GitPullRequestClosed, Sparkles } from "lucide-react"
+import { GitMerge, GitPullRequest, GitPullRequestClosed } from "lucide-react"
 import type { ReactNode } from "react"
 import { MODEL_PROVIDER_ICONS } from "@shared/provider-icons"
+import { GondAgentMark } from "@shared/logo"
 import { providerOf } from "@shared/providers"
 import { cn } from "@/lib/utils"
 import type { RunStatus } from "@/lib/api"
@@ -61,18 +62,18 @@ export function shortModel(name: string | undefined, id: string): string {
   return (name ?? id).replace(/^Claude /, "")
 }
 
-export function ModelMark({ id, className, size = 16 }: { id: string; className?: string; size?: number }) {
-  const provider = providerOf(id)
+export function ModelMark({ id, provider: fallback, className, size = 16 }: { id: string; provider?: string; className?: string; size?: number }) {
+  const identified = providerOf(id)
+  const provider = identified === "other" ? fallback ?? identified : identified
   const src = MODEL_PROVIDER_ICONS[provider]
-  // xAI's mark is drawn inline, and Auto (Gond Agent's pick) gets a sparkle; a provider without an icon gets an
-  // empty slot, never another's mark.
+  // Keep the provider's real mark for API and subscription models; Auto uses Gond's mark.
   return (
-    <span className={cn("inline-grid shrink-0 place-items-center text-foreground/80", className)} style={{ width: size, height: size }}>
+    <span aria-hidden="true" data-model-provider={provider} className={cn("inline-grid shrink-0 place-items-center text-foreground/80", className)} style={{ width: size, height: size }}>
       {provider === "auto" ? (
-        <Sparkles style={{ width: size * 0.82, height: size * 0.82 }} strokeWidth={1.75} aria-hidden />
+        <GondAgentMark size={size * 0.82} />
       ) : src ? (
         <span
-          className="bg-contain bg-center bg-no-repeat invert opacity-75"
+          className={cn("bg-contain bg-center bg-no-repeat", ["openai", "moonshot", "qwen", "zai", "minimax"].includes(provider) && "invert")}
           style={{ backgroundImage: `url("${src}")`, width: size * 0.82, height: size * 0.82 }}
         />
       ) : provider === "xai" ? (

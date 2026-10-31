@@ -34,6 +34,100 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('button', { name: button, exact: true }).click();
     return response;
   };
+  const selectFormat = async (scope, format) => {
+    await scope.getByLabel('Provider type', { exact: true }).selectOption(format === 'anthropic' ? 'anthropic' : 'openai');
+    if (format !== 'anthropic') {
+      await scope.getByText('Advanced settings (optional)', { exact: true }).click();
+      await scope.getByLabel('OpenAI API protocol', { exact: true }).selectOption(format);
+      await scope.getByText('Advanced settings (optional)', { exact: true }).click();
+    }
+  };
+  // UI fixtures exercise API and subscription choices without a paid model call.
+  // Registration, provider setup, storage and the rest of onboarding use the real service.
+  const verifyComposers = async () => {
+    const efforts = ['low', 'medium', 'high'];
+    const models = [
+      { id: 'fixture:gpt-5.4', display_name: 'GPT-5.4 · API', provider: 'openai', efforts },
+      { id: 'fixture:claude-sonnet-4-6', display_name: 'Claude Sonnet · API', provider: 'anthropic', efforts },
+      { id: 'cli-codex:default', display_name: 'Codex · Subscription', provider: 'openai', backend: 'codex', efforts },
+      { id: 'cli-claude-code:sonnet', display_name: 'Sonnet · Subscription', provider: 'anthropic', backend: 'claude-code', efforts },
+    ].map(model => ({ ...model, context_window: 200000 }));
+    const catalogURL = origin + '/api/v1/models';
+    const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
+    let current = models[0], sent;
+    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: 'ready', files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
+    const modelRoute = route => route.fulfill({ json: { models, connections: [] } });
+    const runRoute = route => route.fulfill({ json: run() });
+    const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
+    const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
+    const diffRoute = route => route.fulfill({ body: '' });
+    await page.route(catalogURL, modelRoute);
+    await page.route(fixtureRunURL, runRoute);
+    await page.route(fixtureRunURL + '/messages', messagesRoute);
+    await page.route(fixtureRunURL + '/ticket', ticketRoute);
+    await page.route(fixtureRunURL + '/diff', diffRoute);
+    await page.routeWebSocket('**/ws/runs/composer-fixture?*', socket => socket.onMessage(() => {}));
+    const layout = async label => {
+      const image = await page.getByRole('button', { name: 'Attach images', exact: true }).boundingBox();
+      const model = await page.getByRole('button', { name: label, exact: true }).boundingBox();
+      const thinking = await page.getByRole('button', { name: 'Reasoning effort', exact: true }).boundingBox();
+      expect(model.height).toBe(32); expect(thinking.height).toBe(model.height);
+      expect(Math.abs(thinking.y - model.y)).toBeLessThan(1);
+      expect(image.x + image.width).toBeLessThanOrEqual(model.x);
+      expect(model.x + model.width).toBeLessThanOrEqual(thinking.x);
+      expect(thinking.x + thinking.width).toBeLessThanOrEqual(width);
+    };
+    try {
+      await page.goto(origin + '/agents/');
+      await page.getByRole('button', { name: 'Choose model', exact: true }).click();
+      for (const model of models) {
+        await expect(page.getByRole('button', { name: model.display_name, exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+      }
+      await capture('model-menu-brands');
+      await page.keyboard.press('Escape');
+      for (const model of models) {
+        await page.getByRole('button', { name: 'Choose model', exact: true }).click();
+        await page.getByRole('button', { name: model.display_name, exact: true }).click();
+        await expect(page.getByRole('button', { name: 'Choose model', exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+        await layout('Choose model');
+        await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
+        await expect(page.getByRole('textbox', { name: 'Search thinking levels', exact: true })).toBeVisible();
+        await page.getByRole('button', { name: 'High', exact: true }).click();
+        await expect(page.getByRole('button', { name: 'Reasoning effort', exact: true })).toHaveText('High');
+      }
+      await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
+      await capture('thinking-menu');
+      await page.keyboard.press('Escape');
+      for (const model of models) {
+        current = model;
+        await page.goto(origin + '/agents/runs/composer-fixture');
+        const picker = page.getByRole('button', { name: 'Follow-up model', exact: true });
+        await expect(picker).toContainText(model.display_name);
+        await expect(picker.locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+        await layout('Follow-up model');
+        await picker.click();
+        for (const other of models.filter(item => item.backend !== model.backend)) {
+          await expect(page.getByRole('button', { name: other.display_name, exact: true })).toHaveCount(0);
+        }
+        await page.keyboard.press('Escape');
+        await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
+        await page.getByRole('button', { name: 'Low', exact: true }).click();
+        await page.getByRole('textbox', { name: 'Follow-up message', exact: true }).fill('Check the settings layout');
+        const response = page.waitForResponse(fixtureRunURL + '/messages');
+        await page.getByRole('button', { name: 'Send message', exact: true }).click();
+        await response;
+        expect(sent.effort).toBe('low');
+        await capture('follow-up-' + (model.backend ?? model.provider));
+      }
+    } finally {
+      await page.unroute(catalogURL, modelRoute);
+      await page.unroute(fixtureRunURL, runRoute);
+      await page.unroute(fixtureRunURL + '/messages', messagesRoute);
+      await page.unroute(fixtureRunURL + '/ticket', ticketRoute);
+      await page.unroute(fixtureRunURL + '/diff', diffRoute);
+      await page.goto(origin + '/agents/settings');
+    }
+  };
   try {
     await page.goto(origin + '/');
     await expect(page).toHaveURL(origin + '/agents/');
@@ -53,14 +147,17 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('button', { name: returning ? 'Sign in' : 'Create administrator account', exact: true }).click();
     if (!returning) {
       await expect(page.getByRole('heading', { name: 'Set up Gond Agent', exact: true })).toBeVisible();
+      expect(await page.getByRole('heading', {name: 'Subscription agents', exact: true}).evaluate(element => element.closest('section').nextElementSibling.querySelector('h2').textContent)).toBe('Connect your models');
       await page.getByRole('button', { name: 'Add provider', exact: true }).click();
       await page.getByLabel('Connection name', { exact: true }).fill('Fixture provider');
-      await page.getByLabel('API format', { exact: true }).selectOption('anthropic');
+      await expect(page.getByLabel('Provider type', { exact: true }).locator('option')).toHaveText(['OpenAI Compatible API', 'Anthropic']);
+      await expect(page.getByLabel('OpenAI API protocol', { exact: true })).toBeHidden();
+      await selectFormat(page, 'anthropic');
       await expect(page.getByLabel('API base URL', { exact: true })).toHaveValue('https://api.anthropic.com/v1');
-      await page.getByLabel('API format', { exact: true }).selectOption('openai-responses');
+      await selectFormat(page, 'openai-responses');
       await expect(page.getByLabel('API base URL', { exact: true })).toHaveValue('https://api.openai.com/v1');
       await page.getByLabel('API base URL', { exact: true }).fill(providerOrigin + '/v1');
-      await page.getByLabel('API format', { exact: true }).selectOption(width === 1440 ? 'anthropic' : 'openai-responses');
+      await selectFormat(page, width === 1440 ? 'anthropic' : 'openai-responses');
       await expect(page.getByLabel('API base URL', { exact: true })).toHaveValue(providerOrigin + '/v1');
       await page.getByLabel('API key', { exact: true }).fill(key);
       await page.getByRole('button', { name: 'Add provider', exact: true }).click();
@@ -141,6 +238,7 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('menuitem', { name: 'Settings', exact: true }).click();
     await expect(page).toHaveURL(origin + '/agents/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+    expect(await page.locator('#subscription-agents').evaluate(element => element.nextElementSibling.id)).toBe('providers');
     await page.goto(origin + '/agents/');
     if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
     await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
@@ -165,14 +263,21 @@ const key = 'fixture-only-provider-key';
     await expect(page.getByLabel('Connection name', { exact: true }).first()).toHaveValue('Fixture provider');
     await expect(page.getByLabel('API key', { exact: true }).first()).toHaveValue('');
     await expect(page.getByLabel('API key', { exact: true }).first()).toHaveAttribute('placeholder', 'Saved — leave blank to keep');
+    const firstProvider = page.locator('#providers fieldset').first();
+    await expect(firstProvider.getByLabel('Provider type', { exact: true })).toHaveValue(width === 1440 ? 'anthropic' : 'openai');
+    if (width !== 1440) {
+      await firstProvider.getByText('Advanced settings (optional)', { exact: true }).click();
+      await expect(firstProvider.getByLabel('OpenAI API protocol', { exact: true })).toHaveValue('openai-responses');
+      await firstProvider.getByText('Advanced settings (optional)', { exact: true }).click();
+    }
     if (!returning) {
       await page.getByRole('button', { name: 'Add provider', exact: true }).click();
       const manual = page.locator('fieldset').nth(2);
       await manual.getByLabel('Connection name', { exact: true }).fill('Manual provider');
-      await manual.getByLabel('API format', { exact: true }).selectOption(width === 1440 ? 'anthropic' : 'openai-responses');
+      await selectFormat(manual, width === 1440 ? 'anthropic' : 'openai-responses');
       await manual.getByLabel('API base URL', { exact: true }).fill(providerOrigin + '/unsupported/v1');
       await manual.getByLabel('API key', { exact: true }).fill(key);
-      await manual.getByText('Advanced model overrides (optional)', { exact: true }).click();
+      await manual.getByText('Advanced settings (optional)', { exact: true }).click();
       await manual.getByRole('button', { name: 'Add manual model', exact: true }).click();
       await manual.getByLabel('Model ID', { exact: true }).fill('manual-model');
       expect((await save('Save provider settings')).status()).toBe(200);
@@ -184,6 +289,7 @@ const key = 'fixture-only-provider-key';
       await page.keyboard.press('Escape');
       await page.goto(origin + '/agents/settings');
     }
+    if (!returning) await verifyComposers();
     const beforePhoto = await (await page.request.get(origin + '/api/v1/me')).json();
     if (returning) {
       expect(beforePhoto.user.has_photo).toBe(true);

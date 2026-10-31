@@ -1,4 +1,4 @@
-import { NativeSelect } from "@shared/ui/input"
+import { ModelPicker } from "@/components/workspace/model-picker"
 import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { ChevronRight, ExternalLink, GitPullRequest, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
@@ -200,7 +200,7 @@ export function RunScreen() {
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={<><NativeSelect className="max-w-[180px] flex-1" aria-label="Follow-up model" value={pickedModel || r.model_id} onChange={e=>{setPickedModel(e.target.value);setEffort("default")}}>{models?.filter(m=>m.id!=="auto"&&m.backend===r.backend).map(m=><option key={m.id} value={m.id}>{m.display_name}</option>)}</NativeSelect><EffortPicker model={models?.find(m=>m.id===(pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort}/><AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} className="text-muted-foreground" /></>}
+            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto" && m.backend === r.backend) ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={r.status === "merged"} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={r.status === "merged"} /></div></>}
             placeholder={
               r.status === "merged"
                 ? "This pull request is merged"

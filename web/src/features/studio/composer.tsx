@@ -1,129 +1,18 @@
 import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
-import { Check, ChevronDown, GitBranch, Lock, Search } from "lucide-react"
-import { Popover } from "radix-ui"
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
+import { ChevronDown, GitBranch, Lock } from "lucide-react"
+import { useMemo, useState } from "react"
 import { useNavigate } from "react-router"
 import { GithubMark } from "@/components/brand/github"
 import { TaskInput } from "@/components/workspace/task-input"
+import { PickerPopover } from "@/components/workspace/picker-popover"
+import { ModelPicker } from "@/components/workspace/model-picker"
 import { useBranches, useCreateRun, useGithub, useModelCatalog, useRefreshModels, useRepos, useRuns } from "@/lib/queries"
 import { Button } from "@shared/ui/button"
-import { devOpen } from "@/lib/dev-open"
 import { useImageAttachments } from "@/lib/images"
 import { cn } from "@/lib/utils"
 import { AttachButton, DropHint, ImageTray } from "./attachments"
-import { ModelMark, providerOf, PROVIDER_LABEL } from "./parts"
 import { mono, pickerChip as chip } from "./theme"
 import { prefs } from "@/lib/prefs"
-
-/**
- * A searchable list in a popover. Free text is accepted when `allowCustom` validates it. The reference for
- * every picker (the composer's repository, branch and model; Gond Agent Runners).
- */
-export function PickerPopover({
-  trigger,
-  items,
-  value,
-  onSelect,
-  placeholder,
-  allowCustom,
-  empty,
-  width = "w-80",
-  name,
-  align = "start",
-  footer,
-}: {
-  trigger: ReactNode
-  /** `group` puts items under headings (in order of first appearance); `search` is extra text to match. */
-  items: { value: string; label: ReactNode; hint?: ReactNode; group?: string; search?: string }[]
-  value: string | null
-  onSelect: (v: string) => void
-  placeholder: string
-  allowCustom?: (q: string) => boolean
-  empty?: ReactNode
-  width?: string
-  name?: string
-  align?: "start" | "end"
-  footer?: ReactNode
-}) {
-  const [open, setOpen] = useState(() => !!name && devOpen(name))
-  const [q, setQ] = useState("")
-  const needle = q.trim().toLowerCase()
-  const matches = items.filter((i) => `${i.value} ${i.search ?? ""} ${i.group ?? ""}`.toLowerCase().includes(needle))
-  const shown = matches.slice(0, 50)
-  const custom = q.trim() && allowCustom?.(q.trim()) && !items.some((i) => i.value === q.trim()) ? q.trim() : null
-  // Opens on the selected item (a long list, like times of day, would otherwise hide it).
-  const list = useRef<HTMLUListElement>(null)
-  useEffect(() => {
-    if (!open) return
-    const raf = requestAnimationFrame(() => list.current?.querySelector("[data-selected]")?.scrollIntoView({ block: "center" }))
-    return () => cancelAnimationFrame(raf)
-  }, [open])
-  const pick = (v: string) => {
-    onSelect(v)
-    setOpen(false)
-    setQ("")
-  }
-  return (
-    <Popover.Root open={open} onOpenChange={setOpen}>
-      <Popover.Trigger asChild>{trigger}</Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          side="bottom"
-          align={align}
-          sideOffset={6}
-          className={cn("z-50 overflow-hidden rounded-[4px] border border-border-strong bg-popover text-foreground", width)}
-        >
-          <div className="flex items-center gap-2 border-b border-border px-3">
-            <Search className="size-3.5 text-muted-foreground" />
-            <input
-              autoFocus
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault()
-                  if (custom) pick(custom)
-                  else if (shown[0]) pick(shown[0].value)
-                }
-              }}
-              placeholder={placeholder}
-              className="h-9 min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-subtle"
-            />
-          </div>
-          <ul ref={list} className="max-h-72 overflow-y-auto p-1">
-            {custom && (
-              <li>
-                <button type="button" onClick={() => pick(custom)} className="flex h-8 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[13px] hover:bg-raised">
-                  Use <span style={mono}>{custom}</span>
-                </button>
-              </li>
-            )}
-            {shown.map((i, n) => (
-              <li key={i.value}>
-                {i.group && i.group !== shown[n - 1]?.group && (
-                  <div className={cn("px-2 pt-2 pb-1 text-[11px] text-subtle", n > 0 && "mt-1 border-t border-border")}>{i.group}</div>
-                )}
-                <button
-                  type="button"
-                  data-selected={i.value === value || undefined}
-                  onClick={() => pick(i.value)}
-                  className="flex h-8 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[13px] hover:bg-raised"
-                >
-                  <span className="min-w-0 flex-1 truncate">{i.label}</span>
-                  {i.hint && <span className="shrink-0 text-[12px] text-muted-foreground">{i.hint}</span>}
-                  <Check className={cn("size-3.5 shrink-0 text-foreground", i.value !== value && "invisible")} />
-                </button>
-              </li>
-            ))}
-            {!custom && shown.length === 0 && <li className="px-2 py-2 text-[12px] text-muted-foreground">{empty ?? "Nothing matches"}</li>}
-            {matches.length > shown.length && <li className="px-2 py-2 text-[12px] text-muted-foreground">Showing {shown.length} of {matches.length}. Search to narrow the list.</li>}
-          </ul>
-          {footer && <div className="flex items-center justify-between gap-2 border-t border-border p-2">{footer}</div>}
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
-  )
-}
 
 const REPO_RE = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/
 
@@ -260,43 +149,21 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
         disabled={needsGithub || !repo || !modelInfo}
         onSubmit={submit}
         footer={<>
-          <EffortPicker model={modelInfo} value={effort} onChange={setEffort} />
           <AttachButton onClick={attach.pick} count={attach.items.length} disabled={needsGithub || !repo} />
-            <PickerPopover
-              name="model"
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <ModelPicker
+              models={modelList}
               value={modelId}
-              onSelect={(v) => {
+              onChange={(v) => {
                 setModel(v)
+                setEffort("default")
                 prefs.set("model", v)
               }}
-              width="w-72"
-              placeholder="Search models"
-              empty={models.isPending ? "Loading models…" : "No models available. Check your connections in Settings."}
+              loading={models.isPending}
               footer={<><Button variant="ghost" size="sm" disabled={refreshModels.isPending} onClick={() => refreshModels.mutate()}>{refreshModels.isPending ? "Refreshing…" : "Refresh models"}</Button><Button asChild variant="link" size="sm"><a href="/agents/settings#providers">Providers</a></Button></>}
-              items={modelList.map((m) => {
-                const provider = providerOf(m.id)
-                return {
-                  value: m.id,
-                  label: (
-                    <span className="flex items-center gap-2">
-                      <ModelMark id={m.id} size={15} />
-                      {m.display_name}
-                    </span>
-                  ),
-
-                  group: m.provider === "auto" ? "Automatic" : m.connection_name ?? PROVIDER_LABEL[provider] ?? m.provider,
-                  search: m.display_name,
-                }
-              })}
-              trigger={
-                <button type="button" aria-label="Choose model" className={cn(chip, "ml-0.5 gap-1.5 px-2.5")}>
-                  {modelInfo && <ModelMark id={modelInfo.id} size={15} />}
-                  <span className="max-w-[180px] truncate max-md:max-w-[120px]">{modelInfo?.display_name ?? (models.isPending ? "Loading models…" : "No models available")}</span>
-
-                  <ChevronDown className="size-3.5 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
-                </button>
-              }
             />
+            <EffortPicker model={modelInfo} value={effort} onChange={setEffort} />
+          </div>
         </>}
       ><DropHint show={attach.dragging} /><ImageTray items={attach.items} onRemove={attach.remove} className="px-4 pt-3" /></TaskInput>
       {(attach.error ?? create.error) && (

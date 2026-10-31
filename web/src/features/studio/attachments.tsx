@@ -37,7 +37,7 @@ export function AttachButton({ onClick, count, disabled, className }: { onClick:
       aria-label="Attach images"
       title={full ? `Up to ${MAX_IMAGES} images per message` : "Attach images (or paste or drop them)"}
       className={cn(
-        "grid size-9 shrink-0 place-items-center rounded-[4px] text-muted-foreground transition-colors hover:bg-raised hover:text-foreground disabled:pointer-events-none disabled:opacity-40",
+        "grid size-8 shrink-0 place-items-center rounded-[4px] text-muted-foreground transition-colors hover:bg-raised hover:text-foreground disabled:pointer-events-none disabled:opacity-40",
         className,
       )}
     >
