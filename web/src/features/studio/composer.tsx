@@ -170,7 +170,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
         <p className="mt-2 px-1 text-[13px] text-failed">{attach.error ?? create.error?.message}</p>
       )}
       {(models.error ?? refreshModels.error) && <p role="alert" className="mt-2 px-1 text-[13px] text-failed">{(models.error ?? refreshModels.error)?.message}</p>}
-      {models.data?.connections?.filter(c => c.message).map(c => <p key={c.id} role="status" className="mt-2 px-1 text-[12px] text-muted-foreground">{c.name}: {c.message}</p>)}
+      {models.data?.connections?.filter(c => c.message && !modelInfo?.backend && (!modelInfo || c.id === modelInfo.connection_id)).map(c => <p key={c.id} role="status" className="mt-2 px-1 text-[12px] text-muted-foreground">{c.name}: {c.message}</p>)}
     </div>
   )
 }

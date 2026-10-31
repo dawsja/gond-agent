@@ -63,12 +63,16 @@ const key = 'fixture-only-provider-key';
       { id: 'fixture:claude-sonnet-4-6', display_name: 'Claude Sonnet · API', provider: 'anthropic', efforts },
       { id: 'cli-codex:default', display_name: 'Codex · Subscription', provider: 'openai', backend: 'codex', efforts },
       { id: 'cli-claude-code:sonnet', display_name: 'Sonnet · Subscription', provider: 'anthropic', backend: 'claude-code', efforts },
-    ].map(model => ({ ...model, context_window: 200000 }));
+    ].map(model => ({ ...model, context_window: 200000, ...(!model.backend ? { connection_id: model.provider } : {}) }));
+    const connections = [
+      { id: 'openai', name: 'Provider 1', status: 'error', message: 'OpenAI API connection unavailable.' },
+      { id: 'anthropic', name: 'Other API', status: 'error', message: 'Anthropic API connection unavailable.' },
+    ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
     let current = models[0], sent;
     const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: 'ready', files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
-    const modelRoute = route => route.fulfill({ json: { models, connections: [] } });
+    const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
@@ -101,6 +105,9 @@ const key = 'fixture-only-provider-key';
         await page.getByRole('button', { name: 'Choose model', exact: true }).click();
         await page.getByRole('button', { name: model.display_name, exact: true }).click();
         await expect(page.getByRole('button', { name: 'Choose model', exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+        for (const connection of connections) {
+          await expect(page.getByText(`${connection.name}: ${connection.message}`, { exact: true })).toHaveCount(!model.backend && model.connection_id === connection.id ? 1 : 0);
+        }
         await layout('Choose model');
         await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
         await expect(page.getByRole('textbox', { name: 'Search thinking levels', exact: true })).toBeVisible();
@@ -110,6 +117,7 @@ const key = 'fixture-only-provider-key';
       await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
       await capture('thinking-menu');
       await page.keyboard.press('Escape');
+      await capture('subscription-no-api-warning');
       for (const model of models) {
         current = model;
         await page.goto(origin + '/agents/runs/composer-fixture');
@@ -130,6 +138,41 @@ const key = 'fixture-only-provider-key';
         await response;
         expect(sent.effort).toBe('low');
         await capture('follow-up-' + (model.backend ?? model.provider));
+      }
+      // Exercise removing the final real API connection. Subscription availability
+      // is a UI fixture; saving, discovery and persistence use the packaged API.
+      const meURL = origin + '/api/v1/me';
+      const meRoute = async route => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: { ...await response.json(), setup_required: false } });
+      };
+      const original = await (await page.request.get(settingsURL)).json();
+      await page.route(meURL, meRoute);
+      try {
+        await page.goto(origin + '/agents/settings');
+        const providers = page.locator('#providers');
+        await expect(providers.getByRole('button', { name: 'Save changes', exact: true })).toBeVisible();
+        while (await providers.locator('fieldset').count()) {
+          const connection = providers.locator('fieldset').first();
+          await advanced(connection, true);
+          await connection.getByRole('button', { name: 'Remove provider', exact: true }).click();
+        }
+        await expect(providers.getByRole('button', { name: 'Save changes', exact: true })).toBeEnabled();
+        const cleared = await save('Save changes');
+        expect(cleared.status()).toBe(200);
+        expect((await cleared.json()).connections).toEqual([]);
+        await page.reload();
+        await expect(providers.getByText('No API providers. Subscription agents work without an API connection.', { exact: true })).toBeVisible();
+        await expect(providers.locator('fieldset')).toHaveCount(0);
+        await providers.scrollIntoViewIfNeeded();
+        await capture('subscription-empty-api-settings');
+        await page.goto(origin + '/agents/');
+        await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toContainText('Sonnet');
+        await expect(page.getByText(/API connection unavailable/)).toHaveCount(0);
+      } finally {
+        const restored = await page.request.put(settingsURL, { headers: { Origin: origin }, data: { ...original, connections: original.connections.map(connection => ({ ...connection, apiKey: connection.baseURL === providerOrigin + '/second/v1' ? key + '-second' : key })) } });
+        expect(restored.status()).toBe(200);
+        await page.unroute(meURL, meRoute);
       }
     } finally {
       await page.unroute(catalogURL, modelRoute);

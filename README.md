@@ -95,6 +95,8 @@ Better Auth handles email/password sign-up, password hashing, cookies, sessions,
 
 ## Model providers
 
+Claude Code and Codex subscription sign-ins work without an API provider. To remove unused API connections, open **Settings → Model providers → Advanced settings → Remove provider**, then **Save changes**. You can remove the final API connection. API connection warnings appear only for the selected API connection, or when no models are available.
+
 New tasks and follow-ups place image attachments first, then the model and thinking effort selectors. Model and thinking menus share the same style and control height; API and subscription models show their brand marks. Follow-ups offer models from the current run's backend.
 
 After the first sign-in, setup opens a ready-to-edit API connection. An administrator can add more connections in **Settings → Model providers**, directly below **Subscription agents**. Choose **OpenAI** (including compatible APIs) or **Anthropic**, add a key if required, then save. Provider URLs are filled in automatically; **Edit URL** allows a custom API base URL including its prefix, such as `http://127.0.0.1:8000/v1`. Setup does not require selecting or entering models. Connection names are optional overrides under **Advanced settings**. OpenAI connections default to Chat Completions; select Responses there if your provider requires it. Saved protocol choices are preserved.

@@ -58,6 +58,15 @@ const settings = (format = "openai", baseURL = origin + "/custom/v1") => ({
   defaultModel: modelId("local", model.id),
 });
 describe("provider settings and request routing", () => {
+  it("removes the last API connection without creating a replacement", async () => {
+    saveProviderSettings(db, secret, settings());
+    expect(saveProviderSettings(db, secret, { connections: [], defaultModel: "" })).toEqual({ connections: [], defaultModel: "" });
+    expect(await loadModelCatalog(db, secret, true)).toEqual({ models: [], connections: [] });
+    expect(setupComplete(db)).toBe(false);
+    const reopened = openStore(dir);
+    expect(providerSettings(reopened).connections).toEqual([]);
+    reopened.close();
+  });
   it("starts empty, encrypts keys, persists settings and preserves a blank update", () => {
     expect(publicModels(db).models).toEqual([]);
     expect(() => modelFor(db, "auto")).toThrow(/No models are available/);

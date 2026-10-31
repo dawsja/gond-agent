@@ -460,6 +460,18 @@ describe("local authentication and persistence", () => {
   });
 });
 describe("provider setup access", () => {
+  it("keeps subscription-only accounts configured after removing the final API provider", async () => {
+    const admin = await signup();
+    vi.spyOn(runs.cliAccounts, "models").mockReturnValue([{id:"sonnet",name:"Sonnet",backend:"claude-code",efforts:["low","medium","high"]}]);
+    expect((await (await call("/api/v1/me",undefined,admin)).json()).setup_required).toBe(false);
+    expect((await call("/api/v1/settings/providers",settings,admin,"PUT")).status).toBe(200);
+    expect((await call("/api/v1/settings/providers",{connections:[],defaultModel:""},admin,"PUT")).status).toBe(200);
+    expect((await (await call("/api/v1/settings/providers",undefined,admin)).json()).connections).toEqual([]);
+    expect((await (await call("/api/v1/me",undefined,admin)).json()).setup_required).toBe(false);
+    const catalog=await (await call("/api/v1/models",undefined,admin)).json();
+    expect(catalog.connections).toEqual([]);
+    expect(catalog.models.map((m:{id:string})=>m.id)).toEqual(["cli-claude-code:sonnet"]);
+  });
   const settings = {
     connections: [{ id: "anthropic", name: "Claude", format: "anthropic", baseURL: "https://api.anthropic.com/v1", apiKey: "provider-secret-value", discover: false, models: [{ id: "claude-test", name: "Claude", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
     defaultModel: "anthropic:claude-test",

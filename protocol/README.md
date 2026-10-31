@@ -28,6 +28,8 @@ Start and follow-up `request_id` values are 1–100 characters, token-scoped and
 
 ## Model requests
 
+Subscription models do not require API connections. Provider settings accept an empty `connections` array with an empty `defaultModel` to remove all API providers. Empty Settings remain empty after reload; first-time API setup offers an unsaved draft. Composer discovery messages are scoped to the selected API connection; subscription selections suppress API connection warnings. With no selectable model, API discovery failures remain visible.
+
 The internal container worker calls `GET /v1/models` and `POST /v1/responses` through its loopback proxy at 127.0.0.1:8787. The service receives those requests over Docker's attached stdio channel and scopes them to that run; no network-facing model/control ports or provider keys are needed inside workers. Schemas: `api/src/wire.ts` and `runner/src/api/wire.rs`. Model responses use SSE (`event: <name>`, `data: <JSON>`): response/block starts, block deltas/ends, errors, and response.end with token usage and a stop reason. Opaque reasoning blocks retain their provider and connection-scoped model identity. Provider API URLs, formats, encrypted keys and model IDs live in SQLite; only administrators can edit them. The service translates to Anthropic Messages, OpenAI Chat Completions or OpenAI Responses and sends keys only to the configured endpoint.
 
 ## Agent events

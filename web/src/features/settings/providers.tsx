@@ -18,7 +18,7 @@ export function ProviderSettings({ setup = false }: { setup?: boolean }) {
 const newConnection = (): Connection => ({ id: randomId(), name: "OpenAI", format: "openai", baseURL: DEFAULT_URLS.openai, hasKey: false, discover: true, models: [] })
 
 function ProviderForm({ initial, setup }: { initial: ProviderSettingsValue; setup: boolean }) {
-  const [value, setValue] = useState(() => initial.connections.length ? initial : { ...initial, connections: [newConnection()] })
+  const [value, setValue] = useState(() => setup && !initial.connections.length ? { ...initial, connections: [newConnection()] } : initial)
   const [saved, setSaved] = useState(initial), qc = useQueryClient()
   const update = (next: ProviderSettingsValue) => { setValue(next); save.reset() }
   const connection = (id: string, change: Partial<Connection>) => update({ ...value, connections: value.connections.map(c => c.id === id ? { ...c, ...change } : c) })
@@ -34,10 +34,10 @@ function ProviderForm({ initial, setup }: { initial: ProviderSettingsValue; setu
     <form onSubmit={e => { e.preventDefault(); save.mutate() }} onInvalidCapture={e => { const details = (e.target as HTMLElement).closest("details"); if (details) details.open = true }}>
       <FieldGroup className="gap-0">
         {value.connections.map(c => <div key={c.id} className="border-t border-border p-5 sm:p-7"><ProviderConnection value={c} saved={saved.connections.find(item => item.id === c.id)} multiple={value.connections.length > 1} disabled={save.isPending} onChange={change => connection(c.id, change)} onRemove={() => update({ ...value, connections: value.connections.filter(item => item.id !== c.id) })} /></div>)}
-        {!value.connections.length && <p className="border-t border-border p-5 text-sm text-muted-foreground">Add a provider to make its models available.</p>}
+        {!value.connections.length && <p className="border-t border-border p-5 text-sm text-muted-foreground">No API providers. Subscription agents work without an API connection.</p>}
         {save.isError && <p role="alert" className="px-5 pb-4 text-sm text-failed">{save.error.message}</p>}
         {save.isSuccess && <p role="status" className="px-5 pb-4 text-sm text-muted-foreground">Provider settings saved.</p>}
-        <div className="flex items-center justify-between gap-4 border-t border-border px-5 py-4 sm:px-7"><p className="flex items-center gap-2 text-xs text-muted-foreground"><Check className="size-3.5 shrink-0" />Models appear automatically</p><Button disabled={save.isPending || !value.connections.length} type="submit">{save.isPending ? "Saving…" : setup ? "Finish setup" : "Save changes"}</Button></div>
+        <div className="flex items-center justify-between gap-4 border-t border-border px-5 py-4 sm:px-7"><p className="flex items-center gap-2 text-xs text-muted-foreground"><Check className="size-3.5 shrink-0" />Models appear automatically</p><Button disabled={save.isPending || (setup && !value.connections.length)} type="submit">{save.isPending ? "Saving…" : setup ? "Finish setup" : "Save changes"}</Button></div>
       </FieldGroup>
     </form>
   </Section>

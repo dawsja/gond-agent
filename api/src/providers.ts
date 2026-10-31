@@ -23,7 +23,7 @@ const connectionSchema = z.object({
   discover: z.boolean().default(true),
 });
 const settingsSchema = z.object({
-  connections: z.array(connectionSchema).min(1).max(20),
+  connections: z.array(connectionSchema).max(20),
   defaultModel: z.string().max(1000).default(""),
 });
 const discoverySchema = connectionSchema.omit({ name: true, models: true }).extend({ id: connectionSchema.shape.id.optional() });
