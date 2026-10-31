@@ -9,10 +9,9 @@ import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnv } from "./github-login";
 import { getSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
-import { validateEffort } from "./effort";
 import { cli } from "./cli-runtime";
 import { ApiError } from "./wire";
-import { clearModelCatalog, loadModelCatalog } from "./models";
+import { clearModelCatalog } from "./models";
 import { deletionPolicy } from "./account";
 import { publicProviderSettings, saveProviderSettings, setupComplete } from "./providers";
 import { listRunners, saveRunner } from "./scheduler";
@@ -428,13 +427,7 @@ export function createApp(
       (b.images !== undefined && !Array.isArray(b.images))
     )
       throw new ApiError(400, "invalid_message", "Write a message.");
-    const run=runs.get(c.req.param("id"),c.get("user").id);
-    if(b.model!==undefined && typeof b.model!=="string")throw new ApiError(400,"invalid_model","Choose an available model.");
-    if(b.effort!==undefined || b.model!==undefined){
-      const selected=await runs.resolveSelection(c.get("user").id,b.model ?? run.model_id);
-      if(selected.backend!==run.backend)throw new ApiError(400,"invalid_backend","Start a new run to change coding agents.");
-      validateEffort(selected,b.effort ?? "default");
-    }
+    await runs.validateFollowUp(c.req.param("id"), c.get("user").id, b.model, b.effort);
     runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images, b.effort,b.model);
     return c.json({ ok: true });
   });

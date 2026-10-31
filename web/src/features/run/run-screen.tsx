@@ -1,7 +1,7 @@
 import { ModelPicker } from "@/components/workspace/model-picker"
 import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { ChevronRight, ExternalLink, GitPullRequest, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
@@ -16,7 +16,6 @@ import { ConfirmDialog } from "../studio/confirm-dialog"
 import { StatusPill } from "../studio/parts"
 import { Shell } from "../studio/shell"
 import { mono, tabs } from "../studio/theme"
-import { buildTranscript } from "./transcript"
 import { Menu, MenuContent, MenuItem, MenuTrigger } from "@shared/menu"
 import { SidePanel } from "./side-panel"
 import { TranscriptView } from "./transcript-view"
@@ -37,7 +36,7 @@ export function RunScreen() {
   const [effort,setEffort]=useState<string | null>(null)
   const attach = useImageAttachments()
   const [draft, setDraft] = useState("")
-  const t = useMemo(() => buildTranscript(stream.events), [stream.events])
+  const t = stream.transcript
   const [view, setView] = useState<"chat" | "details">(() => (devOpen("details") ? "details" : "chat"))
   // Desktop only: phones switch between the two with tabs instead.
   const [panel, setPanel] = useState(() => prefs.get("runPanel") !== "hidden" && !devOpen("no-details"))
@@ -58,7 +57,7 @@ export function RunScreen() {
   useLayoutEffect(() => {
     const el = scroller.current
     if (el && pinned.current) el.scrollTop = el.scrollHeight
-  }, [stream.events])
+  }, [t])
 
   if (run.error) {
     return (

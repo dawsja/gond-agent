@@ -349,6 +349,18 @@ export class Runs {
           "That image isn't available.",
         );
   }
+  async validateFollowUp(id: string, user: string, model?: string, effort?: unknown) {
+    const run = this.get(id, user);
+    if (model !== undefined && typeof model !== "string")
+      throw new ApiError(400, "invalid_model", "Choose an available model.");
+    if (model !== undefined || effort !== undefined) {
+      const selected = await this.resolveSelection(user, model ?? run.model_id);
+      if (selected.backend !== run.backend)
+        throw new ApiError(400, "invalid_backend", "Start a new run to change coding agents.");
+      validateEffort(selected, effort ?? "default");
+    }
+    return run;
+  }
   enqueue(
     id: string,
     user: string,

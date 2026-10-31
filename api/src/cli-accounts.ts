@@ -6,6 +6,7 @@ import { CLIRuntimes, type CLI } from "./cli-runtime";
 import { ApiError } from "./wire";
 export interface CLIModel { id: string; name: string; resolved_model?: string; efforts: string[] }
 export interface CLIState { credentials: Record<string,string>; files: Record<string,string>; session?: string }
+interface CLIEvents { events: { type: string; status?: string; models?: CLIModel[]; [key: string]: unknown }[]; alive: boolean }
 interface Flow { owner: string; session: string; workspace: Workspace; state: Record<string,unknown>; cursor: number; expires: number; closed: boolean }
 export class CLIAccounts {
   private flows = new Map<string,Flow>();
@@ -29,6 +30,8 @@ export class CLIAccounts {
   async start(user:string, session:string, backend:CLI, authorized:()=>Promise<boolean> = async()=>true) {
     const key=`${user}:${backend}`;
     await this.cancel(user,session,backend);
+    this.catalogs.delete(key);
+    await this.probes.get(key)?.destroy();
     const runtime=this.runtimes.get(backend);
     if(!runtime)throw new ApiError(409,"cli_install","An administrator needs to install this runtime first.");
     const workspace=await this.factory(`run_${randomBytes(12).toString("hex")}`,async()=>new Response(null,{status:403}),runtime.volume);
@@ -58,7 +61,7 @@ export class CLIAccounts {
     try {
       while(!flow.closed){
         if(Date.now()>flow.expires){flow.state={status:"expired"};break;}
-        const batch=await flow.workspace.rpc<{events:Record<string,any>[];alive:boolean}>("events",{after:flow.cursor});
+        const batch=await flow.workspace.rpc<CLIEvents>("events",{after:flow.cursor});
         flow.cursor+=batch.events.length;
         for(const e of batch.events){
           if(e.type==="cli.auth"){
@@ -68,28 +71,15 @@ export class CLIAccounts {
               if(!await authorized() || flow.closed || Date.now()>flow.expires){flow.state={status:"cancelled"};return;}
               if(!this.db.prepare('SELECT 1 FROM "user" WHERE id=?').get(flow.owner))break;
               this.db.prepare("INSERT INTO cli_accounts(user_id,backend,credentials,connected_at) VALUES(?,?,?,?) ON CONFLICT(user_id,backend) DO UPDATE SET credentials=excluded.credentials,models='[]',connected_at=excluded.connected_at").run(flow.owner,backend,seal(this.secret,JSON.stringify(state.credentials)),Date.now());
-              // Discover through a fresh official CLI session, without sending an inference prompt.
-              await this.dispose(flow);
-              const runtime=this.runtimes.get(backend)!;
-              const probe=await this.factory(`run_${randomBytes(12).toString("hex")}`,async()=>new Response(null,{status:403}),runtime.volume);
-              flow.workspace=probe;
-              flow.closed=false;
-              try{
-                await probe.rpc("cli_prepare",{state,config:{backend,effort:"default"}});
-                await probe.rpc("start",{backend,model:"",effort:"default"});
-                let cursor=0;
-                for(let n=0;n<60;n++){
-                  const b=await probe.rpc<{events:Record<string,any>[];alive:boolean}>("events",{after:cursor});cursor+=b.events.length;
-                  const catalog=b.events.find(e=>e.type==="cli.catalog");
-                  if(catalog && !flow.closed && this.flows.get(key)===flow){
-                    const refreshed=await probe.rpc<CLIState>("cli_state");
-                    if(flow.closed || this.flows.get(key)!==flow)break;
-                    this.db.prepare("UPDATE cli_accounts SET models=?,credentials=? WHERE user_id=? AND backend=?").run(JSON.stringify(catalog.models),seal(this.secret,JSON.stringify(refreshed.credentials)),flow.owner,backend);break;
-                  }
-                  if(!b.alive || b.events.some(e=>e.type==='error'))break;
-                  await new Promise(r=>setTimeout(r,500));
-                }
-              }finally{await this.dispose(flow);}
+              const saved = this.account(flow.owner, backend)!;
+              const current = () => !flow.closed && this.flows.get(key) === flow &&
+                this.account(flow.owner, backend)?.credentials === saved.credentials;
+              // Discover in a fresh official CLI session without an inference prompt.
+              await flow.workspace.destroy();
+              const runtime = this.runtimes.get(backend);
+              if (!runtime || !current()) return;
+              const catalog = await this.discover(key, backend, runtime.volume, state, current);
+              if (catalog && await authorized() && current()) this.saveCatalog(flow.owner, backend, catalog);
               return;
             }
             if(e.status==="error")return;
@@ -101,6 +91,40 @@ export class CLIAccounts {
     }catch{flow.state={status:"error",message:"Sign-in didn't finish. Try again."};}
     finally{await this.dispose(flow).catch(()=>{});}
   }
+  private async discover(
+    key: string, backend: CLI, volume: string,
+    state: Pick<CLIState, "credentials"> & Partial<CLIState>, current: () => boolean,
+  ) {
+    const workspace = await this.factory(`run_${randomBytes(12).toString("hex")}`, async () => new Response(null, {status: 403}), volume);
+    try {
+      if (!current()) return;
+      this.probes.set(key, workspace);
+      await workspace.rpc("cli_prepare", {state, config: {backend, effort: "default"}});
+      if (!current()) return;
+      await workspace.rpc("start", {backend, model: "", effort: "default"});
+      let cursor = 0;
+      for (let n = 0; n < 60 && current(); n++) {
+        const batch = await workspace.rpc<CLIEvents>("events", {after: cursor});
+        cursor += batch.events.length;
+        const catalog = batch.events.find(e => e.type === "cli.catalog");
+        if (catalog?.models) {
+          const refreshed = await workspace.rpc<CLIState>("cli_state");
+          if (current()) return {models: catalog.models, state: refreshed};
+          return;
+        }
+        if (!batch.alive || batch.events.some(e => e.type === "error")) return;
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } finally {
+      if (this.probes.get(key) === workspace) this.probes.delete(key);
+      await workspace.destroy().catch(() => {});
+    }
+  }
+  private saveCatalog(user: string, backend: CLI, catalog: {models: CLIModel[]; state: CLIState}) {
+    this.db.prepare("UPDATE cli_accounts SET models=?,credentials=? WHERE user_id=? AND backend=?").run(
+      JSON.stringify(catalog.models), seal(this.secret, JSON.stringify(catalog.state.credentials)), user, backend,
+    );
+  }
   busy(user:string,backend:CLI){const key=`${user}:${backend}`;return !!this.catalogs.get(key)?.pending || !!this.flows.get(key)&&!this.flows.get(key)!.closed;}
   async refresh(user:string,backend:CLI,force=false){
     const key=`${user}:${backend}`,old=this.account(user,backend),runtime=this.runtimes.get(backend);
@@ -111,37 +135,30 @@ export class CLIAccounts {
     if(cached&&Date.now()-cached.checked<(force?5000:60000))return;
     const entry:{checked:number;pending?:Promise<void>}={checked:Date.now()};this.catalogs.set(key,entry);
     entry.pending=(async()=>{
-      let workspace:Workspace|undefined;
-      try{
-        workspace=await this.factory(`run_${randomBytes(12).toString("hex")}`,async()=>new Response(null,{status:403}),runtime.volume);
-        this.probes.set(key,workspace);
-        if(this.account(user,backend)?.connected_at!==old.connected_at)return;
-        await workspace.rpc("cli_prepare",{state:{credentials:JSON.parse(unseal(this.secret,old.credentials))},config:{backend,effort:"default"}});
-        await workspace.rpc("start",{backend,model:"",effort:"default"});
-        let cursor=0;
-        for(let n=0;n<60;n++){
-          const batch=await workspace.rpc<{events:Record<string,any>[];alive:boolean}>("events",{after:cursor});cursor+=batch.events.length;
-          const catalog=batch.events.find(e=>e.type==='cli.catalog');
-          if(catalog){
-            const refreshed=await workspace.rpc<CLIState>("cli_state");
-            const current=this.account(user,backend);
-            if(current?.credentials!==old.credentials||current.connected_at!==old.connected_at)return;
-            this.db.prepare("UPDATE cli_accounts SET models=?,credentials=? WHERE user_id=? AND backend=?").run(JSON.stringify(catalog.models),seal(this.secret,JSON.stringify(refreshed.credentials)),user,backend);
-            return;
-          }
-          if(!batch.alive||batch.events.some(e=>e.type==='error'))return;
-          await new Promise(r=>setTimeout(r,500));
-        }
-      }catch{ /* A failed refresh retains this account's previous catalog. */ }
-      finally{this.probes.delete(key);await workspace?.destroy().catch(()=>{});entry.pending=undefined;}
+      try {
+        const current = () => {
+          const account = this.account(user, backend);
+          return this.catalogs.get(key) === entry && account?.credentials === old.credentials && account.connected_at === old.connected_at;
+        };
+        const catalog = await this.discover(key, backend, runtime.volume, {credentials: JSON.parse(unseal(this.secret, old.credentials))}, current);
+        if (catalog) this.saveCatalog(user, backend, catalog);
+      } catch { /* A failed refresh retains this account's previous catalog. */ }
+      finally { entry.pending = undefined; }
     })();
     return entry.pending;
   }
   async logout(user:string,backend:CLI){
-    await this.probes.get(`${user}:${backend}`)?.destroy();this.probes.delete(`${user}:${backend}`);this.catalogs.delete(`${user}:${backend}`);
-    for(const [key,flow] of this.flows)if(flow.owner===user&&key.endsWith(`:${backend}`)){await this.dispose(flow);this.flows.delete(key);}
+    const key = `${user}:${backend}`, probe = this.probes.get(key), flow = this.flows.get(key);
+    this.probes.delete(key); this.catalogs.delete(key); this.flows.delete(key);
+    if (flow) flow.closed = true;
+    await probe?.destroy();
+    if (flow) await this.dispose(flow);
     this.db.prepare("DELETE FROM cli_accounts WHERE user_id=? AND backend=?").run(user,backend);
   }
   async remove(user:string){for(const backend of ["claude-code","codex"] as CLI[])await this.logout(user,backend);}
-  async close(){await Promise.all([...this.probes.values()].map(w=>w.destroy().catch(()=>{})));await Promise.all([...this.flows.values()].map(f=>this.dispose(f).catch(()=>{})));}
+  async close(){
+    const probes = [...this.probes.values()], flows = [...this.flows.values()];
+    this.probes.clear(); this.catalogs.clear(); this.flows.clear();
+    await Promise.all([...probes.map(w => w.destroy().catch(() => {})), ...flows.map(f => this.dispose(f).catch(() => {}))]);
+  }
 }

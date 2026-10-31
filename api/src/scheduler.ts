@@ -178,6 +178,13 @@ export class Scheduler {
       this.db
         .prepare("DELETE FROM images WHERE run_id IS NULL AND created_at<?")
         .run(now - 86400000);
+      // Invalid tokens cannot retry requests. Keep their metadata for 30 days,
+      // but retain every idempotency record belonging to a valid token.
+      this.db.transaction(() => {
+        this.db.prepare("DELETE FROM mcp_requests WHERE token_id IN (SELECT id FROM mcp_tokens WHERE revoked_at IS NOT NULL OR expires_at<=?)").run(now);
+        this.db.prepare("DELETE FROM mcp_tokens WHERE expires_at<=? OR revoked_at<=?").run(now - 30 * 86400000, now - 30 * 86400000);
+        this.db.prepare("DELETE FROM occurrences WHERE created_at<? AND NOT EXISTS (SELECT 1 FROM runners WHERE occurrences.key='schedule:' || runners.id || ':' || runners.next_run_at)").run(now - 30 * 86400000);
+      })();
     } catch (e) {
       console.error("scheduler tick failed", e);
     } finally {

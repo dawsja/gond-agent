@@ -8,7 +8,7 @@ import type { Run, Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { gh } from "./github";
 import { githubEnv } from "./github-login";
-import { supportedEfforts, validateEffort } from "./effort";
+import { supportedEfforts } from "./effort";
 
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("hex");
@@ -496,20 +496,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
         false,
         (args) =>
           once("send_session_message", args, async (_runId, complete) => {
-            const r = runs.get(args.session_id, user);
-            if (args.model !== undefined || args.effort !== undefined) {
-              const selected = await runs.resolveSelection(
-                user,
-                args.model ?? r.model_id,
-              );
-              if (selected.backend !== r.backend)
-                throw new ApiError(
-                  400,
-                  "invalid_backend",
-                  "Start a new run to change coding agents.",
-                );
-              validateEffort(selected, args.effort ?? "default");
-            }
+            const r = await runs.validateFollowUp(args.session_id, user, args.model, args.effort);
             check();
             const result = { accepted: true, session_id: r.id };
             db.transaction(() => {

@@ -26,6 +26,8 @@ Event pages contain at most 128,000 JSON characters; oversized individual events
 
 Start and follow-up `request_id` values are 1–100 characters, token-scoped and persisted across restart. Retry with identical arguments; changed arguments conflict. Start reserves a stable run ID before asynchronous work; run insertion and initial queueing are atomic. Follow-up enqueue and result persistence are atomic. Sessions retain `source: "mcp"` and token ID attribution. No billing fallback, direct shell/file access, merges, account deletion or image input tools are added.
 
+Retention keeps all request records for valid tokens. Scheduler cleanup removes records for invalid tokens and deletes token metadata 30 days after expiry or revocation. Schedule claims older than 30 days are removed unless they match a schedule's current occurrence.
+
 ## Model requests
 
 Subscription models do not require API connections. Provider settings accept an empty `connections` array with an empty `defaultModel` to remove all API providers. Empty Settings remain empty after reload; first-time API setup offers an unsaved draft. Composer discovery messages are scoped to the selected API connection; subscription selections suppress API connection warnings. With no selectable model, API discovery failures remain visible.

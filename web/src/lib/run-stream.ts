@@ -2,10 +2,7 @@
 // a dropped connection resumes exactly where it left off.
 import { useEffect, useRef, useState } from "react"
 import { runSocketUrl, type RunStatus } from "./api"
-
-// Event payloads are open-ended (each type has its own fields; see the protocol).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type StreamEvent = { type: string; seq: number; ts: number; [k: string]: any }
+import { createTranscript, type StreamEvent, type Transcript } from "../features/run/transcript"
 
 export interface RunInfo {
   status: RunStatus
@@ -14,17 +11,18 @@ export interface RunInfo {
   pr: { number: number; url: string } | null
 }
 
-const NONE: StreamEvent[] = []
+const EMPTY = createTranscript()([])
 
 export function useRunStream(id: string | undefined) {
   // Keyed by run id, so switching runs never shows the previous run's events.
-  const [data, setData] = useState<{ id?: string; events: StreamEvent[]; info: RunInfo | null }>({ events: NONE, info: null })
+  const [data, setData] = useState<{ id?: string; transcript: Transcript; info: RunInfo | null }>({ transcript: EMPTY, info: null })
   const [connected, setConnected] = useState(false)
   const ws = useRef<WebSocket | null>(null)
 
   useEffect(() => {
     if (!id) return
-    const mine = (prev: typeof data) => (prev.id === id ? prev : { id, events: NONE, info: null })
+    const mine = (prev: typeof data) => (prev.id === id ? prev : { id, transcript: EMPTY, info: null })
+    const append = createTranscript()
     let lastSeq = 0
     let closed = false
     let retry = 0
@@ -35,13 +33,8 @@ export function useRunStream(id: string | undefined) {
       frame = 0
       const batch = pending.splice(0)
       if (!batch.length) return
-      setData((prev) => {
-        // A re-run of this effect for the same run replays from seq 0; keep only what's new.
-        const have = mine(prev)
-        const last = have.events.at(-1)?.seq ?? 0
-        const fresh = batch.filter((e) => e.seq > last)
-        return fresh.length ? { ...have, events: have.events.concat(fresh) } : have
-      })
+      const transcript = append(batch)
+      setData(prev => ({ ...mine(prev), transcript }))
     }
 
     const retryLater = () => {
@@ -62,6 +55,7 @@ export function useRunStream(id: string | undefined) {
         setConnected(true)
       }
       sock.onmessage = (m) => {
+        if (closed) return
         const ev = JSON.parse(m.data as string) as StreamEvent
         if (ev.type === "pong") return
         if (ev.type === "run.info") return setData((prev) => ({ ...mine(prev), info: ev as unknown as RunInfo }))
@@ -71,6 +65,7 @@ export function useRunStream(id: string | undefined) {
         if (!frame) frame = requestAnimationFrame(flush)
       }
       sock.onclose = () => {
+        if (closed) return
         setConnected(false)
         retryLater()
       }
@@ -90,5 +85,5 @@ export function useRunStream(id: string | undefined) {
   }, [id])
 
   const current = data.id === id
-  return { events: current ? data.events : NONE, info: current ? data.info : null, connected }
+  return { transcript: current ? data.transcript : EMPTY, info: current ? data.info : null, connected }
 }

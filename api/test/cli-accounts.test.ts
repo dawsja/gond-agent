@@ -1,4 +1,4 @@
-import { it,expect } from "vitest";
+import { it,expect,vi } from "vitest";
 import { mkdtemp,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,49 @@ import { CLIRuntimes } from "../src/cli-runtime";
 import type { Config } from "../src/config";
 import { seal } from "../src/auth";
 import { Runs } from "../src/runs/service";
+import type { Workspace } from "../src/containers";
+
+it("discovers models after approved sign-in using a fresh worker", async () => {
+ const dir=await mkdtemp(join(tmpdir(),"gond-cli-discover-")),db=openStore(dir),secret="s".repeat(32);
+ db.exec('CREATE TABLE "user" (id TEXT PRIMARY KEY); INSERT INTO "user" VALUES (\'a\');');
+ setSetting(db,"runtime:codex",{backend:"codex",volume:"test",version:"test"});
+ const models=[{id:"native",name:"Native model",efforts:["high"]}];
+ let workers=0;
+ const accounts=new CLIAccounts(db,secret,async()=>{
+   const auth=workers++===0;
+   return {rpc:async(method:string)=>{
+     if(method==="events")return {alive:true,events:auth?[{type:"cli.auth",status:"connected"}]:[{type:"cli.catalog",models}]} as never;
+     if(method==="cli_state")return {credentials:{token:auth?"original":"refreshed"},files:{}} as never;
+     return true as never;
+   },destroy:async()=>{}};
+ },new CLIRuntimes(db,{} as Config));
+ try {
+   await accounts.start("a","session","codex");
+   await vi.waitFor(()=>expect(accounts.models("a")).toEqual([{...models[0],backend:"codex"}]));
+   expect(accounts.credentials("a","codex")).toEqual({token:"refreshed"});
+   expect(workers).toBe(2);
+ } finally {await accounts.close();db.close();await rm(dir,{recursive:true,force:true});}
+});
+
+it("does not prepare credentials when logout wins a pending catalog worker creation", async () => {
+ const dir=await mkdtemp(join(tmpdir(),"gond-cli-cancel-probe-")),db=openStore(dir),secret="s".repeat(32);
+ db.exec('CREATE TABLE "user" (id TEXT PRIMARY KEY); INSERT INTO "user" VALUES (\'a\');');
+ setSetting(db,"runtime:codex",{backend:"codex",volume:"test",version:"test"});
+ db.prepare("INSERT INTO cli_accounts(user_id,backend,credentials) VALUES('a','codex',?)").run(seal(secret,"{}"));
+ let release!: (workspace: Workspace)=>void;
+ const ready=new Promise<Workspace>(resolve=>{release=resolve;});
+ const accounts=new CLIAccounts(db,secret,async()=>ready,new CLIRuntimes(db,{} as Config));
+ const rpc=vi.fn(),destroy=vi.fn(async()=>{});
+ try {
+   const refresh=accounts.refresh("a","codex");
+   await accounts.logout("a","codex");
+   release({rpc,destroy});
+   await refresh;
+   expect(rpc).not.toHaveBeenCalled();
+   expect(destroy).toHaveBeenCalledOnce();
+   expect(accounts.account("a","codex")).toBeUndefined();
+ } finally {await accounts.close();db.close();await rm(dir,{recursive:true,force:true});}
+});
 it("refreshes exact native model metadata without changing saved alias IDs",async()=>{
  const dir=await mkdtemp(join(tmpdir(),"gond-cli-models-")),db=openStore(dir),secret="s".repeat(32);
  db.exec('CREATE TABLE "user" (id TEXT PRIMARY KEY); INSERT INTO "user" VALUES (\'a\');');

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { anthropic } from "../src/adapters/anthropic";
 import { chatAdapter } from "../src/adapters/chat";
 import { responsesAdapter } from "../src/adapters/responses";

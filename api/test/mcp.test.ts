@@ -323,7 +323,7 @@ it("deduplicates concurrent starts and rejects changed retry arguments and backe
   let release!: () => void;
   const pending = new Promise<void>(resolve => { release = resolve; });
   vi.spyOn(runs, "create").mockImplementation(
-    async (user, input, attribution) => {
+    async (user, _input, attribution) => {
       await pending;
       return seed(user, attribution!.id);
     },

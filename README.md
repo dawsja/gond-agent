@@ -6,6 +6,8 @@ Self-hosted coding agents that turn repository tasks into pull requests. Every a
 
 Open **Settings → MCP access**, name a token, and copy it when it is created. Tokens expire after 90 days and can manage all sessions owned by their account, including browser-created runs. Revoke tokens from the same section; revocation does not stop existing runs.
 
+Retry records remain available for the token's entire valid lifetime. Expired/revoked token history is removed after 30 days; invalid-token retry records are cleaned up by the scheduler.
+
 Configure an MCP client that supports authorization headers:
 
 ```json

@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useEffect, useState } from "react"
 import { api, type GithubStatus, type Me, type ModelCatalog, type Repo, type Run, type Runner } from "./api"
 
 const LIVE: Run["status"][] = ["queued", "working"]
@@ -81,15 +82,27 @@ export const useDeleteRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}`
 export const useSendMessage = () =>
   useRunAction<{ text: string; images: string[]; effort?: string; model?: string }>((id, body) => ({ path: `/v1/runs/${id}/messages`, body }))
 
-/** An image attached to one of a run's messages, as an object URL (fetched with the session token). */
-export const useRunImage = (runId: string, imageId: string) =>
-  useQuery({
+/** Cache image bytes briefly; each mounted consumer owns and releases its object URL. */
+export function useRunImage(runId: string, imageId: string) {
+  const query = useQuery({
     queryKey: ["run-image", runId, imageId],
-    queryFn: () => api<Blob>(`/v1/runs/${runId}/images/${imageId}`, { blob: true }).then((b) => URL.createObjectURL(b)),
+    queryFn: () => api<Blob>(`/v1/runs/${runId}/images/${imageId}`, { blob: true }),
     staleTime: Infinity,
-    gcTime: Infinity,
+    gcTime: 5 * 60_000,
     retry: 1,
   })
+  const blob = query.data
+  const [image, setImage] = useState<{ blob: Blob; url: string } | null>(null)
+  useEffect(() => {
+    if (!blob) return
+    const url = URL.createObjectURL(blob)
+    // Publish the browser resource after commit, so abandoned renders never leak URLs.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setImage({ blob, url })
+    return () => URL.revokeObjectURL(url)
+  }, [blob])
+  return { ...query, data: image?.blob === blob ? image?.url : undefined }
+}
 
 export const useRunners = () => useQuery({ queryKey: ["runners"], queryFn: () => api<{ runners: Runner[] }>("/v1/runners").then((r) => r.runners) })
 

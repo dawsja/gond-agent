@@ -70,19 +70,22 @@ const key = 'fixture-only-provider-key';
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
-    let current = models[0], sent;
+    let current = models[0], sent, imageRequests = 0;
+    const sockets = [];
     const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: 'ready', files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
     const diffRoute = route => route.fulfill({ body: '' });
+    const imageRoute = route => { imageRequests++; return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64') }); };
     await page.route(catalogURL, modelRoute);
     await page.route(fixtureRunURL, runRoute);
     await page.route(fixtureRunURL + '/messages', messagesRoute);
     await page.route(fixtureRunURL + '/ticket', ticketRoute);
     await page.route(fixtureRunURL + '/diff', diffRoute);
-    await page.routeWebSocket('**/ws/runs/composer-fixture?*', socket => socket.onMessage(() => {}));
+    await page.route(fixtureRunURL + '/images/stream-image', imageRoute);
+    await page.routeWebSocket('**/ws/runs/composer-fixture?*', socket => { sockets.push(socket); socket.onMessage(() => {}); });
     const layout = async label => {
       const image = await page.getByRole('button', { name: 'Attach images', exact: true }).boundingBox();
       const model = await page.getByRole('button', { name: label, exact: true }).boundingBox();
@@ -147,6 +150,36 @@ const key = 'fixture-only-provider-key';
         expect(sent.effort).toBe('low');
         await capture('follow-up-' + (model.backend ?? model.provider));
       }
+      // Exercise live folding, reconnect replay and object URL lifetime through SPA navigation.
+      await page.evaluate(() => {
+        const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
+        window.imageURLs = { created: [], revoked: [] };
+        URL.createObjectURL = blob => { const url = create(blob); window.imageURLs.created.push(url); return url; };
+        URL.revokeObjectURL = url => { window.imageURLs.revoked.push(url); revoke(url); };
+      });
+      await expect.poll(() => sockets.length).toBe(models.length);
+      const message = { seq: 1, ts: Date.now(), type: 'user', text: 'Inspect the screenshot', images: [{ id: 'stream-image' }] };
+      sockets.at(-1).send(JSON.stringify(message));
+      const attachedImage = page.getByRole('img', { name: 'Attached image', exact: true });
+      await expect(attachedImage).toBeVisible();
+      await expect.poll(() => attachedImage.evaluate(img => img.naturalWidth)).toBe(1);
+      const imageURL = await attachedImage.getAttribute('src');
+      sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
+      await expect(page.getByText('Checking', { exact: true })).toBeVisible();
+      sockets.at(-1).send(JSON.stringify({ seq: 3, ts: Date.now(), type: 'text.delta', text: ' now' }));
+      sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
+      await expect(page.getByText('Checking now', { exact: true })).toBeVisible();
+      await capture('streamed-transcript-image');
+      if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
+      await page.getByRole('link', { name: 'Home', exact: true }).filter({ visible: true }).click();
+      await expect.poll(() => page.evaluate(url => window.imageURLs.revoked.includes(url), imageURL)).toBe(true);
+      await page.goBack();
+      await expect.poll(() => sockets.length).toBe(models.length + 1);
+      sockets.at(-1).send(JSON.stringify(message));
+      await expect(attachedImage).toBeVisible();
+      expect(await attachedImage.getAttribute('src')).not.toBe(imageURL);
+      expect(imageRequests).toBe(1); // Remount reuses bytes, never a revoked URL.
+
       // Exercise removing the final real API connection. Subscription availability
       // is a UI fixture; saving, discovery and persistence use the packaged API.
       const meURL = origin + '/api/v1/me';
@@ -183,6 +216,7 @@ const key = 'fixture-only-provider-key';
         await page.unroute(meURL, meRoute);
       }
     } finally {
+      await page.unroute(fixtureRunURL + '/images/stream-image', imageRoute);
       await page.unroute(catalogURL, modelRoute);
       await page.unroute(fixtureRunURL, runRoute);
       await page.unroute(fixtureRunURL + '/messages', messagesRoute);
