@@ -4,7 +4,7 @@ import { MODEL_PROVIDER_ICONS } from "@shared/provider-icons"
 import { GondAgentMark } from "@shared/logo"
 import { providerOf } from "@shared/providers"
 import { cn } from "@/lib/utils"
-import type { RunStatus } from "@/lib/api"
+import type { Run, RunStatus } from "@/lib/api"
 import { Badge } from "@shared/ui/badge"
 import { STATUS, mono, tint } from "./theme"
 
@@ -41,8 +41,8 @@ export function Dot({ status, className, size = 7 }: { status: RunStatus; classN
 }
 
 export function StatusPill({ status, children }: { status: RunStatus; children?: ReactNode }) {
-  const variant = status === "ready" ? "good" : status === "working" || status === "queued" ? "warning" : status === "failed" ? "bad" : status === "merged" ? "info" : "neutral"
-  return <Badge variant={variant} className="shrink-0 whitespace-nowrap"><Dot status={status} size={6} />{children ?? statusLabel[status]}</Badge>
+  const variant = status === "ready" ? "good" : status === "working" || status === "queued" ? "warning" : status === "failed" ? "bad" : status === "merged" ? "merged" : "neutral"
+  return <Badge variant={variant} className="shrink-0 whitespace-nowrap">{status === "merged" ? <GitMerge className="size-3" /> : <Dot status={status} size={6} />}{children ?? statusLabel[status]}</Badge>
 }
 
 /** The xAI mark (Grok models). */
@@ -129,19 +129,18 @@ export function DiffTile({ files, add, del, status }: { files: number; add: numb
 }
 
 /** Right-hand PR column: what happened to the pull request. */
-export function PrChip({ status, number, files }: { status: RunStatus; number?: number | null; files?: number }) {
-  if (status === "working") return <span className="text-[12px] text-subtle">PR on finish</span>
-  if (status === "queued") return <span className="text-[12px] text-subtle">PR on finish</span>
+export function PrChip({ status, state, number, files }: { status: RunStatus; state?: Run["pr_state"]; number?: number | null; files?: number }) {
+  if (!number && (status === "working" || status === "queued")) return <span className="text-[12px] text-subtle">PR on finish</span>
   const map = {
     ready: { icon: GitPullRequest, color: STATUS.ready, label: number ? "Open" : files ? "No PR" : "No changes" },
     merged: { icon: GitMerge, color: STATUS.merged, label: "Merged" },
     failed: { icon: GitPullRequestClosed, color: STATUS.stopped, label: "No PR" },
     stopped: { icon: GitPullRequestClosed, color: STATUS.stopped, label: "No PR" },
   } as const
-  const s = map[status]
+  const s = number ? state === "merged" || status === "merged" ? map.merged : state === "closed" ? { icon: GitPullRequestClosed, color: STATUS.failed, label: "Closed" } : map.ready : map[status as keyof typeof map]
   const Icon = s.icon
   return (
-    <span className="inline-flex items-center gap-1.5 text-[12px]">
+    <span aria-label={number ? `${s.label} pull request #${number}` : undefined} className="inline-flex items-center gap-1.5 text-[12px]">
       <Icon className="size-3.5" style={{ color: s.color }} />
       {number ? (
         <span className="text-foreground tabular-nums" style={mono}>

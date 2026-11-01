@@ -8,7 +8,7 @@ import { ago, avatarColor, duration, initials } from "@/lib/format"
 import { useMe, useModels, useRunImage } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
-import { Avatar, DiffCounts, Dot, ModelMark } from "../studio/parts"
+import { Avatar, DiffCounts, Dot, ModelMark, PrChip, StatusPill } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
 import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
@@ -246,6 +246,7 @@ function UserMessage({
 }
 
 function EndMarker({ status, error }: { status: RunStatus; error?: string }) {
+  if (status === "merged") return <div><StatusPill status="merged" /></div>
   const text = status === "failed" ? (error ?? "The run failed") : status === "stopped" ? "Stopped" : "Pull request merged"
   return (
     <Tool status={status === "failed" ? "failed" : "done"} name={status === "failed" ? "Failed" : status === "stopped" ? "Stopped" : "Merged"}>
@@ -305,13 +306,9 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
         return <AgentsBlock key={it.key} agents={it.agents} />
       case "pr":
         return (
-          <Tool key={it.key} name="Opened" arg={`PR #${it.number} → ${run.base_branch}`}>
-            <Branch>
-              <a href={it.url} target="_blank" rel="noreferrer" className="text-link hover:underline">
-                {it.url.replace("https://", "")}
-              </a>
-            </Branch>
-          </Tool>
+          <a key={it.key} href={it.url} target="_blank" rel="noreferrer" className="w-fit rounded-sm outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+            <PrChip status={run.status} state={it.number === run.pr_number ? run.pr_state : it.state} number={it.number} />
+          </a>
         )
       case "end":
         return <EndMarker key={it.key} status={it.status} error={it.error} />

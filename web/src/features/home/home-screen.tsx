@@ -90,7 +90,7 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2.5 max-md:flex-col max-md:items-start max-md:gap-1.5">
           <span className="truncate text-[14px] font-medium text-foreground max-md:line-clamp-2 max-md:whitespace-normal">{run.title}</span>
-          {run.status !== "merged" && <StatusPill status={run.status}>{run.status === "ready" && !run.pr_number ? "Ready" : undefined}</StatusPill>}
+          {run.status !== "merged" && <StatusPill status={run.status}>{run.status === "ready" && (!run.pr_number || run.pr_state === "closed") ? "Ready" : undefined}</StatusPill>}
         </div>
         <div className="mt-1.5 flex items-center gap-2 text-[13px] text-muted-foreground max-md:flex-wrap max-md:gap-x-2 max-md:gap-y-1 max-md:text-[12px]">
           {note ? (
@@ -140,14 +140,14 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
           {run.pr_number && (
             <span className="inline-flex items-center gap-2 md:hidden">
               <Sep />
-              <span style={mono}>#{run.pr_number}</span>
+              <PrChip status={run.status} state={run.pr_state} number={run.pr_number} files={run.files} />
             </span>
           )}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-5 max-md:-mt-1 max-md:-mr-1">
         <div className="w-[112px] max-md:hidden">
-          <PrChip status={run.status} number={run.pr_number} files={run.files} />
+          <PrChip status={run.status} state={run.pr_state} number={run.pr_number} files={run.files} />
         </div>
         <div className={cn("w-[64px] text-right text-[13px] tabular-nums max-md:hidden", elapsed === null ? "text-subtle" : "text-muted-foreground")} style={mono}>
           {elapsed ?? "—"}

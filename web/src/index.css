@@ -117,7 +117,7 @@
   --info: #90caf9;
   --status-working: var(--warning);
   --status-ready: var(--good);
-  --status-merged: var(--info);
+  --status-merged: #bc8cff;
   --status-failed: var(--bad);
   --status-stopped: var(--muted-foreground);
   --diff-add: var(--good);

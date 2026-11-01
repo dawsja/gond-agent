@@ -19,12 +19,14 @@ export async function gh<T>(
   method = "GET",
   body?: unknown,
   env?: NodeJS.ProcessEnv,
+  options: { timeout?: number; maxBuffer?: number } = {},
 ): Promise<T> {
   const args = ["api", endpoint, "--method", method];
   if (body !== undefined) args.push("--input", "-");
   return JSON.parse(
     (
       await command("gh", args, {
+        ...options,
         input: body === undefined ? undefined : JSON.stringify(body),
         env,
       })

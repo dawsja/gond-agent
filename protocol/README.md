@@ -30,6 +30,8 @@ Retention keeps all request records for valid tokens. Scheduler cleanup removes 
 
 ## Model requests
 
+Authenticated workspace run-list/detail reads refresh only their account's linked PR metadata using read-only GraphQL batches of up to 25 PRs, a 30-second cache and a five-second request limit. Missing/unavailable metadata preserves the last known state. `run.pr` can carry optional `state: open|closed|merged`; display updates the existing PR card. External merges mark idle runs merged and close their workspaces; active/queued work finishes before finalization. Follow-ups to known merged PRs are rejected. The scheduler does not perform GitHub polling.
+
 The workspace normalizes tool names and structured arguments only for display. Stored `tool.start` events keep their original identities and inputs. Consecutive local exploration and file edits render as expandable groups; external MCP calls retain connection identity in details. Completion and failure labels follow observed tool status, without generating additional agent prose or treating completion as proof that a check passed.
 
 Subscription models do not require API connections. Provider settings accept an empty `connections` array with an empty `defaultModel` to remove all API providers. Empty Settings remain empty after reload; first-time API setup offers an unsaved draft. Composer discovery messages are scoped to the selected API connection; subscription selections suppress API connection warnings. With no selectable model, API discovery failures remain visible.

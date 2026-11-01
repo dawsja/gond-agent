@@ -395,8 +395,12 @@ export function createApp(
   app.post("/api/v1/runs", async (c) =>
     c.json(await runs.create(c.get("user").id, await c.req.json()), 201),
   );
-  app.get("/api/v1/runs", (c) => c.json({ runs: runs.list(c.get("user").id) }));
-  app.get("/api/v1/runs/:id", (c) => {
+  app.get("/api/v1/runs", async (c) => {
+    await runs.refreshPulls(c.get("user").id);
+    return c.json({ runs: runs.list(c.get("user").id) });
+  });
+  app.get("/api/v1/runs/:id", async (c) => {
+    await runs.refreshPulls(c.get("user").id, c.req.param("id"));
     const r = runs.get(c.req.param("id"), c.get("user").id);
     return c.json({ ...r, live: { phase: r.phase, pushed: r.pushed } });
   });

@@ -49,7 +49,7 @@ export type Item =
   | { kind: "tool"; key: string; tool: ToolCall }
   | { kind: "plan"; key: string; steps: PlanStep[] }
   | { kind: "agents"; key: string; agents: SubAgent[] }
-  | { kind: "pr"; key: string; number: number; url: string; ts: number }
+  | { kind: "pr"; key: string; number: number; url: string; ts: number; state?: "open" | "closed" | "merged" }
   | { kind: "end"; key: string; status: RunStatus; error?: string; ts: number }
 
 export interface Transcript {
@@ -193,10 +193,13 @@ export function createTranscript() {
           committed++
           log.push({ ts: ev.ts, source: "git", text: `committed · ${ev.files} files +${ev.additions} −${ev.deletions}` })
           break
-        case "run.pr":
-          items.push({ kind: "pr", key: `r${ev.seq}`, number: ev.number, url: ev.url, ts: ev.ts })
-          log.push({ ts: ev.ts, source: "github", text: `opened pull request #${ev.number}` })
+        case "run.pr": {
+          const existing = items.findLast(item => item.kind === "pr" && item.number === ev.number)
+          if (existing?.kind === "pr") { mark(existing); existing.state = ev.state ?? "open" }
+          else items.push({ kind: "pr", key: `r${ev.seq}`, number: ev.number, url: ev.url, ts: ev.ts, state: ev.state ?? "open" })
+          log.push({ ts: ev.ts, source: "github", text: `${ev.state === "merged" ? "merged" : ev.state === "closed" ? "closed" : "opened"} pull request #${ev.number}` })
           break
+        }
         case "session.start":
           log.push({ ts: ev.ts, source: "agent", text: `started · ${ev.model}` })
           break

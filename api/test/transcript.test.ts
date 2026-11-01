@@ -88,3 +88,13 @@ it("processes streamed text once and leaves previous text snapshots intact", () 
   expect(before.items).toEqual([{ kind: "text", key: "t1", text: "Start" }]);
   expect(append([]).items[0]).toMatchObject({ text: "Start" + ".".repeat(5000) });
 });
+
+it("updates the PR presentation after external merges without duplicating the opened card", () => {
+  const append = createTranscript();
+  const opened = append([{ seq: 1, ts: 1, type: "run.pr", number: 42, url: "https://github.com/acme/app/pull/42" }]);
+  const merged = append([{ seq: 2, ts: 2, type: "run.pr", number: 42, url: "https://github.com/acme/app/pull/42", state: "merged" }]);
+  expect(opened.items).toMatchObject([{ kind: "pr", state: "open" }]);
+  expect(merged.items).toHaveLength(1);
+  expect(merged.items[0]).toMatchObject({ kind: "pr", state: "merged", number: 42 });
+  expect(merged.log.at(-1)?.text).toBe("merged pull request #42");
+});

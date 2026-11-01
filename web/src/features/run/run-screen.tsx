@@ -1,6 +1,6 @@
 import { ModelPicker } from "@/components/workspace/model-picker"
 import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
-import { ChevronRight, ExternalLink, GitPullRequest, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
+import { ChevronRight, ExternalLink, GitMerge, GitPullRequest, GitPullRequestClosed, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
@@ -47,7 +47,7 @@ export function RunScreen() {
   const refetch = run.refetch
 
   // Status changes on the stream refresh the run row (diffstat, PR).
-  const statusKey = `${t.status}:${t.committed}:${t.items.filter((i) => i.kind === "pr").length}`
+  const statusKey = `${t.status}:${t.committed}:${t.items.filter((i) => i.kind === "pr").map(i => `${i.number}:${i.state}`).join(",")}`
   useEffect(() => {
     void refetch()
   }, [statusKey, refetch])
@@ -70,13 +70,15 @@ export function RunScreen() {
   if (!r) return <Shell active="Home" crumbs={<span className="text-muted-foreground">Runs</span>} children={null} />
 
   const live = r.status === "working" || r.status === "queued"
+  const merged = r.status === "merged" || r.pr_state === "merged"
+  const PullIcon = merged ? GitMerge : r.pr_state === "closed" ? GitPullRequestClosed : GitPullRequest
   const author = r.user_id === me?.user?.id ? (me?.user?.name ?? "You") : (r.user_name ?? "Teammate")
   const modelName = models?.find((m) => m.id === r.model_id)?.display_name
   const pill = live ? (
     <StatusPill status={r.status}>
       {r.status === "queued" ? "Queued" : "Working"} · {runElapsed(r) ?? "0s"}
     </StatusPill>
-  ) : r.status === "ready" && r.pr_number ? (
+  ) : merged ? <StatusPill status="merged" /> : r.status === "ready" && r.pr_number && r.pr_state !== "closed" ? (
     <StatusPill status="ready">PR ready · #{r.pr_number}</StatusPill>
   ) : (
     <StatusPill status={r.status}>{r.status === "ready" ? "Ready" : undefined}</StatusPill>
@@ -103,9 +105,10 @@ export function RunScreen() {
               href={r.pr_url}
               target="_blank"
               rel="noreferrer"
+              aria-label={`${merged ? "Merged" : r.pr_state === "closed" ? "Closed" : "Open"} pull request #${r.pr_number}`}
               className="inline-flex h-8 items-center gap-1.5 rounded-[4px] border border-border px-3 text-[13px] text-foreground transition-colors hover:bg-raised"
             >
-              <GitPullRequest className="size-3.5 text-muted-foreground" />
+              <PullIcon className={cn("size-3.5", merged ? "text-merged" : r.pr_state === "closed" ? "text-failed" : "text-muted-foreground")} />
               <span style={mono} className="text-[12px]">
                 #{r.pr_number}
               </span>
@@ -195,13 +198,13 @@ export function RunScreen() {
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />
           <FollowUpInput
-            disabled={r.status === "merged" || send.isPending || attach.busy}
+            disabled={merged || send.isPending || attach.busy}
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={r.status === "merged"} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto" && m.backend === r.backend) ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={r.status === "merged"} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={r.status === "merged"} /></div></>}
+            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={merged} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto" && m.backend === r.backend) ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={merged} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={merged} /></div></>}
             placeholder={
-              r.status === "merged"
+              merged
                 ? "This pull request is merged"
                 : r.status === "stopped" && !r.error
                   ? "Tell the agent what to do instead"

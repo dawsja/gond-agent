@@ -32,6 +32,7 @@ import { seal, unseal } from "../auth";
 import { validateEffort } from "../effort";
 import { ApiError } from "../wire";
 import { modelDisplayName } from "../../../shared/model-names";
+import { PullRequests } from "../pull-requests";
 
 export interface Run {
   id: string;
@@ -91,11 +92,12 @@ export class Runs {
   private launches = new Map<string, Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
+  private pullRequests: PullRequests;
   constructor(
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
-  ) { this.runtimes = new CLIRuntimes(db,cfg); this.cliAccounts = new CLIAccounts(db,cfg.secret,workspaceFactory,this.runtimes); }
+  ) { this.runtimes = new CLIRuntimes(db,cfg); this.cliAccounts = new CLIAccounts(db,cfg.secret,workspaceFactory,this.runtimes); this.pullRequests = new PullRequests(() => githubEnv(db, cfg.secret)); }
   async catalog(user: string, refresh = false) {
     const catalog = await loadModelCatalog(this.db,this.cfg.secret,refresh);
     await Promise.all((["claude-code","codex"] as CLI[]).map(backend=>this.cliAccounts.refresh(user,backend,refresh)));
@@ -161,6 +163,30 @@ export class Runs {
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
       .run(r.status, r.updated_at, JSON.stringify(r), r.id);
+  }
+  async refreshPulls(user: string, id?: string) {
+    this.assertAccount(user);
+    const rows = id ? [this.get(id, user)] : this.list(user);
+    const states = await this.pullRequests.states(rows);
+    this.assertAccount(user);
+    for (const original of rows) {
+      let run: Run;
+      try { run = this.get(original.id, user); } catch { continue; }
+      if (run.repo !== original.repo || run.pr_number !== original.pr_number) continue;
+      const state = run.pr_state === "merged" ? "merged" : states.get(`${run.repo}#${run.pr_number}`);
+      if (!state) continue;
+      if (run.pr_state !== state) {
+        run.pr_state = state;
+        this.save(run);
+        this.append(run.id, { type: "run.pr", number: run.pr_number, url: run.pr_url, state });
+      }
+      // External merges must not interrupt active or already queued user work.
+      if (state === "merged" && run.status !== "merged" && !["queued", "working"].includes(run.status) && !run.pending.length && !this.live.get(run.id)?.busy && !this.booting.has(run.id)) {
+        run.phase = "idle";
+        this.status(run, "merged");
+        await this.close(run.id).catch(() => console.error("Couldn't close merged workspace", run.id));
+      }
+    }
   }
   append(id: string, event: Record<string, unknown>) {
     if (event.type === "tool.images") {
@@ -372,7 +398,7 @@ export class Runs {
     this.assertAccount(user);
     const r = this.get(id, user);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
-    if (r.status === "merged")
+    if (r.status === "merged" || r.pr_state === "merged")
       throw new ApiError(409, "merged", "Start a new run after merging.");
     if (!text.trim() || text.length > 20000)
       throw new ApiError(
@@ -630,6 +656,7 @@ export class Runs {
       r.additions += Number(a) || 0;
       r.deletions += Number(d) || 0;
     }
+    r = { ...this.get(id), pushed: true, head_sha: r.head_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
     this.save(r);
     this.append(id, {
       type: "run.diff",
@@ -637,13 +664,15 @@ export class Runs {
       additions: r.additions,
       deletions: r.deletions,
     });
-    if (r.auto_pr && r.files) await this.openPull(id, r.user_id);
+    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
     r = this.get(id);
     live.busy = false;
     r.phase = "agent";
     r.idle_since = Date.now();
     r.finished_at = Date.now();
-    this.status(r, "ready");
+    const merged = r.pr_state === "merged" && !r.pending.length;
+    this.status(r, merged ? "merged" : "ready");
+    if (merged) await this.close(id);
   }
   async openPull(id: string, user: string) {
     const r = this.get(id, user);
@@ -689,6 +718,7 @@ export class Runs {
     }, githubEnv(this.db, this.cfg.secret));
     r.pr_state = "merged";
     r.phase = "idle";
+    this.append(id, { type: "run.pr", number: r.pr_number, url: r.pr_url, state: "merged" });
     this.status(r, "merged");
     await this.close(id);
   }
