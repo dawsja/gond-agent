@@ -1,5 +1,6 @@
 // Turns a run's event stream (protocol/README.md §2–3) into what the run screen draws.
 import type { RunStatus } from "../../lib/api"
+import { EDIT_TOOLS, EXPLORE_TOOLS, presentTool } from "./tool-presentation"
 
 // Event fields depend on their type; see protocol/README.md.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -8,7 +9,10 @@ export type StreamEvent = { type: string; seq: number; ts: number; [key: string]
 export interface ToolCall {
   callId: string
   name: string
+  label: string
   title: string
+  paths: string[]
+  source?: string
   status: "running" | "done" | "failed"
   summary: string
   output: string
@@ -41,6 +45,7 @@ export type Item =
     }
   | { kind: "text"; key: string; text: string }
   | { kind: "explore"; key: string; tools: ToolCall[] }
+  | { kind: "edits"; key: string; tools: ToolCall[] }
   | { kind: "tool"; key: string; tool: ToolCall }
   | { kind: "plan"; key: string; steps: PlanStep[] }
   | { kind: "agents"; key: string; agents: SubAgent[] }
@@ -59,8 +64,6 @@ export interface Transcript {
   committed: number
 }
 
-/** Read-only tools that collapse into one "Explored" group. */
-const EXPLORE = new Set(["read", "glob", "grep", "symbols", "batch", "list_directory", "list_plan", "web_search", "web_fetch", "bash_output"])
 const OUTPUT_CAP = 8_000
 
 export function createTranscript() {
@@ -110,18 +113,19 @@ export function createTranscript() {
         }
         case "tool.start": {
           if (!main) break
-          const call: ToolCall = { callId: ev.call_id, name: ev.name, title: ev.title ?? "", status: "running", summary: "", output: "", start: ev.ts }
+          const call: ToolCall = { callId: ev.call_id, ...presentTool(ev.name, ev.title ?? "", ev.input), status: "running", summary: "", output: "", start: ev.ts }
           calls.set(ev.call_id, call)
-          if (ev.name === "update_plan" || ev.name === "task") break // shown as the plan card / agents block
+          if (["update_plan", "task", "Agent", "Task"].includes(ev.name)) break // These backends also emit plan/agent events.
           const l = last()
-          if (EXPLORE.has(ev.name)) {
-            if (l?.kind === "explore") { mark(l); l.tools.push(call) }
-            else items.push({ kind: "explore", key: `x${ev.seq}`, tools: [call] })
+          const group = EXPLORE_TOOLS.has(call.name) ? "explore" : EDIT_TOOLS.has(call.name) ? "edits" : undefined
+          if (group) {
+            if (l?.kind === group) { mark(l); l.tools.push(call) }
+            else items.push({ kind: group, key: `x${ev.seq}`, tools: [call] })
           } else {
             items.push({ kind: "tool", key: `c${ev.seq}`, tool: call })
           }
           owners.set(call, last())
-          log.push({ ts: ev.ts, source: "agent", text: `${ev.name} ${ev.title ?? ""}`.trim() })
+          log.push({ ts: ev.ts, source: "agent", text: `${call.label} ${call.title}`.trim() })
           break
         }
         case "tool.output": {
@@ -204,7 +208,8 @@ export function createTranscript() {
         if (!copy || dirty.has(item)) {
           switch (item.kind) {
             case "tool": copy = {...item, tool: {...item.tool}}; break
-            case "explore": copy = {...item, tools: item.tools.map(tool => ({...tool}))}; break
+            case "explore":
+            case "edits": copy = {...item, tools: item.tools.map(tool => ({...tool}))}; break
             case "agents": copy = {...item, agents: item.agents.map(agent => ({...agent}))}; break
             default: copy = {...item}
           }

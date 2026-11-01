@@ -70,9 +70,9 @@ const key = 'fixture-only-provider-key';
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
-    let current = models[0], sent, imageRequests = 0;
+    let current = models[0], sent, imageRequests = 0, activePreview = false;
     const sockets = [];
-    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: 'ready', files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
+    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: activePreview ? 'working' : 'ready', files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
@@ -158,7 +158,7 @@ const key = 'fixture-only-provider-key';
         URL.revokeObjectURL = url => { window.imageURLs.revoked.push(url); revoke(url); };
       });
       await expect.poll(() => sockets.length).toBe(models.length);
-      const message = { seq: 1, ts: Date.now(), type: 'user', text: 'Inspect the screenshot', images: [{ id: 'stream-image' }] };
+      const message = { seq: 1, ts: Date.now(), type: 'user', text: 'Fix sign-in on mobile. It sends me back to the login screen.', images: [{ id: 'stream-image' }] };
       sockets.at(-1).send(JSON.stringify(message));
       const attachedImage = page.getByRole('img', { name: 'Attached image', exact: true });
       await expect(attachedImage).toBeVisible();
@@ -179,6 +179,53 @@ const key = 'fixture-only-provider-key';
       await expect(attachedImage).toBeVisible();
       expect(await attachedImage.getAttribute('src')).not.toBe(imageURL);
       expect(imageRequests).toBe(1); // Remount reuses bytes, never a revoked URL.
+
+      // Approved A layout: real streamed messages, quiet disclosures and visible failures.
+      let activitySeq = 1;
+      const activity = (type, fields) => sockets.at(-1).send(JSON.stringify({ seq: ++activitySeq, ts: Date.now(), type, ...fields }));
+      activePreview = true;
+      activity('run.status', { status: 'working' });
+      activity('text.delta', { text: "I'm checking how sign-in chooses where to send you back." });
+      for (const [index, file] of ['api/src/auth.ts', 'web/src/auth.ts', 'web/src/lib/auth-client.ts', 'api/test/auth.test.ts'].entries()) {
+        activity('tool.start', { call_id: `read-${index}`, name: index === 0 ? 'read' : 'mcp__gond__read', title: index === 0 ? file : 'mcp__gond__read', input: { path: file } });
+        activity('tool.end', { call_id: `read-${index}`, ok: true });
+      }
+      for (const index of [0, 1]) {
+        activity('tool.start', { call_id: `search-${index}`, name: 'mcpToolCall', title: 'grep', input: { server: 'gond', tool: 'grep', arguments: { pattern: 'returnUrl' } } });
+        activity('tool.end', { call_id: `search-${index}`, ok: true });
+      }
+      const explored = page.getByRole('button', { name: 'Viewed 4 files and ran 2 searches', exact: true });
+      await expect(explored).toHaveAttribute('aria-expanded', 'false');
+      await explored.focus(); await page.keyboard.press('Enter');
+      await expect(explored).toHaveAttribute('aria-expanded', 'true');
+      await expect(page.getByText('api/src/auth.ts', { exact: true })).toBeVisible();
+      await page.keyboard.press('Enter');
+      activity('text.delta', { text: "The mobile flow drops the return URL. I've updated the redirect and added a regression check." });
+      for (const [index, file] of ['api/src/auth.ts', 'api/test/auth.test.ts'].entries()) {
+        activity('tool.start', { call_id: `edit-${index}`, name: 'mcp__gond__edit', title: 'mcp__gond__edit', input: { path: file } });
+        activity('tool.end', { call_id: `edit-${index}`, ok: true });
+      }
+      await expect(page.getByRole('button', { name: 'Updated 2 files', exact: true })).toHaveAttribute('aria-expanded', 'false');
+      activity('tool.start', { call_id: 'check', name: 'commandExecution', title: 'npm run typecheck', input: { command: 'npm run typecheck' } });
+      activity('tool.end', { call_id: 'check', ok: true, output: JSON.stringify([{ type: 'text', text: 'No type errors.' }]) });
+      const typecheck = page.getByRole('button', { name: 'Typecheck finished', exact: true });
+      await typecheck.click();
+      await expect(page.getByText('No type errors.', { exact: true })).toBeVisible();
+      await typecheck.click();
+      activity('tool.start', { call_id: 'browser', name: 'mcp__gond__browser', title: 'mcp__gond__browser', input: { url: 'http://app/sign-in' } });
+      await expect(page.getByRole('button', { name: 'Checking browser layouts', exact: true })).toBeVisible();
+      expect((await page.locator('[data-slot=trace]').allTextContents()).join(' ')).not.toMatch(/mcp__|mcpToolCall|commandExecution/);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await page.getByText("The mobile flow drops the return URL. I've updated the redirect and added a regression check.", { exact: true }).click();
+      await capture('message-activity');
+      activity('tool.end', { call_id: 'browser', ok: false, output: 'Expected /agents/; received /login.' });
+      const failedCheck = page.getByRole('button', { name: 'Browser checks failed', exact: true });
+      await expect(failedCheck).toBeVisible();
+      await expect(page.getByText('Open details to see what happened.', { exact: true })).toBeVisible();
+      await capture('message-activity-failed');
+      await failedCheck.click();
+      await expect(page.getByText('Expected /agents/; received /login.', { exact: true })).toBeVisible();
+      await capture('message-activity-details');
 
       // Exercise removing the final real API connection. Subscription availability
       // is a UI fixture; saving, discovery and persistence use the packaged API.

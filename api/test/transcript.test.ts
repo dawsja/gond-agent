@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { createTranscript, type StreamEvent } from "../../web/src/features/run/transcript";
+import { activityLabel, groupLabel, presentTool } from "../../web/src/features/run/tool-presentation";
 
 it("preserves transcript snapshots across batches and deduplicates reconnect replay", () => {
   const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq * 100, type, ...fields });
@@ -25,12 +26,55 @@ it("preserves transcript snapshots across batches and deduplicates reconnect rep
   expect(before).toEqual(frozen);
   expect(after.items[0]).toBe(before.items[0]);
   expect(after.items[2]).toMatchObject({ kind: "explore", tools: [{ output: "source" }] });
-  expect(after.items[3]).toMatchObject({ kind: "tool", tool: { status: "done", diff: "patch" } });
+  expect(after.items[3]).toMatchObject({ kind: "edits", tools: [{ status: "done", diff: "patch" }] });
   expect(after.items[4]).toMatchObject({ kind: "plan", steps: [{ status: "done" }] });
   expect(after.items[5]).toMatchObject({ kind: "agents", agents: [{ status: "done", tools: 2, summary: "Found it" }] });
   expect(after).toMatchObject({ status: "ready", startedAt: 100, committed: 1, editDiffs: ["patch"] });
   expect(append([...initial, ...updates])).toEqual(after);
   expect(after).toEqual(createTranscript()([...initial, ...updates]));
+});
+
+it("groups API, Claude and Codex activity without exposing transport names or merging external tools", () => {
+  const append = createTranscript();
+  const starts = [
+    { name: "read", title: "api/src/auth.ts", input: { path: "api/src/auth.ts" } },
+    { name: "mcp__gond__read", title: "mcp__gond__read", input: { path: "web/src/auth.ts" } },
+    { name: "mcpToolCall", title: "grep", input: { server: "gond", tool: "grep", arguments: JSON.stringify({ pattern: "redirect" }) } },
+    { name: "Read", title: "Read", input: { file_path: "web/src/auth.ts" } },
+    { name: "mcp__gond__edit", input: { path: "api/src/auth.ts" } },
+    { name: "fileChange", input: { changes: [{ path: "api/test/auth.test.ts" }] } },
+  ];
+  const events = starts.flatMap((fields, i) => [
+    { ...fields, seq: i * 2 + 1, ts: i * 100, type: "tool.start", call_id: String(i) },
+    { seq: i * 2 + 2, ts: i * 100 + 50, type: "tool.end", call_id: String(i), ok: true },
+  ]);
+  const result = append(events);
+  expect(result.items).toMatchObject([{ kind: "explore", tools: [{ name: "read" }, { name: "read", title: "web/src/auth.ts" }, { name: "grep", title: "redirect" }, { name: "read" }] }, { kind: "edits", tools: [{ name: "edit" }, { name: "apply_patch" }] }]);
+  const reads = result.items[0], edits = result.items[1];
+  if (reads.kind !== "explore" || edits.kind !== "edits") throw new Error("Expected grouped activity");
+  expect(groupLabel(reads.tools)).toBe("Viewed 2 files and ran 1 search");
+  expect(groupLabel(edits.tools, true)).toBe("Updated 2 files");
+  expect(JSON.stringify(result.log)).not.toMatch(/mcp__|mcpToolCall|fileChange/);
+  expect(presentTool("mcp__github__search_issues", "mcp__github__search_issues", { query: "bug" })).toMatchObject({ name: "external", label: "Search issues", source: "github", title: "bug" });
+  expect(presentTool("mcpToolCall", "read", { server: "gond", tool: "read", arguments: "invalid JSON" })).toMatchObject({ name: "read", title: "" });
+  const planned = append([
+    { seq: 13, ts: 1000, type: "tool.start", call_id: "plan", name: "mcp__gond__update_plan", input: {} },
+    { seq: 14, ts: 1001, type: "tool.end", call_id: "plan", ok: true },
+  ]);
+  expect(planned.items.at(-1)).toMatchObject({ kind: "tool", tool: { name: "update_plan", status: "done" } });
+});
+
+it("keeps running and failed work distinct in activity summaries", () => {
+  const command = { ...presentTool("mcpToolCall", "bash", { server: "gond", tool: "bash", arguments: { command: "npm run typecheck" } }), status: "running" as const };
+  expect(activityLabel(command)).toBe("Running typecheck");
+  expect(activityLabel({ ...command, status: "failed" })).toBe("Typecheck failed");
+  const append = createTranscript();
+  const running = append([{ seq: 1, ts: 1, type: "tool.start", call_id: "read", name: "mcp__gond__read", input: { path: "missing.ts" } }]);
+  const failed = append([{ seq: 2, ts: 2, type: "tool.end", call_id: "read", ok: false, output: "File not found" }]);
+  if (running.items[0].kind !== "explore" || failed.items[0].kind !== "explore") throw new Error("Expected grouped reads");
+  expect(groupLabel(running.items[0].tools)).toBe("Reading missing.ts");
+  expect(groupLabel(failed.items[0].tools)).toBe("Couldn't finish reviewing context");
+  expect(failed.items[0].tools[0]).toMatchObject({ status: "failed", output: "File not found" });
 });
 
 it("processes streamed text once and leaves previous text snapshots intact", () => {
