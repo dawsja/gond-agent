@@ -222,6 +222,35 @@ describe("persistent local run lifecycle", () => {
     expect(runs.list("u")).toHaveLength(2);
     vi.mocked(gh).mockImplementation(original);
   });
+  it("answers a worker question through MCP and continues the session", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const live = (runs as unknown as {live:Map<string,{busy:boolean}>}).live.get(r.id)!;
+    live.busy = true;
+    const current = runs.get(r.id); current.status = "working";
+    db.prepare("UPDATE runs SET status='working',data=? WHERE id=?").run(JSON.stringify(current), r.id);
+    events.push({type:"turn.start",agent_id:"main"},{type:"question",agent_id:"main",request_id:"q-mcp",question:"Which branch?"});
+    await vi.waitFor(() => expect(runs.get(r.id).summary.question?.request_id).toBe("q-mcp"));
+    const token = createToken(db,"u","Question test"), mcp = createMcp(db,cfg(),runs);
+    const client = new Client({name:"question",version:"1"});
+    await client.connect(new StreamableHTTPClientTransport(new URL(cfg().origin+"/mcp"), {
+      requestInit:{headers:{Authorization:`Bearer ${token.token}`}},
+      fetch:async(input,init)=>mcp.fetch(new Request(input,init)),
+    }));
+    const call = async(name:string,args:Record<string,unknown>) => {
+      const result = await client.callTool({name,arguments:args});
+      expect(result.isError).not.toBe(true);
+      return JSON.parse((result.content as {text:string}[])[0].text);
+    };
+    try {
+      expect(await call("get_session",{session_id:r.id})).toMatchObject({state:"waiting_for_input",done:false,question:"Which branch?"});
+      await call("send_session_message",{session_id:r.id,request_id:"answer",text:"Use main"});
+      expect(log).toContainEqual({method:"send",input:{type:"question.reply",request_id:"q-mcp",answer:"Use main"}});
+      events.push({type:"text.delta",agent_id:"main",text:"Continued after answer"},{type:"turn.end",agent_id:"main",stop_reason:"end_turn"});
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+      expect(await call("get_session",{session_id:r.id})).toMatchObject({state:"done",waiting_for_input:false});
+    } finally { await client.close(); await mcp.close(); }
+  });
   it("starts through MCP with durable retry results and token attribution", async () => {
     const token=createToken(db,"u","Lifecycle test");
     let mcp=createMcp(db,cfg(),runs);

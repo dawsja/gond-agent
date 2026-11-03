@@ -1,4 +1,10 @@
 import base64
+import contextlib
+import http.server
+import json
+import socket
+import threading
+import time
 import importlib.util
 import io
 import os
@@ -21,6 +27,36 @@ class AgentTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_search_relay_cancels_when_worker_disconnects(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), agent.ModelProxy)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        output = io.StringIO()
+        connection = None
+        try:
+            with contextlib.redirect_stdout(output):
+                connection = socket.create_connection(server.server_address)
+                body = b'{"query":"fixture"}'
+                connection.sendall(b"POST /v1/search HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+                deadline = time.monotonic() + 3
+                while not output.getvalue() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                frames = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(frames[0]["model"]["path"], "/v1/search")
+                connection.close()
+                connection = None
+                while "model_cancel" not in output.getvalue() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                frames = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(frames[-1]["model_cancel"], frames[0]["model"]["id"])
+                self.assertNotIn(frames[0]["model"]["id"], agent.models)
+        finally:
+            if connection:
+                connection.close()
+            server.shutdown()
+            server.server_close()
 
     def test_archive_rejects_escape_and_unsafe_links(self):
         for symlink in [False, True]:

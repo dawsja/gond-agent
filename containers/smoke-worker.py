@@ -39,20 +39,33 @@ def main():
              call("defs", "symbols", {"action": "definitions", "symbol": "greet"}),
              call("reads", "batch", {"calls": [{"tool": "read", "input": {"path": "app.ts"}}, {"tool": "symbols", "input": {"action": "references", "symbol": "greet"}}]})],
             [call("write", "write", {"path": "feature.txt", "content": "verified\n"})],
-            [call("check", "bash", {"command": "test \"$(cat feature.txt)\" = verified"})],
+            [call("check", "run_checks", {"command": "test \"$(cat feature.txt)\" = verified"})],
             [call("ui", "browser", {"url": f"http://127.0.0.1:{app.server_port}", "script": "await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
+            [call("search-context", "grep", {"pattern": "greet", "path": "app.ts", "output_mode": "content", "context": 1, "head_limit": 1}),
+             call("search-count", "grep", {"pattern": "greet", "path": "app.ts", "output_mode": "count"}),
+             call("git-status", "git", {"action": "status"}),
+             call("shell-list", "bash_list", {}),
+             call("structured-check", "run_checks", {"command": "printf 'check passed'"}),
+             call("web-search", "web_search", {"query": "fixture"})],
             [call("diff", "bash", {"command": "git diff --no-ext-diff; git ls-files --others --exclude-standard; cat feature.txt"})],
         ]
 
         class Model(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                data = json.dumps({"models": [{"id": "fixture", "context_window": 100000}]}).encode()
+                data = json.dumps({"models": [{"id": "fixture", "context_window": 100000}], "web_search": True}).encode()
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(data)
 
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path == "/v1/search":
+                    data = json.dumps({"results": [{"title": "Fixture", "url": "https://example.test", "snippet": "Fixture search text"}]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 index = len(seen)
                 seen.append(request)
                 blocks = workflow[index] if index < len(workflow) else [{"type": "text", "text": "Done."}]
@@ -96,6 +109,8 @@ def main():
             results = [b for req in seen for m in req["messages"] if m["role"] == "tool" for b in m["content"]]
             for id in ["outline", "defs"]:
                 assert any(b["call_id"] == id and "greet" in json.dumps(b["content"]) for b in results), id
+            for tool_id, expected in [("search-context", "More:"), ("search-count", "app.ts:2"), ("git-status", "feature.txt"), ("structured-check", "check passed"), ("web-search", "untrusted text")]:
+                assert any(b["call_id"] == tool_id and expected in json.dumps(b["content"]) for b in results), tool_id
             assert all(t["name"] != "memory" for t in seen[0]["tools"])
             assert "repository instructions" in seen[0]["system"]
             print("Worker smoke passed: symbols, batch, edits, checks, real browser images and normal completion")

@@ -25,7 +25,7 @@ pub struct Bash;
 /// The command that runs `cmd` in this platform's shell, with stderr merged into stdout so output keeps
 /// its real interleaving. Unix: bash (or sh) in its own process group. Windows: PowerShell (`pwsh` when
 /// installed, else the built-in Windows PowerShell) with UTF-8 output and no console window.
-fn shell_command(cmd: &str) -> Command {
+pub(super) fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
         let sh = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
@@ -120,6 +120,7 @@ impl Tool for Bash {
             };
             let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
             let mut collected = Output::default();
+            let mut spill: Option<super::output::Spill> = None;
             let mut buf = [0u8; 8192];
             let deadline = tokio::time::sleep(Duration::from_millis(timeout));
             tokio::pin!(deadline);
@@ -134,6 +135,11 @@ impl Tool for Bash {
                             } else if collected.total - n < MAX_STREAM {
                                 ctx.output("\n… (more output; the end shows when the command finishes)\n".into());
                             }
+                            if spill.is_none() && collected.total <= MAX_OUTPUT && collected.total + n > MAX_OUTPUT {
+                                spill = super::output::Spill::new(ctx).ok();
+                                if let Some(s) = &mut spill { let _ = s.push(&collected.head); }
+                            }
+                            if let Some(s) = &mut spill { if s.push(&buf[..n]).is_err() { spill = None; } }
                             collected.push(&buf[..n]);
                         }
                     },
@@ -164,6 +170,11 @@ impl Tool for Bash {
                 (None, None) => (false, "killed by signal".to_owned()),
             };
             let mut model_text = if out.is_empty() { "(no output)".to_owned() } else { out.clone() };
+            if collected.total > MAX_OUTPUT {
+                let hint = spill.as_ref().map(|s| s.hint()).unwrap_or_else(|| "Full output unavailable; narrow or redirect the command for more.".into());
+                let at = model_text.find("…").unwrap_or(0);
+                model_text.insert_str(at, &format!("{hint}\n"));
+            }
             match (&outcome, code) {
                 (Some(why), _) => model_text.push_str(&format!("\n[{why}]")),
                 (None, Some(c)) if c != 0 => model_text.push_str(&format!("\n[exit code {c}]")),
@@ -226,6 +237,7 @@ pub struct BgShell {
     status: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pid: Option<u32>,
     kill: Option<tokio::sync::oneshot::Sender<()>>,
+    spill_path: Option<std::path::PathBuf>,
 }
 
 impl Drop for BgShell {
@@ -257,6 +269,8 @@ fn start_background(ctx: &ToolCtx, cmd: &str) -> ToolOutput {
     let pid = child.id();
     let (out, st) = (output.clone(), status.clone());
     let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut spill = super::output::Spill::new(ctx).ok();
+    let spill_path = spill.as_ref().map(|s| s.path.clone());
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         tokio::pin!(krx);
@@ -265,6 +279,7 @@ fn start_background(ctx: &ToolCtx, cmd: &str) -> ToolOutput {
                 n = stdout.read(&mut buf) => match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Some(s) = &mut spill { if s.push(&buf[..n]).is_err() { spill = None; } }
                         let mut o = out.lock().unwrap();
                         o.buf.extend(&buf[..n]);
                         if o.buf.len() > BG_BUFFER {
@@ -290,7 +305,7 @@ fn start_background(ctx: &ToolCtx, cmd: &str) -> ToolOutput {
     });
     let mut shells = ctx.shells.lock().unwrap();
     let id = format!("bg-{}", NEXT_SHELL.fetch_add(1, Ordering::Relaxed));
-    shells.insert(id.clone(), BgShell { command: cmd.to_owned(), output, read: 0, status, pid, kill: Some(ktx) });
+    shells.insert(id.clone(), BgShell { command: cmd.to_owned(), output, read: 0, status, pid, kill: Some(ktx), spill_path });
     ToolOutput::ok(
         format!("Started background shell {id}. Read its output with bash_output {{\"shell_id\": \"{id}\"}}; stop it with kill_shell."),
         format!("background · {id}"),
@@ -307,7 +322,7 @@ impl Tool for BashOutput {
         "Read new output from a background shell since the last read, plus whether it is still running."
     }
     fn schema(&self) -> Value {
-        schema(json!({"shell_id": {"type": "string"}}), &["shell_id"])
+        schema(json!({"shell_id": {"type": "string"}, "wait_seconds": {"type":"number", "minimum":0, "maximum":120}, "until":{"type":"string", "description":"Wait for this regex in unread output, exit or timeout"}}), &["shell_id"])
     }
     fn access(&self) -> Access {
         Access::Read
@@ -318,6 +333,29 @@ impl Tool for BashOutput {
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let id = str_arg(&input, "shell_id").unwrap_or("");
+            let until = match str_arg(&input, "until").map(regex::Regex::new).transpose() {
+                Ok(r) => r,
+                Err(e) => return ToolOutput::err(format!("bad until regex: {e}")),
+            };
+            let wait = input["wait_seconds"].as_f64().unwrap_or(0.0).clamp(0.0, 120.0);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait);
+            loop {
+                let ready = {
+                    let shells = ctx.shells.lock().unwrap();
+                    let Some(sh) = shells.get(id) else { break };
+                    let out = sh.output.lock().unwrap();
+                    let from = sh.read.max(out.start) - out.start;
+                    let bytes: Vec<_> = out.buf.iter().skip(from).copied().collect();
+                    sh.status.lock().unwrap().is_some() ||
+                        until.as_ref().map_or(!bytes.is_empty(), |r| r.is_match(&String::from_utf8_lossy(&bytes)))
+                };
+                if ready || tokio::time::Instant::now() >= deadline { break; }
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return ToolOutput::err("interrupted"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
             let mut shells = ctx.shells.lock().unwrap();
             let Some(sh) = shells.get_mut(id) else {
                 let known: Vec<_> = shells.keys().cloned().collect();
@@ -336,10 +374,36 @@ impl Tool for BashOutput {
             }
             let state = sh.status.lock().unwrap().clone().unwrap_or_else(|| "running".into());
             let body = clip(new.trim_end(), MAX_OUTPUT);
-            let text = format!("[{id}: {state}] {}\n{}", sh.command, if body.is_empty() { "(no new output)" } else { &body });
+            let mut text = format!("[{id}: {state}] {}\n{}", sh.command, if body.is_empty() { "(no new output)" } else { &body });
+            if skipped > 0 || new.len() > MAX_OUTPUT {
+                if let Some(path) = &sh.spill_path {
+                    text = format!("Stored output (up to 32 MiB): {}. Read with read offset/limit or grep; repeat bash_output for new output.\n{text}", path.display());
+                }
+            }
             let mut o = ToolOutput::ok(text, format!("{state} · {} new lines", body.lines().count()));
             o.display = body;
             o
+        })
+    }
+}
+
+pub struct BashList;
+impl Tool for BashList {
+    fn name(&self) -> &'static str { "bash_list" }
+    fn description(&self) -> &'static str { "List background shells and their current state. Read more with bash_output; stop one with kill_shell." }
+    fn schema(&self) -> Value { schema(json!({}), &[]) }
+    fn access(&self) -> Access { Access::Read }
+    fn title(&self, _: &Value) -> String { "background shells".into() }
+    fn run<'a>(&'a self, ctx: &'a ToolCtx, _: Value) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
+            let shells = ctx.shells.lock().unwrap();
+            let mut rows: Vec<_> = shells.iter().map(|(id, sh)| {
+                let state = sh.status.lock().unwrap().clone().unwrap_or_else(|| "running".into());
+                format!("{id}: {state} — {}", sh.command)
+            }).collect();
+            rows.sort();
+            ToolOutput::ok(if rows.is_empty() { "No background shells".into() } else { rows.join("\n") }, format!("{} shells", rows.len()))
         })
     }
 }
@@ -511,6 +575,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(BashOutput.run(&c, id).await.display, "again", "new output after the buffer filled");
         c.shells.lock().unwrap().clear();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waits_for_output_pattern_exit_and_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, _rx) = ctx(dir.path());
+        let start = Bash.run(&c, json!({"command":"printf ready; sleep 0.1; echo done", "run_in_background":true})).await;
+        let id = start.summary.strip_prefix("background · ").unwrap();
+        assert!(text(&BashList.run(&c, json!({})).await).contains(id));
+        let out = BashOutput.run(&c, json!({"shell_id":id,"wait_seconds":2,"until":"done"})).await;
+        assert!(text(&out).contains("readydone"), "{}", text(&out));
+        let out = BashOutput.run(&c, json!({"shell_id":id,"wait_seconds":2})).await;
+        assert!(text(&out).contains("exited with code 0"));
+        c.cancel.cancel();
+        assert!(!BashOutput.run(&c, json!({"shell_id":id,"wait_seconds":2})).await.ok);
     }
 
     #[cfg(windows)]

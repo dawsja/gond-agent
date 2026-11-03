@@ -1,3 +1,4 @@
+import { searchConfigured, searchResponse } from "../search";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
@@ -468,7 +469,8 @@ export class Runs {
       const owner = r.user_id;
       workspace = await this.workspaceFactory(id, (req) =>
         new URL(req.url).pathname === "/v1/models"
-          ? this.catalog(owner).then(catalog => Response.json(catalog))
+          ? this.catalog(owner).then(catalog => Response.json({ ...catalog, web_search: searchConfigured(this.db) }))
+          : new URL(req.url).pathname === "/v1/search" ? searchResponse(this.db, this.cfg.secret, req)
           : modelResponse(this.db, this.cfg.secret, owner, id, req, this.access),
       );
       r = this.get(id);

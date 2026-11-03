@@ -177,3 +177,18 @@ Earlier releases could run Claude Code or Codex inside workspaces. These agents 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Workspace tools and optional Web search
+
+The built-in tools include `read`, `write`, `edit`, `multi_edit`, `apply_patch`, `list_directory`, `glob`, `grep`, `symbols`, `batch`, `bash`, `bash_output`, `bash_list`, `kill_shell`, `git`, `run_checks`, `browser` and `web_fetch`, alongside optional MCP tools and the conversation's plan, question, skill and delegation tools. All tools are optional; `run_checks` does not gate completion.
+
+- `grep` streams ordinary files, respects ignore rules and skips binary files. Use `context_before`, `context_after` or `context`, `output_mode: "count"`, and zero-based `offset` with `head_limit` (default/max 300 result lines). Context lines count toward paging. Optional multiline mode accepts files up to 8 MiB; ordinary lines are limited to 1 MiB to bound memory.
+- `bash_output` accepts `wait_seconds` (0–120) and an optional `until` regex. Without `until` it returns on new output; with it, it waits for a match, exit or timeout. `bash_list` lists shell IDs, commands and state; `kill_shell` remains available.
+- `git` only offers status, diff, log, show and blame, with path/revision/stat filters. The service still owns commits and publication. `run_checks` executes a supplied command, reports exit status/duration, parses common check failures and falls back to an output tail. Background checks use shell IDs.
+- Text previews are bounded by a shared output wrapper. Large output is saved under `/tmp/gond-agent-output/` with read/grep instructions. Storage is ephemeral, up to 32 MiB per output and 128 MiB total with oldest-first cleanup; reaching a storage limit is reported, not represented as complete output. A busy store may decline a new spill. Shell output streams to disk before in-memory head/tail buffers discard bytes. Search paging can retrieve more even when a spill is unavailable.
+- `read` rejects binary text and converts supported raster images to JPEG, at most 2048 pixels on either axis and 3 MiB encoded bytes (base64 stays below 5 MiB). Input images are limited to 20 MiB, 16384 pixels per axis and a 128 MiB decode allocation. Notebook rendering is not included. Exact edits preserve untouched CRLF/newline bytes; patch updates preserve the file's CRLF/LF and final-newline convention. Failed string matches show numbered candidate lines, never apply fuzzy edits.
+- `ask_user` emits a pending question. MCP reports `waiting_for_input`; `send_session_message` answers it and the same turn continues. This is optional, not a requirement to ask questions.
+
+Administrators can enable **Settings → Agent access → Web search** using a **Brave Search API key** (a free tier exists). Enter the key in Settings after deployment, never in chat or the repository. Clear key/Undo takes effect on Save; Test uses saved settings. Keys are encrypted with the instance auth secret and never sent to browsers or workers. Search runs only when called, through the existing worker control relay, with no hosted model-search dependency and no fallback provider or `web_fetch` fallback. The tool is absent from new workspaces unless a provider and key are configured. Existing workspaces retain their advertised tool list; disabling search takes effect immediately on service requests.
+
+Search returns an explicit untrusted-text warning and `{title,url,snippet}` results, default 5/max 10, with a 1000-character query limit, a 15-second provider timeout and a 1 MiB response-read limit. Provider redirects are rejected; auth/quota/rate errors omit provider bodies and keys. Brave is the first provider behind a small service-side interface; SearXNG is not implemented in this pass.

@@ -839,6 +839,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_model_drives_new_tools_and_question_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").arg("init").arg(dir.path()).output().unwrap();
+        std::fs::write(dir.path().join("a"), "before\nhit\nafter\n").unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let handler: Handler = Arc::new(|req: &Value| {
+            if req["messages"].as_array().unwrap().len() == 1 {
+                sse(&[
+                    json!({"type":"tool_call","id":"g","name":"grep","input":{"pattern":"hit","output_mode":"content","context":1}}),
+                    json!({"type":"tool_call","id":"git","name":"git","input":{"action":"status"}}),
+                    json!({"type":"tool_call","id":"checks","name":"run_checks","input":{"command":"printf checked"}}),
+                    json!({"type":"tool_call","id":"shells","name":"bash_list","input":{}}),
+                    json!({"type":"tool_call","id":"background","name":"bash","input":{"command":"sleep 0.1; echo ready","run_in_background":true}}),
+                    json!({"type":"tool_call","id":"search","name":"web_search","input":{"query":"fixture"}}),
+                ], "tool_use")
+            } else if req["messages"].as_array().unwrap().len() == 3 {
+                let results = req["messages"][2]["content"].as_array().unwrap();
+                let started = results.iter().find(|b| b["call_id"] == "background").unwrap()["content"][0]["text"].as_str().unwrap();
+                let shell = started.split("background shell ").nth(1).unwrap().split('.').next().unwrap();
+                sse(&[
+                    json!({"type":"tool_call","id":"wait","name":"bash_output","input":{"shell_id":shell,"wait_seconds":2,"until":"ready"}}),
+                    json!({"type":"tool_call","id":"question","name":"ask_user","input":{"question":"Which branch?"}}),
+                ], "tool_use")
+            } else { sse(&[json!({"type":"text","text":"Continued after answer"})], "end_turn") }
+        });
+        let url = mock(handler, seen.clone()).await;
+        let search_url = crate::tools::testutil::http::serve(|req| {
+            assert_eq!(req.json()["query"], "fixture");
+            crate::tools::testutil::http::Res::new(200, "application/json", r#"{"results":[{"title":"Fixture","url":"https://example.test","snippet":"Fixture text"}]}"#)
+        }).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.tools.push(crate::tools::bounded(Arc::new(crate::tools::web_search::WebSearch { relay: search_url })));
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        h.input.send(AgentInput::User { text: "go".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::Question { .. })).await;
+        for id in ["g", "git", "checks", "shells", "search"] {
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { call_id, ok:true, .. } if call_id == id)), "{id}");
+        }
+        let AgentEvent::Question { request_id, .. } = events.last().unwrap() else { unreachable!() };
+        h.input.send(AgentInput::QuestionReply { request_id: request_id.clone(), answer: "Use main".into() }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text, .. } if text == "Continued after answer")));
+        let reqs = seen.lock().unwrap();
+        println!("Scripted runner runtime: {}", reqs[1]["messages"][2]["content"]);
+        assert!(reqs.last().unwrap().to_string().contains("Use main"));
+        let final_request = reqs.last().unwrap().to_string();
+        assert!(final_request.contains("ready"));
+    }
+
+    #[tokio::test]
     async fn tool_loop_with_permission_prompt() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();

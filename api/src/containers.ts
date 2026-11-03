@@ -121,7 +121,7 @@ export class ContainerPool {
       const controller = new AbortController();
       models.set(key, controller);
       try {
-        if (!((frame.method === "GET" && frame.path === "/v1/models") || (frame.method === "POST" && frame.path === "/v1/responses"))) {
+        if (!((frame.method === "GET" && frame.path === "/v1/models") || (frame.method === "POST" && ["/v1/responses", "/v1/search"].includes(frame.path)))) {
           await send({ model_id: key, status: 403, headers: { "content-type": "text/plain" } });
         } else {
           const req = new Request(`http://worker${frame.path}`, {

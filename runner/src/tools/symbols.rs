@@ -5,7 +5,7 @@ use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{Tool, ToolCtx, ToolOutput, clip, schema, str_arg};
+use super::{Tool, ToolCtx, ToolOutput, schema, str_arg};
 use crate::permissions::Access;
 
 pub struct Symbols;
@@ -97,7 +97,7 @@ fn navigation_output(rows: Vec<String>, more: bool, kind: &str) -> ToolOutput {
     let summary = format!("{}{} {kind}", rows.len(), if more { "+" } else { "" });
     let mut text = if rows.is_empty() { "No matches".into() } else { rows.join("\n") };
     if more { text.push_str("\n… results truncated; narrow path or symbol"); }
-    ToolOutput::ok(clip(&text, 30_000), summary)
+    ToolOutput::ok(text, summary)
 }
 
 #[cfg(test)]

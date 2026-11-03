@@ -47,7 +47,7 @@ impl Tool for Batch {
                 return ToolOutput::err("Every call needs an allowed read tool and an input object");
             }
             let outputs = join_all(calls.iter().map(|c| async {
-                tool(c["tool"].as_str().unwrap()).unwrap().run(ctx, c["input"].clone()).await
+                super::output::bound(ctx, tool(c["tool"].as_str().unwrap()).unwrap().run(ctx, c["input"].clone()).await)
             })).await;
             let mut content = Vec::new();
             let mut failed = 0;
