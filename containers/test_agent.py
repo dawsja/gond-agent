@@ -77,7 +77,10 @@ class AgentTest(unittest.TestCase):
                  "UV_INSTALL_DIR": "bin", "UV_TOOL_DIR": "uv/tools",
                  "UV_PYTHON_INSTALL_DIR": "uv/python", "UV_TOOL_BIN_DIR": "bin",
                  "XDG_BIN_HOME": "bin", "XDG_DATA_HOME": "share", "PYTHONUSERBASE": "python",
-                 "npm_config_prefix": "npm", "COREPACK_HOME": "corepack", "PNPM_HOME": "pnpm"}
+                 "npm_config_prefix": "npm", "COREPACK_HOME": "corepack", "PNPM_HOME": "pnpm",
+                 "TMPDIR": "tmp", "TMP": "tmp", "TEMP": "tmp", "TEMPDIR": "tmp",
+                 "BUN_INSTALL_CACHE_DIR": "cache/bun", "npm_config_cache": "cache/npm",
+                 "XDG_CACHE_HOME": "cache", "PIP_CACHE_DIR": "cache/pip", "UV_CACHE_DIR": "cache/uv"}
         expected = {key: f"/opt/gond-tools/{value}" for key, value in homes.items()}
         tool_path = ":".join(f"/opt/gond-tools/{directory}" for directory in
                              ("bin", "bun/bin", "cargo/bin", "npm/bin", "pnpm", "python/bin"))
@@ -89,6 +92,12 @@ class AgentTest(unittest.TestCase):
         self.assertIn('ENV PATH="${PATH}:' + tool_path + '"', dockerfile)
         self.assertIn("PLAYWRIGHT_BROWSERS_PATH=/opt/gond-agent-browser/browsers", dockerfile)
         self.assertIn("NODE_PATH=/opt/gond-agent-browser/node_modules", dockerfile)
+        self.assertIn("mkdir -p /workspace/repo /home/gond-agent /opt/gond-tools/bin /opt/gond-tools/tmp /opt/gond-tools/cache", dockerfile)
+        self.assertIn("chown -R 1000:1000 /workspace /home/gond-agent /opt/gond-tools", dockerfile)
+        self.assertIn("bun-v1.4.4/bun-linux-x64.zip", dockerfile)
+        self.assertIn('echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  /tmp/bun.zip" | sha256sum -c -', dockerfile)
+        self.assertIn("/tmp/bun/bun-linux-x64/bun /usr/local/bin/bun", dockerfile)
+        self.assertNotIn("CARGO_TARGET_DIR=", dockerfile)
         script = """
 import json, subprocess
 from agent import worker_env

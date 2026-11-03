@@ -78,6 +78,7 @@ def dispatch(req):
         with worker_lock:
             if worker and worker.poll() is None:
                 raise RuntimeError("The worker is already running.")
+            pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
             with open("/tmp/worker.log", "ab") as log:
                 worker = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
