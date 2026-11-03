@@ -1,9 +1,10 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configFromEnv } from "../src/config";
-import { CLOUD_PATH, CLOUD_TRANSFORM, MARK_INK } from "../../shared/brand-mark";
+import { MARK_SVG, MARK_INK } from "../../shared/brand-mark";
 import { HELP_EMAIL } from "../../shared/brand";
 
 const file = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
@@ -21,15 +22,28 @@ describe("Gond Agent identity", () => {
     expect(config.workerImage).toBe("gond-agent-worker:fixture");
   });
 
-  it("uses the canonical faceless cloud in both frontends", () => {
-    const site = file("../../site/public/favicon.svg");
-    expect(site).toContain(`transform="${CLOUD_TRANSFORM}"`);
-    expect(site).toBe(file("../../web/public/favicon.svg"));
-    expect(site).toContain(`d="${CLOUD_PATH}"`);
-    expect(site).toContain(`fill="${MARK_INK}" stroke="${MARK_INK}"`);
-    expect(site.match(/<circle\b/g)).toHaveLength(1);
-    expect(site.match(/<path\b/g)).toHaveLength(1);
-    expect(site).not.toMatch(/<rect\b|<animate\b/);
+  it("uses Logo C from one source in both frontends and all generated assets", () => {
+    expect(MARK_SVG).toContain(`fill="${MARK_INK}"`);
+    expect(MARK_SVG).toContain('stroke-opacity="0.22"');
+    for (const frontend of ["site", "web"]) {
+      expect(file(`../../${frontend}/public/favicon.svg`)).toBe(MARK_SVG);
+    }
+    expect(file("../../shared/logo.tsx")).toContain("MARK_CONTENT");
+    execFileSync(process.execPath, ["--import", "tsx", "scripts/build-brand.ts", "--check"], {
+      cwd: new URL("..", import.meta.url), stdio: "pipe",
+    });
+  });
+
+  it("does not reintroduce the retired mark in tracked source", () => {
+    const root = new URL("../../", import.meta.url);
+    const paths = execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root }).toString().split("\0").filter(Boolean);
+    const retired = ["M29 79 " + "A17 17", "CLOUD" + "_PATH", "CLOUD" + "_TRANSFORM"];
+    for (const path of new Set(paths)) {
+      let bytes: Buffer;
+      try { bytes = readFileSync(new URL(path, root)); } catch { continue; }
+      if (bytes.includes(0)) continue;
+      for (const token of retired) expect(bytes.toString(), path).not.toContain(token);
+    }
   });
 
   it("defines a self-hosted Compose project instead of inheriting the checkout name", () => {
