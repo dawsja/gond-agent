@@ -199,7 +199,7 @@ Validation commands and development rules are in [AGENTS.md](AGENTS.md). CI type
 
 ### Task plans
 
-For multi-step work, the built-in runner can use `update_plan` and `list_plan`. A pinned **Tasks** panel shows progress, highlights the current step and updates live without scrolling back through the transcript. On phones it is a compact expandable bar. No panel appears until a plan exists. Run lists show plan counts while work is active.
+For multi-step work, the built-in runner can use `update_plan` and `list_plan`. The plan shows as a checklist in the conversation and is also available to other tools over MCP. Run lists show plan counts while work is active.
 
 Plans stay in memory across follow-ups and compaction. The service stores `todos` events and the latest plan summary in SQLite, then restores the plan into a replacement worker when reopening a workspace or continuing after a service restart. This restores plan state, not the full model conversation or unpushed files lost with a removed container.
 
