@@ -31,10 +31,22 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(env["GOND_AGENT_PLAN_NUDGE_LIMIT"], "2")
 
     def test_toolchain_environment_reaches_worker_and_shell(self):
-        keys = ("PATH", "BUN_INSTALL", "CARGO_HOME", "RUSTUP_HOME", "UV_INSTALL_DIR",
-                "XDG_BIN_HOME", "npm_config_prefix", "COREPACK_HOME", "PNPM_HOME")
-        expected = {key: f"/opt/gond-tools/{key.lower()}" for key in keys if key != "PATH"}
-        expected["PATH"] = "/opt/gond-tools/bin:" + os.environ["PATH"]
+        homes = {"BUN_INSTALL": "bun", "CARGO_HOME": "cargo", "RUSTUP_HOME": "rustup",
+                 "UV_INSTALL_DIR": "bin", "UV_TOOL_DIR": "uv/tools",
+                 "UV_PYTHON_INSTALL_DIR": "uv/python", "UV_TOOL_BIN_DIR": "bin",
+                 "XDG_BIN_HOME": "bin", "XDG_DATA_HOME": "share", "PYTHONUSERBASE": "python",
+                 "npm_config_prefix": "npm", "COREPACK_HOME": "corepack", "PNPM_HOME": "pnpm"}
+        expected = {key: f"/opt/gond-tools/{value}" for key, value in homes.items()}
+        tool_path = ":".join(f"/opt/gond-tools/{directory}" for directory in
+                             ("bin", "bun/bin", "cargo/bin", "npm/bin", "pnpm", "python/bin"))
+        expected["PATH"] = os.environ["PATH"] + ":" + tool_path
+        dockerfile = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+        for key, value in expected.items():
+            if key != "PATH":
+                self.assertIn(f"{key}={value}", dockerfile)
+        self.assertIn('ENV PATH="${PATH}:' + tool_path + '"', dockerfile)
+        self.assertIn("PLAYWRIGHT_BROWSERS_PATH=/opt/gond-agent-browser/browsers", dockerfile)
+        self.assertIn("NODE_PATH=/opt/gond-agent-browser/node_modules", dockerfile)
         script = """
 import json, subprocess
 from agent import worker_env
@@ -47,8 +59,8 @@ print(output)
             ["python3", "-c", script], cwd=pathlib.Path(__file__).parent,
             env={**os.environ, **expected}, text=True)
         shell_env = json.loads(output)
-        for key in keys:
-            self.assertEqual(shell_env[key], expected[key])
+        for key, value in expected.items():
+            self.assertEqual(shell_env[key], value)
 
     def test_archive_rejects_escape_and_unsafe_links(self):
         for symlink in [False, True]:

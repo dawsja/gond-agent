@@ -44,11 +44,16 @@ ENV HOME=/home/gond-agent \
     CARGO_HOME=/opt/gond-tools/cargo \
     RUSTUP_HOME=/opt/gond-tools/rustup \
     UV_INSTALL_DIR=/opt/gond-tools/bin \
+    UV_TOOL_DIR=/opt/gond-tools/uv/tools \
+    UV_PYTHON_INSTALL_DIR=/opt/gond-tools/uv/python \
+    UV_TOOL_BIN_DIR=/opt/gond-tools/bin \
+    XDG_DATA_HOME=/opt/gond-tools/share \
+    PYTHONUSERBASE=/opt/gond-tools/python \
     XDG_BIN_HOME=/opt/gond-tools/bin \
     npm_config_prefix=/opt/gond-tools/npm \
     COREPACK_HOME=/opt/gond-tools/corepack \
     PNPM_HOME=/opt/gond-tools/pnpm
-ENV PATH="/opt/gond-tools/bin:/opt/gond-tools/bun/bin:/opt/gond-tools/cargo/bin:/opt/gond-tools/npm/bin:/opt/gond-tools/pnpm:${PATH}"
+ENV PATH="${PATH}:/opt/gond-tools/bin:/opt/gond-tools/bun/bin:/opt/gond-tools/cargo/bin:/opt/gond-tools/npm/bin:/opt/gond-tools/pnpm:/opt/gond-tools/python/bin"
 USER 1000:1000
 RUN python3 /opt/gond-agent/smoke-worker.py
 WORKDIR /workspace/repo

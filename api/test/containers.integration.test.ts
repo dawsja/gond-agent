@@ -287,7 +287,7 @@ if touch /rootfs-probe 2>/tmp/rootfs.err; then exit 1; fi
 grep -q 'Read-only file system' /tmp/rootfs.err
 bun --version
 uv --version
-python3 -c 'import os; expected={"BUN_INSTALL":"bun","CARGO_HOME":"cargo","RUSTUP_HOME":"rustup","UV_INSTALL_DIR":"bin","XDG_BIN_HOME":"bin","npm_config_prefix":"npm","COREPACK_HOME":"corepack","PNPM_HOME":"pnpm"}; assert all(os.environ[k]=="/opt/gond-tools/"+v for k,v in expected.items())'
+python3 -c 'import os; expected={"BUN_INSTALL":"bun","CARGO_HOME":"cargo","RUSTUP_HOME":"rustup","UV_INSTALL_DIR":"bin","UV_TOOL_DIR":"uv/tools","UV_PYTHON_INSTALL_DIR":"uv/python","UV_TOOL_BIN_DIR":"bin","XDG_BIN_HOME":"bin","XDG_DATA_HOME":"share","PYTHONUSERBASE":"python","npm_config_prefix":"npm","COREPACK_HOME":"corepack","PNPM_HOME":"pnpm"}; assert all(os.environ[k]=="/opt/gond-tools/"+v for k,v in expected.items())'
 echo toolchain-isolation-verified`})],
       [call("symbols","symbols",{action:"outline",path:"app.ts"}), call("batch","batch",{calls:[{tool:"read",input:{path:"app.ts"}},{tool:"symbols",input:{action:"references",symbol:"greet"}}]})],
       [call("write","write",{path:"feature.txt",content:"verified\n"})],
