@@ -261,30 +261,35 @@ const key = 'fixture-only-provider-key';
       await expect(page.getByText('Expected /agents/; received /login.', { exact: true })).toBeVisible();
       await capture('message-activity-details');
 
-      const tasks = page.getByRole('complementary', { name: 'Tasks', exact: true });
-      await expect(tasks).toHaveCount(0);
+      const noPinnedTasks = async () => {
+        await expect(page.getByRole('complementary', { name: 'Tasks', exact: true })).toHaveCount(0);
+        await expect(page.getByRole('button', { name: 'Expand tasks', exact: true })).toHaveCount(0);
+        await expect(page.getByRole('heading', { name: 'Tasks', exact: true })).toHaveCount(0);
+        await expect(page.getByText(/Tasks\s+\d+ of \d+ done/)).toHaveCount(0);
+      };
+      await noPinnedTasks();
+      await capture('run-without-plan');
       const plan = [{ text: 'Inspect sign-in flow', status: 'done' }, { text: 'Fix mobile return URL', status: 'in_progress' }, { text: 'Verify redirect behavior', status: 'pending' }];
       activity('todos', { agent_id: 'main', items: plan });
-      await expect(tasks).toContainText('1 of 3 done');
-      if (width === 390) {
-        await expect(tasks.getByRole('list')).toBeHidden();
-        await tasks.getByRole('button', { name: 'Expand tasks' }).click();
-      }
-      await expect(tasks.getByRole('listitem')).toHaveCount(3);
-      await expect(tasks.locator('[aria-current=step]')).toHaveText('Fix mobile return URL');
-      const top = (await tasks.boundingBox()).y;
-      await page.getByText('Expected /agents/; received /login.', { exact: true }).evaluate(el => {
-        let parent = el.parentElement;
-        while (parent && getComputedStyle(parent).overflowY !== 'auto') parent = parent.parentElement;
-        if (parent) parent.scrollTop = 0;
-      });
-      expect((await tasks.boundingBox()).y).toBe(top);
+      const checklist = page.getByRole('list').filter({ hasText: 'Inspect sign-in flow' });
+      await expect(checklist.getByRole('listitem')).toHaveText(plan.map(step => step.text));
+      await expect(checklist.locator('svg.lucide-check')).toHaveCount(1);
+      await checklist.scrollIntoViewIfNeeded();
+      await expect(checklist).toBeVisible();
+      // The surviving checklist must live inside the transcript's scroller.
+      expect(await checklist.evaluate(el => {
+        for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+          if (getComputedStyle(parent).overflowY === 'auto') return true;
+        }
+        return false;
+      })).toBe(true);
+      await noPinnedTasks();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-      await capture('pinned-tasks');
+      await capture('in-chat-plan');
       activity('todos', { agent_id: 'main', items: plan.map((step, i) => ({ ...step, status: i < 2 ? 'done' : 'in_progress' })) });
-      await expect(tasks).toContainText('2 of 3 done');
-      await expect(tasks.locator('[aria-current=step]')).toHaveText('Verify redirect behavior');
-      if (width === 390) await tasks.getByRole('button', { name: 'Expand tasks' }).click();
+      await expect(checklist.locator('svg.lucide-check')).toHaveCount(2);
+      await expect(checklist.getByRole('listitem')).toHaveText(plan.map(step => step.text));
+      await noPinnedTasks();
 
       // A GitHub merge updates the existing PR card and every current-state icon.
       activePreview = false; prState = 'open';
