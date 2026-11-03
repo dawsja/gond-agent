@@ -6,7 +6,7 @@ import { providerOf } from "@shared/providers"
 import { cn } from "@/lib/utils"
 import type { Run, RunStatus } from "@/lib/api"
 import { Badge } from "@shared/ui/badge"
-import { STATUS, mono, tint } from "./theme"
+import { STATUS, mono } from "./theme"
 
 const statusColor: Record<RunStatus, string> = STATUS
 
@@ -148,28 +148,6 @@ export function PrChip({ status, state, number, files }: { status: RunStatus; st
         </span>
       ) : null}
       <span className="text-muted-foreground">{s.label}</span>
-    </span>
-  )
-}
-
-export function Avatar({ initials, color, size = 24, src }: { initials: string; color: string; size?: number; src?: string }) {
-  if (src) {
-    return (
-      <img
-        src={src}
-        alt=""
-        referrerPolicy="no-referrer"
-        className="shrink-0 rounded-full object-cover"
-        style={{ width: size, height: size, boxShadow: "inset 0 0 0 1px color-mix(in srgb, var(--foreground) 8%, transparent)" }}
-      />
-    )
-  }
-  return (
-    <span
-      className="inline-grid shrink-0 place-items-center rounded-full text-[11px] font-semibold"
-      style={{ width: size, height: size, background: tint(color, 14), color, boxShadow: `inset 0 0 0 1px ${tint(color, 22)}` }}
-    >
-      {initials}
     </span>
   )
 }

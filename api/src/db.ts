@@ -1,3 +1,4 @@
+import { isLocalProfilePhoto } from "../../shared/profile-photo";
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -27,6 +28,7 @@ export function openStore(data: string) {
     CREATE INDEX IF NOT EXISTS subscription_accounts_owner ON subscription_accounts(user_id,provider);
     CREATE TABLE IF NOT EXISTS subscription_notices (user_id TEXT PRIMARY KEY, welcomed_at INTEGER NOT NULL);
   `);
+  clearExternalProfileImages(db);
   retireCodingAgents(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
@@ -37,6 +39,18 @@ export function openStore(data: string) {
       if (!allowed.has(name)) db.exec(`ALTER TABLE profiles DROP COLUMN "${name.replace(/"/g, '\"\"')}"`);
   })();
   return db;
+}
+export function clearExternalProfileImages(db: Database.Database) {
+  if (!(db.pragma('table_info("user")') as { name: string }[]).some(column => column.name === "image")) return 0;
+  const cleared = db.transaction(() => {
+    const rows = db.prepare('SELECT id,image FROM "user" WHERE image IS NOT NULL').all() as { id: string; image: string }[];
+    const clear = db.prepare('UPDATE "user" SET image=NULL WHERE id=?');
+    let count = 0;
+    for (const row of rows) if (!isLocalProfilePhoto(row.image)) count += clear.run(row.id).changes;
+    return count;
+  })();
+  if (cleared) console.log(`Cleared ${cleared} external profile image URLs.`);
+  return cleared;
 }
 /**
  * Claude Code and Codex agents were removed in favour of the built-in runner. Idempotently delete

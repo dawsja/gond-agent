@@ -76,6 +76,13 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 describe("local authentication and persistence", () => {
+  it("sets an image-only CSP on HTML and SPA responses", async () => {
+    for (const path of ["/agents/", "/agents/settings", "/health"]) {
+      const response = await call(path);
+      expect(response.headers.get("content-security-policy")).toBe("img-src 'self' data: blob:");
+    }
+  });
+
   it("saves sanitized circular photos for the current account and removes them without changing other users", async () => {
     const owner = await signup(), other = await signup("photo-other@example.test");
     const input = await sharp({ create: { width: 300, height: 200, channels: 3, background: "#ff0000" } }).withExif({ IFD0: { Artist: "Private photo metadata" } }).jpeg().toBuffer();
@@ -335,6 +342,7 @@ describe("local authentication and persistence", () => {
           email: "oidc@example.com",
           email_verified: true,
           name: "OIDC User",
+          picture: "https://www.gravatar.com/avatar/x",
         });
       if (url.endsWith("/token")) {
         const now = Math.floor(Date.now() / 1000);
@@ -348,6 +356,7 @@ describe("local authentication and persistence", () => {
             email: "oidc@example.com",
             email_verified: true,
             name: "OIDC User",
+            picture: "https://www.gravatar.com/avatar/x",
             nonce,
             iat: now,
             exp: now + 300,
@@ -383,38 +392,42 @@ describe("local authentication and persistence", () => {
         )
       ).status,
     ).toBe(200);
-    const start = await call("/api/auth/sign-in/social", {
-      provider: "oidc",
-      callbackURL: "http://localhost:8787/agents/",
-    });
-    expect(start.status, await start.clone().text()).toBe(200);
-    const url = new URL((await start.json()).url);
-    expect(url.origin).toBe(issuer);
-    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
-    nonce = url.searchParams.get("nonce")!;
-    expect(nonce).toBeTruthy();
-    const state = url.searchParams.get("state")!;
-    const stateCookie = start.headers
-      .getSetCookie()
-      .map((x) => x.split(";")[0])
-      .join("; ");
-    const result = await call(
-      "/api/auth/callback/oidc?code=test-code&state=" +
-        encodeURIComponent(state),
-      undefined,
-      stateCookie,
-    );
-    expect(result.headers.get("location")).toBe(
-      "http://localhost:8787/agents/",
-    );
-    const signed = result.headers
-      .getSetCookie()
-      .map((x) => x.split(";")[0])
-      .join("; ");
-    const session = await auth.current.api.getSession({
-      headers: new Headers({ cookie: signed }),
-    });
-    expect(session?.user.email).toBe("oidc@example.com");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const start = await call("/api/auth/sign-in/social", {
+        provider: "oidc",
+        callbackURL: "http://localhost:8787/agents/",
+      });
+      expect(start.status, await start.clone().text()).toBe(200);
+      const url = new URL((await start.json()).url);
+      expect(url.origin).toBe(issuer);
+      expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+      nonce = url.searchParams.get("nonce")!;
+      expect(nonce).toBeTruthy();
+      const state = url.searchParams.get("state")!;
+      const stateCookie = start.headers
+        .getSetCookie()
+        .map((x) => x.split(";")[0])
+        .join("; ");
+      const result = await call(
+        "/api/auth/callback/oidc?code=test-code&state=" +
+          encodeURIComponent(state),
+        undefined,
+        stateCookie,
+      );
+      expect(result.headers.get("location")).toBe(
+        "http://localhost:8787/agents/",
+      );
+      const signed = result.headers
+        .getSetCookie()
+        .map((x) => x.split(";")[0])
+        .join("; ");
+      const session = await auth.current.api.getSession({
+        headers: new Headers({ cookie: signed }),
+      });
+      expect(session?.user.email).toBe("oidc@example.com");
+      expect(session?.user.image).toBeNull();
+      expect(db.prepare('SELECT image FROM "user" WHERE id=?').get(session!.user.id)).toEqual({ image: null });
+    }
   });
   it("permits only the initial registration when signup is closed", async () => {
     const closed = await createAuthentication(db, { ...cfg(), signup: false });
