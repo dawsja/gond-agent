@@ -1,4 +1,4 @@
-# Gond Agent
+# <img src="web/public/favicon.svg" width="32" height="32" alt="" /> Gond Agent
 
 Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, pull requests, images and profile photos.
 
