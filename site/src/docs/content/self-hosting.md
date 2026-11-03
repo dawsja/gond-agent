@@ -52,7 +52,7 @@ The data volume contains the SQLite database in WAL mode, service-side checkouts
 
 ## Worker limits and browser testing
 
-Workers run as UID 1000 with a read-only root, dropped capabilities, no privilege escalation, private volumes/networks and a 512-process limit. `MAX_ACTIVE_RUNS` defaults to 5, `RUN_CPUS` to 2 and `RUN_MEMORY_MB` to 2048. `RUN_IDLE_MINUTES` defaults to 30 and `RUN_TURN_MINUTES` to 60. Workspace disk use is not quota-limited. Follow-ups reuse the live worker; idle cleanup or a service restart resumes later from the last pushed branch.
+Workers run as UID 1000 with a read-only root, dropped capabilities, no privilege escalation, private volumes/networks and a 512-process limit. `MAX_ACTIVE_RUNS` defaults to 5, `RUN_CPUS` to 2 and `RUN_MEMORY_MB` to 2048. Runs have no idle or turn time limit; the retired `RUN_IDLE_MINUTES` and `RUN_TURN_MINUTES` settings are ignored. Workspace disk use is not quota-limited. Follow-ups reuse the live worker; explicit workspace closure or a service restart resumes later from the last pushed branch.
 
 Playwright, Chromium and fonts are built into the worker image. Agents test web apps at wide and phone sizes and return screenshots in the transcript before self-review. Chromium runs without its own sandbox inside the non-root container. Treat this as trusted self-hosted execution, not hostile multi-tenant isolation.
 

@@ -23,6 +23,7 @@ vi.mock("../src/github", async (original) => {
           ? []
           : { default_branch: "main" },
     ),
+    commitIdentity: vi.fn(async () => ({name:"fixture",email:"123+fixture@users.noreply.github.com"})),
     checkout: vi.fn(async () => ({
       cwd: "/fake",
       archive: Buffer.from("repo"),
@@ -57,8 +58,6 @@ const cfg = (): Config => ({
   maxRuns: 2,
   runCPUs: 2,
   runMemoryMB: 2048,
-  idleMs: 60000,
-  turnMs: 60000,
 });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
@@ -123,6 +122,31 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("routes a pending question answer to the worker instead of queuing it", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const live = (runs as unknown as {live:Map<string,{busy:boolean}>}).live.get(r.id)!;
+    live.busy = true;
+    events.push({type:"question",agent_id:"main",request_id:"q1",question:"Which branch?"});
+    await vi.waitFor(() => expect(runs.get(r.id).summary.question?.request_id).toBe("q1"));
+    runs.enqueue(r.id, "u", "Use main");
+    expect(log).toContainEqual({method:"send",input:{type:"question.reply",request_id:"q1",answer:"Use main"}});
+    expect(runs.get(r.id).pending).toHaveLength(0);
+    expect(runs.get(r.id).summary.question).toBeNull();
+  });
+  it("keeps an idle workspace across elapsed time and closes only on stop", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 30 * 86400_000);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect(runs.get(r.id).status).toBe("ready");
+      expect(destroy).not.toHaveBeenCalled();
+      await runs.stop(r.id, "u");
+      expect(destroy).toHaveBeenCalledTimes(1);
+    } finally { clock.mockRestore(); }
+  });
   it("does not resume a stopped workspace when all slots are occupied", async () => {
     const first=await runs.create("u",{repo:"acme/app",model:"local:coder",prompt:"First"});
     await vi.waitFor(()=>expect(runs.get(first.id).status).toBe("ready"));

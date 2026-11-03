@@ -31,8 +31,6 @@ const cfg = (): Config => ({
   maxRuns: 2,
   runCPUs: 2,
   runMemoryMB: 2048,
-  idleMs: 10000,
-  turnMs: 10000,
 });
 const call = (
   path: string,

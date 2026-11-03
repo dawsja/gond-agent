@@ -36,8 +36,6 @@ const cfg: Config = {
   maxRuns: 2,
   runCPUs: 2,
   runMemoryMB: 2048,
-  idleMs: 10000,
-  turnMs: 10000,
 };
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gond-mcp-"));
@@ -142,6 +140,9 @@ async function call(
   return { result, body: JSON.parse(content[0].text) };
 }
 async function withWaitingReads(client: Client, sessionId: string, afterSeq: number, action: () => void | Promise<void>, count = 4) {
+  const run = runs.get(sessionId, owner);
+  run.status = "working";
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(run.status, JSON.stringify(run), sessionId);
   const waits = Array.from({ length: count }, () => call(client, "read_session_events", {
     session_id: sessionId, after_seq: afterSeq, wait_seconds: 30,
   }));
@@ -401,4 +402,48 @@ it("paginates events, reports large events and releases waiting reads on revoke"
     db.prepare("UPDATE mcp_tokens SET revoked_at=? WHERE id=?").run(Date.now(), token.id);
   });
   for (const result of waiting) expect(result.body.error).toBe("invalid_token");
+});
+
+
+it.each([
+  ["queued", "queued", false], ["working", "working", false],
+  ["ready", "done", true], ["failed", "failed", true],
+  ["stopped", "stopped", true], ["merged", "merged", true],
+])("exposes completion consistently for %s", async (status, state, done) => {
+  const r = seed();
+  r.status = status as string;
+  r.pr_url = "https://github.com/acme/app/pull/42";
+  r.error = status === "failed" ? "Model unavailable" : null;
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(status, JSON.stringify(r), r.id);
+  const client = await connect();
+  const detail = (await call(client, "get_session", {session_id:r.id})).body;
+  const listed = (await call(client, "list_sessions")).body.sessions[0];
+  const events = (await call(client, "read_session_events", {session_id:r.id, wait_seconds:done ? 30 : 0})).body;
+  for (const result of [detail, listed, events]) {
+    expect(result).toMatchObject({state, done, waiting_for_input:false, asking_question:false, question:null, pr_url:r.pr_url, last_error:r.error});
+  }
+  if (done) expect(events.return_reason).toBe("done");
+});
+
+it("wakes a waiting read on completion without a transcript event", async () => {
+  const r = seed(); r.status = "working";
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  const client = await connect();
+  const waiting = call(client, "read_session_events", {session_id:r.id, wait_seconds:30});
+  const timer = setTimeout(() => {
+    r.status = "ready";
+    db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  }, 300);
+  try { expect((await waiting).body).toMatchObject({events:[], state:"done", done:true, return_reason:"done", pr_url:null}); }
+  finally { clearTimeout(timer); }
+});
+
+it("reports a pending question without calling it done", async () => {
+  const r = seed(); r.status = "working";
+  r.summary = {...r.summary, question:{request_id:"q1",question:"Which branch?"}};
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  const client = await connect();
+  for (const name of ["get_session", "read_session_events"]) {
+    expect((await call(client, name, {session_id:r.id, ...(name === "read_session_events" ? {wait_seconds:30} : {})})).body).toMatchObject({state:"waiting_for_input", done:false, waiting_for_input:true, asking_question:true, question:"Which branch?"});
+  }
 });

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { command } from "./command";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -40,6 +41,27 @@ export async function githubStatus(env?: NodeJS.ProcessEnv) {
   } catch {
     return { configured: false, login: null };
   }
+}
+export interface CommitIdentity { name: string; email: string }
+const identities = new Map<string, Promise<CommitIdentity>>();
+export function commitIdentity(env: NodeJS.ProcessEnv = process.env): Promise<CommitIdentity> {
+  const key = createHash("sha256").update(JSON.stringify([env.GH_TOKEN ?? env.GITHUB_TOKEN, env.GH_CONFIG_DIR, env.HOME])).digest("hex");
+  let identity = identities.get(key);
+  if (!identity) {
+    identity = gh<{ login: string; id: number }>("user", "GET", undefined, env).then(user => {
+      if (!user.login || !Number.isSafeInteger(user.id) || user.id <= 0) throw new Error("Missing GitHub identity");
+      return { name: user.login, email: `${user.id}+${user.login}@users.noreply.github.com` };
+    }).catch(() => {
+      identities.delete(key);
+      throw new ApiError(409, "github_identity", "Connect a GitHub account before publishing changes.");
+    });
+    identities.set(key, identity);
+  }
+  return identity.then(value => {
+    const result = { name: env.GOND_AGENT_COMMIT_NAME || value.name, email: env.GOND_AGENT_COMMIT_EMAIL || value.email };
+    if (Object.values(result).some(v => !v.trim() || /[\r\n\0<>]/.test(v))) throw new ApiError(400, "commit_identity", "Check the configured commit name and email.");
+    return result;
+  });
 }
 const gitEnv = (env: NodeJS.ProcessEnv, cwd: string, args: string[], timeout = 120_000, onStderr?: (text: string) => void) =>
   command(
@@ -108,8 +130,9 @@ export async function checkout(
   } catch {
     throw new ApiError(502, "checkout_failed", "Couldn't download the repository. Check its GitHub access and the server's connection, then retry.");
   }
-  await git(cwd, "config", "user.name", "Gond Agent");
-  await git(cwd, "config", "user.email", "agent@localhost");
+  const identity = await commitIdentity(env);
+  await git(cwd, "config", "user.name", identity.name);
+  await git(cwd, "config", "user.email", identity.email);
   if (!resume) await git(cwd, "checkout", "-b", branch);
   progress("Packing repository for the workspace");
   let archive: Buffer;

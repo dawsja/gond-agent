@@ -10,7 +10,7 @@ pub struct Browser;
 impl Tool for Browser {
     fn name(&self) -> &'static str { "browser" }
     fn description(&self) -> &'static str {
-        "Test a web app with container Playwright/Chromium at wide and phone viewports. Supply a URL and JavaScript test body using page and expect (Playwright assertions). Runs the test independently at both sizes, returns screenshots as images plus console/network failures. Example: await page.getByRole('button', {name:'Save'}).click(); await expect(page.getByText('Saved')).toBeVisible(); Inspect screenshots before finish_review."
+        "Test a web app with container Playwright/Chromium at wide and phone viewports. Supply a URL and JavaScript test body using page and expect (Playwright assertions). Runs the test independently at both sizes, returns screenshots as images plus console/network failures. Example: await page.getByRole('button', {name:'Save'}).click(); await expect(page.getByText('Saved')).toBeVisible();"
     }
     fn schema(&self) -> Value {
         schema(json!({"url":{"type":"string"},"script":{"type":"string","description":"Async JavaScript test body with page and expect; use meaningful interactions/assertions"}}), &["url","script"])

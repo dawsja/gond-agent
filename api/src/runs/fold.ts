@@ -14,6 +14,7 @@ export interface Summary {
   /** The main agent's text in the current turn: the pull request description when the turn ends. */
   text: string;
   error: string | null;
+  question?: { request_id: string; question: string } | null;
 }
 
 export const emptySummary = (): Summary => ({
@@ -33,7 +34,6 @@ const VERB: Record<string, string> = {
   symbols: "Navigating",
   batch: "Reading",
   browser: "Testing browser",
-  finish_review: "Reviewing",
   write: "Writing",
   edit: "Editing",
   multi_edit: "Editing",
@@ -74,7 +74,11 @@ export function fold(s: Summary, ev: Ev): Summary {
   const main = ev.agent_id === "main";
   switch (ev.type) {
     case "turn.start":
-      return main ? { ...s, text: "", error: null } : s;
+      return main ? { ...s, text: "", error: null, question: null } : s;
+    case "question":
+      return main ? { ...s, question: { request_id: ev.request_id, question: ev.question } } : s;
+    case "turn.end":
+      return main ? { ...s, question: null } : s;
     case "text.delta":
       return main ? { ...s, text: s.text + ev.text } : s;
     case "tool.start":

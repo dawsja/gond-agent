@@ -32,9 +32,9 @@ services:
       GOND_AGENT_DATA_DIR: /data
       GH_CONFIG_DIR: /gh
       GOND_AGENT_WORKER_IMAGE: "${GOND_AGENT_WORKER_IMAGE:-ghcr.io/dawsja/gond-agent-worker:main}"
+      GOND_AGENT_COMMIT_NAME: "${GOND_AGENT_COMMIT_NAME:-}"
+      GOND_AGENT_COMMIT_EMAIL: "${GOND_AGENT_COMMIT_EMAIL:-}"
       MAX_ACTIVE_RUNS: "${MAX_ACTIVE_RUNS:-5}"
-      RUN_IDLE_MINUTES: "${RUN_IDLE_MINUTES:-30}"
-      RUN_TURN_MINUTES: "${RUN_TURN_MINUTES:-60}"
       RUN_CPUS: "${RUN_CPUS:-2}"
       RUN_MEMORY_MB: "${RUN_MEMORY_MB:-2048}"
       DOCKER_HOST: unix:///var/run/docker.sock

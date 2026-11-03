@@ -42,7 +42,6 @@ def main():
             [call("check", "bash", {"command": "test \"$(cat feature.txt)\" = verified"})],
             [call("ui", "browser", {"url": f"http://127.0.0.1:{app.server_port}", "script": "await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
             [call("diff", "bash", {"command": "git diff --no-ext-diff; git ls-files --others --exclude-standard; cat feature.txt"})],
-            [call("review", "finish_review", {"understanding": "Traced greet and the save flow", "design": "Keep the existing flow", "checks": ["check"], "diff_call_id": "diff", "review": "Inspected new file and both browser screenshots", "web_app": True})],
         ]
 
         class Model(http.server.BaseHTTPRequestHandler):
@@ -98,8 +97,8 @@ def main():
             for id in ["outline", "defs"]:
                 assert any(b["call_id"] == id and "greet" in json.dumps(b["content"]) for b in results), id
             assert all(t["name"] != "memory" for t in seen[0]["tools"])
-            assert "go deep first" in seen[0]["system"]
-            print("Worker smoke passed: symbols, batch, edits, checks, real browser images and completion gate")
+            assert "repository instructions" in seen[0]["system"]
+            print("Worker smoke passed: symbols, batch, edits, checks, real browser images and normal completion")
         finally:
             app.shutdown()
             model.shutdown()

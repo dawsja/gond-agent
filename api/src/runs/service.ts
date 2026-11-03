@@ -11,6 +11,7 @@ import {
   gh,
   git,
   importBundle,
+  commitIdentity,
   validRepo,
   validBranch,
 } from "../github";
@@ -80,7 +81,6 @@ interface Live {
   cursor: number;
   closed: boolean;
   busy: boolean;
-  turnAt: number;
 }
 export class Runs {
   events = new EventEmitter();
@@ -406,6 +406,15 @@ export class Runs {
         "invalid_prompt",
         "Write a message of up to 20,000 characters.",
       );
+    const question = r.summary.question;
+    const answering = this.live.get(id);
+    if (question && answering?.busy && !r.backend) {
+      r.summary.question = null;
+      this.save(r);
+      this.append(id, { type: "user", text, images: [] });
+      void answering.workspace.rpc("send", { input: { type: "question.reply", request_id: question.request_id, answer: text } }).catch(e => this.fail(id, e));
+      return;
+    }
     if (r.pending.length >= 20)
       throw new ApiError(
         429,
@@ -496,7 +505,6 @@ export class Runs {
         cursor: 0,
         closed: false,
         busy: false,
-        turnAt: 0,
       };
       this.live.set(id, live);
       r.base_sha ??= (
@@ -543,7 +551,6 @@ export class Runs {
       r.effort=validateEffort(selected,message.effort);this.save(r);
     }
     live.busy = true;
-    live.turnAt = Date.now();
     if(!r.backend){
       const selected=await resolveModel(this.db,this.cfg.secret,r.model_id);
       await live.workspace.rpc("send",{input:{type:"model",model:r.model_id,context_window:selected.context_window}});
@@ -610,12 +617,6 @@ export class Runs {
       const r = this.get(id);
       if(!live.busy && r.pending.length)await this.next(id,live);
       if (!batch.alive && live.busy) throw new Error("The workspace worker exited");
-      if (live.busy && Date.now() - live.turnAt > this.cfg.turnMs)
-        await this.stop(id, r.user_id);
-      if (!live.busy && Date.now() - r.idle_since > this.cfg.idleMs) {
-        await this.close(id);
-        return;
-      }
       await delay(batch.events.length ? 50 : 300);
     }
   }
@@ -625,7 +626,7 @@ export class Runs {
     this.status(r, "working", "Pushing changes");
     const snapshot = await live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
-      { title: r.title },
+      { title: r.title, identity: await commitIdentity(githubEnv(this.db, this.cfg.secret)) },
     );
     await importBundle(
       live.cwd,
@@ -682,9 +683,7 @@ export class Runs {
         "not_pushed",
         "Wait until the changes have been pushed.",
       );
-    const body =
-      (r.summary.text || r.prompt) +
-      `\n\nOpened by [Gond Agent](${this.cfg.origin}/agents/runs/${id}).`;
+    const body = r.summary.text || r.prompt;
     if (r.pr_number)
       await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnv(this.db, this.cfg.secret));
     else {
@@ -729,6 +728,7 @@ export class Runs {
     this.status(r, "stopped");
     const live = this.live.get(id);
     if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    await this.close(id);
   }
   async remove(id: string, user: string) {
     this.get(id, user);
@@ -741,6 +741,7 @@ export class Runs {
       force: true,
     });
   }
+  // Workspaces end only on explicit close/stop/merge/delete, failure, or shutdown/recovery.
   async close(id: string) {
     const live = this.live.get(id);
     if (live) {

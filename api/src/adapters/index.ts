@@ -13,7 +13,7 @@ export function adapterFor(model: ModelRow): Adapter {
 export async function callProvider(connection: ProviderConnection, secret: string, up: UpstreamRequest, signal: AbortSignal): Promise<Response> {
   try {
     return await fetch(providerURL(connection, up.path), {
-      method: "POST", signal: AbortSignal.any([signal, AbortSignal.timeout(10 * 60_000)]), redirect: "error",
+      method: "POST", signal, redirect: "error",
       headers: { "content-type": "application/json", ...up.headers, ...providerHeaders(connection, secret) },
       body: JSON.stringify(up.body),
     });
