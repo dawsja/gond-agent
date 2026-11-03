@@ -7,10 +7,9 @@ use futures::future::BoxFuture;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolOutput, clip, schema, str_arg};
+use super::{Tool, ToolCtx, ToolOutput, schema, str_arg};
 use crate::permissions::Access;
 
-const MAX_CHARS: usize = 60_000;
 const MAX_BYTES: usize = 5 * 1024 * 1024;
 
 /// The host a fetch of `url` really goes to, as the HTTP client parses it (lowercase, no port), for rules.
@@ -106,7 +105,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &'static str {
-        "Fetch a URL and return its content as readable text (HTML is converted; JSON and text are returned as-is). Use for documentation and pages the user links. Results are capped at 60k characters."
+        "Fetch a URL and return its content as readable text (HTML is converted; JSON and text are returned as-is). Use for documentation and pages the user links. Large text results include a saved-output path and read/grep instructions."
     }
     fn schema(&self) -> Value {
         schema(json!({"url": {"type": "string", "description": "http(s) URL"}}), &["url"])
@@ -153,6 +152,7 @@ impl Tool for WebFetch {
             let final_url = res.url().to_string();
             let ctype = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
             let mut bytes = Vec::new();
+            let mut limited = false;
             loop {
                 let chunk = tokio::select! {
                     c = res.chunk() => c,
@@ -163,6 +163,7 @@ impl Tool for WebFetch {
                         let take = c.len().min(MAX_BYTES.saturating_sub(bytes.len()));
                         bytes.extend_from_slice(&c[..take]);
                         if bytes.len() >= MAX_BYTES {
+                            limited = true;
                             break;
                         }
                     }
@@ -183,7 +184,8 @@ impl Tool for WebFetch {
             if let Some(t) = &title {
                 text.push_str(&format!("# {t}\n\n"));
             }
-            text.push_str(&clip(&body, MAX_CHARS));
+            text.push_str(&body);
+            if limited { text.push_str("\nResponse reached the 5 MiB fetch limit and may be incomplete. Fetch a narrower URL or use a ranged request through bash for more."); }
             let mut out = if status.is_success() { ToolOutput::ok(text, format!("{} · {kb} KB", status.as_u16())) } else { ToolOutput::err(format!("HTTP {status}\n{text}")) };
             out.display = title.unwrap_or_default();
             out

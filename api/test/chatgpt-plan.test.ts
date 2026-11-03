@@ -335,7 +335,7 @@ describe("ChatGPT plan models and inference", () => {
     // Structural guard: the worker gets model IDs and the loopback relay, never plan credentials.
     const workerTraffic = JSON.stringify(rpcs);
     for (const value of mock.issued) expect(workerTraffic).not.toContain(value);
-    expect(rpcs.find(r => r.method === "start")!.args).toEqual({ model, effort: "xhigh" });
+    expect(rpcs.find(r => r.method === "start")!.args).toEqual({ model, effort: "xhigh", interactive: true, question_wait_minutes: 240 });
     const relayed = await (await handler!(runnerRequest(model))).text();
     for (const value of mock.issued) expect(relayed).not.toContain(value);
     expect(relayed).toContain('"name":"read"');

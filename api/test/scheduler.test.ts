@@ -43,6 +43,7 @@ describe("scheduled runs without GitHub polling", () => {
       const scheduler = new Scheduler(db, runs);
       await scheduler.tick(); await scheduler.tick();
       expect(create).toHaveBeenCalledTimes(1);
+      expect(create).toHaveBeenCalledWith("admin", expect.objectContaining({source: "runner"}));
       expect(create.mock.calls.length).toBe(1);
       expect(gh).not.toHaveBeenCalled();
       const saved = JSON.parse((db.prepare("SELECT data FROM runners WHERE id='runner_fixture'").get() as { data: string }).data);

@@ -66,6 +66,8 @@ pub enum AgentEvent {
     AgentEnd { agent_id: String, ok: bool, summary: String },
     #[serde(rename = "permission.request")]
     PermissionRequest { request_id: String, agent_id: String, tool: String, title: String, detail: String, rule: String },
+    #[serde(rename = "question.resolved")]
+    QuestionResolved { request_id: String, agent_id: String },
     #[serde(rename = "question")]
     Question { request_id: String, agent_id: String, question: String, options: Vec<QuestionOption> },
     #[serde(rename = "usage")]

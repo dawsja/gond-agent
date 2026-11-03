@@ -1,4 +1,5 @@
 import { unseal } from "./auth";
+import { publicSearchSettings, saveSearchSettings, executeSearch } from "./search";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { randomBytes } from "node:crypto";
@@ -340,6 +341,18 @@ export function createApp(
       throw new ApiError(400, "invalid_oidc", (e as Error).message);
     }
     return c.json({ ok: true });
+  });
+  app.get("/api/v1/settings/web-search", (c) => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage web search.");
+    return c.json(publicSearchSettings(db));
+  });
+  app.put("/api/v1/settings/web-search", async (c) => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage web search.");
+    return c.json(saveSearchSettings(db, cfg.secret, await c.req.json()));
+  });
+  app.post("/api/v1/settings/web-search/test", async (c) => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can test web search.");
+    return c.json(await executeSearch(db, cfg.secret, { query: "Brave Search API", count: 1 }, c.req.raw.signal));
   });
   app.get("/api/v1/settings/providers", (c) => {
     if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage model providers.");

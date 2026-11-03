@@ -4,12 +4,16 @@
 pub mod bash;
 pub mod batch;
 pub mod browser;
+pub mod checks;
 pub mod fs;
+pub mod git;
+pub mod output;
 pub mod patch;
 pub(crate) mod process;
 pub mod search;
 pub mod symbols;
 pub mod web;
+pub mod web_search;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,24 +115,36 @@ pub trait Tool: Send + Sync {
     }
 }
 
+struct Bounded(Arc<dyn Tool>);
+impl Tool for Bounded {
+    fn name(&self) -> &'static str { self.0.name() }
+    fn description(&self) -> &'static str { self.0.description() }
+    fn schema(&self) -> Value { self.0.schema() }
+    fn access(&self) -> Access { self.0.access() }
+    fn title(&self, input: &Value) -> String { self.0.title(input) }
+    fn target(&self, input: &Value) -> String { self.0.target(input) }
+    fn paths(&self, input: &Value) -> Vec<String> { self.0.paths(input) }
+    fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
+            let out = self.0.run(ctx, input).await;
+            output::bound(ctx, out)
+        })
+    }
+}
+
+pub fn bounded(tool: Arc<dyn Tool>) -> Arc<dyn Tool> { Arc::new(Bounded(tool)) }
+
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
-    vec![
-        Arc::new(fs::Read),
-        Arc::new(fs::Write),
-        Arc::new(fs::Edit),
-        Arc::new(fs::MultiEdit),
-        Arc::new(patch::ApplyPatch),
-        Arc::new(search::ListDir),
-        Arc::new(search::Glob),
-        Arc::new(search::Grep),
-        Arc::new(symbols::Symbols),
-        Arc::new(batch::Batch),
-        Arc::new(browser::Browser),
-        Arc::new(bash::Bash),
-        Arc::new(bash::BashOutput),
-        Arc::new(bash::KillShell),
-        Arc::new(web::WebFetch),
-    ]
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(fs::Read), Arc::new(git::Git), Arc::new(checks::RunChecks),
+        Arc::new(fs::Write), Arc::new(fs::Edit), Arc::new(fs::MultiEdit),
+        Arc::new(patch::ApplyPatch), Arc::new(search::ListDir), Arc::new(search::Glob),
+        Arc::new(search::Grep), Arc::new(symbols::Symbols), Arc::new(batch::Batch),
+        Arc::new(browser::Browser), Arc::new(bash::Bash), Arc::new(bash::BashOutput),
+        Arc::new(bash::BashList), Arc::new(bash::KillShell), Arc::new(web::WebFetch),
+    ];
+    tools.into_iter().map(bounded).collect()
 }
 
 /// `p` as the file system sees it: each existing part resolved in order (links, including ones whose
@@ -374,6 +390,32 @@ pub mod testutil {
         }
     }
 
+
+    #[tokio::test]
+    async fn every_builtin_uses_the_shared_output_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = ctx(dir.path());
+        for tool in builtin() {
+            ctx.cancel.cancel();
+            let out = tool.run(&ctx, json!({})).await;
+            assert_eq!(text(&out), "interrupted", "{} bypassed the shared boundary", tool.name());
+        }
+        struct Large;
+        impl Tool for Large {
+            fn name(&self) -> &'static str { "large" }
+            fn description(&self) -> &'static str { "large" }
+            fn schema(&self) -> Value { json!({}) }
+            fn access(&self) -> Access { Access::Read }
+            fn title(&self, _: &Value) -> String { "large".into() }
+            fn run<'a>(&'a self, _: &'a ToolCtx, _: Value) -> BoxFuture<'a, ToolOutput> {
+                Box::pin(async { ToolOutput::ok("x".repeat(40_000), "large") })
+            }
+        }
+        let (ctx, _rx) = self::ctx(dir.path());
+        let out = bounded(Arc::new(Large)).run(&ctx, json!({})).await;
+        assert!(text(&out).contains("Full output:"));
+        assert!(text(&out).len() < 32_000);
+    }
 
     #[test]
     fn outside_follows_dotdot_and_absolute_paths() {

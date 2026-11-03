@@ -28,8 +28,30 @@ export function planSetting(name: "GOND_AGENT_PLAN_REMINDER_EVERY" | "GOND_AGENT
   }
   return name === "GOND_AGENT_PLAN_NUDGE_LIMIT" ? Math.min(value, 2) : value;
 }
+export function webSearchLimit(): number {
+  const raw = process.env.GOND_AGENT_WEB_SEARCH_LIMIT;
+  if (raw === undefined) return 30;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(value) || value > 0xffff_ffff) {
+    console.warn("Invalid GOND_AGENT_WEB_SEARCH_LIMIT; using default 30.");
+    return 30;
+  }
+  return value;
+}
+export function questionWaitMinutes(): number {
+  const raw = process.env.GOND_AGENT_QUESTION_WAIT_MINUTES;
+  if (raw === undefined) return 240;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(value) || value > 0xffff_ffff) {
+    console.warn("Invalid GOND_AGENT_QUESTION_WAIT_MINUTES; using default 240.");
+    return 240;
+  }
+  return value;
+}
 export function configFromEnv(): Config {
   modelStallMs();
+  webSearchLimit();
+  questionWaitMinutes();
   planSetting("GOND_AGENT_PLAN_REMINDER_EVERY");
   planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT");
   const secret = process.env.BETTER_AUTH_SECRET ?? "";

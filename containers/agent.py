@@ -7,6 +7,9 @@ import json
 import os
 import pathlib
 import queue
+import select
+import socket
+import time
 import signal
 import subprocess
 import sys
@@ -54,6 +57,8 @@ def drain(stream, source=None):
 def worker_env(req):
     """The built-in runner reaches models only through the loopback relay; no model credentials exist here."""
     return {**os.environ, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
+            "GOND_AGENT_QUESTION_WAIT_MINUTES": str(req.get("question_wait_minutes", 240)),
+            "GOND_AGENT_INTERACTIVE": "true" if req.get("interactive") is True else "false",
             "GOND_AGENT_PLAN_REMINDER_EVERY": str(req.get("plan_reminder_every", 6)), "GOND_AGENT_PLAN_NUDGE_LIMIT": str(req.get("plan_nudge_limit", 2))}
 
 
@@ -127,7 +132,7 @@ def handle(req):
 
 class ModelProxy(http.server.BaseHTTPRequestHandler):
     def relay(self):
-        if (self.command, self.path) not in [("GET", "/v1/models"), ("POST", "/v1/responses")]:
+        if (self.command, self.path) not in [("GET", "/v1/models"), ("POST", "/v1/responses"), ("POST", "/v1/search")]:
             self.send_error(403)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -145,8 +150,18 @@ class ModelProxy(http.server.BaseHTTPRequestHandler):
         try:
             body = self.rfile.read(length)
             emit({"model": {"id": key, "method": self.command, "path": self.path, "body": base64.b64encode(body).decode()}})
+            deadline = time.monotonic() + 600
             while True:
-                frame = replies.get(timeout=600)
+                try:
+                    frame = replies.get(timeout=0.2)
+                except queue.Empty:
+                    if time.monotonic() >= deadline:
+                        break
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                        break
+                    continue
+                deadline = time.monotonic() + 600
                 if "status" in frame and not started:
                     self.send_response(frame["status"])
                     self.send_header("Content-Type", frame.get("headers", {}).get("content-type", "application/json"))

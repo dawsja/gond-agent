@@ -10,7 +10,6 @@ use crate::api::wire::ResultPart;
 use crate::permissions::Access;
 
 const MAX_LINES: usize = 2000;
-const MAX_LINE_LEN: usize = 2000;
 
 fn mtime(p: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
@@ -58,6 +57,29 @@ pub(crate) fn remember(ctx: &ToolCtx, path: &Path) {
     ctx.reads.lock().unwrap().insert(path.to_path_buf(), mtime(path));
 }
 
+const MAX_IMAGE_INPUT: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_OUTPUT: usize = 3 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 2048;
+
+fn resize_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_| "Cannot identify image")?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|_| "Cannot decode image within memory and dimension limits")?;
+    let mut resized = decoded.thumbnail(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION);
+    loop {
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85).encode_image(&resized.to_rgb8()).map_err(|_| "Cannot encode image")?;
+        if encoded.len() <= MAX_IMAGE_OUTPUT { return Ok(encoded); }
+        let dimension = resized.width().max(resized.height()) / 2;
+        if dimension == 0 { return Err("Image cannot fit the output limit".into()); }
+        resized = resized.thumbnail(dimension, dimension);
+    }
+}
+
 pub struct Read;
 
 impl Tool for Read {
@@ -87,14 +109,23 @@ impl Tool for Read {
         Box::pin(async move {
             let Some(p) = str_arg(&input, "path") else { return ToolOutput::err("path is required") };
             let path = ctx.resolve(p);
-            if let Some(mt) = image_type(&path) {
+            if image_type(&path).is_some() {
+                if tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() > MAX_IMAGE_INPUT) {
+                    return ToolOutput::err("Image exceeds the 20 MiB input limit; resize it before reading");
+                }
                 return match tokio::fs::read(&path).await {
                     Ok(bytes) => {
+                        let bytes = match tokio::task::spawn_blocking(move || resize_image(&bytes)).await {
+                            Ok(Ok(b)) => b,
+                            Ok(Err(e)) => return ToolOutput::err(e),
+                            Err(_) => return ToolOutput::err("Image processing failed"),
+                        };
+                        if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
                         remember(ctx, &path);
                         let kb = bytes.len() / 1024;
                         ToolOutput {
                             ok: true,
-                            content: vec![ResultPart::Image { media_type: mt.into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) }],
+                            content: vec![ResultPart::Image { media_type: "image/jpeg".into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) }],
                             summary: format!("image · {kb} KB"),
                             display: String::new(),
                             diff: None,
@@ -104,7 +135,10 @@ impl Tool for Read {
                 };
             }
             let text = match tokio::fs::read(&path).await {
-                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Ok(b) => match String::from_utf8(b) {
+                    Ok(t) if !t.contains('\0') => t,
+                    _ => return ToolOutput::err(format!("{p} is a binary file; read supports UTF-8 text and image files")),
+                },
                 Err(e) => return ToolOutput::err(format!("cannot read {p}: {e}")),
             };
             remember(ctx, &path);
@@ -113,14 +147,13 @@ impl Tool for Read {
             let limit = input.get("limit").and_then(Value::as_u64).map(|l| l as usize).unwrap_or(MAX_LINES).min(MAX_LINES);
             let mut out = String::new();
             for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
-                let line = if line.len() > MAX_LINE_LEN { &line[..super::floor_char(line, MAX_LINE_LEN)] } else { line };
                 out.push_str(&format!("{:>6}\t{line}\n", i + 1));
             }
             let shown_end = (offset - 1 + limit).min(total);
             if total == 0 {
                 out = "(empty file)".into();
             } else if shown_end < total || offset > 1 {
-                out.push_str(&format!("… showing lines {offset}-{shown_end} of {total}\n"));
+                out.push_str(&format!("… showing lines {offset}-{shown_end} of {total}; use read offset={} and limit={limit} for more\n", shown_end + 1));
             }
             let summary = format!("{total} lines");
             ToolOutput { ok: true, display: String::new(), content: vec![ResultPart::Text { text: out }], summary, diff: None }
@@ -244,7 +277,15 @@ pub fn replace_once(text: &str, old_s: &str, new_s: &str, all: bool) -> Result<(
     }
     let count = text.matches(old_s).count();
     if count == 0 {
-        return Err("old_string not found; read the file again and copy the text exactly".into());
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let needle = normalize(&old_s.chars().take(1000).collect::<String>());
+        let mut candidates: Vec<_> = text.lines().enumerate().map(|(i, line)| {
+            let normalized = normalize(&line.chars().take(1000).collect::<String>());
+            (similar::TextDiff::from_chars(&needle, &normalized).ratio(), i + 1, line)
+        }).collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let hint = candidates.iter().take(3).map(|(_, n, line)| format!("{n}: {}", line.chars().take(300).collect::<String>())).collect::<Vec<_>>().join("\n");
+        return Err(format!("old_string not found; closest candidate lines (whitespace-normalized comparison):\n{hint}\nRead surrounding lines with read offset/limit and copy the text exactly"));
     }
     if count > 1 && !all {
         return Err(format!("old_string appears {count} times; add surrounding context to make it unique, or set replace_all"));
@@ -329,6 +370,41 @@ impl Tool for MultiEdit {
 mod tests {
     use super::*;
     use crate::tools::testutil::{ctx, text};
+
+    #[test]
+    fn images_are_resized_and_below_service_payload_limit() {
+        let image = image::DynamicImage::new_rgb8(3000, 2200);
+        let mut input = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut input, image::ImageFormat::Png).unwrap();
+        let output = resize_image(input.get_ref()).unwrap();
+        let resized = image::load_from_memory(&output).unwrap();
+        assert!(resized.width() <= MAX_IMAGE_DIMENSION && resized.height() <= MAX_IMAGE_DIMENSION);
+        assert!(output.len() <= MAX_IMAGE_OUTPUT);
+        assert!(base64::engine::general_purpose::STANDARD.encode(output).len() < 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn edits_preserve_crlf_and_final_newline_and_offer_candidates() {
+        for ending in ["", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a"), format!("one\r\n  two{ending}")).unwrap();
+            let (c, _rx) = ctx(dir.path());
+            Read.run(&c, json!({"path":"a"})).await;
+            let bad = Edit.run(&c, json!({"path":"a","old_string":" two ","new_string":"x"})).await;
+            assert!(text(&bad).contains("2:   two"));
+            assert!(Edit.run(&c, json!({"path":"a","old_string":"one","new_string":"ONE"})).await.ok);
+            assert!(MultiEdit.run(&c, json!({"path":"a","edits":[{"old_string":"two","new_string":"TWO"}]})).await.ok);
+            assert_eq!(std::fs::read_to_string(dir.path().join("a")).unwrap(), format!("ONE\r\n  TWO{ending}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_binary_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"a\0b").unwrap();
+        let (c, _rx) = ctx(dir.path());
+        assert!(text(&Read.run(&c, json!({"path":"a"})).await).contains("binary file"));
+    }
 
     #[tokio::test]
     async fn read_then_edit() {
