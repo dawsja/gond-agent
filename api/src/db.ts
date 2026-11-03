@@ -1,3 +1,4 @@
+import { hasServiceGithubCredentials } from "./github-credentials";
 import { isLocalProfilePhoto } from "../../shared/profile-photo";
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
@@ -28,6 +29,10 @@ export function openStore(data: string) {
     CREATE INDEX IF NOT EXISTS subscription_accounts_owner ON subscription_accounts(user_id,provider);
     CREATE TABLE IF NOT EXISTS subscription_notices (user_id TEXT PRIMARY KEY, welcomed_at INTEGER NOT NULL);
   `);
+  db.transaction(() => {
+    db.exec(`CREATE TABLE IF NOT EXISTS github_connections (user_id TEXT PRIMARY KEY REFERENCES "user"(id) ON DELETE CASCADE, token TEXT NOT NULL, login TEXT, connected_at INTEGER NOT NULL)`);
+    db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('github-shared-fallback',?)").run(JSON.stringify(!!(getSetting(db, "github") || hasServiceGithubCredentials(process.env))));
+  })();
   clearExternalProfileImages(db);
   retireCodingAgents(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
@@ -112,9 +117,10 @@ export function installAccountCleanup(db: Store) {
     DELETE FROM usage WHERE user_id=OLD.id;
     DELETE FROM images WHERE user_id=OLD.id;
     DELETE FROM runs WHERE user_id=OLD.id;
+    DELETE FROM github_connections WHERE user_id=OLD.id;
     DELETE FROM profiles WHERE user_id=OLD.id;
     DELETE FROM administrators WHERE user_id=OLD.id;
-    DELETE FROM settings WHERE key IN ('providers','oidc','github','web-search') AND NOT EXISTS (SELECT 1 FROM "user");
+    DELETE FROM settings WHERE key IN ('providers','oidc','github','github-shared-fallback','web-search') AND NOT EXISTS (SELECT 1 FROM "user");
     DELETE FROM occurrences WHERE NOT EXISTS (SELECT 1 FROM "user");
   END`);
 }

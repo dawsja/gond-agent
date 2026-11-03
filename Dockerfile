@@ -75,7 +75,7 @@ COPY api/src/ ./src/
 COPY shared/model-names.ts shared/profile-photo.ts /app/shared/
 COPY api/package.json ./
 COPY --from=frontend /src/web/dist/ /app/web/dist/
-ENV NODE_ENV=production GOND_AGENT_DATA_DIR=/data GH_CONFIG_DIR=/gh PORT=8787
+ENV NODE_ENV=production GOND_AGENT_DATA_DIR=/data PORT=8787
 VOLUME ["/data"]
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||'8787')+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"

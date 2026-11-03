@@ -1,3 +1,5 @@
+import { GithubConnection } from "../plugins/plugins-screen"
+import { People, SignInMethods } from "./accounts"
 import { WebSearchSettings } from "./web-search"
 import { ChatGPTPlanSettings } from "./chatgpt-plan"
 import { MCPAccess } from "./mcp-access"
@@ -32,9 +34,12 @@ export function SettingsScreen() {
       {me?.admin && <div id="providers"><ProviderSettings /></div>}
     </SettingsCategory>
     <SettingsCategory id="security-settings" title="Security">
+      <div id="sign-in-methods"><SignInMethods /></div>
       {me?.admin && <div id="oidc"><OIDCSettings /></div>}
       <div id="sessions"><SessionsSection /></div>
     </SettingsCategory>
+    <SettingsCategory id="connections-settings" title="Connections"><div id="connections"><GithubConnection /></div>{me?.admin && <GithubConnection shared />}</SettingsCategory>
+    {me?.admin && <SettingsCategory id="people-settings" title="People"><People /></SettingsCategory>}
     <SettingsCategory id="agent-access-settings" title="Agent access">
       {me?.admin && <div id="web-search"><WebSearchSettings /></div>}
       <div id="mcp"><MCPAccess /></div>

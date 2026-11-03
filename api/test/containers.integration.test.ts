@@ -154,6 +154,14 @@ describe.skipIf(!image)("real container workspaces", () => {
       await compose("up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60");
       await compose("exec", "-T", "gond-agent", "node", "-e", "if(require('node:fs').existsSync('/app/site'))process.exit(1)");
       await browser("bootstrap");
+      await compose("exec", "-T", "gond-agent", "node", "--input-type=module", "-e", `
+        import Database from 'better-sqlite3';
+        const db = new Database('/data/gond-agent.sqlite'), now=Date.now();
+        db.transaction(() => {
+          db.prepare('INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run('browser-member','Team member','member@example.test',0,now,now);
+          db.prepare("INSERT INTO account(id,accountId,providerId,userId,password,createdAt,updatedAt) SELECT 'browser-member-password','browser-member','credential','browser-member',password,?,? FROM account WHERE providerId='credential' LIMIT 1").run(now,now);
+          db.prepare("INSERT INTO profiles(user_id) VALUES('browser-member')").run();
+        })(); db.close();`);
       await compose("up", "-d", "--no-build", "--pull", "never", "--force-recreate", "--wait", "--wait-timeout", "60");
       await browser("returning");
     } finally {

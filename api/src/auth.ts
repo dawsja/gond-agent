@@ -45,6 +45,13 @@ export function unseal(secret: string, value: string): string {
     decipher.final(),
   ]).toString();
 }
+export function oidcSubject(idToken?: string): string {
+  // genericOAuth verifies the ID token first when requireIdTokenVerification is on.
+  if (!idToken) throw new Error("A verified ID token is required.");
+  const { sub } = JSON.parse(Buffer.from(idToken.split(".")[1], "base64url").toString()) as { sub?: unknown };
+  if (typeof sub !== "string" || !sub) throw new Error("The ID token has no subject.");
+  return sub;
+}
 // Better Auth 1.7 accepts undefined, not null, to override the provider image.
 export function oidcProfileToUser(profile: { name?: string | null; email?: string | null }) {
   return { name: profile.name ?? undefined, email: profile.email ?? undefined, image: undefined };
@@ -66,7 +73,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
         maxPasswordLength: 128,
       },
       session: { expiresIn: 60 * 60 * 24 * 7, updateAge: 60 * 60 * 24 },
-      account: { accountLinking: { enabled: false } },
+      account: { accountLinking: { enabled: true, disableImplicitLinking: true, allowDifferentEmails: true, allowUnlinkingAll: false } },
       // HTTP deletion stays disabled. Only the confirmed workspace action enables it.
       user: { deleteUser: { enabled: !!beforeDelete, beforeDelete } },
       rateLimit: { enabled: true, storage: "database", window: 60, max: 60 },
@@ -119,6 +126,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
                   mapProfileToUser: oidcProfileToUser,
                   pkce: true,
                   requireIdTokenVerification: true,
+                  accountSubject: ({ tokens }) => oidcSubject(tokens.idToken),
                 },
               ]
             : [],

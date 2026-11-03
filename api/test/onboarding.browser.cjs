@@ -36,7 +36,7 @@ const key = 'fixture-only-provider-key';
     await expect(locator).toHaveText('');
   };
   page.on('pageerror', error => errors.push(error.message));
-  const capture = async name => screenshots.push({ name: `${name}-${width}.png`, data: (await page.screenshot({ fullPage: true, mask: [page.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
+  const capture = async (name, target = page) => screenshots.push({ name: `${name}-${width}.png`, data: (await target.screenshot({ fullPage: true, mask: [target.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
   const settingsURL = origin + '/api/v1/settings/providers';
   const save = async button => {
     const response = page.waitForResponse(r => r.url() === settingsURL && r.request().method() === 'PUT');
@@ -473,7 +473,7 @@ const key = 'fixture-only-provider-key';
     await expect(page).toHaveURL(origin + '/agents/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     if (!returning) {
-      const categoryNames = ['Personal settings', 'Models', 'Security', 'Agent access', 'Account management'];
+      const categoryNames = ['Personal settings', 'Models', 'Security', 'Connections', 'People', 'Agent access', 'Account management'];
       await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
       for (const name of categoryNames) {
         const heading = page.getByRole('heading', { name, exact: true, level: 2 });
@@ -655,7 +655,7 @@ const key = 'fixture-only-provider-key';
     await page.goto(origin + '/agents/plugins');
     await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
     if (!returning) {
-      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
       await expect(page.getByRole('link', { name: 'Continue on GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
       await capture('github-device-login');
@@ -663,11 +663,11 @@ const key = 'fixture-only-provider-key';
       await expect(page.getByText('GitHub sign-in cancelled.', { exact: true })).toBeVisible();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveCount(0);
       writeFileSync(join(fixtureDir, 'fail'), 'yes');
-      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByText(/GitHub sign-in didn't finish/)).toBeVisible();
       await capture('github-login-error');
       unlinkSync(join(fixtureDir, 'fail'));
-      await page.getByRole('button', { name: 'Sign in to GitHub', exact: true }).click();
+      await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
       writeFileSync(join(fixtureDir, 'approve'), 'yes');
     }
@@ -678,6 +678,38 @@ const key = 'fixture-only-provider-key';
     expect(repos.repos[0].full_name).toBe('acme/app');
     expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
     await capture(returning ? 'github-after-restart' : 'github-connected');
+    await page.goto(origin + '/agents/settings#connections');
+    await expect(page.getByLabel('Use the shared GitHub connection for accounts without their own', { exact: true })).not.toBeChecked();
+    await expect(page.getByText('Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on.', { exact: true })).toBeVisible();
+    await page.getByRole('heading', { name: 'Shared connection', exact: true }).scrollIntoViewIfNeeded();
+    await capture('github-admin-shared');
+    await page.goto(origin + '/agents/settings#people-settings');
+    await page.getByRole('heading', { name: 'People', level: 3, exact: true }).scrollIntoViewIfNeeded();
+    await capture('people-role-actions');
+    if (returning) {
+      const memberContext = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
+      const member = await memberContext.newPage();
+      try {
+        const signed = await member.request.post(origin + '/api/auth/sign-in/email', { headers: { Origin: origin }, data: { email: 'member@example.test', password: 'test-password-only-123456' } });
+        expect(signed.status()).toBe(200);
+        await member.goto(origin + '/agents/settings#connections');
+        await expect(member.getByText('Connect your own GitHub account here. Your runs and pull requests use it.', { exact: true })).toBeVisible();
+        await expect(member.getByRole('button', { name: 'Connect GitHub', exact: true })).toBeVisible();
+        await expect(member.getByRole('heading', { name: 'Shared connection', exact: true })).toHaveCount(0);
+        await capture('github-non-admin-disconnected', member);
+        await member.getByRole('button', { name: 'Connect GitHub', exact: true }).click();
+        await expect(member.getByText('Signed in as fixture-operator', { exact: true })).toBeVisible();
+        await expect(member.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
+        await expect(member.getByText('This removes the saved connection from this server. To revoke access completely, remove the app in your GitHub settings.', { exact: true })).toBeVisible();
+        await capture('github-non-admin-connected', member);
+        await member.getByRole('button', { name: 'Disconnect', exact: true }).click();
+        await expect(member.getByText('Not connected', { exact: true })).toBeVisible();
+        expect((await member.request.get(origin + '/api/v1/github/repos')).status()).toBe(409);
+        const removed = await member.request.delete(origin + '/api/v1/me', { headers: { Origin: origin }, data: { confirmation: 'member@example.test', password: 'test-password-only-123456' } });
+        expect(removed.status()).toBe(200);
+      } finally { await memberContext.close(); }
+    }
+    await page.goto(origin + '/agents/plugins');
     if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
     await page.getByRole('button', { name: 'Account menu', exact: true }).filter({ visible: true }).click();
     await page.getByRole('menuitem', { name: 'Sign out', exact: true }).click();

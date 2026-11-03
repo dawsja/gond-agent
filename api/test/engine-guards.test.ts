@@ -20,7 +20,7 @@ it("keeps publication identity centralized and free of fixed product authors", (
     }
   }
   expect(read("api/src/github.ts")).toContain("const identity = await commitIdentity(env)");
-  expect(read("api/src/runs/service.ts")).toContain("identity: await commitIdentity(githubEnv(this.db, this.cfg.secret))");
+  expect(read("api/src/runs/service.ts")).toContain("identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id))");
 });
 it("keeps elapsed-time teardown out of the run pump and removes the completion gate", () => {
   const service = read("api/src/runs/service.ts");

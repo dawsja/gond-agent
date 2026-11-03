@@ -93,10 +93,14 @@ describe("confirmed account deletion", () => {
     const user = await signup("only@example.test"); history(user, "c");
     setSetting(db, "providers", { connections: [{ id: "old" }] });
     setSetting(db, "github", { token: seal(cfg.secret, "old-github-secret") });
+    setSetting(db, "github-shared-fallback", true);
+    setSetting(db, "web-search", { provider: "brave", secret: seal(cfg.secret, "old-search-secret") });
+    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run(user.id, seal(cfg.secret, "personal-github-secret"), Date.now());
     setSetting(db, "oidc", { enabled: true, name: "Old SSO", issuer: "https://issuer.example.test", clientId: "old", secret: seal(cfg.secret, "old-oidc-secret") });
     const result = await remove(user);
     expect(result.status).toBe(200); expect(await result.json()).toEqual({ ok: true, setup_reset: true });
-    for (const key of ["providers", "github", "oidc"]) expect(getSetting(db, key)).toBeNull();
+    for (const key of ["providers", "github", "github-shared-fallback", "oidc", "web-search"]) expect(getSetting(db, key)).toBeNull();
+    expect(db.prepare("SELECT 1 FROM github_connections WHERE user_id=?").get(user.id)).toBeUndefined();
     expect(auth.providers()).toEqual([]);
     expect(await (await request("/api/auth/bootstrap")).json()).toEqual({ firstAccount: true, signupAllowed: true, providers: [] });
     const next = await signup("new-owner@example.test"), me = await (await request("/api/v1/me", next.cookie)).json();

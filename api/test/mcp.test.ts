@@ -8,7 +8,7 @@ import {
   StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { openStore } from "../src/db";
-import { createAuthentication } from "../src/auth";
+import { createAuthentication, seal } from "../src/auth";
 import { createApp } from "../src/app";
 import { Runs, type Run } from "../src/runs/service";
 import { emptySummary, fold, planState } from "../src/runs/fold";
@@ -497,4 +497,16 @@ it("persists an empty legacy plan marker instead of querying events on every rea
   expect(prepare.mock.calls.filter(([sql]) => sql.includes("json_extract(data,'$.type')='todos'"))).toHaveLength(1);
   const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
   expect(JSON.parse(stored.data).summary.plan_steps).toEqual([]);
+});
+
+it("uses only the MCP token owner's GitHub connection, never another account's", async () => {
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"]) vi.stubEnv(key, "");
+  try {
+    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run(other, seal(cfg.secret, "other-users-token"), Date.now());
+    const client = await connect();
+    const denied = await call(client, "list_repositories");
+    expect(denied.result.isError).toBe(true);
+    expect(JSON.stringify(denied.body)).toContain("Connect your GitHub account in Settings > Connections");
+    expect(JSON.stringify(denied.body)).not.toContain("other-users-token");
+  } finally { vi.unstubAllEnvs(); }
 });

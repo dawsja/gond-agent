@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../src/db";
-import { createAuthentication } from "../src/auth";
+import { createAuthentication, seal } from "../src/auth";
 import { saveProviderSettings } from "../src/providers";
 import { BACKEND, assertBackend, type Backend } from "../src/backend";
 import { Runs, parseRun, type Run } from "../src/runs/service";
@@ -24,6 +24,7 @@ beforeEach(async () => {
   db = openStore(dir);
   await createAuthentication(db, cfg());
   db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("u", "User", "user@example.test", 0, Date.now(), Date.now());
+  db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run("u", seal(cfg().secret, "fixture-backend-github-token"), Date.now());
   saveProviderSettings(db, cfg().secret, { connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:9/v1", discover: false, models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: false }] }], defaultModel: "local:coder" });
   started.length = 0;
   runs = new Runs(db, cfg(), async () => ({ destroy: async () => {}, rpc: async (method: string, args?: unknown) => { started.push({ method, args }); return (method === "events" ? { events: [], alive: true } : true) as never; } }));

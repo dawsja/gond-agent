@@ -16,7 +16,7 @@ import {
   validRepo,
   validBranch,
 } from "../github";
-import { githubEnv } from "../github-login";
+import { githubEnvFor } from "../github-login";
 import { modelResponse } from "../responses";
 import {
   emptySummary,
@@ -103,7 +103,7 @@ export class Runs {
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
     subscriptions = new SubscriptionAccounts(db, cfg.secret, [new ChatGPTProvider()]),
-  ) { this.access = new ModelAccess(db, cfg.secret, subscriptions); this.pullRequests = new PullRequests(() => githubEnv(db, cfg.secret)); }
+  ) { this.access = new ModelAccess(db, cfg.secret, subscriptions); this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user)); }
   get subscriptions() { return this.access.subscriptions; }
   catalog(user: string, refresh = false) { return this.access.catalog(user, refresh); }
   resolveSelection(user: string, id: string) { return this.access.resolve(user, id); }
@@ -173,7 +173,7 @@ export class Runs {
   async refreshPulls(user: string, id?: string) {
     this.assertAccount(user);
     const rows = id ? [this.get(id, user)] : this.list(user);
-    const states = await this.pullRequests.states(rows);
+    const states = await this.pullRequests.states(rows, user);
     this.assertAccount(user);
     for (const original of rows) {
       let run: Run;
@@ -284,9 +284,10 @@ export class Runs {
         "invalid_request",
         "Choose a repository and describe the task.",
       );
+    githubEnvFor(this.db, this.cfg.secret, user);
     const selectedModel = await this.resolveSelection(user,input.model);
     this.checkCapacity();
-    const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnv(this.db, this.cfg.secret)),
+    const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, user)),
       base = input.base_branch || info.default_branch;
     if (!validBranch(base))
       throw new ApiError(
@@ -471,7 +472,7 @@ export class Runs {
         r.base_branch,
         r.branch,
         r.pushed,
-        githubEnv(this.db, this.cfg.secret),
+        githubEnvFor(this.db, this.cfg.secret, r.user_id),
         step => {
           const current = this.get(id);
           if (!this.shuttingDown && current.status !== "stopped" && current.step !== step) this.status(current, "working", step);
@@ -636,13 +637,13 @@ export class Runs {
     let r = this.get(id);
     const snapshot = await live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
-      { title: r.title, identity: await commitIdentity(githubEnv(this.db, this.cfg.secret)) },
+      { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     );
     await importBundle(
       live.cwd,
       Buffer.from(snapshot.bundle, "base64"),
       r.branch,
-      githubEnv(this.db, this.cfg.secret),
+      githubEnvFor(this.db, this.cfg.secret, r.user_id),
     );
     r = this.get(id);
     r.pushed = true;
@@ -686,11 +687,11 @@ export class Runs {
       );
     const body = r.summary.text || r.prompt;
     if (r.pr_number)
-      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnv(this.db, this.cfg.secret));
+      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     else {
       const existing = await gh<{ number: number; html_url: string }[]>(
         `repos/${r.repo}/pulls?head=${encodeURIComponent(r.repo.split("/")[0] + ":" + r.branch)}&state=open`,
-        "GET", undefined, githubEnv(this.db, this.cfg.secret),
+        "GET", undefined, githubEnvFor(this.db, this.cfg.secret, r.user_id),
       );
       const pr =
         existing[0] ??
@@ -698,7 +699,7 @@ export class Runs {
           `repos/${r.repo}/pulls`,
           "POST",
           { head: r.branch, base: r.base_branch, title: r.title, body },
-          githubEnv(this.db, this.cfg.secret),
+          githubEnvFor(this.db, this.cfg.secret, r.user_id),
         ));
       r.pr_number = pr.number;
       r.pr_url = pr.html_url;
@@ -715,7 +716,7 @@ export class Runs {
     await gh(`repos/${r.repo}/pulls/${r.pr_number}/merge`, "PUT", {
       merge_method: "squash",
       sha: r.head_sha,
-    }, githubEnv(this.db, this.cfg.secret));
+    }, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     r.pr_state = "merged";
     r.phase = "idle";
     this.append(id, { type: "run.pr", number: r.pr_number, url: r.pr_url, state: "merged" });

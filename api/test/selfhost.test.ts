@@ -139,7 +139,7 @@ describe("local authentication and persistence", () => {
     expect(await saved.json()).toEqual({ automations: { auto_pr: false } });
     expect((await (await call("/api/v1/me", undefined, owner)).json()).automations.auto_pr).toBe(true);
   });
-  it("protects GitHub device sign-in by administrator, origin and session without exposing credentials", async () => {
+  it("protects personal and shared GitHub device sign-in by ownership, origin and session without exposing credentials", async () => {
     let code!: (code: string) => void, approve!: (token: string) => void;
     const login = new GithubLogin(db, secret, dir, (_root, callback) => {
       code = callback;
@@ -148,7 +148,7 @@ describe("local authentication and persistence", () => {
     app = createApp(db, cfg(), auth, runs, login).app;
     const admin = await signup(), other = await signup("other@example.test");
     expect((await call("/api/v1/github/login")).status).toBe(401);
-    for (const method of ["GET", "POST", "DELETE"]) expect((await call("/api/v1/github/login", method === "GET" ? undefined : {}, other, method)).status).toBe(403);
+    for (const method of ["GET", "POST", "DELETE"]) expect((await call("/api/v1/settings/github/login", method === "GET" ? undefined : {}, other, method)).status).toBe(403);
     expect((await call("/api/v1/github/login", {}, admin, "POST", "https://elsewhere.test")).status).toBe(403);
     const begun = await call("/api/v1/github/login", {}, admin);
     expect(begun.headers.get("cache-control")).toBe("no-store");
@@ -159,7 +159,7 @@ describe("local authentication and persistence", () => {
     const session = await auth.current.api.getSession({ headers: new Headers({ cookie: admin }) });
     await call("/api/auth/sign-out", {}, admin);
     approve("credential-after-signout");
-    await vi.waitFor(() => expect(login.state(session!.session.token).status).toBe("cancelled"));
+    await vi.waitFor(() => expect(login.state(session!.session.token, session!.user.id).status).toBe("cancelled"));
     await login.close();
     expect(getSetting(db, "github")).toBeNull();
   });
@@ -302,7 +302,7 @@ describe("local authentication and persistence", () => {
     expect(unseal(secret, encrypted)).toBe("sensitive");
     expect(() => unseal("different secret", encrypted)).toThrow();
   });
-  it("completes a verified OIDC login using discovery, PKCE and an ID-token nonce", async () => {
+  it.each(["signup", "link", "implicit", "conflict"])("verifies OIDC discovery, PKCE and ID-token identity for %s", async mode => {
     const cookie = await signup();
     const issuer = "https://identity.example.com";
     const { publicKey, privateKey } = generateKeyPairSync("rsa", {
@@ -392,11 +392,18 @@ describe("local authentication and persistence", () => {
         )
       ).status,
     ).toBe(200);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const start = await call("/api/auth/sign-in/social", {
+    const existing = await auth.current.api.getSession({ headers: new Headers({ cookie }) });
+    if (mode === "implicit") db.prepare('UPDATE "user" SET email=? WHERE id=?').run("oidc@example.com", existing!.user.id);
+    if (mode === "conflict") {
+      await signup("identity-owner@example.com");
+      const target = db.prepare('SELECT id FROM "user" WHERE email=?').get("identity-owner@example.com") as { id: string };
+      db.prepare('INSERT INTO account(id,accountId,providerId,userId,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("existing-oidc", "external-user", "oidc", target.id, Date.now(), Date.now());
+    }
+    for (let attempt = 0; attempt < (mode === "signup" ? 2 : 1); attempt++) {
+      const start = await call(mode === "link" || mode === "conflict" ? "/api/auth/link-social" : "/api/auth/sign-in/social", {
         provider: "oidc",
         callbackURL: "http://localhost:8787/agents/",
-      });
+      }, mode === "link" || mode === "conflict" ? cookie : "");
       expect(start.status, await start.clone().text()).toBe(200);
       const url = new URL((await start.json()).url);
       expect(url.origin).toBe(issuer);
@@ -412,8 +419,18 @@ describe("local authentication and persistence", () => {
         "/api/auth/callback/oidc?code=test-code&state=" +
           encodeURIComponent(state),
         undefined,
-        stateCookie,
+        stateCookie + "; " + cookie,
       );
+      if (mode === "implicit" || mode === "conflict") {
+        expect(result.headers.get("location")).toContain(mode === "implicit" ? "account_not_linked" : "account_already_linked_to_different_user");
+        expect(db.prepare('SELECT count(*) AS n FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ n: 0 });
+        return;
+      }
+      if (mode === "link") {
+        expect(db.prepare('SELECT accountId FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ accountId: "external-user" });
+        expect(db.prepare('SELECT count(*) AS n FROM "user"').get()).toEqual({ n: 1 });
+        return;
+      }
       expect(result.headers.get("location")).toBe(
         "http://localhost:8787/agents/",
       );

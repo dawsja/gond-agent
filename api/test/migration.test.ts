@@ -55,7 +55,7 @@ it("retires Claude Code and Codex data idempotently while keeping history readab
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map(t => t.name);
   expect(tables.filter(t => t.startsWith("cli_"))).toEqual([]);
   expect(tables).toEqual(expect.arrayContaining(["subscription_accounts", "subscription_notices"]));
-  expect((db.prepare("SELECT key FROM settings ORDER BY key").all() as { key: string }[]).map(r => r.key)).toEqual(["providers", "retired-runtime-cleanup"]);
+  expect((db.prepare("SELECT key FROM settings ORDER BY key").all() as { key: string }[]).map(r => r.key)).toEqual(["github-shared-fallback", "providers", "retired-runtime-cleanup"]);
   const cleanup = getSetting<{ instance: string; volumes: string[] }>(db, "retired-runtime-cleanup")!;
   expect(cleanup.instance).toBe(instance);
   expect([...cleanup.volumes].sort()).toEqual([volume(1), volume(2), volume(3)]);

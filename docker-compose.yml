@@ -30,7 +30,6 @@ services:
       ALLOW_SIGNUP: "${ALLOW_SIGNUP:-false}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
       GOND_AGENT_DATA_DIR: /data
-      GH_CONFIG_DIR: /gh
       GOND_AGENT_WORKER_IMAGE: "${GOND_AGENT_WORKER_IMAGE:-ghcr.io/dawsja/gond-agent-worker:main}"
       GOND_AGENT_COMMIT_NAME: "${GOND_AGENT_COMMIT_NAME:-}"
       GOND_AGENT_COMMIT_EMAIL: "${GOND_AGENT_COMMIT_EMAIL:-}"
