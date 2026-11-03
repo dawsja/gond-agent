@@ -160,7 +160,7 @@ describe("local authentication and persistence", () => {
     const root = await call("/");
     expect(root.status).toBe(302);
     expect(root.headers.get("location")).toBe("/agents/");
-    for (const path of ["/docs", "/pricing", "/terms", "/privacy", "/missing"]) {
+    for (const path of ["/pricing", "/terms", "/privacy", "/missing"]) {
       expect((await call(path)).status).toBe(404);
     }
   });

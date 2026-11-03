@@ -33,4 +33,4 @@ export const MODELS = [
 
 
 export const MODELS_NOTE = "Choose the right model for the task. Every account has access to all configured models."
-export const FOOTER = { links: [{ label: "Docs", href: "/docs" }, { label: "Sign in", href: APP_URL }, { label: "Privacy", href: "/privacy" }], note: "Your coding agents. Your infrastructure. Every feature, for every account.", email: HELP_EMAIL }
+export const FOOTER = { links: [{ label: "Sign in", href: APP_URL }, { label: "Privacy", href: "/privacy" }], note: "Your coding agents. Your infrastructure. Every feature, for every account.", email: HELP_EMAIL }

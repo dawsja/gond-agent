@@ -10,7 +10,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "brand:build": "tsx scripts/build-brand.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.3",

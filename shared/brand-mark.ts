@@ -1,5 +1,3 @@
-/** Canonical Gond Bot cloud body. The Agent mark intentionally has no face or motion. */
-export const CLOUD_PATH = "M29 79 A17 17 0 0 1 26.46 45.19 A3 3 0 0 0 29.01 42.32 A21 21 0 0 1 70.55 38.67 A3 3 0 0 0 73.28 41.04 A19 19 0 0 1 72 79 Z"
-// Translate the exact SVG bounds' center (51.521610, 50.495359) onto the circle's center.
-export const CLOUD_TRANSFORM = "translate(-1.52161 -0.495359)"
-export const MARK_INK = "#1b1a18"
+export const MARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><g transform="translate(512 512) scale(1.1667) translate(-512 -512)"><rect x="128" y="128" width="768" height="768" rx="300" fill="#1b1a18"/><rect x="141" y="141" width="742" height="742" rx="287" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="26"/><g transform="rotate(-8 512 512)"><path d="M372 520 L512 380 L652 520" fill="none" stroke="#ffffff" stroke-width="104" stroke-linecap="round" stroke-linejoin="round"/><circle cx="512" cy="660" r="58" fill="#ffffff"/></g></g></svg>'
+export const MARK_CONTENT = MARK_SVG.slice(MARK_SVG.indexOf(">") + 1, -6)
+export const MARK_INK = /fill="([^"]+)"/.exec(MARK_SVG)![1]
