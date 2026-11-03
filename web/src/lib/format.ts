@@ -39,20 +39,6 @@ export function runElapsed(r: { status: string; created_at: number; started_at: 
   return duration(end - start)
 }
 
-export function initials(name: string | null | undefined, email?: string | null): string {
-  const src = (name || email || "?").trim()
-  const parts = src.split(/[\s@._-]+/).filter(Boolean)
-  return ((parts[0]?.[0] ?? "?") + (parts[1]?.[0] ?? "")).toUpperCase()
-}
-
-const AVATAR = ["var(--tint-ink)", "var(--info)"]
-
-export function avatarColor(id: string): string {
-  let h = 0
-  for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) | 0
-  return AVATAR[Math.abs(h) % AVATAR.length]!
-}
-
 export function greeting(d = new Date()): string {
   const h = d.getHours()
   return h < 5 ? "Good evening" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening"

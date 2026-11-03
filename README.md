@@ -59,7 +59,9 @@ Approved credentials are encrypted in SQLite with `BETTER_AUTH_SECRET`. Temporar
 
 The account popup at the bottom of the sidebar contains Settings and Sign out; Settings is not a sidebar navigation item. The Settings Account card shows your photo, name and email. Sign out stays in the account popup; Settings omits the instance label and storage information block. Collapsed navigation uses tooltips; hover or focus the logo to expand it.
 
-The workspace uses Gond Code's default dark blue palette. The sidebar shows the logo alone, at the same readable size when expanded or collapsed. In either message composer, **Enter sends** and **Shift+Enter adds a newline**; IME composition does not submit. In **Settings → Account**, upload a PNG, JPEG or WebP profile photo (up to 2 MiB and 16 megapixels), reposition/zoom it in a circular preview and save. Photos appear in the account menu and your messages, survive restarts, and can be changed or removed. The server re-encodes them as metadata-free, circular 256px PNGs in SQLite. Photos require an authenticated session to view and only their owner can replace or remove them.
+The workspace uses Gond Code's default dark blue palette. The sidebar shows the logo alone, at the same readable size when expanded or collapsed. In either message composer, **Enter sends** and **Shift+Enter adds a newline**; IME composition does not submit. Your account shows a neutral grey default picture. Pictures from your sign-in provider are never used or loaded; upload your own photo in Settings, Account. In **Settings → Account**, upload a PNG, JPEG or WebP profile photo (up to 2 MiB and 16 megapixels), reposition/zoom it in a circular preview and save. Photos appear in the account menu and your messages, survive restarts, and can be changed or removed. The server re-encodes them as metadata-free, circular 256px PNGs in SQLite. Photos require an authenticated session to view and only their owner can replace or remove them.
+
+Remote images in rendered Markdown output are shown as links (using their alt text or URL) and never loaded automatically. Same-origin images and data/blob image previews still work. An image Content-Security-Policy (`img-src` only) also blocks remote image requests, including tracking pixels and exfiltration beacons; it does not restrict scripts, frames or other resources.
 
 The sidebar uses a compact 28px logo in a 48px header: aligned with navigation icons when expanded, centered when collapsed. **Settings → Delete account** permanently removes your local account, sessions, photos, schedules, runs, images and usage records. Search opens that section, not a deletion action. An extra confirmation asks for your email and current password; passwordless accounts require a sign-in within the last 15 minutes. Stop active runs before deleting. You cannot delete the only administrator while other accounts remain. Deleting the final account also clears saved provider, GitHub and single sign-on connections and returns the server to administrator registration and model setup, even when general registration is closed. Work pushed to GitHub is not deleted.
 
@@ -72,7 +74,16 @@ docker compose pull
 docker compose up -d
 ```
 
-Keep your data volume and `BETTER_AUTH_SECRET`. Do not use `down -v`. Updating the service interrupts active runs; follow-ups resume from their last pushed branch. To pin a release, set the same version tag in both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`. If your `.env` selects `:local` images, change both entries to the GHCR images in `.env.example` to use this pull-only flow.
+Keep your data volume and `BETTER_AUTH_SECRET`. Do not use `down -v`. Updating the service interrupts active runs; follow-ups resume from their last pushed branch. To pin a release, set the same version tag in both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`.
+
+```sh
+GOND_AGENT_IMAGE=ghcr.io/dawsja/gond-agent:0.1.0
+GOND_AGENT_WORKER_IMAGE=ghcr.io/dawsja/gond-agent-worker:0.1.0
+```
+
+The image tag has no `v` (use `0.1.0`, not `v0.1.0`), and both variables must use the same version.
+
+If your `.env` selects `:local` images, change both entries to the GHCR images in `.env.example` to use this pull-only flow.
 
 ### Optional source builds
 
@@ -89,13 +100,35 @@ This selects local images for both the service and its workers. The default Comp
 
 Docker socket access gives the Gond Agent service administrative control of the Docker host. Use a dedicated trusted machine or Linux VM; do not expose the socket over unauthenticated TCP. Worker containers never receive the socket, application data, host bind mounts, GitHub credentials or provider keys. They run as UID 1000 with a read-only root, dropped capabilities, no privilege escalation, a PID limit, and private workspace volumes/networks. `RUN_CPUS` and `RUN_MEMORY_MB` default to 2 and 2048; `MAX_ACTIVE_RUNS` defaults to 5. Workspace disk use is not quota-limited: monitor free disk space.
 
+Workers keep `/tmp` (1 GiB) and `$HOME` (256 MiB) on `nosuid,nodev,noexec` tmpfs. Install executable toolchains in `/opt/gond-tools`, a second writable, executable named volume owned by UID 1000 outside the Git checkout. Each run has its own tools volume, with the same instance/run labels and cleanup as the workspace: close, destroy, failed startup and restart recovery remove it. Follow-ups in a live run retain it; reopening a closed run starts fresh. Nothing is shared across runs or users: a shared executable cache could let one run poison another. Workspace **and tools** disk use is not quota-limited; monitor Docker host storage, especially for Rust installations.
+
+The image ships Node/npm, Corepack, Python/pip, Bun 1.3.2, uv 0.9.7 and Playwright/Chromium. Bun and uv are pinned linux/amd64 official release assets verified with SHA-256 before installation. Installer variables (`BUN_INSTALL`, `CARGO_HOME`, `RUSTUP_HOME`, `UV_INSTALL_DIR`, `UV_TOOL_DIR`, `UV_PYTHON_INSTALL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `XDG_DATA_HOME`, `PYTHONUSERBASE`, `npm_config_prefix`, `COREPACK_HOME`, `PNPM_HOME`) point into the tools volume; its bin directories (including `/opt/gond-tools/python/bin` for `pip install --user`) follow the image PATH so downloaded tools cannot shadow image commands such as Git, Python or Bash. uv tool environments and managed Python installations also live in the executable tools volume, not noexec home. Playwright and Node retain their explicit image browser/module paths. Rust is installed per run, for example:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy
+cargo --version
+```
+
+Noexec scratch is defense in depth against dropped binaries, not the isolation boundary: Python, Node and Bash already execute arbitrary code as UID 1000, including syscalls through FFI. The boundary remains the container: dropped capabilities, no-new-privileges, default seccomp, read-only root, private volumes/network, and no host mounts, Docker socket or credentials. Executing downloaded/compiled native code exposes more of the kernel's seccomp-filtered syscall surface. Docker's ordinary disk-backed named-volume interface does not offer per-mount `nosuid,nodev`; these flags remain enforced on scratch tmpfs, not claimed for the tools volume. Dropped capabilities and no-new-privileges still prevent privilege gains via devices or setuid binaries. The existing checkout volume is also executable; do not install toolchains there because they would pollute snapshots.
+
+To bake Rust or other large dependencies into an operator-controlled custom image, extend the worker image (not the runtime), install into the read-only image's `/usr/local` rather than the per-run volume, and restore UID 1000:
+
+```dockerfile
+FROM ghcr.io/dawsja/gond-agent-worker:main
+USER root
+# Install pinned project-specific dependencies into /usr/local here.
+USER 1000:1000
+```
+
+Build it with `docker build --platform linux/amd64 -t gond-agent-worker:custom -f Dockerfile.worker .`, set `GOND_AGENT_WORKER_IMAGE=gond-agent-worker:custom` in `.env`, and run `docker compose up -d --pull never`. Both the helper and service select that image; it must exist on the service's Docker host. Per-repository setup settings and shared toolchain caches are not supported.
+
 Containers share the host kernel and are not a boundary for hostile multi-tenant workloads. Their bridge networks allow dependency downloads; host/LAN destinations are not automatically blocked, so apply host firewall/egress policies when needed. Chromium uses the container as its containment boundary and runs without its own sandbox. Keep the host kernel, Docker and worker image updated.
 
 ## Authentication and OIDC
 
 Settings are grouped under large headings for Personal settings, Models, Security, Agent access and Account management. Administrator-only provider and single sign-on controls remain in their respective groups.
 
-Better Auth handles email/password sign-up, password hashing, cookies, sessions, CSRF checks and rate limiting. Passwords need at least 12 characters. Settings lists and revokes active sessions. An administrator can configure an OIDC issuer, client ID and secret in Settings; the page shows the redirect URI to register with the provider. Discovery, PKCE and verified ID tokens are required. Password sign-in remains enabled. OIDC changes require a sign-in within the last ten minutes. Client secrets are encrypted in SQLite and never returned to the browser. Set `ALLOW_SIGNUP=true` to permit new users, including new OIDC users. Account linking by matching emails is disabled.
+Better Auth handles email/password sign-up, password hashing, cookies, sessions, CSRF checks and rate limiting. Passwords need at least 12 characters. Settings lists and revokes active sessions. An administrator can configure an OIDC issuer, client ID and secret in Settings; the page shows the redirect URI to register with the provider. Discovery, PKCE and verified ID tokens are required. Password sign-in remains enabled. OIDC changes require a sign-in within the last ten minutes. Client secrets are encrypted in SQLite and never returned to the browser. Set `ALLOW_SIGNUP=true` to permit new users, including new OIDC users. Account linking by matching emails is disabled. The provider’s `picture` claim is ignored; only locally uploaded account photos are shown.
 
 ## Model providers
 

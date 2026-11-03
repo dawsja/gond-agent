@@ -23,9 +23,10 @@ export function containerArguments(cfg: Config, name: string, instance: string, 
     "--security-opt", "no-new-privileges=true", "--pids-limit", "512",
     "--cpus", String(cfg.runCPUs), "--memory", `${cfg.runMemoryMB}m`, "--memory-swap", `${cfg.runMemoryMB}m`,
     "--shm-size", "256m", "--ulimit", "nofile=4096:4096",
-    "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=1777",
-    "--tmpfs", "/home/gond-agent:rw,nosuid,nodev,size=256m,uid=1000,gid=1000",
+    "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=1g,uid=1000,gid=1000,mode=1777",
+    "--tmpfs", "/home/gond-agent:rw,nosuid,nodev,noexec,size=256m,uid=1000,gid=1000",
     "--mount", `type=volume,source=${name}-work,target=/workspace/repo`,
+    "--mount", `type=volume,source=${name}-tools,target=/opt/gond-tools`,
     "--network", `${name}-net`, "--log-driver", "none", cfg.workerImage,
   ];
 }
@@ -157,7 +158,9 @@ export class ContainerPool {
       const labels = ["--label", MANAGED, "--label", `io.gond-agent.instance=${instance}`, "--label", `io.gond-agent.run=${id}`];
       // Never pull or run an arbitrary repository-provided image; operators build/pull this image.
       await this.docker(["image", "inspect", this.cfg.workerImage]);
-      await this.docker(["volume", "create", ...labels, `${name}-work`]);
+      for (const suffix of ["work", "tools"]) {
+        await this.docker(["volume", "create", ...labels, `${name}-${suffix}`]);
+      }
       await this.docker(["network", "create", ...labels, "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", `${name}-net`]);
       await this.docker(containerArguments(this.cfg, name, instance, id));
       child = spawn(this.cfg.dockerBin, ["start", "--attach", "--interactive", name], { stdio: ["pipe", "pipe", "pipe"] });
