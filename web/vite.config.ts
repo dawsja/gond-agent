@@ -35,7 +35,6 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": resolve(import.meta.dirname, "./src"),
-      // Code shared by the web app and the landing page (the repo root\'s shared/).
       "@shared": resolve(import.meta.dirname, "../shared"),
     },
     // shared/ has no node_modules: its imports resolve from this app\'s.

@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        app: [web, site]
+        app: [web]
     defaults:
       run:
         working-directory: ${{ matrix.app }}
