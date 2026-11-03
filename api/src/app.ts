@@ -62,6 +62,19 @@ export function createApp(
     c.header("Referrer-Policy", "same-origin");
     c.header("X-Frame-Options", "DENY");
   });
+  app.use("*", async (c, next) => {
+    let path: string;
+    try {
+      path = new URL(decodeURIComponent(new URL(c.req.url).pathname).replace(/\/+/g, "/"), cfg.origin).pathname.replace(/\/+$/, "").toLowerCase();
+    } catch { throw new ApiError(400, "invalid_path", "Use a valid request address."); }
+    if (/^\/api\/auth\/(link-social|unlink-account)$/.test(path)) {
+      const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+      if (!current) throw new ApiError(401, "unauthorized", "Sign in before linking a sign-in method.");
+      if (Date.now() - new Date(current.session.createdAt).getTime() > 10 * 60000)
+        throw new ApiError(403, "recent_signin", "Sign out and sign in again before changing sign-in methods.");
+    }
+    await next();
+  });
   app.all("/mcp", c => mcp.fetch(c.req.raw));
   app.use(
     "/api/*",
@@ -94,13 +107,7 @@ export function createApp(
     accountQueue = result.catch(() => {});
     return result;
   };
-  app.on(["GET", "POST"], "/api/auth/*", async (c) => {
-    if (["/api/auth/link-social", "/api/auth/unlink-account"].includes(c.req.path)) {
-      const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
-      if (!current) throw new ApiError(401, "unauthorized", "Sign in before linking a sign-in method.");
-      if (Date.now() - new Date(current.session.createdAt).getTime() > 10 * 60000)
-        throw new ApiError(403, "recent_signin", "Sign out and sign in again before changing sign-in methods.");
-    }
+  app.on(["GET", "POST"], "/api/auth/*", (c) => {
     // User creation (including OIDC callbacks) must not race the last account's deletion.
     return changeAccounts(() => authentication.current.handler(c.req.raw));
   });

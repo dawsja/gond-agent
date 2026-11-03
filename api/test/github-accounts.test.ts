@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore, getSetting, setSetting } from "../src/db";
-import { createAuthentication, seal } from "../src/auth";
+import { createAuthentication, oidcSubject, seal } from "../src/auth";
 import { githubEnvFor } from "../src/github-login";
 import { command } from "../src/command";
 import { checkout, importBundle, commitIdentity, gh } from "../src/github";
@@ -79,6 +79,9 @@ it("resolves personal before opt-in shared before explicit service credentials; 
   expect(githubEnvFor(db, cfg.secret, b.id).GH_TOKEN).toBe("fixture-token-b");
   setSetting(db, "github-shared-fallback", false);
   vi.stubEnv("GH_TOKEN", "service-credential");
+  expect(() => githubEnvFor(db, cfg.secret, a.id)).toThrow("Connect your GitHub");
+  setSetting(db, "github-shared-fallback", true);
+  db.prepare("DELETE FROM settings WHERE key='github'").run();
   expect(githubEnvFor(db, cfg.secret, a.id).GH_TOKEN).toBe("service-credential");
   expect(githubEnvFor(db, cfg.secret, b.id).GH_TOKEN).toBe("fixture-token-b");
   db.prepare("DELETE FROM settings WHERE key='github-shared-fallback'").run();
@@ -173,4 +176,60 @@ const result=cp.spawnSync('/usr/bin/git',process.argv.slice(2),{stdio:'inherit',
   expect(calls.filter(call => call.args.includes("clone") || call.args.includes("push")).map(call => call.token)).toEqual(["fixture-token-a", "fixture-token-a"]);
   expect(readFileSync(join(checked.cwd, ".git/config"), "utf8")).not.toMatch(/fixture-token|credential/);
   expect(checked.archive.includes(Buffer.from("fixture-token-a"))).toBe(false);
+});
+
+it.each(["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"])("uses explicit service %s only after personal and enabled shared connections", key => {
+  const value = key === "GH_CONFIG_DIR" ? join(dir, "service-gh") : "fixture-service-token";
+  if (key === "GH_CONFIG_DIR") {
+    mkdirSync(value);
+    writeFileSync(join(value, "hosts.yml"), "github.com:\n  oauth_token: fixture-service-token\n");
+  }
+  vi.stubEnv(key, value);
+  expect(() => githubEnvFor(db, cfg.secret, a.id)).toThrow("Connect your GitHub");
+  setSetting(db, "github", { token: seal(cfg.secret, "fixture-shared-token") });
+  expect(() => githubEnvFor(db, cfg.secret, a.id)).toThrow("Connect your GitHub");
+  setSetting(db, "github-shared-fallback", true);
+  expect(githubEnvFor(db, cfg.secret, a.id).GH_TOKEN).toBe("fixture-shared-token");
+  expect(githubEnvFor(db, cfg.secret, a.id).GITHUB_TOKEN).toBeUndefined();
+  connect(a.id, "fixture-personal-token");
+  expect(githubEnvFor(db, cfg.secret, a.id).GH_TOKEN).toBe("fixture-personal-token");
+  expect(githubEnvFor(db, cfg.secret, a.id).GITHUB_TOKEN).toBeUndefined();
+  db.prepare("DELETE FROM github_connections WHERE user_id=?").run(a.id);
+  setSetting(db, "github-shared-fallback", false);
+  expect(() => githubEnvFor(db, cfg.secret, a.id)).toThrow("Connect your GitHub");
+  db.prepare("DELETE FROM settings WHERE key='github'").run();
+  setSetting(db, "github-shared-fallback", true);
+  expect(githubEnvFor(db, cfg.secret, a.id)[key]).toBe(value);
+});
+
+it.each(["/api/auth/link-social/", "/API/AUTH/LINK-SOCIAL", "//api/auth//link-social", "/api/auth/%2e/link-social", "/api/auth/unused/%2e%2e/link-social", "/api/auth/%6cink-social", "/api/auth/unlink-account/"])("refuses stale identity changes through path variant %s", async path => {
+  db.prepare('UPDATE session SET createdAt=? WHERE userId=?').run(Date.now() - 11 * 60000, b.id);
+  for (const method of ["GET", "POST", "PUT", "DELETE"]) {
+    const result = await request(path, b.cookie, method === "GET" ? undefined : { provider: "oidc" }, method);
+    expect(result.status).toBe(403);
+    expect((await result.json()).error.code).toBe("recent_signin");
+  }
+});
+
+it("enables shared fallback on upgrade without service credentials", () => {
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"]) vi.stubEnv(key, "");
+  setSetting(db, "github", { token: seal(cfg.secret, "fixture-shared-token") });
+  db.prepare("DELETE FROM settings WHERE key='github-shared-fallback'").run();
+  db.close(); db = openStore(dir);
+  expect(getSetting(db, "github-shared-fallback")).toBe(true);
+  expect(githubEnvFor(db, cfg.secret, a.id).GH_TOKEN).toBe("fixture-shared-token");
+});
+
+it.each(["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"])("enables fallback once when migrating with service %s", key => {
+  db.prepare("DELETE FROM settings WHERE key='github-shared-fallback'").run();
+  vi.stubEnv(key, key === "GH_CONFIG_DIR" ? join(dir, "service-config") : "fixture-service-token");
+  db.close(); db = openStore(dir);
+  expect(getSetting(db, "github-shared-fallback")).toBe(true);
+  setSetting(db, "github-shared-fallback", false);
+  db.close(); db = openStore(dir);
+  expect(getSetting(db, "github-shared-fallback")).toBe(false);
+});
+
+it.each([undefined, "header." + Buffer.from("{}").toString("base64url") + ".signature", "malformed", "header." + Buffer.from('{"sub":123}').toString("base64url") + ".signature"])("refuses invalid OIDC account subject from %s", token => {
+  expect(() => oidcSubject(token)).toThrow();
 });

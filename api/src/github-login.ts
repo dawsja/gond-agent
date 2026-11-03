@@ -12,12 +12,13 @@ import { ApiError } from "./wire";
 export function githubEnvFor(db: Store, secret: string, userId: string): NodeJS.ProcessEnv {
   if (!userId) throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
   const own = db.prepare("SELECT token FROM github_connections WHERE user_id=?").get(userId) as { token: string } | undefined;
-  const saved = own ?? (getSetting<boolean>(db, "github-shared-fallback") ? getSetting<{ token: string }>(db, "github") : null);
+  const fallback = getSetting<boolean>(db, "github-shared-fallback");
+  const saved = own ?? (fallback ? getSetting<{ token: string }>(db, "github") : null);
   const env: NodeJS.ProcessEnv = { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" };
   if (saved) {
     delete env.GITHUB_TOKEN;
     env.GH_TOKEN = unseal(secret, saved.token);
-  } else if (!env.GH_TOKEN && !env.GITHUB_TOKEN && !(env.GH_CONFIG_DIR && existsSync(join(env.GH_CONFIG_DIR, "hosts.yml")))) {
+  } else if (!fallback || (!env.GH_TOKEN && !env.GITHUB_TOKEN && !(env.GH_CONFIG_DIR && existsSync(join(env.GH_CONFIG_DIR, "hosts.yml"))))) {
     throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
   }
   return env;

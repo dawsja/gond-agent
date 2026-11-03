@@ -64,6 +64,7 @@ beforeEach(async () => {
   db = openStore(dir);
   await createAuthentication(db, cfg());
   db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("u", "User", "user@example.test", 0, Date.now(), Date.now());
+  db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run("u", seal(cfg().secret, "test-managed-github-token"), Date.now());
   saveProviderSettings(db, cfg().secret, {
     connections: [{ id: "local", name: "Local", format: "openai", baseURL: "http://127.0.0.1:8000/v1", apiKey: "test-provider-key", discover: false, models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }],
     defaultModel: "local:coder",
@@ -370,7 +371,6 @@ describe("persistent local run lifecycle", () => {
     expect(runs.history(r.id, 0).find((e) => e.type === "tool.images").images).toEqual(images);
   });
   it("starts a container, streams, pushes and creates a PR without giving the worker credentials", async () => {
-    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run("u", seal(cfg().secret, "test-managed-github-token"), Date.now());
     const r = await runs.create("u", {
       repo: "acme/app",
       model: "auto",
@@ -402,7 +402,6 @@ describe("persistent local run lifecycle", () => {
   it("refreshes externally merged PRs once, preserves concurrent run updates and blocks follow-ups", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
-    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run("u", seal(cfg().secret, "test-managed-github-token"), Date.now());
     let resolve!: (value: unknown) => void;
     vi.mocked(gh).mockImplementationOnce(() => new Promise(done => { resolve = done; }) as never);
     const a = runs.refreshPulls("u", r.id), b = runs.refreshPulls("u");

@@ -29,7 +29,7 @@ export function openStore(data: string) {
   `);
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS github_connections (user_id TEXT PRIMARY KEY REFERENCES "user"(id) ON DELETE CASCADE, token TEXT NOT NULL, login TEXT, connected_at INTEGER NOT NULL)`);
-    db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('github-shared-fallback',?)").run(JSON.stringify(!!getSetting(db, "github")));
+    db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('github-shared-fallback',?)").run(JSON.stringify(!!(getSetting(db, "github") || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_CONFIG_DIR)));
   })();
   retireCodingAgents(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.

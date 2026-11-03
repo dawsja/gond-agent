@@ -30,7 +30,7 @@ export function GithubConnection({ shared = false }: { shared?: boolean }) {
     if (status && !["starting", "pending", "busy"].includes(status)) for (const item of [key, "github", "repos", "branches"]) void qc.invalidateQueries({ queryKey: [item] })
   }, [status, qc, key])
   const error = start.error ?? cancel.error ?? disconnect.error ?? fallback.error ?? login.error
-  return <Section title={shared ? "Shared connection" : "GitHub"} icon={<Plug className="size-5 shrink-0" />} description={shared ? "Shared connection (used by accounts without their own). New accounts need their own connection unless the fallback is on." : "Connect your own GitHub account here. Your runs and pull requests use it."}>
+  return <Section title={shared ? "Shared connection" : "GitHub"} icon={<Plug className="size-5 shrink-0" />} description={shared ? "Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on." : "Connect your own GitHub account here. Your runs and pull requests use it."}>
       <Row label="Status">{github.isPending ? "Checking…" : github.isError ? "Couldn't check GitHub" : github.data?.configured ? `Signed in as ${github.data.login}` : "Not connected"}</Row>
       <div className="flex flex-col gap-4 border-t border-border px-5 py-4 max-md:px-4">
         <>
@@ -50,7 +50,7 @@ export function GithubConnection({ shared = false }: { shared?: boolean }) {
           {status === "connected" && <p role="status" className="text-sm">GitHub connected.</p>}
           {error && <p role="alert" className="text-sm text-failed">{error.message}</p>}
           {pending ? <Button variant="outline" className="self-start" disabled={!login.data?.id || cancel.isPending} onClick={() => cancel.mutate()}>{cancel.isPending ? "Cancelling…" : "Cancel sign-in"}</Button> : <Button variant="outline" className="self-start" disabled={login.isPending || status === "busy"} onClick={() => { cancel.reset(); start.mutate() }}>{github.data?.managed ? "Reconnect GitHub" : "Connect GitHub"}</Button>}
-          {github.data?.managed && <Button variant="outline" className="self-start" disabled={disconnect.isPending} onClick={() => disconnect.mutate()}>Disconnect</Button>}
+          {github.data?.managed && <><Button variant="outline" className="self-start" disabled={disconnect.isPending} onClick={() => disconnect.mutate()}>Disconnect</Button><p className="text-xs text-muted-foreground">This removes the saved connection from this server. To revoke access completely, remove the app in your GitHub settings.</p></>}
           <p className="text-xs text-muted-foreground">The approved credential is encrypted on this server and never sent to a worker. Reconnecting replaces the saved connection only after approval.</p>
         </>
       </div>

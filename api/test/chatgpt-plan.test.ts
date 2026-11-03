@@ -79,6 +79,7 @@ beforeEach(async () => {
   }, subscriptions);
   ({ app, mcp } = createApp(db, cfg(), await createAuthentication(db, cfg()), runs));
   ({ cookie, id: user } = await signUp("plan@example.test"));
+  db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run(user, seal(secret, "fixture-plan-github-token"), Date.now());
 });
 
 afterEach(async () => {

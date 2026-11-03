@@ -44,6 +44,13 @@ export function unseal(secret: string, value: string): string {
     decipher.final(),
   ]).toString();
 }
+export function oidcSubject(idToken?: string): string {
+  // genericOAuth verifies the ID token first when requireIdTokenVerification is on.
+  if (!idToken) throw new Error("A verified ID token is required.");
+  const { sub } = JSON.parse(Buffer.from(idToken.split(".")[1], "base64url").toString()) as { sub?: unknown };
+  if (typeof sub !== "string" || !sub) throw new Error("The ID token has no subject.");
+  return sub;
+}
 export async function createAuthentication(db: Store, cfg: Config) {
   const build = (beforeDelete?: (user: { id: string }) => Promise<void>) => {
     const oidc = getSetting<OIDC>(db, "oidc");
@@ -108,13 +115,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
                   scopes: ["openid", "profile", "email"],
                   pkce: true,
                   requireIdTokenVerification: true,
-                  accountSubject: ({ tokens }) => {
-                    // genericOAuth verifies the ID token before resolving this key.
-                    if (!tokens.idToken) throw new Error("A verified ID token is required.");
-                    const { sub } = JSON.parse(Buffer.from(tokens.idToken.split(".")[1], "base64url").toString()) as { sub?: unknown };
-                    if (typeof sub !== "string" || !sub) throw new Error("The ID token has no subject.");
-                    return sub;
-                  },
+                  accountSubject: ({ tokens }) => oidcSubject(tokens.idToken),
                 },
               ]
             : [],
