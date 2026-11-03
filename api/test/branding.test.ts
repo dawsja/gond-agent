@@ -34,6 +34,19 @@ describe("Gond Agent identity", () => {
     });
   });
 
+  it("keeps conversation identity independent of models and retired backends", () => {
+    const transcript = file("../../web/src/features/run/transcript-view.tsx");
+    const label = file("../../web/src/features/run/agent-label.tsx");
+    for (const source of [transcript, label]) {
+      expect(source).not.toMatch(/\b(ModelMark|ProviderIcon|PROVIDER_LABEL|providerOf|retired_backend)\b/);
+    }
+    expect(transcript).toMatch(/headings\.has\(it\.key\) && <AgentLabel \/>/);
+    expect(label).toContain('<GondAgentMark size={16}');
+    expect(label).toContain('data-agent-label');
+    expect(label).toContain('aria-label="Gond Agent"');
+    expect(label).toContain('<span>Agent</span>');
+  });
+
   it("does not reintroduce the retired mark in tracked source", () => {
     const root = new URL("../../", import.meta.url);
     const paths = execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root }).toString().split("\0").filter(Boolean);

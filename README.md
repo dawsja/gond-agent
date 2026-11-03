@@ -164,7 +164,7 @@ Keys are encrypted in SQLite using the persistent auth secret and never returned
 
 ## Runs and GitHub
 
-Run transcripts keep agent messages readable and group routine activity into expandable summaries. Open a summary for file names, commands, diffs and output. Failed actions stay visible, and API and ChatGPT plan runs use the same plain activity labels. Runs created by the removed Claude Code and Codex agents keep their transcripts and diffs but can't take follow-ups; start a new run to continue that work.
+Run transcripts always label messages with the Gond Agent mark and **Agent**, whichever model runs, including retired runs. Model and provider information stays in model pickers, run details, Settings and usage. Transcripts keep agent messages readable and group routine activity into expandable summaries. Open a summary for file names, commands, diffs and output. Failed actions stay visible, and API and ChatGPT plan runs use the same plain activity labels. Runs created by the removed Claude Code and Codex agents keep their transcripts and diffs but can't take follow-ups; start a new run to continue that work.
 
 Linked pull requests refresh while viewing the workspace, including after merging or closing them on GitHub. Merged PRs show a purple merge icon in the run list, header and PR panel. Reads share a short cache; if GitHub is unavailable, the last known state stays visible. Active work can finish before its merged run is closed.
 

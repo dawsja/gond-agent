@@ -37,6 +37,20 @@ const key = 'fixture-only-provider-key';
   };
   page.on('pageerror', error => errors.push(error.message));
   const capture = async (name, target = page) => screenshots.push({ name: `${name}-${width}.png`, data: (await target.screenshot({ fullPage: true, mask: [target.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
+  const agentHeaders = async () => {
+    const headers = page.locator('[data-agent-label]');
+    await expect(headers.first()).toBeVisible();
+    for (const header of await headers.all()) {
+      await expect(header).toHaveText('Agent');
+      const mark = header.getByRole('img', { name: 'Gond Agent', exact: true });
+      await expect(mark).toBeVisible();
+      await expect(mark.locator('svg')).toHaveAttribute('width', '16');
+      await expect(mark.locator('svg')).toHaveAttribute('height', '16');
+      await expect(header.locator('svg')).toHaveCount(1);
+      await expect(header.locator('[data-model-provider], img, [style*="background-image"]')).toHaveCount(0);
+      await expect(header).not.toContainText(/OpenAI|Anthropic|xAI|Claude|Codex/);
+    }
+  };
   const settingsURL = origin + '/api/v1/settings/providers';
   const save = async button => {
     const response = page.waitForResponse(r => r.url() === settingsURL && r.request().method() === 'PUT');
@@ -80,9 +94,9 @@ const key = 'fixture-only-provider-key';
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
-    let current = models[0], sent, imageRequests = 0, activePreview = false, prState = null;
+    let current = models[0], retiredBackend, sent, imageRequests = 0, activePreview = false, prState = null;
     const sockets = [];
-    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
+    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
     const listRoute = route => route.fulfill({ json: { runs: prState ? [run()] : [] } });
@@ -148,6 +162,11 @@ const key = 'fixture-only-provider-key';
         const picker = page.getByRole('button', { name: 'Follow-up model', exact: true });
         await expect(picker).toContainText(model.display_name.replace(/^Claude /, ''));
         await expect(picker.locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
+        await expect.poll(() => sockets.length).toBe(models.indexOf(model) + 1);
+        sockets.at(-1).send(JSON.stringify({ seq: 1, ts: Date.now(), type: 'user', text: 'Review the settings' }));
+        sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'I will check the settings layout and model selection.' }));
+        await agentHeaders();
+        await capture('agent-label-' + model.id.replaceAll(/[^a-zA-Z0-9-]/g, '-'));
         await layout('Follow-up model');
         await picker.click();
         for (const other of models) {
@@ -163,6 +182,7 @@ const key = 'fixture-only-provider-key';
         await response;
         expect(sent.effort).toBe('low');
         expect(sent.model).toBe(nextModel.id);
+        await agentHeaders();
         await capture('follow-up-' + model.id.replaceAll(/[^a-zA-Z0-9-]/g, '-'));
       }
       // Exercise live folding, reconnect replay and object URL lifetime through SPA navigation.
@@ -173,18 +193,19 @@ const key = 'fixture-only-provider-key';
         URL.revokeObjectURL = url => { window.imageURLs.revoked.push(url); revoke(url); };
       });
       await expect.poll(() => sockets.length).toBe(models.length);
-      const message = { seq: 1, ts: Date.now(), type: 'user', text: 'Fix sign-in on mobile. It sends me back to the login screen.', images: [{ id: 'stream-image' }] };
+      const message = { seq: 3, ts: Date.now(), type: 'user', text: 'Fix sign-in on mobile. It sends me back to the login screen.', images: [{ id: 'stream-image' }] };
       sockets.at(-1).send(JSON.stringify(message));
       const attachedImage = page.getByRole('img', { name: 'Attached image', exact: true });
       await expect(attachedImage).toBeVisible();
       await expect.poll(() => attachedImage.evaluate(img => img.naturalWidth)).toBe(1);
       const imageURL = await attachedImage.getAttribute('src');
-      sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
+      sockets.at(-1).send(JSON.stringify({ seq: 4, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
       await expect(page.getByText('Checking', { exact: true })).toBeVisible();
-      sockets.at(-1).send(JSON.stringify({ seq: 3, ts: Date.now(), type: 'text.delta', text: ' now' }));
-      sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
+      sockets.at(-1).send(JSON.stringify({ seq: 5, ts: Date.now(), type: 'text.delta', text: ' now' }));
+      sockets.at(-1).send(JSON.stringify({ seq: 4, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
       await expect(page.getByText('Checking now', { exact: true })).toBeVisible();
       await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
+      await agentHeaders();
       await capture('streamed-transcript-image');
       const inlineImage = await page.evaluate(() => {
         const canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
@@ -193,7 +214,7 @@ const key = 'fixture-only-provider-key';
       });
       const remoteImage = 'https://remote.example.test/tracking.png';
       const bareImage = 'https://remote.example.test/no-alt.png';
-      sockets.at(-1).send(JSON.stringify({ seq: 4, ts: Date.now(), type: 'text.delta', text: `\n\n![Remote diagram](${remoteImage})\n\n![](${bareImage})\n\n![Local diagram](${origin}/agents/favicon-32.png)\n\n![Data diagram](${inlineImage.data})\n\n![Blob diagram](${inlineImage.blob})` }));
+      sockets.at(-1).send(JSON.stringify({ seq: 6, ts: Date.now(), type: 'text.delta', text: `\n\n![Remote diagram](${remoteImage})\n\n![](${bareImage})\n\n![Local diagram](${origin}/agents/favicon-32.png)\n\n![Data diagram](${inlineImage.data})\n\n![Blob diagram](${inlineImage.blob})` }));
       await expect(page.getByRole('link', { name: 'Remote diagram', exact: true })).toHaveAttribute('href', remoteImage);
       await expect(page.getByRole('link', { name: bareImage, exact: true })).toHaveAttribute('href', bareImage);
       await expect(page.locator('img[src*="remote.example.test"]')).toHaveCount(0);
@@ -215,7 +236,7 @@ const key = 'fixture-only-provider-key';
       expect(imageRequests).toBe(1); // Remount reuses bytes, never a revoked URL.
 
       // Approved A layout: real streamed messages, quiet disclosures and visible failures.
-      let activitySeq = 1;
+      let activitySeq = 3;
       const activity = (type, fields) => sockets.at(-1).send(JSON.stringify({ seq: ++activitySeq, ts: Date.now(), type, ...fields }));
       activePreview = true;
       activity('run.status', { status: 'working' });
@@ -251,11 +272,13 @@ const key = 'fixture-only-provider-key';
       expect((await page.locator('[data-slot=trace]').allTextContents()).join(' ')).not.toMatch(/mcp__|mcpToolCall|commandExecution/);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByText("The mobile flow drops the return URL. I've updated the redirect and added a regression check.", { exact: true }).click();
+      await agentHeaders();
       await capture('message-activity');
       activity('tool.end', { call_id: 'browser', ok: false, output: 'Expected /agents/; received /login.' });
       const failedCheck = page.getByRole('button', { name: 'Browser checks failed', exact: true });
       await expect(failedCheck).toBeVisible();
       await expect(page.getByText('Open details to see what happened.', { exact: true })).toBeVisible();
+      await agentHeaders();
       await capture('message-activity-failed');
       await failedCheck.click();
       await expect(page.getByText('Expected /agents/; received /login.', { exact: true })).toBeVisible();
@@ -317,6 +340,17 @@ const key = 'fixture-only-provider-key';
       await expect(page.getByLabel('Closed pull request #42', { exact: true }).filter({ visible: true }).locator('.lucide-git-pull-request-closed')).toBeVisible();
       await expect(page.getByLabel('Merged pull request #42', { exact: true })).toHaveCount(0);
       prState = null;
+
+      for (const backend of ['claude-code', 'codex']) {
+        retiredBackend = backend;
+        const previousSockets = sockets.length;
+        await page.goto(origin + '/agents/runs/composer-fixture');
+        await expect.poll(() => sockets.length).toBe(previousSockets + 1);
+        sockets.at(-1).send(JSON.stringify({ seq: 1, ts: Date.now(), type: 'text.delta', text: 'Preserved run history.' }));
+        await agentHeaders();
+        await capture('agent-label-retired-' + backend);
+      }
+      retiredBackend = undefined;
 
       // Exercise removing the final real API connection. Subscription availability
       // is a UI fixture; saving, discovery and persistence use the packaged API.

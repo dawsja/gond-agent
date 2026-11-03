@@ -5,15 +5,15 @@ import { Activity } from "@/components/workspace/activity"
 import { ProfileAvatar } from "@/components/profile-avatar"
 import type { Run, RunStatus } from "@/lib/api"
 import { ago, duration } from "@/lib/format"
-import { useMe, useModels, useRunImage } from "@/lib/queries"
+import { useMe, useRunImage } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
-import { DiffCounts, Dot, ModelMark, PrChip, StatusPill } from "../studio/parts"
+import { DiffCounts, Dot, PrChip, StatusPill } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
 import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceLine, TraceTitle } from "@shared/ui/trace"
-import { PROVIDER_LABEL, providerOf } from "@shared/providers"
+import { AgentLabel } from "./agent-label"
 import { activityLabel, groupLabel } from "./tool-presentation"
 
 /* ───────────── transcript pieces (TUI language, softened) ───────────── */
@@ -260,9 +260,6 @@ function EndMarker({ status, error }: { status: RunStatus; error?: string }) {
 export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; author: string }) {
   const live = (t.status ?? run.status) === "working" || (t.status ?? run.status) === "queued"
   const busyTool = t.items.some(item => item.kind === "tool" ? item.tool.status === "running" : (item.kind === "explore" || item.kind === "edits") && item.tools.some(tool => tool.status === "running"))
-  const { data: models } = useModels()
-  const provider = models?.find(model => model.id === run.model_id)?.provider ?? providerOf(run.model_id)
-  const agentName = run.retired_backend === "claude-code" ? "Claude" : run.retired_backend === "codex" ? "Codex" : PROVIDER_LABEL[provider] ?? "Agent"
   const headings = useMemo(() => {
     const keys = new Set<string>()
     let first = true
@@ -291,7 +288,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
         )
       case "text": {
         return <section key={it.key} className="flex min-w-0 flex-col gap-2.5">
-          {headings.has(it.key) && <div className="flex items-center gap-2 text-xs text-muted-foreground"><ModelMark id={run.model_id} provider={provider} size={16} /><span>{agentName}</span></div>}
+          {headings.has(it.key) && <AgentLabel />}
           <Prose text={it.text} />
         </section>
       }
