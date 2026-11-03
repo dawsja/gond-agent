@@ -15,7 +15,6 @@ import {
   validRepo,
   validBranch,
 } from "../github";
-import { resolveModel, loadModelCatalog } from "../models";
 import { githubEnv } from "../github-login";
 import { modelResponse } from "../responses";
 import {
@@ -26,13 +25,12 @@ import {
   totals,
   type Summary,
 } from "./fold";
-import { recordCLIUsage } from "../cli-usage";
-import { CLIRuntimes, type CLI } from "../cli-runtime";
-import { CLIAccounts, type CLIState } from "../cli-accounts";
-import { seal, unseal } from "../auth";
 import { validateEffort } from "../effort";
 import { ApiError } from "../wire";
-import { modelDisplayName } from "../../../shared/model-names";
+import { assertActive, assertBackend, BACKEND, type Backend } from "../backend";
+import { ModelAccess } from "../access";
+import { SubscriptionAccounts } from "../subscriptions/accounts";
+import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
 
 export interface Run {
@@ -43,9 +41,9 @@ export interface Run {
   branch: string;
   model_id: string;
   effort?: string;
-  backend?: CLI;
-  runtime_volume?: string;
-  runtime_version?: string;
+  backend: Backend;
+  /** The removed coding agent that created this run. Its history stays readable; it takes no new work. */
+  retired_backend?: string;
   title: string;
   prompt: string;
   status: string;
@@ -74,6 +72,12 @@ export interface Run {
   base_sha: string | null;
   auto_pr: boolean;
 }
+/** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
+export function parseRun(data: string): Run {
+  const { backend, runtime_volume: _volume, runtime_version: _version, ...run } = JSON.parse(data) as Run & { runtime_volume?: unknown; runtime_version?: unknown };
+  if (backend === undefined || backend === BACKEND) return { ...run, backend: BACKEND };
+  return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
+}
 interface Live {
   workspace: Workspace;
   cwd: string;
@@ -84,9 +88,7 @@ interface Live {
 }
 export class Runs {
   events = new EventEmitter();
-  readonly runtimes: CLIRuntimes;
-  readonly cliAccounts: CLIAccounts;
-  private cliLeases = new Map<string,string>();
+  readonly access: ModelAccess;
   private live = new Map<string, Live>();
   private booting = new Set<string>();
   private launches = new Map<string, Promise<void>>();
@@ -97,26 +99,11 @@ export class Runs {
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
-  ) { this.runtimes = new CLIRuntimes(db,cfg); this.cliAccounts = new CLIAccounts(db,cfg.secret,workspaceFactory,this.runtimes); this.pullRequests = new PullRequests(() => githubEnv(db, cfg.secret)); }
-  async catalog(user: string, refresh = false) {
-    const catalog = await loadModelCatalog(this.db,this.cfg.secret,refresh);
-    await Promise.all((["claude-code","codex"] as CLI[]).map(backend=>this.cliAccounts.refresh(user,backend,refresh)));
-    const own = this.cliAccounts.models(user).map(m => ({id:`cli-${m.backend}:${encodeURIComponent(m.id)}`,provider:m.backend === "codex" ? "openai" : "anthropic",display_name:`${modelDisplayName(m.name,m.id,m.resolved_model)} · ${m.backend === "codex" ? "Codex" : "Claude Code"}`,resolved_model:m.resolved_model,connection_id:`cli-${m.backend}`,connection_name:m.backend === "codex" ? "Codex subscription" : "Claude subscription",context_window:200000,max_output:8192,capabilities:{images:true,reasoning:"effort" as const},efforts:m.efforts,backend:m.backend}));
-    return {...catalog,models:[...catalog.models,...own]};
-  }
-  async resolveSelection(user:string,id:string) {
-    if(!id.startsWith("cli-"))return {...await resolveModel(this.db,this.cfg.secret,id),backend:undefined};
-    const model=this.cliAccounts.models(user).find(m=>`cli-${m.backend}:${encodeURIComponent(m.id)}`===id);
-    if(!model)throw new ApiError(404,"unknown_model","Sign in and choose an available subscription model in Settings.");
-    return {id,upstream_id:model.id,backend:model.backend,capabilities:{reasoning:"effort" as const,images:true,efforts:model.efforts}};
-  }
-  private async captureCLI(r:Run,workspace:Workspace) {
-    if(!r.backend)return;
-    const state=await workspace.rpc<CLIState>("cli_state");
-    this.db.prepare("UPDATE cli_accounts SET credentials=? WHERE user_id=? AND backend=?").run(seal(this.cfg.secret,JSON.stringify(state.credentials)),r.user_id,r.backend);
-    this.db.prepare("INSERT INTO cli_sessions(run_id,state) VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET state=excluded.state").run(r.id,seal(this.cfg.secret,JSON.stringify({...state,credentials:{}})));
-  }
-  private releaseCLI(r:Run){if(r.backend && this.cliLeases.get(`${r.user_id}:${r.backend}`)===r.id)this.cliLeases.delete(`${r.user_id}:${r.backend}`);}
+    subscriptions = new SubscriptionAccounts(db, cfg.secret, [new ChatGPTProvider()]),
+  ) { this.access = new ModelAccess(db, cfg.secret, subscriptions); this.pullRequests = new PullRequests(() => githubEnv(db, cfg.secret)); }
+  get subscriptions() { return this.access.subscriptions; }
+  catalog(user: string, refresh = false) { return this.access.catalog(user, refresh); }
+  resolveSelection(user: string, id: string) { return this.access.resolve(user, id); }
   assertAccount(user: string) {
     if (this.deletingAccounts.has(user)) throw new ApiError(409, "account_deleting", "Your account is being deleted.");
     if (!this.db.prepare('SELECT 1 FROM "user" WHERE id=?').get(user)) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
@@ -129,7 +116,7 @@ export class Runs {
         const rows = this.db.prepare("SELECT id,status FROM runs WHERE user_id=?").all(user) as { id: string; status: string }[];
         if (rows.some(r => ["queued", "working"].includes(r.status) || this.booting.has(r.id) || this.launches.has(r.id) || this.live.get(r.id)?.busy))
           throw new ApiError(409, "active_runs", "Stop your active runs and wait for them to finish before deleting your account.");
-        await this.cliAccounts.remove(user);
+        await this.subscriptions.revokeAll(user);
         for (const row of rows) {
           const live = this.live.get(row.id);
           try { await this.close(row.id); }
@@ -147,7 +134,7 @@ export class Runs {
       )
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
     if (!r) throw new ApiError(404, "not_found", "That run doesn't exist.");
-    return JSON.parse(r.data);
+    return parseRun(r.data);
   }
   list(user: string): Run[] {
     return (
@@ -156,9 +143,10 @@ export class Runs {
           "SELECT data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
         )
         .all(user) as { data: string }[]
-    ).map((r) => JSON.parse(r.data));
+    ).map((r) => parseRun(r.data));
   }
   save(r: Run) {
+    assertBackend(r.backend);
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -234,7 +222,6 @@ export class Runs {
     this.append(r.id, { type: "run.status", status, step, error });
   }
   async recover() {
-    await this.runtimes.recover();
     for (const row of this.db
       .prepare("SELECT data FROM runs WHERE status IN ('queued','working')")
       .all() as { data: string }[]) {
@@ -263,10 +250,12 @@ export class Runs {
       prompt: string;
       images?: string[];
       source?: string;
+      backend?: unknown;
     },
     attribution?: { id: string; tokenId: string; authorize?: () => void },
   ) {
     this.assertAccount(user);
+    const backend = assertBackend(input.backend);
     if (
       !validRepo(input.repo) ||
       !input.prompt?.trim() ||
@@ -299,7 +288,7 @@ export class Runs {
       base_branch: base,
       branch: `gond-agent/${slug(title)}-${id.slice(-6)}`,
       model_id: selectedModel.id,
-      ...(selectedModel.backend ? {backend:selectedModel.backend,runtime_volume:this.runtimes.get(selectedModel.backend)!.volume,runtime_version:this.runtimes.get(selectedModel.backend)!.version} : {}),
+      backend,
       effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
@@ -376,12 +365,11 @@ export class Runs {
   }
   async validateFollowUp(id: string, user: string, model?: string, effort?: unknown) {
     const run = this.get(id, user);
+    assertActive(run);
     if (model !== undefined && typeof model !== "string")
       throw new ApiError(400, "invalid_model", "Choose an available model.");
     if (model !== undefined || effort !== undefined) {
       const selected = await this.resolveSelection(user, model ?? run.model_id);
-      if (selected.backend !== run.backend)
-        throw new ApiError(400, "invalid_backend", "Start a new run to change coding agents.");
       validateEffort(selected, effort ?? "default");
     }
     return run;
@@ -396,6 +384,7 @@ export class Runs {
   ) {
     this.assertAccount(user);
     const r = this.get(id, user);
+    assertActive(r);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
       throw new ApiError(409, "merged", "Start a new run after merging.");
@@ -408,7 +397,7 @@ export class Runs {
     if (this.live.get(id)?.closing) throw new ApiError(409, "workspace_closing", "Wait for the workspace to close before sending a follow-up.");
     const question = r.summary.question;
     const answering = this.live.get(id);
-    if (question && answering?.busy && !r.backend) {
+    if (question && answering?.busy) {
       r.summary.question = null;
       this.save(r);
       this.append(id, { type: "user", text, images: [] });
@@ -453,6 +442,7 @@ export class Runs {
     let workspace: Workspace | undefined;
     try {
       let r = this.get(id);
+      assertActive(r);
       r.phase = "booting";
       r.started_at ??= Date.now();
       this.status(r, "working", "Cloning repository");
@@ -475,11 +465,11 @@ export class Runs {
         r = this.get(id); r.phase = "idle"; r.pending = []; this.status(r, "stopped"); return;
       }
       this.status(r, "working", "Starting a workspace container");
+      const owner = r.user_id;
       workspace = await this.workspaceFactory(id, (req) =>
         new URL(req.url).pathname === "/v1/models"
-          ? loadModelCatalog(this.db, this.cfg.secret).then(catalog => Response.json(catalog))
-          : modelResponse(this.db, this.cfg.secret, r.user_id, id, req),
-        r.runtime_volume,
+          ? this.catalog(owner).then(catalog => Response.json(catalog))
+          : modelResponse(this.db, this.cfg.secret, owner, id, req, this.access),
       );
       r = this.get(id);
       if (this.shuttingDown || r.status === "stopped") {
@@ -492,12 +482,7 @@ export class Runs {
       r = this.get(id);
       if (this.shuttingDown || r.status === "stopped") return await workspace.destroy();
       this.status(r, "working", "Starting the agent");
-      if(r.backend){
-        const saved=this.db.prepare("SELECT state FROM cli_sessions WHERE run_id=?").get(id) as {state:string}|undefined;
-        const state=saved?JSON.parse(unseal(this.cfg.secret,saved.state)):{};
-        await workspace.rpc("cli_prepare",{state:{...state,credentials:this.cliAccounts.credentials(r.user_id,r.backend)},config:{backend:r.backend,model:decodeURIComponent(r.model_id.split(":").slice(1).join(":")),effort:r.effort ?? "default"}});
-      }
-      if(!r.backend)await workspace.rpc("start", { model: r.model_id, effort: r.effort ?? "high" });
+      await workspace.rpc("start", { model: r.model_id, effort: r.effort ?? "high" });
       if (this.shuttingDown) return await workspace.destroy();
       const live: Live = {
         workspace,
@@ -527,19 +512,10 @@ export class Runs {
     const r = this.get(id);
     if(!r.pending.length || live.closed)return;
     const message=r.pending[0];
+    assertActive(r);
     if(message.model || message.effort !== undefined){
       const selected=await this.resolveSelection(r.user_id,message.model ?? r.model_id);
-      if(selected.backend!==r.backend)throw new ApiError(400,"invalid_backend","Start a new run to change coding agents.");
       r.model_id=selected.id;r.effort=validateEffort(selected,message.effort ?? "default");this.save(r);
-    }
-    if(r.backend){
-      const key=`${r.user_id}:${r.backend}`;
-      if(this.cliAccounts.busy(r.user_id,r.backend) || this.cliLeases.has(key) && this.cliLeases.get(key)!==id){this.status(r,"queued","Waiting for your subscription agent");return;}
-      this.cliLeases.set(key,id);
-      const state=await live.workspace.rpc<CLIState>("cli_state");
-      await live.workspace.rpc("cli_stop");
-      await live.workspace.rpc("cli_prepare",{state:{...state,credentials:this.cliAccounts.credentials(r.user_id,r.backend)},config:{backend:r.backend,model:decodeURIComponent(r.model_id.split(":").slice(1).join(":")),effort:r.effort??"default"}});
-      await live.workspace.rpc("start",{backend:r.backend,model:r.model_id,effort:r.effort??"default"});
     }
     r.pending.shift();
     if (live.closed) return;
@@ -551,21 +527,15 @@ export class Runs {
       r.effort=validateEffort(selected,message.effort);this.save(r);
     }
     live.busy = true;
-    if(!r.backend){
-      const selected=await resolveModel(this.db,this.cfg.secret,r.model_id);
-      await live.workspace.rpc("send",{input:{type:"model",model:r.model_id,context_window:selected.context_window}});
-      await live.workspace.rpc("send", {input:{type:"effort",effort:r.effort ?? "high"}});
-    }
+    const selected=await this.resolveSelection(r.user_id,r.model_id);
+    await live.workspace.rpc("send",{input:{type:"model",model:r.model_id,context_window:selected.context_window}});
+    await live.workspace.rpc("send", {input:{type:"effort",effort:r.effort ?? "high"}});
     await live.workspace.rpc("send", {
       input: {
         type: "user",
         text: message.text,
         effort: message.effort ?? r.effort ?? "high",
-        images: message.images.map((id) => {
-          if(!r.backend)return {id};
-          const image=this.db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND run_id=? AND user_id=?").get(id,r.id,r.user_id) as {media_type:string;bytes:Buffer};
-          return {media_type:image.media_type,data:image.bytes.toString("base64")};
-        }),
+        images: message.images.map((id) => ({ id })),
       },
     });
   }
@@ -578,13 +548,6 @@ export class Runs {
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
-        if(event.type === "cli.usage"){
-          const owner=this.get(id);
-          const u=recordCLIUsage(this.db,owner.user_id,id,{...event,model:`cli-${owner.backend}:${encodeURIComponent(event.model)}`} as any);
-          if(u)this.append(id,{type:"usage",input:u.input_uncached,output:u.output,cache_read:u.cache_read,context_used:0,context_window:200000});
-          continue;
-        }
-        if(event.type === "cli.catalog" || event.type === "cli.account")continue;
         this.append(id, event);
         const r = this.get(id);
         r.summary = fold(r.summary, event as any);
@@ -595,12 +558,10 @@ export class Runs {
         });
         this.save(r);
         if (event.type === "error" && event.agent_id === "main") {
-          await this.captureCLI(r,live.workspace);this.releaseCLI(r);
           live.busy = false;
           this.status(r, "failed", null, String(event.message));
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
-          await this.captureCLI(r,live.workspace);this.releaseCLI(r);
           if (event.stop_reason === "error") continue;
           if (event.stop_reason === "interrupted") {
             live.busy = false;
@@ -760,9 +721,6 @@ export class Runs {
     if (live) {
       live.closed = true;
       this.live.delete(id);
-      const closingRun=this.get(id);
-      if(closingRun.backend && this.cliLeases.get(`${closingRun.user_id}:${closingRun.backend}`)===id)await this.captureCLI(closingRun,live.workspace).catch(()=>{});
-      this.releaseCLI(this.get(id));
       await live.workspace.destroy();
     }
     try {
@@ -771,16 +729,9 @@ export class Runs {
       this.save(r);
     } catch {}
   }
-  async closeCLIRuntime(backend:CLI,user?:string){
-    const rows=this.db.prepare("SELECT data FROM runs WHERE json_extract(data,'$.backend')=? AND deleted_at IS NULL"+(user?" AND user_id=?":"")).all(...(user?[backend,user]:[backend])) as {data:string}[];
-    const runs=rows.map(r=>JSON.parse(r.data) as Run);
-    if(runs.some(r=>["queued","working"].includes(r.status)||this.live.get(r.id)?.busy||this.booting.has(r.id)))throw new ApiError(409,"cli_in_use","Stop active subscription runs before closing workspaces.");
-    for(const r of runs)await this.close(r.id);
-    return {ok:true};
-  }
   async shutdown() {
     this.shuttingDown = true;
-    await this.cliAccounts.close();
+    this.subscriptions.close();
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));
   }

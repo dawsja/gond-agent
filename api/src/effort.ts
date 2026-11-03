@@ -22,6 +22,21 @@ export function knownReasoning(format: string, id: string): {reasoning:"none"|"a
     if(/^(o[134](-|$)|gpt-5(-|$))/.test(id))return {reasoning:"effort",efforts:["low","medium","high"]};
     if(/^gpt-5\.[2-6](-|$)/.test(id))return {reasoning:"effort",efforts:["low","medium","high","xhigh"]};
     if(/^gpt-6(?:\.[0-9]+)?-(astra|sol|terra|luna)(-|$)/.test(id))return {reasoning:"effort",efforts:["low","medium","high","xhigh","max"]};
+    // xAI accepts reasoning_effort only on its mini reasoning models; other Grok models reject it.
+    if(/^grok-3-mini(-|$)/.test(id))return {reasoning:"effort",efforts:["low","high"]};
   }
   return {reasoning:"none"};
+}
+
+/** Image input for documented multimodal families when discovery doesn't report it. */
+export function knownImages(format: string, id: string): boolean {
+  if (format === "anthropic") return /^claude-(3|opus|sonnet|haiku)/.test(id);
+  return /^(gpt-4o|gpt-4\.1|gpt-5|gpt-6|o1(?!-mini)|o3|o4|grok-4|grok-2-vision)(-|\.|$)/.test(id);
+}
+
+/** Official endpoints list embedding, audio and image models that can't run the coding agent. */
+export function agentModel(baseURL: string, id: string): boolean {
+  const host = (() => { try { return new URL(baseURL).hostname; } catch { return ""; } })();
+  if (host !== "api.openai.com" && host !== "api.x.ai") return true;
+  return !/(embed|tts|whisper|dall-e|davinci|babbage|moderation|transcribe|realtime|audio|image|sora)/i.test(id);
 }

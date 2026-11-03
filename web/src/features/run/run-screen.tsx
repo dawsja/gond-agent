@@ -6,7 +6,8 @@ import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
 import { runElapsed } from "@/lib/format"
-import { useCloseRun, useDeleteRun, useMe, useModels, useRun, useSendMessage, useStopRun } from "@/lib/queries"
+import { useCloseRun, useDeleteRun, useMe, useModelCatalog, useRun, useSendMessage, useStopRun } from "@/lib/queries"
+import { PlanIndicator } from "../settings/chatgpt-plan"
 import { useRunStream } from "@/lib/run-stream"
 import { devOpen } from "@/lib/dev-open"
 import { useImageAttachments } from "@/lib/images"
@@ -26,7 +27,7 @@ export function RunScreen() {
   const navigate = useNavigate()
   const run = useRun(id)
   const { data: me } = useMe()
-  const { data: models } = useModels()
+  const { data: catalog } = useModelCatalog(), models = catalog?.models
   const stream = useRunStream(id)
   const stop = useStopRun()
   const close = useCloseRun()
@@ -72,6 +73,7 @@ export function RunScreen() {
 
   const live = r.status === "working" || r.status === "queued"
   const merged = r.status === "merged" || r.pr_state === "merged"
+  const retired = !!r.retired_backend
   const PullIcon = merged ? GitMerge : r.pr_state === "closed" ? GitPullRequestClosed : GitPullRequest
   const author = r.user_id === me?.user?.id ? (me?.user?.name ?? "You") : (r.user_name ?? "Teammate")
   const modelName = models?.find((m) => m.id === r.model_id)?.display_name
@@ -202,13 +204,15 @@ export function RunScreen() {
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />
           <FollowUpInput
-            disabled={merged || send.isPending || attach.busy}
+            disabled={merged || retired || send.isPending || attach.busy}
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={merged} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto" && m.backend === r.backend) ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={merged} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={merged} /></div></>}
+            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={merged || retired} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto") ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={merged || retired} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={merged || retired} /></div></>}
             placeholder={
-              merged
+              retired
+                ? "Claude Code and Codex agents were removed. Start a new run to continue."
+                : merged
                 ? "This pull request is merged"
                 : r.status === "stopped" && !r.error
                   ? "Tell the agent what to do instead"
@@ -228,6 +232,7 @@ export function RunScreen() {
               send.mutate({ id: r.id, arg: { text: p, images, model:pickedModel || undefined, effort:effortFor(models?.find(m=>m.id===(pickedModel || r.model_id)),effort ?? r.effort ?? "default") } }, { onSuccess: () => { attach.clear(); setDraft("") } })
             }}
           />
+          {!retired && <PlanIndicator model={models?.find(m => m.id === (pickedModel || r.model_id))} connections={catalog?.connections} />}
           {(attach.error ?? send.error ?? close.error) && (
             <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message ?? close.error?.message}</p>
           )}

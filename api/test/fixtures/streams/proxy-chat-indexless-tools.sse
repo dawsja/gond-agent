@@ -1,0 +1,8 @@
+data: {"id":"p1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.ts\"}"}}]}}]}
+
+data: {"id":"p1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"b.ts\"}"}}]}}]}
+
+data: {"id":"p1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":300,"completion_tokens":30,"total_tokens":330}}
+
+data: [DONE]
+

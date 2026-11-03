@@ -8,7 +8,9 @@ export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "
 export interface Run {
   id: string
   user_id: string
-  backend?: "claude-code" | "codex"
+  backend?: "builtin"
+  /** Set on runs created by the removed Claude Code or Codex agents: readable, not continuable. */
+  retired_backend?: string
   user_name?: string | null
   repo: string
   base_branch: string
@@ -75,12 +77,19 @@ export interface Model {
   display_name: string
   context_window: number
   efforts?: string[]
-  backend?: "claude-code" | "codex"
+  backend?: "builtin"
+  /** "api" for API connections, otherwise the subscription that serves it, e.g. "chatgpt". */
+  access?: string
   connection_id?: string
   connection_name?: string
 }
 
-export interface ModelCatalog { models: Model[]; connections: { id: string; name: string; status: "ready" | "empty" | "unsupported" | "error"; message?: string }[] }
+export interface ModelConnection { id: string; name: string; status: "ready" | "empty" | "unsupported" | "error"; message?: string; access?: string; limited?: boolean; usage_url?: string }
+export interface ModelCatalog { models: Model[]; connections: ModelConnection[] }
+
+export interface SubscriptionAccount { id: string; provider: string; email: string | null; label: string; status: "active" | "signed_out" | "reauth"; plan: "enabled" | "disabled" | "not_eligible"; limited: boolean; connected_at: number; usage_url?: string }
+export interface SubscriptionSignIn { provider: string; account_id: string | null; url: string; expires_at: number }
+export interface Subscriptions { providers: { id: string; name: string; usage_url: string }[]; accounts: SubscriptionAccount[]; pending: SubscriptionSignIn | null; welcome: boolean }
 
 export interface Repo {
   full_name: string
