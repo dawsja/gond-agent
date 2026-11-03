@@ -4,6 +4,7 @@ import { getSetting, type Store } from "../db";
 import { ApiError } from "../wire";
 import { ReauthRequired, type Failure, type Registration, type SubscriptionModel, type SubscriptionProvider, type Tokens } from "./provider";
 
+export const MAX_PENDING_LOGINS = 1000;
 const LOGIN_TTL = 10 * 60_000;
 const REFRESH_MARGIN = 5 * 60_000;
 const LIMIT_PAUSE = 60_000;
@@ -97,6 +98,11 @@ export class SubscriptionAccounts {
   }
 
   begin(user: string, session: string, providerId: string, accountId?: string) {
+    const now = Date.now();
+    for (const [key, pending] of this.logins) if (pending.expires <= now) this.logins.delete(key);
+    const key = `${user}\0${session}`;
+    if (!this.logins.has(key) && this.logins.size >= MAX_PENDING_LOGINS)
+      throw new ApiError(429, "signin_capacity", "Too many sign-ins are pending. Try again shortly.");
     const provider = this.provider(providerId);
     const row = accountId ? this.owned(user, accountId) : undefined;
     if (row && row.provider !== provider.id) throw new ApiError(400, "unknown_subscription", "Choose a ChatGPT account.");

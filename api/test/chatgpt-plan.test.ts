@@ -12,7 +12,7 @@ import { Runs } from "../src/runs/service";
 import { createToken } from "../src/mcp";
 import { saveProviderSettings } from "../src/providers";
 import { modelResponse } from "../src/responses";
-import { SubscriptionAccounts } from "../src/subscriptions/accounts";
+import { MAX_PENDING_LOGINS, SubscriptionAccounts } from "../src/subscriptions/accounts";
 import { ChatGPTProvider, CHATGPT_REDIRECT } from "../src/subscriptions/chatgpt";
 import type { Tokens } from "../src/subscriptions/provider";
 import type { Config } from "../src/config";
@@ -164,6 +164,18 @@ describe("Sign in with ChatGPT by pasting the loopback address", () => {
       // A code works once; the attempt is gone afterwards.
       expect((await call("/api/v1/subscriptions/chatgpt/callback", { url: pasted.toString() })).status).toBe(409);
     } finally { await new Promise<void>(resolve => bait.close(() => resolve())); }
+  });
+
+  it("bounds pending sign-ins and sweeps expired sessions on new login", () => {
+    for (let i = 0; i < MAX_PENDING_LOGINS; i++) runs.subscriptions.begin(user, `session-${i}`, "chatgpt");
+    expect(() => runs.subscriptions.begin(user, "overflow", "chatgpt")).toThrow(expect.objectContaining({ code: "signin_capacity" }));
+    expect(runs.subscriptions.begin(user, "session-0", "chatgpt")).toBeDefined();
+    const future = Date.now() + 10 * 60_000 + 1;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(future);
+    try {
+      expect(runs.subscriptions.begin(user, "overflow", "chatgpt")).toBeDefined();
+      for (let i = 0; i < MAX_PENDING_LOGINS; i++) expect(runs.subscriptions.pending(user, `session-${i}`)).toBeUndefined();
+    } finally { clock.mockRestore(); }
   });
 
   it("expires attempts after ten minutes", async () => {
