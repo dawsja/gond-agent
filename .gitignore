@@ -12,3 +12,5 @@ data/
 **/__pycache__/
 api/test-artifacts/
 test-artifacts/
+
+shots/
