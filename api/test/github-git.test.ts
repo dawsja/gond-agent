@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, writeFile, readFile, rm, unlink } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
@@ -6,6 +6,15 @@ import { tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
 import { command } from "../src/command";
 import { checkout, importBundle } from "../src/github";
+
+// Only the external identity lookup is substituted; Git, tar, bundles and pushes are real.
+vi.mock("../src/command", async original => {
+  const actual = await original<typeof import("../src/command")>();
+  return { command: vi.fn((file: string, args: string[], options?: Parameters<typeof actual.command>[2]) =>
+    file === "gh" && args[0] === "api" && args[1] === "user"
+      ? Promise.resolve(Buffer.from('{"login":"fixture","id":123}'))
+      : actual.command(file, args, options)) };
+});
 
 describe("real service Git operations", () => {
   it("clones, imports a worker bundle and pushes without persisting credentials or changing global helpers", async () => {

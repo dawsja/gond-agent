@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../src/db";
@@ -23,6 +23,7 @@ vi.mock("../src/github", async (original) => {
           ? []
           : { default_branch: "main" },
     ),
+    commitIdentity: vi.fn(async () => ({name:"fixture",email:"123+fixture@users.noreply.github.com"})),
     checkout: vi.fn(async () => ({
       cwd: "/fake",
       archive: Buffer.from("repo"),
@@ -57,8 +58,6 @@ const cfg = (): Config => ({
   maxRuns: 2,
   runCPUs: 2,
   runMemoryMB: 2048,
-  idleMs: 60000,
-  turnMs: 60000,
 });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
@@ -123,6 +122,74 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("routes a pending question answer to the worker instead of queuing it", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const live = (runs as unknown as {live:Map<string,{busy:boolean}>}).live.get(r.id)!;
+    live.busy = true;
+    events.push({type:"question",agent_id:"main",request_id:"q1",question:"Which branch?"});
+    await vi.waitFor(() => expect(runs.get(r.id).summary.question?.request_id).toBe("q1"));
+    runs.enqueue(r.id, "u", "Use main");
+    expect(log).toContainEqual({method:"send",input:{type:"question.reply",request_id:"q1",answer:"Use main"}});
+    expect(runs.get(r.id).pending).toHaveLength(0);
+    expect(runs.get(r.id).summary.question).toBeNull();
+  });
+  it("stop preserves uncommitted work and follow-ups reuse the workspace", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const path = join(dir, "uncommitted.txt");
+    writeFileSync(path, "work in progress");
+    destroy.mockImplementation(async () => { rmSync(path, {force:true}); });
+    const live = (runs as unknown as {live:Map<string,{busy:boolean}>}).live.get(r.id)!;
+    live.busy = true;
+    await expect(runs.closeSession(r.id, "u")).rejects.toMatchObject({code:"workspace_busy"});
+    await runs.stop(r.id, "u");
+    await vi.waitFor(() => expect(live.busy).toBe(false));
+    expect(destroy).not.toHaveBeenCalled();
+    expect(readFileSync(path, "utf8")).toBe("work in progress");
+    const clones = vi.mocked(checkout).mock.calls.length;
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(checkout).toHaveBeenCalledTimes(clones);
+    expect(readFileSync(path, "utf8")).toBe("work in progress");
+  });
+  it("safe close pushes before releasing capacity and preserves history", async () => {
+    const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
+    const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
+    await vi.waitFor(() => expect(runs.get(second.id).status).toBe("ready"));
+    await vi.waitFor(() => expect(runs.get(first.id).status).toBe("ready"));
+    await expect(runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"})).rejects.toMatchObject({code:"run_limit"});
+    const history = runs.history(first.id, 0);
+    vi.mocked(importBundle).mockRejectedValueOnce(new Error("push failed"));
+    await expect(runs.closeSession(first.id, "u")).rejects.toThrow("push failed");
+    expect(destroy).not.toHaveBeenCalled();
+    await runs.closeSession(first.id, "u");
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(runs.history(first.id, 0).slice(0, history.length)).toEqual(history);
+    expect(runs.get(first.id).diff).toContain("src/app.ts");
+    expect(runs.get(first.id).pushed).toBe(true);
+    const third = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"});
+    await vi.waitFor(() => expect(runs.get(third.id).status).toBe("ready"));
+    await runs.closeSession(third.id, "u");
+    runs.enqueue(first.id, "u", "Resume");
+    await vi.waitFor(() => expect(runs.get(first.id).status).toBe("ready"));
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
+  });
+  it("keeps an idle workspace across elapsed time until explicitly closed", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 30 * 86400_000);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect(runs.get(r.id).status).toBe("ready");
+      expect(destroy).not.toHaveBeenCalled();
+      await runs.stop(r.id, "u");
+      expect(destroy).not.toHaveBeenCalled();
+      await runs.closeSession(r.id, "u");
+      expect(destroy).toHaveBeenCalledTimes(1);
+    } finally { clock.mockRestore(); }
+  });
   it("does not resume a stopped workspace when all slots are occupied", async () => {
     const first=await runs.create("u",{repo:"acme/app",model:"local:coder",prompt:"First"});
     await vi.waitFor(()=>expect(runs.get(first.id).status).toBe("ready"));
@@ -184,6 +251,9 @@ describe("persistent local run lifecycle", () => {
       await vi.waitFor(()=>expect(runs.get(started.id,"u").status).toBe("ready"));
       expect((await call("open_session_pull_request",{session_id:started.id})).url).toContain("github.com");
       await call("stop_session",{session_id:started.id});
+      expect((await call("close_session",{session_id:started.id})).closed).toBe(true);
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect((await call("get_session",{session_id:started.id})).id).toBe(started.id);
     } finally {await client.close();await mcp.close();}
   });
   it("closes an idle workspace before deleting its account records", async () => {
@@ -254,11 +324,11 @@ describe("persistent local run lifecycle", () => {
     expect(runs.get(r.id).pending).toEqual([]);
     expect(log.some((x) => x.method === "start")).toBe(false);
   });
-  it("does not snapshot, push or open a PR when verification is blocked", async () => {
-    workerFailure = "Verification and self-review are incomplete.";
+  it("does not snapshot, push or open a PR when the model fails", async () => {
+    workerFailure = "The model connection failed.";
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
-    expect(runs.get(r.id).error).toContain("Verification");
+    expect(runs.get(r.id).error).toBe("The model connection failed.");
     expect(log.some((x) => x.method === "snapshot")).toBe(false);
     expect(importBundle).not.toHaveBeenCalled();
     expect(vi.mocked(gh).mock.calls.some((c) => c[1] === "POST")).toBe(false);

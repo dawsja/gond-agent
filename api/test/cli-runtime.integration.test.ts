@@ -10,7 +10,7 @@ import type { Config } from "../src/config";
 test.skipIf(!process.env.GOND_AGENT_CONTAINER_TEST_IMAGE)("installs official CLI packages and starts isolated authorization",async()=>{
   const data=await mkdtemp(join(tmpdir(),"gond-cli-test-"));
   const db=openStore(data);
-  const cfg:Config={data,secret:"x".repeat(32),origin:"http://localhost",signup:false,port:8787,dockerBin:"docker",workerImage:process.env.GOND_AGENT_CONTAINER_TEST_IMAGE!,maxRuns:5,runCPUs:2,runMemoryMB:2048,idleMs:60000,turnMs:60000};
+  const cfg:Config={data,secret:"x".repeat(32),origin:"http://localhost",signup:false,port:8787,dockerBin:"docker",workerImage:process.env.GOND_AGENT_CONTAINER_TEST_IMAGE!,maxRuns:5,runCPUs:2,runMemoryMB:2048,};
   const runtimes=new CLIRuntimes(db,cfg),pool=new ContainerPool(cfg);
   try{
     for(const backend of ["codex","claude-code"] as const){

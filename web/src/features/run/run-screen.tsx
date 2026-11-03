@@ -6,7 +6,7 @@ import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
 import { runElapsed } from "@/lib/format"
-import { useDeleteRun, useMe, useModels, useRun, useSendMessage, useStopRun } from "@/lib/queries"
+import { useCloseRun, useDeleteRun, useMe, useModels, useRun, useSendMessage, useStopRun } from "@/lib/queries"
 import { useRunStream } from "@/lib/run-stream"
 import { devOpen } from "@/lib/dev-open"
 import { useImageAttachments } from "@/lib/images"
@@ -29,6 +29,7 @@ export function RunScreen() {
   const { data: models } = useModels()
   const stream = useRunStream(id)
   const stop = useStopRun()
+  const close = useCloseRun()
   const del = useDeleteRun()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const send = useSendMessage()
@@ -154,6 +155,9 @@ export function RunScreen() {
               </button>
             </MenuTrigger>
             <MenuContent align="end" side="bottom" className="w-48">
+              {!live && <MenuItem disabled={close.isPending} onSelect={() => close.mutate({ id: r.id, arg: undefined })}>
+                Close workspace
+              </MenuItem>}
               <MenuItem className="text-destructive" onSelect={() => setConfirmDelete(true)}>
                 <Trash2 className="size-3.5" />
                 <span className="min-w-0 flex-1 truncate">Delete run</span>
@@ -224,8 +228,8 @@ export function RunScreen() {
               send.mutate({ id: r.id, arg: { text: p, images, model:pickedModel || undefined, effort:effortFor(models?.find(m=>m.id===(pickedModel || r.model_id)),effort ?? r.effort ?? "default") } }, { onSuccess: () => { attach.clear(); setDraft("") } })
             }}
           />
-          {(attach.error ?? send.error) && (
-            <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message}</p>
+          {(attach.error ?? send.error ?? close.error) && (
+            <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message ?? close.error?.message}</p>
           )}
         </div>
       </section>

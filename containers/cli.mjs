@@ -1,9 +1,8 @@
 // Official native agents, adapted to Gond's worker event protocol.
-import { randomUUID } from 'node:crypto';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 const config = JSON.parse(readFileSync('/tmp/cli-config.json', 'utf8'));
 const emit = (type, value = {}) => process.stdout.write(JSON.stringify({ type, agent_id: 'main', ...value }) + '\n');
@@ -21,7 +20,7 @@ function claudeBinary() {
   if (!folder) throw new Error('This runtime has no compatible native Claude binary');
   return `${sdkRoot}/${folder}/claude`;
 }
-const instructions = `You are working in Gond Agent's isolated coding workspace. Read and follow AGENTS.md and GOND_AGENT.md. Before ending every coding turn use Gond MCP bash tools to run relevant verification and inspect the final git diff and new files, then call Gond finish_review with successful call IDs. Web applications require the Gond browser tool's wide and phone screenshot tests. Inspect returned screenshots. Completion without current verification and self-review is blocked. Do not claim human approval. Do not push or create pull requests; Gond handles Git publication.`;
+const instructions = `You work in an isolated workspace at /workspace/repo with code, shell and optional MCP tools. Follow AGENTS.md, CLAUDE.md and GOND_AGENT.md. The caller supplies task-specific requirements. A final response ends the turn. The service commits and pushes changes and opens a pull request when configured or requested; do not commit, push or create pull requests yourself.`;
 let session = config.session;
 let agent;
 let child;
@@ -39,20 +38,9 @@ async function* messages() {
 function enqueue(message) { inputs.push(message); wake?.(); wake = undefined; }
 function saveSession() { writeFileSync('/tmp/cli-session.json', JSON.stringify({ session })); }
 function usage(model, u, id) { emit('cli.usage', { id, model, usage: u, session, cumulative:backend==='claude-code' }); }
-function review() {
-  try { execFileSync('/usr/local/bin/gond-agent-worker', ['--check-review'], { env, stdio: 'pipe' }); return true; }
-  catch { return false; }
-}
 const subagents=new Set();
-let corrections = 0;
 async function ended(ok, interrupted = false) {
   saveSession();
-  if (ok && !interrupted && !review()) {
-    if (corrections++ < 2) return send({ type: 'user', text: 'Completion is blocked. Run verification and inspect the final diff with Gond MCP tools, inspect wide/phone browser screenshots for web apps, then call finish_review with the current evidence call IDs.', correction: true });
-    emit('error', { message: 'Verification and self-review are incomplete. Changes have not been published.' });
-    busy = false;
-    return;
-  }
   busy = false;
   emit('turn.end', { stop_reason: interrupted ? 'interrupted' : ok ? 'end_turn' : 'error' });
 }
@@ -156,7 +144,7 @@ async function setupCodex() {
 async function send(m) {
   if (m.type === 'interrupt') { interrupted=true; if (backend==='codex') await rpc('turn/interrupt',{threadId:session,turnId:currentTurn}); else await agent.interrupt(); return; }
   if (m.type !== 'user') return;
-  if (!m.correction) { interrupted=false;corrections=0; emit('turn.start'); writeFileSync('/tmp/gond-turn',randomUUID()); try {unlinkSync('/tmp/gond-reviewed');} catch {} }
+  interrupted=false; emit('turn.start');
   busy=true;
   const effort=m.effort ?? config.effort;
   if (backend==='codex') {

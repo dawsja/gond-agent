@@ -44,13 +44,21 @@ class AgentTest(unittest.TestCase):
         hook = pathlib.Path(agent.ROOT, ".git/hooks/pre-commit")
         hook.write_text("#!/bin/sh\ntouch hook-ran\nexit 17\n")
         hook.chmod(0o755)
-        data = agent.dispatch({"method": "snapshot", "title": "Add hello"})
+        data = agent.dispatch({"method": "snapshot", "title": "Add hello", "identity": {"name": "connected-user", "email": "123+connected-user@users.noreply.github.com"}})
         bundle = pathlib.Path(agent.ROOT, "saved.bundle")
         bundle.write_bytes(base64.b64decode(data["bundle"]))
+        self.assertEqual(git("log", "-1", "--format=%an <%ae>|%cn <%ce>").decode().strip(), "connected-user <123+connected-user@users.noreply.github.com>|connected-user <123+connected-user@users.noreply.github.com>")
+        self.assertEqual(git("log", "-1", "--format=%B").decode().strip(), "Add hello")
         self.assertEqual(len(data["head"]), 40)
         git("bundle", "verify", str(bundle))
         self.assertEqual(git("show", "HEAD:a.txt"), b"hello")
         self.assertFalse(pathlib.Path(agent.ROOT, "hook-ran").exists())
+
+    def test_snapshot_requires_connected_identity(self):
+        subprocess.run(["git", "init", "-q"], cwd=agent.ROOT, check=True)
+        pathlib.Path(agent.ROOT, "a.txt").write_text("hello")
+        with self.assertRaisesRegex(RuntimeError, "connected GitHub"):
+            agent.dispatch({"method": "snapshot"})
 
     def test_event_cursor_is_bounded_and_validated(self):
         agent.events = [{"n": i} for i in range(250)]
