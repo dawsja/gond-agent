@@ -30,6 +30,7 @@ const sealed = (secret: string, tokens: Tokens) => seal(secret, JSON.stringify(t
 export class SubscriptionAccounts {
   private providers = new Map<string, SubscriptionProvider>();
   private logins = new Map<string, Pending>();
+  private signingOut = new Set<string>();
   private refreshing = new Map<string, Promise<Tokens>>();
   private catalogs = new Map<string, Catalog>();
   constructor(private db: Store, private secret: string, providers: SubscriptionProvider[]) {
@@ -129,6 +130,8 @@ export class SubscriptionAccounts {
       if (!(error instanceof ApiError && ["chatgpt_callback", "chatgpt_state"].includes(error.code))) this.logins.delete(key);
       throw error;
     }
+    let saved = false;
+    try {
     if (this.logins.get(key) !== pending) throw new ApiError(409, "signin_expired", "This sign-in was cancelled. Continue with ChatGPT again.");
     this.logins.delete(key);
     if (!await authorized()) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
@@ -140,17 +143,26 @@ export class SubscriptionAccounts {
       VALUES(?,?,?,?,?,?,?,'active',?,NULL,?,?)
       ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,email=excluded.email,credentials=excluded.credentials,status='active',plan=excluded.plan,limited_at=NULL,updated_at=excluded.updated_at`)
       .run(id, user, provider.id, grant.registration.subject, grant.registration.email ?? null, grant.registration.clientId, sealed(this.secret, grant.tokens), plan, now, now);
+    saved = true;
     this.catalogs.delete(id);
     return { account: this.list(user).find(a => a.id === id)!, welcome: this.welcomePending(user) };
+    } finally {
+      if (!saved) await provider.revoke(grant.registration, grant.tokens).catch(() => false);
+    }
   }
 
   /** Revokes the renewable session, then clears tokens. The registration and host ID are kept. */
   async signOut(user: string, id: string) {
+    this.owned(user, id);
+    this.signingOut.add(id);
+    try {
+    await this.refreshing.get(id)?.catch(() => {});
     const row = this.owned(user, id), tokens = this.tokensOf(row);
     this.catalogs.delete(id);
     const revoked = tokens ? await this.provider(row.provider).revoke(this.registration(row), tokens).catch(() => false) : true;
     this.db.prepare("UPDATE subscription_accounts SET credentials='',status='signed_out',limited_at=NULL,updated_at=? WHERE id=?").run(Date.now(), id);
     return { revoked };
+    } finally { this.signingOut.delete(id); }
   }
 
   async remove(user: string, id: string) {
@@ -166,6 +178,7 @@ export class SubscriptionAccounts {
 
   /** A current access token; refreshes before expiry, or when `stale` was just rejected. */
   async tokens(id: string, stale?: string): Promise<Tokens> {
+    if (this.signingOut.has(id)) throw new ApiError(401, "subscription_signin", "This ChatGPT account is signing out.");
     const row = this.row(id), tokens = row && this.tokensOf(row);
     if (!row || row.status !== "active" || !tokens)
       throw new ApiError(401, "subscription_signin", "Sign in to ChatGPT again in Settings → Models to keep using your plan.");
@@ -195,7 +208,10 @@ export class SubscriptionAccounts {
     // Access token, expiry, scopes and the rotated refresh token are replaced together.
     const changed = this.db.prepare("UPDATE subscription_accounts SET credentials=?,plan=CASE WHEN plan='not_eligible' THEN plan ELSE ? END,updated_at=? WHERE id=? AND credentials=?")
       .run(sealed(this.secret, next), provider.planEnabled(next) ? "enabled" : "disabled", Date.now(), id, row.credentials).changes;
-    if (!changed) throw new ApiError(409, "subscription_signin", "This ChatGPT account changed while renewing its sign-in. Try again.", true);
+    if (!changed) {
+      await provider.revoke(this.registration(row), next).catch(() => false);
+      throw new ApiError(409, "subscription_signin", "This ChatGPT account changed while renewing its sign-in. Try again.", true);
+    }
     return next;
   }
 

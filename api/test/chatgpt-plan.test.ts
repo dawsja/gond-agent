@@ -343,6 +343,40 @@ describe("ChatGPT plan models and inference", () => {
     expect(mock.calls.find(c => c.form?.grant_type === "refresh_token")!.form).toEqual({ grant_type: "refresh_token", client_id: row.client_id, refresh_token: before.refreshToken, resource: "https://api.openai.com/v1" });
   });
 
+  it("revokes the rotated token when signing out during a slow refresh", async () => {
+    await signIn();
+    const row = account(), old = tokensOf(row);
+    mock.refreshDelay = 100;
+    const refreshing = runs.subscriptions.tokens(row.id, old.accessToken);
+    await vi.waitFor(() => expect(mock.calls.some(c => c.form?.grant_type === "refresh_token")).toBe(true));
+    const signedOut = runs.subscriptions.signOut(user, row.id);
+    const rotated = await refreshing;
+    expect(await signedOut).toEqual({ revoked: true });
+    expect(mock.refreshTokens.get(rotated.refreshToken!)!.state).toBe("revoked");
+    expect(account().credentials).toBe("");
+  });
+
+  it("revokes a rotated token discarded after a compare-and-swap miss", async () => {
+    await signIn();
+    const row = account();
+    mock.refreshDelay = 100;
+    const refreshing = runs.subscriptions.tokens(row.id, tokensOf(row).accessToken);
+    const rejected = expect(refreshing).rejects.toMatchObject({ code: "subscription_signin" });
+    await vi.waitFor(() => expect(mock.calls.some(c => c.form?.grant_type === "refresh_token")).toBe(true));
+    db.prepare("UPDATE subscription_accounts SET credentials='' WHERE id=?").run(row.id);
+    await rejected;
+    expect([...mock.refreshTokens.values()].filter(t => t.state === "active")).toEqual([]);
+    expect(mock.revoked).toHaveLength(1);
+  });
+
+  it("revokes an exchanged grant if the local session is no longer authorized", async () => {
+    const pending = runs.subscriptions.begin(user, "expired-session", "chatgpt");
+    const pasted = await approve(pending.url);
+    await expect(runs.subscriptions.complete(user, "expired-session", pasted, async () => false)).rejects.toMatchObject({ code: "unauthorized" });
+    expect(account()).toBeUndefined();
+    expect([...mock.refreshTokens.values()].map(t => t.state)).toEqual(["revoked"]);
+  });
+
   it("requires a new sign-in after a refresh-token reuse error and keeps the registration", async () => {
     await signIn();
     const row = account(), stale = tokensOf(row);
