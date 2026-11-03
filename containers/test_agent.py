@@ -7,6 +7,7 @@ import threading
 import time
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import subprocess
@@ -57,6 +58,13 @@ class AgentTest(unittest.TestCase):
                 connection.close()
             server.shutdown()
             server.server_close()
+
+    def test_start_environment_restores_plan_and_reminder_settings(self):
+        plan = [{"text": "Continue work", "status": "in_progress"}]
+        env = agent.worker_env({"model": "fixture", "plan": plan, "plan_reminder_every": 0, "plan_nudge_limit": 2})
+        self.assertEqual(json.loads(env["GOND_AGENT_INITIAL_PLAN"]), plan)
+        self.assertEqual(env["GOND_AGENT_PLAN_REMINDER_EVERY"], "0")
+        self.assertEqual(env["GOND_AGENT_PLAN_NUDGE_LIMIT"], "2")
 
     def test_archive_rejects_escape_and_unsafe_links(self):
         for symlink in [False, True]:
@@ -113,7 +121,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(env["GOND_AGENT_API_URL"], "http://127.0.0.1:8787")
         self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
         added = set(env) - set(os.environ)
-        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME"})
+        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT"})
 
 
 if __name__ == "__main__":

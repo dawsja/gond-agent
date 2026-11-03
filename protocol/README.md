@@ -193,3 +193,25 @@ The worker's loopback relay accepts POST `/v1/search` alongside model requests, 
 Built-in text results pass through one shared output wrapper (30,000-byte previews). Large results include an ephemeral path under `/tmp/gond-agent-output/` and read offset/limit or grep instructions. Shell producers spill before dropping their head/tail buffers. Files are capped at 32 MiB, total storage at 128 MiB including active reservations; oldest inactive outputs are cleaned first. A cap/busy-store failure is reported as incomplete, with narrowing/paging guidance. Paths include a sanitized call ID and unique suffix to avoid concurrent or batched collisions.
 
 `grep` supports `context_before`/`context_after`/`context`, files/content/count modes and zero-based result-line `offset`/`head_limit` paging; context lines are page rows too. Ordinary reads are streamed, at most 1 MiB per line; optional multiline searches require files no larger than 8 MiB. `bash_output` adds `wait_seconds` (0–120) and `until` (regex over unread buffered output); `bash_list` lists shells. Read-only `git` offers status/diff/log/show/blame. Optional `run_checks` reports exit_code (null for timeout/interruption), duration_seconds, summary, detected failures and an output tail; background calls return bash shell IDs. None changes completion behavior. Image reads decode under explicit limits, scale to 2048px and encode at most 3 MiB JPEG, below the service's base64 limit.
+
+## Task plan state
+
+`update_plan {plan:[{step,status}],explanation?}` replaces the main worker's plan; `list_plan {}` reads it. Statuses are `pending`, `in_progress`, `done`. Multi-step tasks should begin with a plan, keep one step in progress while working, and update statuses as work changes. Plans are bounded to 50 steps and 300 characters per text. `todos {agent_id:"main",items:[{text,status}]}` events replace the displayed plan and persisted summary; subagent plans do not change it.
+
+`get_session`, `list_sessions` entries and `read_session_events` share additive fields:
+- `plan_steps`: up to 50 `{text,status}` entries, text limited to 300 characters.
+- `plan_done`, `plan_total`: counts over those bounded entries.
+- `current_step`: `{text,index}` for the first `in_progress` step (1-based), or `null`.
+
+No plan returns `[]`, `0`, `0`, `null`. These fields are independent of session completion: `done:true` is valid with unfinished plan steps.
+
+Example JSON inside MCP text content:
+```json
+{"id":"run_example","state":"working","done":false,"plan_steps":[{"text":"Inspect code","status":"done"},{"text":"Implement change","status":"in_progress"},{"text":"Run checks","status":"pending"}],"plan_done":1,"plan_total":3,"current_step":{"text":"Implement change","index":2}}
+```
+
+The API folds plan snapshots into durable run summaries and reconstructs older summaries from the latest stored main `todos` event. The restore result, including an empty plan when there are no Todos events, is saved once without changing run timestamps; subsequent reads skip the event lookup. Follow-ups preserve them. Controller `start` accepts optional `plan` plus `plan_reminder_every` and `plan_nudge_limit`, forwarded as `GOND_AGENT_INITIAL_PLAN`, `GOND_AGENT_PLAN_REMINDER_EVERY` and `GOND_AGENT_PLAN_NUDGE_LIMIT` to the runner. Reopened containers receive the stored plan, including after service recovery; this does not restore lost filesystem changes or the complete model history.
+
+Reminders are main-loop request context, not transcript events or provider-specific behavior. The interval counts main model rounds, resets per user turn, defaults to 6, and 0 disables reminders including change-triggered ones. With reminders enabled the first request and the request immediately after a plan change include current statuses. Pending/in-progress steps may trigger at most two continuation nudges per user turn (configurable down to 0). The counter never resets on plan edits or tool calls. Exhausting nudges ends normally on the next final response, without checking plan completion. Interrupted/error paths do not trigger nudges. No review/completion gate exists.
+
+Invalid initial-plan JSON is ignored with a warning and an empty plan, never a startup error. Service plan controls accept only nonnegative decimal integers through the u32 range; invalid settings warn without echoing values and use defaults. Compose forwards both controls from `.env`. Nudge wording is singular for one step ("1 plan step is still pending") and plural otherwise ("N plan steps are still pending").

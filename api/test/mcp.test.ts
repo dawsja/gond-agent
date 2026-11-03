@@ -11,6 +11,7 @@ import { openStore } from "../src/db";
 import { createAuthentication } from "../src/auth";
 import { createApp } from "../src/app";
 import { Runs, type Run } from "../src/runs/service";
+import { emptySummary, fold, planState } from "../src/runs/fold";
 import { createToken } from "../src/mcp";
 import type { Config } from "../src/config";
 
@@ -459,4 +460,41 @@ it("closes only owned idle sessions while preserving readable history", async ()
   const r = runs.get("run_test", owner); r.status = "working";
   db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
   expect((await call(client, "close_session", {session_id:r.id})).body.error).toBe("workspace_busy");
+});
+
+it("bounds plan state, ignores subagent plans and preserves completion with pending steps", async () => {
+  const items = [{text:"Read",status:"done"}, {text:"Implement",status:"in_progress"}, ...Array.from({length:60}, () => ({text:"x".repeat(400),status:"pending"}))];
+  const summary = fold(emptySummary(), {type:"todos",agent_id:"main",items});
+  expect(summary).toMatchObject({plan_total:50,plan_done:1,current_step:{text:"Implement",index:2}});
+  expect(summary.plan_steps[49].text).toHaveLength(300);
+  expect(fold(summary, {type:"todos",agent_id:"helper",items:[]})).toBe(summary);
+  expect(planState([{text:"bad",status:"unknown"},null])).toMatchObject({plan_total:0,current_step:null});
+  const r = seed();
+  runs.append(r.id, {type:"todos",agent_id:"main",items});
+  // A fresh service and a legacy summary must reconstruct the plan from SQLite events.
+  const reopenedDb = openStore(dir);
+  const reopened = new Runs(reopenedDb, cfg, async () => { throw new Error("No worker expected"); });
+  expect(reopened.get(r.id).summary.plan_steps).toEqual(summary.plan_steps);
+  await reopened.recover();
+  await reopened.shutdown();
+  reopenedDb.close();
+  const client = await connect();
+  for (const name of ["get_session", "read_session_events"]) {
+    const result = (await call(client, name, {session_id:r.id})).body;
+    expect(result).toMatchObject({done:true,state:"done",plan_total:50,plan_done:1,current_step:{text:"Implement",index:2}});
+    expect(result.plan_steps).toEqual(summary.plan_steps);
+  }
+  expect(runs.list(owner)[0].plan_total).toBe(50);
+});
+
+it("persists an empty legacy plan marker instead of querying events on every read", () => {
+  const r = seed();
+  const prepare = vi.spyOn(db, "prepare");
+  for (let i = 0; i < 3; i++) {
+    expect(runs.get(r.id).summary.plan_steps).toEqual([]);
+    expect(runs.list(owner)[0].summary.plan_steps).toEqual([]);
+  }
+  expect(prepare.mock.calls.filter(([sql]) => sql.includes("json_extract(data,'$.type')='todos'"))).toHaveLength(1);
+  const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+  expect(JSON.parse(stored.data).summary.plan_steps).toEqual([]);
 });

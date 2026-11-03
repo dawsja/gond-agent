@@ -152,6 +152,16 @@ API: `cd api && npm ci && BETTER_AUTH_SECRET=<random-32+-characters> npm run dev
 
 Validation commands and development rules are in [AGENTS.md](AGENTS.md). CI typechecks/tests the API, lints/builds the workspace frontend, checks/tests the worker and builds both Docker targets. Only the workspace frontend enters the runtime image. Docker CI runs real container lifecycle, model relay, Git export, interruption, recovery and browser tests, including first-administrator registration, provider setup and sign-in after a restart at desktop/phone sizes on HTTP. To run the full suite locally after building both images: `cd api && GOND_AGENT_CONTAINER_TEST_IMAGE=gond-agent-worker:local GOND_AGENT_RUNTIME_TEST_IMAGE=gond-agent:local npm test -- test/containers.integration.test.ts`.
 
+### Task plans
+
+For multi-step work, the built-in runner can use `update_plan` and `list_plan`. A pinned **Tasks** panel shows progress, highlights the current step and updates live without scrolling back through the transcript. On phones it is a compact expandable bar. No panel appears until a plan exists. Run lists show plan counts while work is active.
+
+Plans stay in memory across follow-ups and compaction. The service stores `todos` events and the latest plan summary in SQLite, then restores the plan into a replacement worker when reopening a workspace or continuing after a service restart. This restores plan state, not the full model conversation or unpushed files lost with a removed container.
+
+`GOND_AGENT_PLAN_REMINDER_EVERY` controls context reminders in main-worker model rounds (default `6`, `0` disables). The current bounded plan is included on the next request after a change and at the interval. `GOND_AGENT_PLAN_NUDGE_LIMIT` controls optional continuation nudges when a final response leaves pending/in-progress steps (default `2`, `0` disables, hard maximum `2` per user turn). After that cap, a final response ends normally regardless of plan status. Plans are guidance, never a completion requirement or run failure condition. Set these variables in `.env` for the default Compose deployment (see `.env.example`); the API service validates and forwards them at worker startup. Invalid non-integer, negative or out-of-range settings log a warning without the supplied value and use defaults. A malformed initial plan also logs a warning and starts with an empty plan.
+
+Remote MCP `get_session`, `list_sessions` and `read_session_events` include bounded `plan_steps`, `plan_done`, `plan_total` and `current_step`; see the [protocol](protocol/README.md#task-plan-state).
+
 ### ChatGPT plan
 
 Each account can sign in with ChatGPT in **Settings → Models → ChatGPT plan** so the built-in agent uses that person's ChatGPT plan instead of an API key. This uses OpenAI's "Sign in with ChatGPT" token sharing for open-source apps: Gond Agent registers itself on the first sign-in as "Gond Agent", and the issued app registration is kept for that account. Plan usage counts toward the person's ChatGPT limits; review it at [ChatGPT settings → Usage](https://chatgpt.com/settings/usage). Gond Agent never switches a plan request to API billing.
