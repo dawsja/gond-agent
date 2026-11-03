@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import io
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -67,6 +68,16 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(batch["events"][0]["n"], 10)
         with self.assertRaises(RuntimeError):
             agent.dispatch({"method": "events", "after": -1})
+
+    def test_only_the_builtin_runner_starts_without_model_credentials(self):
+        for method in ["cli_prepare", "cli_state", "cli_stop"]:
+            with self.assertRaisesRegex(RuntimeError, "Unknown workspace method"):
+                agent.dispatch({"method": method, "state": {"credentials": {"x": "eA=="}}, "config": {}})
+        env = agent.worker_env({"model": "chatgpt.acct:gpt-5.5", "effort": "low", "backend": "codex"})
+        self.assertEqual(env["GOND_AGENT_API_URL"], "http://127.0.0.1:8787")
+        self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
+        added = set(env) - set(os.environ)
+        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME"})
 
 
 if __name__ == "__main__":

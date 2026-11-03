@@ -7,12 +7,14 @@ import { ContainerPool } from "./containers";
 import { Runs } from "./runs/service";
 import { createApp } from "./app";
 import { Scheduler } from "./scheduler";
+import { removeRetiredRuntimes } from "./retired-runtimes";
 const cfg = configFromEnv(),
   db = openStore(cfg.data),
   auth = await createAuthentication(db, cfg),
   pool = new ContainerPool(cfg);
 await pool.recover();
-const runs = new Runs(db, cfg, (id, handler, volume) => pool.start(id, handler, volume));
+await removeRetiredRuntimes(db, cfg).catch(() => console.error("Couldn't remove retired coding-agent runtime volumes yet; retrying at the next start."));
+const runs = new Runs(db, cfg, (id, handler) => pool.start(id, handler));
 await runs.recover();
 const { app, tickets, githubLogin, mcp } = createApp(db, cfg, auth, runs);
 const server = serve({

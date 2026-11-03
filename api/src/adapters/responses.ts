@@ -3,6 +3,10 @@ import type { Block, Message, Opaque, Provider, ResponsesRequest, StopReason, St
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { dataUrl, maxOutput, parseArgs, sameModel } from "./common";
+import { errorParts, providerFailure } from "./errors";
+
+/** Plan usage accepts function tools only inside a namespace; the runner's tools share this one. */
+export const TOOL_NAMESPACE = "gond";
 
 type Item = Record<string, unknown>;
 
@@ -11,7 +15,7 @@ function own(o: Opaque | undefined, model: ModelRow): Item | undefined {
   return o.data as Item;
 }
 
-function toInput(messages: Message[], model: ModelRow): Item[] {
+function toInput(messages: Message[], model: ModelRow, namespace?: string): Item[] {
   const input: Item[] = [];
   for (const m of messages) {
     if (m.role === "user") {
@@ -31,7 +35,7 @@ function toInput(messages: Message[], model: ModelRow): Item[] {
         } else if (b.type === "text") {
           input.push(item ?? { type: "message", role: "assistant", content: [{ type: "output_text", text: b.text }] });
         } else if (b.type === "tool_call") {
-          input.push(item ?? { type: "function_call", call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {}) });
+          input.push(item ?? { type: "function_call", call_id: b.id, name: b.name, ...(namespace ? { namespace } : {}), arguments: JSON.stringify(b.input ?? {}) });
         }
       }
       continue;
@@ -51,22 +55,27 @@ function toInput(messages: Message[], model: ModelRow): Item[] {
 
 export const responsesAdapter: Adapter = {
   build(req: ResponsesRequest, model: ModelRow): UpstreamRequest {
+    // Subscription plans follow the preview limits: full history in `input`, `instructions` instead of
+    // system items, namespaced function tools, and no output limit, metadata, sampling or truncation.
+    const plan = !!model.access;
     const body: Record<string, unknown> = {
       model: model.upstream_id,
-      input: toInput(req.messages, model),
+      input: toInput(req.messages, model, plan ? TOOL_NAMESPACE : undefined),
       store: false,
       stream: true,
-      max_output_tokens: maxOutput(req, model),
     };
+    if (!plan) body.max_output_tokens = maxOutput(req, model);
     if (req.system) body.instructions = req.system;
     if (req.tools?.length) {
-      body.tools = req.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.input_schema, strict: false }));
+      const functions = req.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.input_schema, strict: false }));
+      body.tools = plan ? [{ type: "namespace", name: TOOL_NAMESPACE, description: "Tools for the Gond Agent workspace container.", tools: functions }] : functions;
     }
     if (model.capabilities.reasoning === "effort" && req.reasoning?.effort !== "default") {
       const effort = req.reasoning?.effort ?? "medium";
       // "off" is each model's lowest setting: "none" where reasoning can be turned off, "low" where it can't.
       const off = model.capabilities.off === "low" || model.capabilities.off === "none" ? model.capabilities.off : "minimal";
-      body.reasoning = { effort: effort === "off" ? off : effort, summary: "auto" };
+      // xAI reasons without summaries; its Responses API accepts only the effort.
+      body.reasoning = { effort: effort === "off" ? off : effort, ...(model.provider === "xai" ? {} : { summary: "auto" }) };
       body.include = ["reasoning.encrypted_content"];
     }
     if (model.provider === "openai" && req.metadata?.session_id) body.prompt_cache_key = req.metadata.session_id;
@@ -155,8 +164,9 @@ class ResponsesParser implements StreamParser {
       }
       case "response.failed":
       case "error": {
-        const err = d.response?.error ?? d.error ?? d;
-        return [{ event: "error", data: { code: "provider_error", message: "The model provider reported an error.", retryable: /rate|overload|server/i.test(String(err.code ?? "")) } }];
+        // Keep the provider's code so subscription access can apply its own recovery.
+        const { code } = errorParts(d), failure = providerFailure(0, d);
+        return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
       }
       default:
         return [];

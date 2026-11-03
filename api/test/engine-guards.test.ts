@@ -10,7 +10,7 @@ function sources(path: string): string[] {
     entry.isDirectory() ? sources(`${path}/${entry.name}`) : /\.(ts|rs|py|mjs)$/.test(entry.name) && !entry.name.startsWith("test_") ? [`${path}/${entry.name}`] : []);
 }
 it("keeps publication identity centralized and free of fixed product authors", () => {
-  for (const path of [...sources("api/src"), ...sources("runner/src"), "containers/agent.py", "containers/cli.mjs"]) {
+  for (const path of [...sources("api/src"), ...sources("runner/src"), "containers/agent.py"]) {
     const source = read(path);
     expect(source, path).not.toMatch(/agent@localhost|user\.name[="\s,]+Gond Agent/);
     if (/"commit",\s*"-m"/.test(source)) {
@@ -27,7 +27,7 @@ it("keeps elapsed-time teardown out of the run pump and removes the completion g
   const pump = service.slice(service.indexOf("private async pump"), service.indexOf("private async finish"));
   expect(pump).not.toMatch(/Date\.now\(\)\s*[-<>]|this\.close|this\.stop/);
   expect(read("api/src/config.ts")).not.toMatch(/idleMs|turnMs|RUN_IDLE_MINUTES|RUN_TURN_MINUTES/);
-  for (const path of ["runner/src/agent/core.rs", "runner/src/tool_server.rs", "containers/cli.mjs"]) {
+  for (const path of ["runner/src/agent/core.rs"]) {
     expect(read(path)).not.toMatch(/finish_review|gond-reviewed|check-review|require_review/);
   }
 });

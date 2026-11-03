@@ -3,6 +3,7 @@ import type { Block, Message, Opaque, ResponsesRequest, StopReason, StreamEvent,
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { maxOutput, parseArgs, sameModel } from "./common";
+import { errorParts, providerFailure } from "./errors";
 
 type ABlock = Record<string, unknown>;
 interface AMessage {
@@ -175,6 +176,8 @@ class AnthropicParser implements StreamParser {
           return [];
         }
         if (delta.type === "input_json_delta") {
+          // Anthropic opens every tool input with an empty fragment; it carries nothing to stream.
+          if (!delta.partial_json) return [];
           ob.json += delta.partial_json;
           this.chars += delta.partial_json.length;
           return [{ event: "block.delta", data: { index: ob.index, partial_json: delta.partial_json } }];
@@ -204,17 +207,10 @@ class AnthropicParser implements StreamParser {
       case "message_stop":
         this.done = true;
         return [];
-      case "error":
-        return [
-          {
-            event: "error",
-            data: {
-              code: "provider_error",
-              message: "The model provider reported an error.",
-              retryable: d.error?.type === "overloaded_error" || d.error?.type === "rate_limit_error",
-            },
-          },
-        ];
+      case "error": {
+        const { code } = errorParts(d), failure = providerFailure(0, d);
+        return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
+      }
       default:
         return [];
     }

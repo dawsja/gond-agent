@@ -1,4 +1,4 @@
-import { CLIAgents } from "./cli-agents"
+import { ChatGPTPlanSettings } from "./chatgpt-plan"
 import { MCPAccess } from "./mcp-access"
 import { useEffect, type ReactNode } from "react"
 import { useLocation } from "react-router"
@@ -27,7 +27,7 @@ export function SettingsScreen() {
       <Section title="Account" description="Your account on this Gond Agent server."><ProfilePhoto /><Row label="Name">{me?.user?.name ?? "—"}</Row><Row label="Email">{me?.user?.email ?? "—"}</Row></Section>
     </SettingsCategory>
     <SettingsCategory id="model-settings" title="Models">
-      <div id="subscription-agents"><CLIAgents /></div>
+      <div id="chatgpt"><ChatGPTPlanSettings /></div>
       {me?.admin && <div id="providers"><ProviderSettings /></div>}
     </SettingsCategory>
     <SettingsCategory id="security-settings" title="Security">

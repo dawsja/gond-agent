@@ -10,7 +10,6 @@ mod prompt;
 mod skills;
 mod tools;
 mod transport;
-mod tool_server;
 
 use anyhow::{Context, Result};
 use agent::AgentConfig;
@@ -19,7 +18,6 @@ use permissions::Mode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().any(|a| a == "--tool-server") { return tool_server::serve().await; }
     let cwd = std::env::current_dir().context("no working directory")?;
     let api = ApiClient::new(std::env::var("GOND_AGENT_API_URL").context("GOND_AGENT_API_URL is required")?, None);
     let model = std::env::var("GOND_AGENT_MODEL").unwrap_or_else(|_| "auto".into());

@@ -3,6 +3,7 @@ import type { Block, Message, ResponsesRequest, StopReason, StreamEvent, Usage }
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { dataUrl, maxOutput, parseArgs } from "./common";
+import { errorParts, providerFailure } from "./errors";
 
 type Msg = Record<string, unknown>;
 
@@ -82,6 +83,7 @@ class ChatParser implements StreamParser {
   private flow: Open | null = null;
   /** Tool calls by their index in the choice. */
   private calls = new Map<number, Open>();
+  private ids = new Set<string>();
   private chars = 0;
   constructor(private model: ModelRow) {}
 
@@ -93,8 +95,8 @@ class ChatParser implements StreamParser {
       return []; // "[DONE]"
     }
     if (d.error) {
-      const e = d.error;
-      return [{ event: "error", data: { code: "provider_error", message: "The model provider reported an error.", retryable: /rate|overload|server/i.test(String(e.code ?? e.type ?? "")) } }];
+      const { code } = errorParts(d), failure = providerFailure(0, d);
+      return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
     }
     const out: StreamEvent[] = [];
     if (!this.started) {
@@ -110,11 +112,15 @@ class ChatParser implements StreamParser {
     if (typeof reasoning === "string" && reasoning) out.push(...this.stream("reasoning", reasoning));
     if (typeof delta.content === "string" && delta.content) out.push(...this.stream("text", delta.content));
     for (const tc of (delta.tool_calls ?? []) as Record<string, any>[]) {
-      let o = this.calls.get(tc.index ?? 0);
+      // Some compatible servers omit `index`; a new call ID then starts a new call.
+      const key: number = typeof tc.index === "number" ? tc.index
+        : tc.id && !this.ids.has(tc.id) ? this.calls.size : Math.max(0, this.calls.size - 1);
+      let o = this.calls.get(key);
       if (!o) {
         out.push(...this.closeFlow());
         o = { index: this.next++, kind: "tool_call", json: "" };
-        this.calls.set(tc.index ?? 0, o);
+        this.calls.set(key, o);
+        if (tc.id) this.ids.add(tc.id);
         out.push({ event: "block.start", data: { index: o.index, type: "tool_call", id: tc.id, name: tc.function?.name } });
       }
       const args = tc.function?.arguments;

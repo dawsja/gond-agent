@@ -355,23 +355,25 @@ it("deduplicates concurrent starts and rejects changed retry arguments and backe
     (await call(client, "start_session", { ...args, prompt: "Different" })).body
       .error,
   ).toBe("request_conflict");
-  const backend = vi.spyOn(runs, "resolveSelection").mockResolvedValue({
-    id: "cli",
-    backend: "codex",
-    upstream_id: "model",
-    capabilities: { reasoning: "effort" },
-  } as never);
+  // Only the built-in runner exists: another backend is refused, and a run created by a
+  // removed coding agent stays readable but takes no follow-ups.
+  vi.mocked(runs.create).mockRestore();
+  expect(
+    (await call(client, "start_session", { ...args, request_id: "create-2", backend: "codex" })).body.error,
+  ).toBe("invalid_backend");
+  const retired = seed(owner, "run_retired");
+  db.prepare("UPDATE runs SET data=json_set(data,'$.backend','codex') WHERE id=?").run(retired.id);
+  expect((await call(client, "get_session", { session_id: retired.id })).body).toMatchObject({ backend: "builtin", retired_backend: "codex" });
   expect(
     (
       await call(client, "send_session_message", {
-        session_id: "run_test",
+        session_id: retired.id,
         text: "Continue",
         request_id: "message-2",
-        model: "cli",
+        model: "model",
       })
     ).body.error,
-  ).toBe("invalid_backend");
-  expect(backend).toHaveBeenCalled();
+  ).toBe("retired_backend");
 });
 it("paginates events, reports large events and releases waiting reads on revoke", async () => {
   seed();
