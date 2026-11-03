@@ -23,13 +23,11 @@ describe("Gond Agent identity", () => {
     expect(config.workerImage).toBe("gond-agent-worker:fixture");
   });
 
-  it("uses Logo C from one source in both frontends and all generated assets", () => {
+  it("uses Logo C from one source in the workspace and all generated assets", () => {
     expect(createHash("sha256").update(MARK_SVG).digest("hex")).toBe("9812328725e54b0bc4cd4b587968d9fef4a61865aa223f58277e891fc79ec17b");
     expect(MARK_SVG).toContain(`fill="${MARK_INK}"`);
     expect(MARK_SVG).toContain('stroke-opacity="0.22"');
-    for (const frontend of ["site", "web"]) {
-      expect(file(`../../${frontend}/public/favicon.svg`)).toBe(MARK_SVG);
-    }
+    expect(file("../../web/public/favicon.svg")).toBe(MARK_SVG);
     expect(file("../../shared/logo.tsx")).toContain("MARK_CONTENT");
     execFileSync(process.execPath, ["--import", "tsx", "scripts/build-brand.ts", "--check"], {
       cwd: new URL("..", import.meta.url), stdio: "pipe",

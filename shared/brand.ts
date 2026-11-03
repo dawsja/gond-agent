@@ -1,4 +1,4 @@
-/** Product identity shared by the self-hosted frontends. */
+/** Product identity shared by the self-hosted workspace. */
 export const PRODUCT_NAME = "Gond Agent"
 export const PRODUCT_URL = "https://gond.io/agent"
 export const SOURCE_URL = "https://github.com/dawsja/gond-agent"

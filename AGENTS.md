@@ -9,14 +9,14 @@ Gond Agent is a self-hosted coding workspace. Every account has access to all fe
 - Worker tools include Universal Ctags symbol navigation, bounded read-only batches and container Playwright browser tests. Persistent agent memory is not supported; keep repository instructions. Tools are optional. The system prompt supplies only workspace/tool/publication context; callers supply their process. A final response ends a turn without a review gate.
 - `containers/`: non-root worker control service, browser dependencies and image smoke tests. `api/src/containers.ts` owns Docker lifecycle and the scoped model relay.
 - `web/`: React workspace, built at `/agents/`; API requests use `/api/` on the same origin.
-- `site/`: standalone site source, not built or served by the self-hosted runtime. Public marketing lives in the separate `gond-landing` repository at `https://gond.io/agent`; the public website does not host workspaces. Never bundle a marketing frontend into the application image.
+- Public marketing lives in the separate `gond-landing` repository at `https://gond.io/agent`; the public website does not host workspaces. Never bundle a marketing frontend into the application image.
 - `shared/`: frontend code imported through `@shared`.
 - `protocol/`: model, agent and live-run event formats.
 - `Dockerfile`, `docker-compose.yml`: self-hosted runtime and worker-image targets. Default Compose uses prebuilt GHCR images: `docker compose pull && docker compose up -d` updates both. The one-shot `worker-image` helper exits successfully; only the API launches actual workers. Source builds require the explicit `docker-compose.build.yml` override.
 
 ## Work rules
 
-The product is **Gond Agent**, source slug `gond-agent`, contact `hi@gond.io`. Use `GOND_AGENT_*` environment variables, `.gond-agent/` project configuration and `GOND_AGENT.md` product instructions. The static mark is Logo C: an ink rounded square (#1b1a18), white chevron and dot, and faint white inner ring, without a white circle behind it. `shared/brand-mark.ts` is the single source for the exact SVG; `shared/logo.tsx` renders it in React. Regenerate both frontends' SVG, PNG and ICO assets with `cd api && npm run brand:build`; never edit derived assets by hand. Branding tests verify generated assets and reject retired geometry. `shared/brand.ts` defines product identity. No prior-brand compatibility aliases or migration fallbacks are supported.
+The product is **Gond Agent**, source slug `gond-agent`, contact `hi@gond.io`. Use `GOND_AGENT_*` environment variables, `.gond-agent/` project configuration and `GOND_AGENT.md` product instructions. The static mark is Logo C: an ink rounded square (#1b1a18), white chevron and dot, and faint white inner ring, without a white circle behind it. `shared/brand-mark.ts` is the single source for the exact SVG; `shared/logo.tsx` renders it in React. Regenerate the workspace's SVG, PNG and ICO assets with `cd api && npm run brand:build`; never edit derived assets by hand. Branding tests verify generated assets and reject retired geometry. `shared/brand.ts` defines product identity. No prior-brand compatibility aliases or migration fallbacks are supported.
 
 Keep changes concise and customer messages plain. Use the custom shadcn controls in `shared/ui/`. The workspace matches Gond Code's default dark blue palette: canvas #000000, rail #030303, panels #0e0e0e, raised #141414, hover #1a1a1a–#1e1e1e, borders #1c1c1c and input borders #262626. Text is #ededed with #8a8a8a muted text; primary buttons use #2b61b9 with white text, accent ink #8db0e8, selection wash #252f40 and focus rings #5c5c5c. Status colors are #a5d6a7, #ffe082, #ef9a9a and #90caf9; destructive actions use #e5484d. Keep existing typography, layout and radii; use Inter for UI and JetBrains Mono for code and commands. Do not show internals in ordinary error messages; put technical detail in server logs. Keep secrets out of logs and source.
 
@@ -65,12 +65,11 @@ Settings use larger near-white category headings for Personal settings, Models, 
 
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
-- `cd site && npm ci && npm run lint && npm run build`
 - `cd runner && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
 - `python3 -m py_compile containers/agent.py` and `python3 -m unittest discover -s containers -p 'test_*.py'`
 - Build `runtime` and `worker-image` Docker targets as `gond-agent:local` and `gond-agent-worker:local`. Then `cd api && GOND_AGENT_CONTAINER_TEST_IMAGE=gond-agent-worker:local GOND_AGENT_RUNTIME_TEST_IMAGE=gond-agent:local npm test -- test/containers.integration.test.ts` to exercise real Docker lifecycle, streamed model relay, Git export, follow-ups, interruption, cleanup, recovery and browser onboarding. Do not claim container lifecycle verification from mocks alone. CI saves onboarding screenshots as an artifact.
 - Worker-image builds run real Chromium interaction/screenshot/error tests and `containers/smoke-worker.py` (real worker tools against a scripted model). Keep `containers/browser/package-lock.json` and the installed browser version in sync.
-- Render account creation, provider setup and the workspace at wide and phone viewports after UI changes. Shared imports resolve from each frontend's dependencies; preserve Vite and TS aliases.
+- Render account creation, provider setup and the workspace at wide and phone viewports after UI changes. Shared imports resolve from the workspace's dependencies; preserve Vite and TS aliases.
 - Verify first-account registration → provider setup → workspace with the real packaged API and SQLite at wide/phone sizes on a non-loopback HTTP origin. UI IDs must use `crypto.getRandomValues`, not secure-context-only `crypto.randomUUID`.
 
 Update this guide, README and protocol when behavior changes.

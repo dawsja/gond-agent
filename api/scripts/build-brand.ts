@@ -29,14 +29,12 @@ const images = iconSizes.map((size, i) => {
 });
 assets.set("favicon.ico", Buffer.concat([header, ...images]));
 
-for (const frontend of ["web", "site"]) {
-  for (const [name, bytes] of assets) {
-    const target = new URL(`../../${frontend}/public/${name}`, import.meta.url);
-    if (check) {
-      if (!bytes.equals(await readFile(target))) throw new Error(`${frontend}/public/${name} is stale; run npm run brand:build`);
-    } else {
-      await writeFile(target, bytes);
-    }
+for (const [name, bytes] of assets) {
+  const target = new URL(`../../web/public/${name}`, import.meta.url);
+  if (check) {
+    if (!bytes.equals(await readFile(target))) throw new Error(`web/public/${name} is stale; run npm run brand:build`);
+  } else {
+    await writeFile(target, bytes);
   }
 }
-console.log(`${check ? "Verified" : "Generated"} ${assets.size * 2} Logo C assets (SVG, PNG ${sizes.join("/")}, ICO 16/32/48)`);
+console.log(`${check ? "Verified" : "Generated"} ${assets.size} Logo C assets (SVG, PNG ${sizes.join("/")}, ICO 16/32/48)`);
