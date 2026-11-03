@@ -8,7 +8,7 @@ import type { Config } from "./config";
 import { parseRun, type Run, type Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { gh } from "./github";
-import { githubEnv } from "./github-login";
+import { githubEnvFor } from "./github-login";
 import { supportedEfforts } from "./effort";
 
 const hash = (value: string) =>
@@ -319,7 +319,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             `user/repos?per_page=100&sort=pushed&page=${page}`,
             "GET",
             undefined,
-            githubEnv(db, cfg.secret),
+            githubEnvFor(db, cfg.secret, user),
           );
           return {
             repositories: repos.map((r) => ({

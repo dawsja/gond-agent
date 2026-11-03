@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openStore, getSetting, setSetting } from "../src/db";
 import { seal } from "../src/auth";
-import { GithubLogin, deviceLogin, githubEnv, type LoginDriver } from "../src/github-login";
+import { GithubLogin, deviceLogin, githubEnvFor, type LoginDriver } from "../src/github-login";
 
 const secret = "fixture-auth-secret-at-least-32-characters";
 let dir: string, db: ReturnType<typeof openStore>, login: GithubLogin;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gond-agent-github-")); db = openStore(dir); });
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gond-agent-github-")); db = openStore(dir); setSetting(db, "github-shared-fallback", true); });
 afterEach(async () => { vi.useRealTimers(); await login?.close(); db.close(); rmSync(dir, { recursive: true, force: true }); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 function deferred() {
   let resolve!: (token: string) => void, reject!: (e: Error) => void, code!: (value: string) => void;
@@ -25,16 +25,16 @@ describe("GitHub browser authorization", () => {
     job.code("ABCD-1234");
     expect(login.state("session-a")).toMatchObject({ status: "pending", code: "ABCD-1234", url: "https://github.com/login/device" });
     expect(login.state("session-b")).toEqual({ status: "busy" });
-    expect(() => login.start("session-b")).toThrow(/Another administrator/);
+    expect(() => login.start("session-b")).toThrow(/Another session/);
     expect(() => login.cancel("session-b", flow.id!)).toThrow(/another session/);
     job.resolve("fixture-token");
     await vi.waitFor(() => expect(login.state("session-a").status).toBe("connected"));
     expect(JSON.stringify(getSetting(db, "github"))).not.toContain("fixture-token");
     expect(JSON.stringify(login.state("session-a"))).not.toMatch(/fixture-token|ABCD/);
-    expect(githubEnv(db, secret).GH_TOKEN === "fixture-token").toBe(true);
+    expect(githubEnvFor(db, secret, "fixture-user").GH_TOKEN === "fixture-token").toBe(true);
     expect(process.env.GH_TOKEN === "fixture-token").toBe(false);
     await login.close(); db.close(); db = openStore(dir);
-    expect(githubEnv(db, secret).GH_TOKEN === "fixture-token").toBe(true);
+    expect(githubEnvFor(db, secret, "fixture-user").GH_TOKEN === "fixture-token").toBe(true);
   });
   it.each(["cancel", "expire", "signout", "shutdown", "reset"])("never persists late approval after %s", async mode => {
     const job = deferred(); login = new GithubLogin(db, secret, dir, job.driver);
@@ -47,7 +47,7 @@ describe("GitHub browser authorization", () => {
     const closed = mode === "shutdown" ? login.close() : undefined;
     job.resolve("late-credential");
     await Promise.resolve(); await Promise.resolve(); await closed;
-    expect(githubEnv(db, secret).GH_TOKEN === "old-credential").toBe(true);
+    expect(githubEnvFor(db, secret, "fixture-user").GH_TOKEN === "old-credential").toBe(true);
     expect(login.state("owner")).not.toHaveProperty("code");
     expect(login.state("owner").status).toBe(mode === "reset" ? "idle" : mode === "expire" ? "expired" : "cancelled");
   });

@@ -59,8 +59,8 @@ export async function createAuthentication(db: Store, cfg: Config) {
         minPasswordLength: 12,
         maxPasswordLength: 128,
       },
-      session: { expiresIn: 60 * 60 * 24 * 7, updateAge: 60 * 60 * 24 },
-      account: { accountLinking: { enabled: false } },
+      session: { expiresIn: 60 * 60 * 24 * 7, freshAge: 10 * 60, updateAge: 60 * 60 * 24 },
+      account: { accountLinking: { enabled: true, disableImplicitLinking: true, allowDifferentEmails: true, allowUnlinkingAll: false } },
       // HTTP deletion stays disabled. Only the confirmed workspace action enables it.
       user: { deleteUser: { enabled: !!beforeDelete, beforeDelete } },
       rateLimit: { enabled: true, storage: "database", window: 60, max: 60 },
@@ -108,6 +108,13 @@ export async function createAuthentication(db: Store, cfg: Config) {
                   scopes: ["openid", "profile", "email"],
                   pkce: true,
                   requireIdTokenVerification: true,
+                  accountSubject: ({ tokens }) => {
+                    // genericOAuth verifies the ID token before resolving this key.
+                    if (!tokens.idToken) throw new Error("A verified ID token is required.");
+                    const { sub } = JSON.parse(Buffer.from(tokens.idToken.split(".")[1], "base64url").toString()) as { sub?: unknown };
+                    if (typeof sub !== "string" || !sub) throw new Error("The ID token has no subject.");
+                    return sub;
+                  },
                 },
               ]
             : [],

@@ -6,14 +6,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { getSetting, setSetting, type Store } from "./db";
 import { seal, unseal } from "./auth";
+import { githubStatus } from "./github";
 import { ApiError } from "./wire";
 
-export function githubEnv(db: Store, secret: string): NodeJS.ProcessEnv {
-  const saved = getSetting<{ token: string }>(db, "github");
+export function githubEnvFor(db: Store, secret: string, userId: string): NodeJS.ProcessEnv {
+  if (!userId) throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
+  const own = db.prepare("SELECT token FROM github_connections WHERE user_id=?").get(userId) as { token: string } | undefined;
+  const saved = own ?? (getSetting<boolean>(db, "github-shared-fallback") ? getSetting<{ token: string }>(db, "github") : null);
   const env: NodeJS.ProcessEnv = { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" };
   if (saved) {
     delete env.GITHUB_TOKEN;
     env.GH_TOKEN = unseal(secret, saved.token);
+  } else if (!env.GH_TOKEN && !env.GITHUB_TOKEN && !env.GH_CONFIG_DIR) {
+    throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
   }
   return env;
 }
@@ -74,68 +79,79 @@ export const deviceLogin: LoginDriver = (root, onCode) => {
 
 interface Flow { owner: string; state: LoginState; job: LoginJob; timer: ReturnType<typeof setTimeout>; done: Promise<void> }
 export class GithubLogin {
-  private flow?: Flow;
+  private flows = new Map<string, Flow>();
   private closed = false;
   private root: string;
   constructor(private db: Store, private secret: string, data: string, private driver: LoginDriver = deviceLogin) {
     this.root = join(data, "github-login");
-    // Only this service's disposable authorization files; never the mounted host config.
     rmSync(this.root, { recursive: true, force: true });
     mkdirSync(this.root, { mode: 0o700 });
   }
   private owner(session: string) { return createHash("sha256").update(session).digest("hex"); }
-  state(session: string): LoginState {
-    if (!this.flow) return { status: "idle" };
-    if (this.flow.owner !== this.owner(session)) return { status: this.pending() ? "busy" : "idle" };
-    return { ...this.flow.state };
+  private pending(flow?: Flow) { return !!flow && ["starting", "pending"].includes(flow.state.status); }
+  state(session: string, userId = "shared"): LoginState {
+    const flow = this.flows.get(userId);
+    if (!flow) return { status: "idle" };
+    if (flow.owner !== this.owner(session)) return { status: this.pending(flow) ? "busy" : "idle" };
+    return { ...flow.state };
   }
-  private pending() { return this.flow && ["starting", "pending"].includes(this.flow.state.status); }
-  start(session: string, authorized: () => Promise<boolean> = async () => true) {
+  start(session: string, authorized: () => Promise<boolean> = async () => true, userId = "shared") {
     if (this.closed) throw new ApiError(503, "github_closed", "The server is restarting. Try again in a moment.");
-    if (this.pending()) {
-      if (this.flow!.owner === this.owner(session)) return this.state(session);
-      throw new ApiError(409, "github_busy", "Another administrator is connecting GitHub. Try again later.");
+    for (const [key, flow] of this.flows) if (!this.pending(flow) && flow.state.expiresAt! <= Date.now()) this.flows.delete(key);
+    const previous = this.flows.get(userId);
+    if (this.pending(previous)) {
+      if (previous!.owner === this.owner(session)) return this.state(session, userId);
+      throw new ApiError(409, "github_busy", "Another session of this account is connecting GitHub. Try again later.");
     }
+    if (!previous && this.flows.size >= 100) throw new ApiError(429, "github_busy", "Too many sign-ins. Try again later.");
     const state: LoginState = { id: randomBytes(16).toString("hex"), status: "starting", expiresAt: Date.now() + 10 * 60000 };
     const job = this.driver(this.root, code => {
-      if (this.flow?.state === state && this.pending()) Object.assign(state, { status: "pending", code, url: "https://github.com/login/device" });
+      const flow = this.flows.get(userId);
+      if (flow?.state === state && this.pending(flow)) Object.assign(state, { status: "pending", code, url: "https://github.com/login/device" });
     });
-    const flow: Flow = { owner: this.owner(session), state, job, timer: setTimeout(() => this.stop("expired"), 10 * 60000), done: Promise.resolve() };
+    const flow: Flow = { owner: this.owner(session), state, job, timer: setTimeout(() => this.stop(userId, "expired"), 10 * 60000), done: Promise.resolve() };
     flow.timer.unref();
-    this.flow = flow;
+    this.flows.set(userId, flow);
+    const current = () => this.flows.get(userId) === flow && this.pending(flow);
     flow.done = job.token.then(async token => {
-      if (!await authorized()) { if (this.flow === flow) this.stop("cancelled"); return; }
-      if (this.flow !== flow || !this.pending()) return;
-      if (Date.now() >= state.expiresAt!) { this.stop("expired"); return; }
-      setSetting(this.db, "github", { token: seal(this.secret, token) });
-      flow.state = { id: state.id, status: "connected" };
+      if (!await authorized()) { if (current()) this.stop(userId, "cancelled"); return; }
+      if (!current()) return;
+      if (Date.now() >= state.expiresAt!) { this.stop(userId, "expired"); return; }
+      const status = await githubStatus({ ...process.env, GH_TOKEN: token, GITHUB_TOKEN: undefined });
+      if (!await authorized()) { if (current()) this.stop(userId, "cancelled"); return; }
+      if (!current()) return;
+      if (Date.now() >= state.expiresAt!) { this.stop(userId, "expired"); return; }
+      if (userId === "shared") setSetting(this.db, "github", { token: seal(this.secret, token) });
+      else this.db.prepare("INSERT INTO github_connections(user_id,token,login,connected_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,login=excluded.login,connected_at=excluded.connected_at").run(userId, seal(this.secret, token), status.login, Date.now());
+      flow.state = { id: state.id, status: "connected", expiresAt: state.expiresAt };
     }).catch(() => {
-      if (this.flow === flow && this.pending()) {
+      if (current()) {
         console.warn("GitHub device authorization did not finish");
-        flow.state = { id: state.id, status: "error", message: "GitHub sign-in didn't finish. Try again and approve the code on GitHub." };
+        flow.state = { id: state.id, expiresAt: state.expiresAt, status: "error", message: "GitHub sign-in didn't finish. Try again and approve the code on GitHub." };
       }
     }).finally(() => clearTimeout(flow.timer));
-    return this.state(session);
+    return this.state(session, userId);
   }
-  private stop(status: "cancelled" | "expired") {
-    const flow = this.flow;
-    if (!flow || !this.pending()) return;
-    flow.state = { id: flow.state.id, status };
+  private stop(userId: string, status: "cancelled" | "expired") {
+    const flow = this.flows.get(userId);
+    if (!flow || !this.pending(flow)) return;
+    flow.state = { id: flow.state.id, expiresAt: flow.state.expiresAt, status };
     clearTimeout(flow.timer);
     flow.job.cancel();
   }
-  cancel(session: string, id: string) {
-    if (this.flow && (this.flow.owner !== this.owner(session) || this.flow.state.id !== id)) throw new ApiError(409, "github_flow", "This sign-in belongs to another session. Refresh and try again.");
-    this.stop("cancelled");
-    return this.state(session);
+  cancel(session: string, id: string, userId = "shared") {
+    const flow = this.flows.get(userId);
+    if (flow && (flow.owner !== this.owner(session) || flow.state.id !== id)) throw new ApiError(409, "github_flow", "This sign-in belongs to another session. Refresh and try again.");
+    this.stop(userId, "cancelled");
+    return this.state(session, userId);
   }
-  reset() {
-    this.stop("cancelled");
-    this.flow = undefined;
+  reset(userId?: string) {
+    for (const key of userId ? [userId] : this.flows.keys()) { this.stop(key, "cancelled"); this.flows.delete(key); }
   }
   async close() {
     this.closed = true;
-    this.stop("cancelled");
-    await this.flow?.done;
+    const flows = [...this.flows.values()];
+    for (const key of this.flows.keys()) this.stop(key, "cancelled");
+    await Promise.all(flows.map(flow => flow.done));
   }
 }

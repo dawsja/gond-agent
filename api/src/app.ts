@@ -1,3 +1,4 @@
+import { unseal } from "./auth";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { randomBytes } from "node:crypto";
@@ -6,8 +7,8 @@ import type { Config } from "./config";
 import type { Authentication } from "./auth";
 import type { Runs } from "./runs/service";
 import { gh, githubStatus, validRepo } from "./github";
-import { GithubLogin, githubEnv } from "./github-login";
-import { getSetting } from "./db";
+import { GithubLogin, githubEnvFor } from "./github-login";
+import { getSetting, setSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
 import { ApiError } from "./wire";
 import { clearModelCatalog } from "./models";
@@ -93,7 +94,13 @@ export function createApp(
     accountQueue = result.catch(() => {});
     return result;
   };
-  app.on(["GET", "POST"], "/api/auth/*", (c) => {
+  app.on(["GET", "POST"], "/api/auth/*", async (c) => {
+    if (["/api/auth/link-social", "/api/auth/unlink-account"].includes(c.req.path)) {
+      const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+      if (!current) throw new ApiError(401, "unauthorized", "Sign in before linking a sign-in method.");
+      if (Date.now() - new Date(current.session.createdAt).getTime() > 10 * 60000)
+        throw new ApiError(403, "recent_signin", "Sign out and sign in again before changing sign-in methods.");
+    }
     // User creation (including OIDC callbacks) must not race the last account's deletion.
     return changeAccounts(() => authentication.current.handler(c.req.raw));
   });
@@ -191,6 +198,7 @@ export function createApp(
         throw new ApiError(400, "delete_failed", "Couldn't delete your account. Sign in again and retry.");
       }
       const reset = !db.prepare('SELECT 1 FROM "user" LIMIT 1').get();
+      githubLogin.reset(user.id);
       deletionAttempts.delete(user.id);
       for (const [key, ticket] of tickets) if (ticket.user === user.id) tickets.delete(key);
       if (reset) {
@@ -255,6 +263,32 @@ export function createApp(
   app.post("/api/v1/subscriptions/welcome", c => { subscriptions.acknowledgeWelcome(c.get("user").id); return c.json({ ok: true }); });
   app.post("/api/v1/subscriptions/accounts/:id/sign-out", async c => c.json(await subscriptions.signOut(c.get("user").id, c.req.param("id"))));
   app.delete("/api/v1/subscriptions/accounts/:id", async c => c.json(await subscriptions.remove(c.get("user").id, c.req.param("id"))));
+  app.get("/api/v1/me/sign-in-methods", c => {
+    c.header("Cache-Control", "no-store");
+    return c.json({ methods: db.prepare('SELECT id,providerId AS provider FROM account WHERE userId=?').all(c.get("user").id), providers: authentication.providers() });
+  });
+  app.get("/api/v1/settings/people", c => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage accounts.");
+    c.header("Cache-Control", "no-store");
+    const people = db.prepare('SELECT u.id,u.name,u.email,EXISTS(SELECT 1 FROM administrators a WHERE a.user_id=u.id) AS admin FROM "user" u ORDER BY u.createdAt,u.id').all() as { id: string; name: string; email: string; admin: number }[];
+    return c.json({ people: people.map(person => ({ ...person, admin: !!person.admin, methods: (db.prepare('SELECT providerId AS provider FROM account WHERE userId=?').all(person.id) as { provider: string }[]).map(method => method.provider) })) });
+  });
+  app.put("/api/v1/settings/people/:id/role", c => changeAccounts(async () => {
+    const body = await c.req.json();
+    if (typeof body.admin !== "boolean") throw new ApiError(400, "invalid_request", "Choose an account role.");
+    db.transaction(() => {
+      if (!db.prepare("SELECT 1 FROM administrators WHERE user_id=?").get(c.get("user").id)) throw new ApiError(403, "forbidden", "Only an administrator can manage accounts.");
+      const id = c.req.param("id");
+      if (!db.prepare('SELECT 1 FROM "user" WHERE id=?').get(id)) throw new ApiError(404, "not_found", "That account no longer exists.");
+      if (body.admin) db.prepare("INSERT OR IGNORE INTO administrators(user_id) VALUES(?)").run(id);
+      else {
+        if (db.prepare("SELECT 1 FROM administrators WHERE user_id=?").get(id) && !db.prepare("SELECT 1 FROM administrators WHERE user_id<>? LIMIT 1").get(id))
+          throw new ApiError(409, "administrator_required", "Keep at least one administrator.");
+        db.prepare("DELETE FROM administrators WHERE user_id=?").run(id);
+      }
+    })();
+    return c.json({ ok: true });
+  }));
   app.get("/api/v1/settings/oidc", (c) => {
     if (!c.get("admin"))
       throw new ApiError(
@@ -321,32 +355,63 @@ export function createApp(
       },
     });
   });
-  const credentials = () => githubEnv(db, cfg.secret);
+  const credentials = (user: string) => githubEnvFor(db, cfg.secret, user);
   app.get("/api/v1/github", async (c) => {
     c.header("Cache-Control", "no-store");
-    return c.json({ ...await githubStatus(credentials()), managed: !!getSetting(db, "github") });
+    const managed = !!db.prepare("SELECT 1 FROM github_connections WHERE user_id=?").get(c.get("user").id);
+    try { return c.json({ ...await githubStatus(credentials(c.get("user").id)), managed }); }
+    catch (error) { if (error instanceof ApiError && error.code === "github_required") return c.json({ configured: false, login: null, managed }); throw error; }
   });
-  app.use("/api/v1/github/login", async (c, next) => {
-    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can connect GitHub.");
+  app.delete("/api/v1/github", c => {
+    githubLogin.reset(c.get("user").id);
+    db.prepare("DELETE FROM github_connections WHERE user_id=?").run(c.get("user").id);
+    return c.json({ ok: true });
+  });
+  for (const shared of [false, true]) {
+    const path = shared ? "/api/v1/settings/github" : "/api/v1/github";
+    app.use(`${path}/login`, async (c, next) => {
+      if (shared && !c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage the shared connection.");
+      c.header("Cache-Control", "no-store");
+      await next();
+    });
+    const target = (user: string) => shared ? "shared" : user;
+    app.get(`${path}/login`, c => c.json(githubLogin.state(c.get("session").token, target(c.get("user").id))));
+    app.post(`${path}/login`, c => c.json(githubLogin.start(c.get("session").token, async () => {
+      const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+      return current?.user.id === c.get("user").id && (!shared || !!db.prepare("SELECT 1 FROM administrators WHERE user_id=?").get(current.user.id));
+    }, target(c.get("user").id))));
+    app.delete(`${path}/login`, async c => {
+      const body = await c.req.json();
+      if (typeof body.id !== "string") throw new ApiError(400, "github_flow", "Choose the current GitHub sign-in.");
+      return c.json(githubLogin.cancel(c.get("session").token, body.id, target(c.get("user").id)));
+    });
+  }
+  app.use("/api/v1/settings/github", async (c, next) => {
+    if (!c.get("admin")) throw new ApiError(403, "forbidden", "Only an administrator can manage the shared connection.");
     c.header("Cache-Control", "no-store");
     await next();
   });
-  app.get("/api/v1/github/login", c => c.json(githubLogin.state(c.get("session").token)));
-  app.post("/api/v1/github/login", c => c.json(githubLogin.start(c.get("session").token, async () => {
-    const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
-    return !!current && !!db.prepare("SELECT 1 FROM administrators WHERE user_id=?").get(current.user.id);
-  })));
-  app.delete("/api/v1/github/login", async c => {
+  app.get("/api/v1/settings/github", async c => {
+    const saved = getSetting<{ token: string }>(db, "github");
+    return c.json({ ...(saved ? await githubStatus({ ...process.env, GH_TOKEN: unseal(cfg.secret, saved.token), GITHUB_TOKEN: undefined }) : { configured: false, login: null }), managed: !!saved, fallback: !!getSetting(db, "github-shared-fallback") });
+  });
+  app.put("/api/v1/settings/github", async c => {
     const body = await c.req.json();
-    if (typeof body.id !== "string") throw new ApiError(400, "github_flow", "Choose the current GitHub sign-in.");
-    return c.json(githubLogin.cancel(c.get("session").token, body.id));
+    if (typeof body.fallback !== "boolean") throw new ApiError(400, "invalid_request", "Choose whether to use the shared connection.");
+    setSetting(db, "github-shared-fallback", body.fallback);
+    return c.json({ ok: true });
+  });
+  app.delete("/api/v1/settings/github", c => {
+    githubLogin.reset("shared");
+    db.prepare("DELETE FROM settings WHERE key='github'").run();
+    return c.json({ ok: true });
   });
   app.get("/api/v1/github/repos", async (c) => {
     const repos: any[] = [];
     for (let page = 1; page <= 10; page++) {
       const batch = await gh<any[]>(
         `user/repos?per_page=100&sort=pushed&page=${page}`,
-        "GET", undefined, credentials(),
+        "GET", undefined, credentials(c.get("user").id),
       );
       repos.push(...batch);
       if (batch.length < 100) break;
@@ -366,7 +431,7 @@ export function createApp(
       throw new ApiError(400, "invalid_repo", "Choose a repository.");
     const branches = await gh<{ name: string }[]>(
       `repos/${repo}/branches?per_page=100`,
-      "GET", undefined, credentials(),
+      "GET", undefined, credentials(c.get("user").id),
     );
     return c.json({ branches: branches.map((r) => r.name) });
   });
