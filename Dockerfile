@@ -16,8 +16,8 @@ RUN cargo build --release --locked
 FROM node:24.22.1-trixie-slim AS worker-tools
 RUN apt-get update && apt-get install -y --no-install-recommends bash git ca-certificates curl python3 python3-venv python3-pip build-essential ripgrep universal-ctags jq unzip && rm -rf /var/lib/apt/lists/* && corepack enable
 RUN test "$(dpkg --print-architecture)" = amd64 \
- && curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.3.2/bun-linux-x64.zip -o /tmp/bun.zip \
- && echo "0cb56a4484bd7764a3eef9b9e67ab457840981287b46794974d1e6612cbf6709  /tmp/bun.zip" | sha256sum -c - \
+ && curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o /tmp/bun.zip \
+ && echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  /tmp/bun.zip" | sha256sum -c - \
  && unzip -q /tmp/bun.zip -d /tmp/bun \
  && install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun \
  && curl -fsSL https://github.com/astral-sh/uv/releases/download/0.9.7/uv-x86_64-unknown-linux-gnu.tar.gz -o /tmp/uv.tar.gz \
@@ -38,8 +38,17 @@ COPY --from=worker-build /src/target/release/gond-agent-worker /usr/local/bin/go
 COPY containers/agent.py /opt/gond-agent/agent.py
 COPY containers/smoke-worker.py /opt/gond-agent/smoke-worker.py
 RUN useradd --uid 1000 --gid 1000 --non-unique --home-dir /home/gond-agent --no-create-home --shell /bin/bash gond-agent \
- && mkdir -p /workspace/repo /home/gond-agent /opt/gond-tools/bin && chown -R 1000:1000 /workspace /home/gond-agent /opt/gond-tools
+ && mkdir -p /workspace/repo /home/gond-agent /opt/gond-tools/bin /opt/gond-tools/tmp /opt/gond-tools/cache && chown -R 1000:1000 /workspace /home/gond-agent /opt/gond-tools
 ENV HOME=/home/gond-agent \
+    TMPDIR=/opt/gond-tools/tmp \
+    TMP=/opt/gond-tools/tmp \
+    TEMP=/opt/gond-tools/tmp \
+    TEMPDIR=/opt/gond-tools/tmp \
+    XDG_CACHE_HOME=/opt/gond-tools/cache \
+    BUN_INSTALL_CACHE_DIR=/opt/gond-tools/cache/bun \
+    npm_config_cache=/opt/gond-tools/cache/npm \
+    PIP_CACHE_DIR=/opt/gond-tools/cache/pip \
+    UV_CACHE_DIR=/opt/gond-tools/cache/uv \
     BUN_INSTALL=/opt/gond-tools/bun \
     CARGO_HOME=/opt/gond-tools/cargo \
     RUSTUP_HOME=/opt/gond-tools/rustup \

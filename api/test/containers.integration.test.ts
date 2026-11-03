@@ -286,6 +286,13 @@ describe.skipIf(!image)("real container workspaces", () => {
 mkdir -p /opt/gond-tools/bin
 cp /bin/true /opt/gond-tools/bin/probe
 probe
+case "$TMPDIR" in /opt/gond-tools/tmp) ;; *) exit 1 ;; esac
+cp /bin/true "$TMPDIR/probe"
+"$TMPDIR/probe"
+installer_tmp=$(mktemp -d)
+printf '#!/bin/sh\\necho rustup-style-temp-exec-verified\\n' > "$installer_tmp/x"
+chmod +x "$installer_tmp/x"
+"$installer_tmp/x"
 for dir in /tmp "$HOME"; do
   cp /bin/true "$dir/probe"
   if "$dir/probe" 2>"$dir/probe.err"; then exit 1; else test "$?" -eq 126; fi
@@ -293,9 +300,23 @@ for dir in /tmp "$HOME"; do
 done
 if touch /rootfs-probe 2>/tmp/rootfs.err; then exit 1; fi
 grep -q 'Read-only file system' /tmp/rootfs.err
+test "$(bun --version)" = 1.4.4
 bun --version
+project=$(mktemp -d)
+(
+  cd "$project"
+  printf '%s\\n' '{"name":"bun-lockfile-fixture","version":"1.0.0","dependencies":{"local-fixture":"file:./local-fixture"},"scripts":{"build":"bun build ./build.ts --outdir ./dist"}}' > package.json
+  printf '%s\\n' 'console.log("bun-build-verified")' > build.ts
+  mkdir local-fixture
+  printf '%s\\n' '{"name":"local-fixture","version":"1.0.0"}' > local-fixture/package.json
+  bun install
+  python3 -c 'import re; assert re.search(chr(34)+"lockfileVersion"+chr(34)+r":\\s*2", open("bun.lock").read())'
+  bun install --frozen-lockfile
+  bun run build
+  test -s dist/build.js
+)
 uv --version
-python3 -c 'import os; expected={"BUN_INSTALL":"bun","CARGO_HOME":"cargo","RUSTUP_HOME":"rustup","UV_INSTALL_DIR":"bin","UV_TOOL_DIR":"uv/tools","UV_PYTHON_INSTALL_DIR":"uv/python","UV_TOOL_BIN_DIR":"bin","XDG_BIN_HOME":"bin","XDG_DATA_HOME":"share","PYTHONUSERBASE":"python","npm_config_prefix":"npm","COREPACK_HOME":"corepack","PNPM_HOME":"pnpm"}; assert all(os.environ[k]=="/opt/gond-tools/"+v for k,v in expected.items())'
+python3 -c 'import os; expected={"BUN_INSTALL":"bun","CARGO_HOME":"cargo","RUSTUP_HOME":"rustup","UV_INSTALL_DIR":"bin","UV_TOOL_DIR":"uv/tools","UV_PYTHON_INSTALL_DIR":"uv/python","UV_TOOL_BIN_DIR":"bin","XDG_BIN_HOME":"bin","XDG_DATA_HOME":"share","PYTHONUSERBASE":"python","npm_config_prefix":"npm","COREPACK_HOME":"corepack","PNPM_HOME":"pnpm","TMPDIR":"tmp","TMP":"tmp","TEMP":"tmp","TEMPDIR":"tmp","BUN_INSTALL_CACHE_DIR":"cache/bun","npm_config_cache":"cache/npm","XDG_CACHE_HOME":"cache","PIP_CACHE_DIR":"cache/pip","UV_CACHE_DIR":"cache/uv"}; assert all(os.environ[k]=="/opt/gond-tools/"+v for k,v in expected.items()); assert "CARGO_TARGET_DIR" not in os.environ; assert os.environ["PLAYWRIGHT_BROWSERS_PATH"]=="/opt/gond-agent-browser/browsers"; assert os.environ["NODE_PATH"]=="/opt/gond-agent-browser/node_modules"'
 echo toolchain-isolation-verified`})],
       [call("symbols","symbols",{action:"outline",path:"app.ts"}), call("batch","batch",{calls:[{tool:"read",input:{path:"app.ts"}},{tool:"symbols",input:{action:"references",symbol:"greet"}}]})],
       [call("write","write",{path:"feature.txt",content:"verified\n"})],
@@ -347,6 +368,7 @@ echo toolchain-isolation-verified`})],
       expect(volume.Labels["io.gond-agent.run"]).toBe(id);
       expect(JSON.stringify(inspect.Config.Env)).not.toMatch(/host-only|BETTER_AUTH|GH_TOKEN|GITHUB_TOKEN|DOCKER_HOST/);
       await workspace.rpc("setup",{archive:archive.toString("base64")});
+      await docker("exec",container,"rmdir","/opt/gond-tools/tmp");
       await workspace.rpc("start",{model:"fixture"});
       await workspace.rpc("send",{input:{type:"user",text:"Implement and verify",images:[]}});
       let cursor = 0;
