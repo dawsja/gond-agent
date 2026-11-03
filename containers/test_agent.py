@@ -66,6 +66,12 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(env["GOND_AGENT_PLAN_REMINDER_EVERY"], "0")
         self.assertEqual(env["GOND_AGENT_PLAN_NUDGE_LIMIT"], "2")
 
+    def test_questions_require_explicit_interactive_start(self):
+        self.assertEqual(agent.worker_env({"model": "fixture", "question_wait_minutes": 8})["GOND_AGENT_QUESTION_WAIT_MINUTES"], "8")
+        for value in [None, False, "true", 1]:
+            self.assertEqual(agent.worker_env({"model": "fixture", "interactive": value})["GOND_AGENT_INTERACTIVE"], "false")
+        self.assertEqual(agent.worker_env({"model": "fixture", "interactive": True})["GOND_AGENT_INTERACTIVE"], "true")
+
     def test_archive_rejects_escape_and_unsafe_links(self):
         for symlink in [False, True]:
             body = io.BytesIO()
@@ -121,7 +127,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(env["GOND_AGENT_API_URL"], "http://127.0.0.1:8787")
         self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
         added = set(env) - set(os.environ)
-        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT"})
+        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES"})
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ pub struct AgentConfig {
     pub plan_nudge_limit: u32,
     /// When false (headless), permission prompts and questions are answered automatically.
     pub interactive: bool,
+    pub question_wait: std::time::Duration,
     /// Tools available inside the workspace container.
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
@@ -76,6 +77,7 @@ struct Shared {
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     turn_cancel: Mutex<CancellationToken>,
     interactive: bool,
+    question_wait: std::time::Duration,
     sub_counter: AtomicU32,
     main_context: Mutex<u64>,
     skills: Mutex<Vec<Skill>>,
@@ -147,6 +149,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         locks: Mutex::default(),
         turn_cancel: Mutex::new(CancellationToken::new()),
         interactive: cfg.interactive,
+        question_wait: cfg.question_wait,
         sub_counter: AtomicU32::new(0),
         main_context: Mutex::new(0),
         skills: Mutex::new(cfg.skills),
@@ -784,7 +787,20 @@ async fn ask_user(s: &Arc<Shared>, run: &Run, id: String, name: String, input: &
     }
     let request_id = uuid::Uuid::new_v4().to_string();
     let ev = AgentEvent::Question { request_id: request_id.clone(), agent_id: run.id.clone(), question, options };
-    match s.wait_reply(ev, request_id, cancel).await {
+    let reply = if s.question_wait.is_zero() {
+        s.wait_reply(ev, request_id.clone(), cancel).await
+    } else {
+        match tokio::time::timeout(s.question_wait, s.wait_reply(ev, request_id.clone(), cancel)).await {
+            Ok(reply) => reply,
+            Err(_) => {
+                s.pending.lock().unwrap().remove(&request_id);
+                s.emit(AgentEvent::QuestionResolved { request_id, agent_id: run.id.clone() });
+                return result(id, name, "No one answered; decide yourself and continue", false);
+            }
+        }
+    };
+    s.emit(AgentEvent::QuestionResolved { request_id, agent_id: run.id.clone() });
+    match reply {
         Some(Reply::Answer(a)) => result(id, name, format!("The user answered: {a}"), false),
         _ => result(id, name, "The question was dismissed without an answer.", true),
     }
@@ -873,6 +889,7 @@ mod tests {
             plan_reminder_every: 6,
             plan_nudge_limit: 0,
             interactive: true,
+            question_wait: std::time::Duration::from_secs(240 * 60),
             tools: crate::tools::builtin(),
             system: "sys".into(),
             sub_system: "sub".into(),
@@ -1113,6 +1130,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_question_timeout_continues_and_answer_before_timeout_wins() {
+        for answer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = Arc::new(StdMutex::new(vec![]));
+            let handler: Handler = Arc::new(|req: &Value| {
+                if req["messages"].as_array().unwrap().len() == 1 {
+                    sse(&[json!({"type":"tool_call","id":"q","name":"ask_user","input":{"question":"Which branch?"}})], "tool_use")
+                } else { sse(&[json!({"type":"text","text":"Continued"})], "end_turn") }
+            });
+            let url = mock(handler, seen.clone()).await;
+            let mut cfg = config(dir.path(), Mode::Allow);
+            cfg.question_wait = Duration::from_millis(if answer { 2000 } else { 30 });
+            let mut h = spawn(ApiClient::new(url, None), cfg);
+            h.input.send(AgentInput::User { text: "go".into(), images: vec![] }).unwrap();
+            let events = until(&mut h, |e| matches!(e, AgentEvent::Question { .. })).await;
+            let AgentEvent::Question { request_id, .. } = events.last().unwrap() else { unreachable!() };
+            if answer { h.input.send(AgentInput::QuestionReply { request_id: request_id.clone(), answer: "main".into() }).unwrap(); }
+            let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::QuestionResolved { request_id: id, .. } if id == request_id)));
+            let requests = seen.lock().unwrap();
+            let output = requests[1]["messages"][2]["content"][0]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(output, if answer { "The user answered: main" } else { "No one answered; decide yourself and continue" });
+        }
+    }
+
+    #[tokio::test]
     async fn autonomous_runs_never_ask() {
         // An autonomous worker configuration: mode allow, non-interactive.
         let dir = tempfile::tempdir().unwrap();
@@ -1138,6 +1181,11 @@ mod tests {
         h.input.send(AgentInput::User { text: "go".into(), images: vec![] }).unwrap();
         let evs = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
         assert!(!evs.iter().any(|e| matches!(e, AgentEvent::PermissionRequest { .. } | AgentEvent::Question { .. })));
+        let requests = seen.lock().unwrap();
+        let results = requests[1]["messages"][2]["content"].as_array().unwrap();
+        let answer = results.iter().find(|r| r["call_id"] == "q").unwrap();
+        assert_ne!(answer["is_error"], true);
+        assert!(answer["content"][0]["text"].as_str().unwrap().contains("Proceed with your best judgment"));
         assert_eq!(std::fs::read_to_string(dir.path().join("x.txt")).unwrap(), "hi");
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::ToolEnd { ok: true, output, .. } if output == "hi")));
     }

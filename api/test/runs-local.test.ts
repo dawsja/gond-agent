@@ -47,6 +47,7 @@ let dir: string,
   events: Record<string, unknown>[],
   destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
 let workerFailure: string | null;
+let relay: (req: Request) => Promise<Response>;
 const cfg = (): Config => ({
   data: dir,
   origin: "http://localhost:8787",
@@ -72,56 +73,87 @@ beforeEach(async () => {
   events = [];
   workerFailure = null;
   destroy = vi.fn(async () => {});
-  runs = new Runs(db, cfg(), async () => ({
-    destroy,
-    rpc: async (method, args) => {
-      log.push({ method, ...args });
-      if (method === "send") {
-        const input = args?.input as any;
-        if (input.type === "interrupt")
-          events.push({
-            type: "turn.end",
-            agent_id: "main",
-            stop_reason: "interrupted",
-          });
-        else if (input.type !== "user") return true as any;
-        else if (workerFailure)
-          events.push(
-            { type: "turn.start", agent_id: "main" },
-            { type: "turn.end", agent_id: "main", stop_reason: "error" },
-            { type: "error", agent_id: "main", message: workerFailure, retryable: false },
-          );
-        else
-          events.push(
-            { type: "turn.start", agent_id: "main" },
-            {
-              type: "text.delta",
+  runs = new Runs(db, cfg(), async (_id, handler) => {
+    relay = handler;
+    return {
+      destroy,
+      rpc: async (method, args) => {
+        log.push({ method, ...args });
+        if (method === "send") {
+          const input = args?.input as any;
+          if (input.type === "interrupt")
+            events.push({
+              type: "turn.end",
               agent_id: "main",
-              text: "Fixed it and tested it.",
-            },
-            { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
-          );
-      }
-      if (method === "events") {
-        const batch = events.splice(0);
-        return { events: batch, alive: true } as any;
-      }
-      if (method === "snapshot")
-        return {
-          bundle: Buffer.from("bundle").toString("base64"),
-          head: "b".repeat(40),
-        } as any;
-      return true as any;
-    },
-  }));
+              stop_reason: "interrupted",
+            });
+          else if (input.type !== "user") return true as any;
+          else if (workerFailure)
+            events.push(
+              { type: "turn.start", agent_id: "main" },
+              { type: "turn.end", agent_id: "main", stop_reason: "error" },
+              { type: "error", agent_id: "main", message: workerFailure, retryable: false },
+            );
+          else
+            events.push(
+              { type: "turn.start", agent_id: "main" },
+              {
+                type: "text.delta",
+                agent_id: "main",
+                text: "Fixed it and tested it.",
+              },
+              { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+            );
+        }
+        if (method === "events") {
+          const batch = events.splice(0);
+          return { events: batch, alive: true } as any;
+        }
+        if (method === "snapshot")
+          return {
+            bundle: Buffer.from("bundle").toString("base64"),
+            head: "b".repeat(40),
+          } as any;
+        return true as any;
+      },
+    };
+  });
 });
 afterEach(async () => {
   await runs.shutdown();
   db.close();
   rmSync(dir, { recursive: true, force: true });
   vi.clearAllMocks();
+  vi.unstubAllEnvs();
 });
 describe("persistent local run lifecycle", () => {
+  it.each([['runner', false], ['web', true], ['mcp', true], ['unknown', false]] as const)("starts %s runs with interactive=%s", async (source, interactive) => {
+    const r = await runs.create("u", {repo:"acme/app", model:"auto", prompt:"Work", source});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.find(call => call.method === "start")).toMatchObject({interactive, question_wait_minutes: 240});
+  });
+  it("enforces a durable run-wide search cap through the service relay without failing the run", async () => {
+    vi.stubEnv("GOND_AGENT_WEB_SEARCH_LIMIT", "2");
+    const r = await runs.create("u", {repo:"acme/app", model:"auto", prompt:"Work"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const search = () => relay(new Request("http://worker/v1/search", {method:"POST", body:JSON.stringify({query:"fixture"})}));
+    // No provider is configured: attempts still count, without external network calls.
+    const stale = runs.get(r.id);
+    const responses = await Promise.all([search(), search(), search()]);
+    expect(await responses[2].json()).toEqual({error:"web search limit for this run reached"});
+    expect(runs.get(r.id).web_search_calls).toBe(2);
+    runs.save(stale); // A stale lifecycle snapshot cannot reset the search allowance.
+    expect(runs.get(r.id).web_search_calls).toBe(2);
+    await runs.closeSession(r.id, "u");
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "start")).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(await (await search()).json()).toEqual({error:"web search limit for this run reached"});
+    expect(JSON.parse((db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as {data:string}).data).web_search_calls).toBe(2);
+    vi.stubEnv("GOND_AGENT_WEB_SEARCH_LIMIT", "0");
+    expect(await (await search()).json()).not.toEqual({error:"web search limit for this run reached"});
+    expect(runs.get(r.id).status).toBe("ready");
+  });
   it("retains plans across follow-ups, workspace reopen and service recovery", async () => {
     const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Work"});
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
@@ -262,6 +294,11 @@ describe("persistent local run lifecycle", () => {
     };
     try {
       expect(await call("get_session",{session_id:r.id})).toMatchObject({state:"waiting_for_input",done:false,question:"Which branch?"});
+      events.push({type:"question.resolved",agent_id:"main",request_id:"q-mcp"});
+      await vi.waitFor(() => expect(runs.get(r.id).summary.question).toBeNull());
+      expect(await call("get_session",{session_id:r.id})).toMatchObject({state:"working",waiting_for_input:false});
+      events.push({type:"question",agent_id:"main",request_id:"q-mcp",question:"Which branch?"});
+      await vi.waitFor(() => expect(runs.get(r.id).summary.question?.request_id).toBe("q-mcp"));
       await call("send_session_message",{session_id:r.id,request_id:"answer",text:"Use main"});
       expect(log).toContainEqual({method:"send",input:{type:"question.reply",request_id:"q-mcp",answer:"Use main"}});
       events.push({type:"text.delta",agent_id:"main",text:"Continued after answer"},{type:"turn.end",agent_id:"main",stop_reason:"end_turn"});

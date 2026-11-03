@@ -95,6 +95,8 @@ export function fold(s: Summary, ev: Ev): Summary {
       return main ? { ...s, text: "", error: null, question: null } : s;
     case "question":
       return main ? { ...s, question: { request_id: ev.request_id, question: ev.question } } : s;
+    case "question.resolved":
+      return main && s.question?.request_id === ev.request_id ? { ...s, question: null } : s;
     case "turn.end":
       return main ? { ...s, question: null } : s;
     case "text.delta":
