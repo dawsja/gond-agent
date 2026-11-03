@@ -209,13 +209,13 @@ export class ChatGPTProvider implements SubscriptionProvider {
     if (typeof b?.access_token !== "string" || !b.access_token)
       throw new ApiError(502, "chatgpt_exchange", "ChatGPT sign-in couldn't be completed. Try again.", true);
     const lifetime = typeof b.expires_in === "number" && b.expires_in > 0 ? Math.min(b.expires_in, 86400) : 3600;
-    const scope = typeof b.scope === "string" ? b.scope : undefined;
+    const scope = typeof b.scope === "string" ? b.scope : old ? undefined : SCOPES;
     return {
       accessToken: b.access_token,
       refreshToken: typeof b.refresh_token === "string" && b.refresh_token ? b.refresh_token : old?.refreshToken,
       idToken: typeof b.id_token === "string" && b.id_token ? b.id_token : old?.idToken,
       expiresAt: Date.now() + lifetime * 1000,
-      scopes: scope ? [...new Set(scope.split(/[\s+]+/).filter(Boolean))].sort() : old?.scopes ?? [],
+      scopes: scope !== undefined ? [...new Set(scope.split(/[\s+]+/).filter(Boolean))].sort() : old?.scopes ?? [],
     };
   }
 

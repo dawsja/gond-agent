@@ -206,13 +206,39 @@ describe("Sign in with ChatGPT by pasting the loopback address", () => {
     expect(mock.count("/v1/models")).toBe(0);
   });
 
-  it("never grants plan permission from the pasted callback scope", async () => {
+  it("uses the requested scopes when the code exchange omits scope", async () => {
     mock.omitTokenScope = true;
-    const { pasted, body } = await signIn();
-    expect(new URL(pasted).searchParams.get("scope")).toContain("chatgpt.tokens.use.direct");
-    expect(body.account.plan).toBe("disabled");
-    expect(tokensOf(account()).scopes).toEqual([]);
-    expect((await runs.catalog(user)).models).toEqual([]);
+    const { start, done, body } = await signIn();
+    expect(done.status).toBe(200);
+    expect(body.account.plan).toBe("enabled");
+    expect(tokensOf(account()).scopes).toEqual(new URL(start.url).searchParams.get("scope")!.split(" ").sort());
+    expect((await runs.catalog(user)).models).not.toEqual([]);
+  });
+
+  it.each([
+    [true, "unrequested.scope", "enabled"],
+    [false, "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct unrequested.scope", "disabled"],
+  ])("ignores pasted callback scope when token scope is omitted=%s", async (omitted, callbackScope, plan) => {
+    mock.omitTokenScope = omitted;
+    if (!omitted) mock.consent = "no-plan-scope";
+    const start = await (await call("/api/v1/subscriptions/chatgpt/login", {})).json();
+    const pasted = new URL(await approve(start.url));
+    pasted.searchParams.set("scope", callbackScope);
+    const response = await call("/api/v1/subscriptions/chatgpt/callback", { url: pasted.toString() });
+    expect(response.status).toBe(200);
+    expect((await response.json()).account.plan).toBe(plan);
+    const requested = new URL(start.url).searchParams.get("scope")!.split(" ");
+    expect(tokensOf(account()).scopes).toEqual(requested.filter(scope => omitted || scope !== "chatgpt.tokens.use.direct").sort());
+  });
+
+  it("retains the old scopes when refresh omits scope, including a narrower grant", async () => {
+    mock.consent = "no-plan-scope";
+    await signIn();
+    const row = account(), old = tokensOf(row);
+    mock.omitTokenScope = true;
+    const refreshed = await runs.subscriptions.tokens(row.id, old.accessToken);
+    expect(refreshed.scopes).toEqual(old.scopes);
+    expect(refreshed.scopes).not.toContain("chatgpt.tokens.use.direct");
   });
 
   it("rejects an ID token whose nonce doesn't match the attempt", async () => {

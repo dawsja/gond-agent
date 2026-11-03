@@ -61,12 +61,13 @@ const key = 'fixture-only-provider-key';
     const models = [
       { id: 'fixture:gpt-5.4', display_name: 'GPT-5.4 · API', provider: 'openai', efforts },
       { id: 'fixture:claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6 · API', resolved_model: 'claude-sonnet-4-6', provider: 'anthropic', efforts },
-      { id: 'cli-codex:default', display_name: 'Codex · Subscription', provider: 'openai', backend: 'codex', efforts },
-      { id: 'cli-claude-code:sonnet', display_name: 'Claude Sonnet 8.12 · Subscription', resolved_model: 'claude-sonnet-8-12', provider: 'anthropic', backend: 'claude-code', efforts },
-    ].map(model => ({ ...model, context_window: 200000, ...(!model.backend ? { connection_id: model.provider } : {}) }));
+      { id: 'chatgpt.fixture:gpt-5.4', display_name: 'GPT-5.4 · ChatGPT', provider: 'openai', access: 'chatgpt', connection_id: 'chatgpt.fixture', efforts },
+      { id: 'chatgpt.fixture:gpt-5.4-mini', display_name: 'GPT-5.4 mini · ChatGPT', provider: 'openai', access: 'chatgpt', connection_id: 'chatgpt.fixture', efforts },
+    ].map(model => ({ context_window: 200000, backend: 'builtin', access: 'api', connection_id: model.provider, ...model }));
     const connections = [
       { id: 'openai', name: 'Provider 1', status: 'error', message: 'OpenAI API connection unavailable.' },
       { id: 'anthropic', name: 'Other API', status: 'error', message: 'Anthropic API connection unavailable.' },
+      { id: 'chatgpt.fixture', name: 'ChatGPT · fixture@example.test', access: 'chatgpt', status: 'ready', usage_url: 'https://chatgpt.com/settings/usage' },
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
@@ -119,8 +120,9 @@ const key = 'fixture-only-provider-key';
           return range.getBoundingClientRect().right <= element.getBoundingClientRect().right + 1;
         }, version)).toBe(true);
         for (const connection of connections) {
-          await expect(page.getByText(`${connection.name}: ${connection.message}`, { exact: true })).toHaveCount(!model.backend && model.connection_id === connection.id ? 1 : 0);
+          await expect(page.getByText(`${connection.name}: ${connection.message}`, { exact: true })).toHaveCount(model.access === 'api' && model.connection_id === connection.id ? 1 : 0);
         }
+        await expect(page.getByText('Using ChatGPT plan', { exact: true })).toHaveCount(model.access === 'chatgpt' ? 1 : 0);
         await layout('Choose model');
         await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
         await expect(page.getByRole('textbox', { name: 'Search thinking levels', exact: true })).toBeVisible();
@@ -139,10 +141,11 @@ const key = 'fixture-only-provider-key';
         await expect(picker.locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
         await layout('Follow-up model');
         await picker.click();
-        for (const other of models.filter(item => item.backend !== model.backend)) {
-          await expect(page.getByRole('button', { name: other.display_name, exact: true })).toHaveCount(0);
+        for (const other of models) {
+          await expect(page.getByRole('button', { name: other.display_name, exact: true })).toBeVisible();
         }
-        await page.keyboard.press('Escape');
+        const nextModel = models[(models.indexOf(model) + 1) % models.length];
+        await page.getByRole('button', { name: nextModel.display_name, exact: true }).click();
         await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
         await page.getByRole('button', { name: 'Low', exact: true }).click();
         await page.getByRole('textbox', { name: 'Follow-up message', exact: true }).fill('Check the settings layout');
@@ -150,7 +153,8 @@ const key = 'fixture-only-provider-key';
         await page.getByRole('button', { name: 'Send message', exact: true }).click();
         await response;
         expect(sent.effort).toBe('low');
-        await capture('follow-up-' + (model.backend ?? model.provider));
+        expect(sent.model).toBe(nextModel.id);
+        await capture('follow-up-' + model.id.replaceAll(/[^a-zA-Z0-9-]/g, '-'));
       }
       // Exercise live folding, reconnect replay and object URL lifetime through SPA navigation.
       await page.evaluate(() => {
@@ -279,12 +283,12 @@ const key = 'fixture-only-provider-key';
         expect(cleared.status()).toBe(200);
         expect((await cleared.json()).connections).toEqual([]);
         await page.reload();
-        await expect(providers.getByText('No API providers. Subscription agents work without an API connection.', { exact: true })).toBeVisible();
+        await expect(providers.getByText('No API providers. ChatGPT plan sign-in works without an API connection.', { exact: true })).toBeVisible();
         await expect(providers.locator('fieldset')).toHaveCount(0);
         await providers.scrollIntoViewIfNeeded();
         await capture('subscription-empty-api-settings');
         await page.goto(origin + '/agents/');
-        await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toContainText('Sonnet');
+        await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toContainText('GPT-5.4 mini');
         await expect(page.getByText(/API connection unavailable/)).toHaveCount(0);
       } finally {
         const restored = await page.request.put(settingsURL, { headers: { Origin: origin }, data: { ...original, connections: original.connections.map(connection => ({ ...connection, apiKey: connection.baseURL === providerOrigin + '/second/v1' ? key + '-second' : key })) } });
@@ -321,7 +325,7 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('button', { name: returning ? 'Sign in' : 'Create administrator account', exact: true }).click();
     if (!returning) {
       await expect(page.getByRole('heading', { name: 'Set up Gond Agent', exact: true })).toBeVisible();
-      await expect(page.getByRole('heading', { level: 2 })).toHaveText(['Subscription agents', 'Connect your API']);
+      await expect(page.getByRole('heading', { level: 2 })).toHaveText(['ChatGPT plan', 'Connect your API']);
       await expect(page.getByRole('radio')).toHaveText(['OpenAI', 'Anthropic']);
       await expect(page.getByLabel('API base URL', { exact: true })).toHaveCount(0);
       await nameConnection(page, 'Fixture provider');
@@ -437,7 +441,7 @@ const key = 'fixture-only-provider-key';
         if (['Personal settings', 'Security', 'Account management'].includes(name)) await capture('settings-category-' + name.toLowerCase().replaceAll(' ', '-'));
       }
     }
-    await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['Subscription agents', 'Model providers']);
+    await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['ChatGPT plan', 'Model providers']);
     const mcp = page.locator('#mcp');
     await mcp.scrollIntoViewIfNeeded();
     if (!returning) {
@@ -624,10 +628,10 @@ const key = 'fixture-only-provider-key';
       await page.getByRole('option', { name: 'Delete account', exact: true }).click();
       await expect(page).toHaveURL(origin + '/agents/settings#delete');
       await expect(page.locator('#delete').getByRole('heading', { name: 'Delete account', exact: true })).toBeVisible();
-      await page.locator('#subscription-agents').scrollIntoViewIfNeeded();
-      await expect(page.getByText('Subscription agents', { exact: true })).toBeVisible();
-      await expect(page.getByText('Claude Code', { exact: true })).toBeVisible();
-      await expect(page.getByText('Codex', { exact: true })).toBeVisible();
+      await page.locator('#chatgpt').scrollIntoViewIfNeeded();
+      await expect(page.getByText('ChatGPT plan', { exact: true })).toBeVisible();
+      await expect(page.locator('#chatgpt').getByRole('button', { name: 'Continue with ChatGPT', exact: true })).toBeVisible();
+      await expect(page.locator('#chatgpt').getByText('No ChatGPT accounts. Sign in to use your plan with the built-in agent.', { exact: true })).toBeVisible();
       await capture('subscription-settings');
       await page.locator('#delete').scrollIntoViewIfNeeded();
       await capture('delete-account-settings');
