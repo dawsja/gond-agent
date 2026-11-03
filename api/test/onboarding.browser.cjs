@@ -77,6 +77,135 @@ const key = 'fixture-only-provider-key';
       await advanced(scope, false);
     }
   };
+  const verifyAccents = async () => {
+    const accentURL = origin + '/api/v1/me/accent';
+    const cacheKey = 'gond-agent-accent';
+    const control = target => target.locator('#appearance').getByRole('button', { name: 'Color', exact: true });
+    const primary = target => target.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--primary').trim());
+    const unchangedIdentity = async target => {
+      await greyAvatar(target.getByRole('region', { name: 'Personal settings', exact: true }).getByLabel('No profile photo', { exact: true }));
+      const marks = target.locator('[aria-label="Gond Agent"] svg');
+      expect(await marks.count()).toBeGreaterThan(0);
+      for (const mark of await marks.all()) {
+        await expect(mark.locator('rect').first()).toHaveAttribute('fill', '#1b1a18');
+        await expect(mark.locator('rect').first()).toHaveCSS('fill', 'rgb(27, 26, 24)');
+        await expect(mark.locator('path')).toHaveCSS('stroke', 'rgb(255, 255, 255)');
+        await expect(mark.locator('circle')).toHaveCSS('fill', 'rgb(255, 255, 255)');
+      }
+    };
+    const state = async (target, name, color) => {
+      const accent = name.toLowerCase();
+      await expect(target.locator('html')).toHaveAttribute('data-accent', accent);
+      await expect.poll(() => primary(target)).toBe(color);
+      await expect(control(target)).toHaveText(name);
+      await expect.poll(() => target.evaluate(key => localStorage.getItem(key), cacheKey)).toBe(accent);
+      await unchangedIdentity(target);
+    };
+    const selected = async (target, name, shot) => {
+      await expect(control(target)).toBeEnabled();
+      await control(target).click();
+      await expect(target.getByRole('menuitemradio', { name, exact: true })).toHaveAttribute('aria-checked', 'true');
+      await expect(target.locator('[role="menuitemradio"][aria-checked="true"]')).toHaveCount(1);
+      if (shot) await capture(shot, target);
+      await target.keyboard.press('Escape');
+      await expect(target.getByRole('menu')).toHaveCount(0);
+      await expect(control(target)).toBeFocused();
+    };
+    const choose = async (name, keyboard = false) => {
+      if (keyboard) {
+        await control(page).focus();
+        await page.keyboard.press('Enter');
+        await expect(page.getByRole('menuitemradio', { name: 'Blue', exact: true })).toBeFocused();
+        await page.keyboard.press('ArrowDown');
+        await expect(page.getByRole('menuitemradio', { name, exact: true })).toBeFocused();
+      } else await control(page).click();
+      const saving = page.waitForResponse(response => response.url() === accentURL && response.request().method() === 'PUT');
+      if (keyboard) await page.keyboard.press('Enter');
+      else await page.getByRole('menuitemradio', { name, exact: true }).click();
+      const response = await saving;
+      expect(response.status()).toBe(200);
+      expect(await response.json()).toEqual({ accent: name.toLowerCase() });
+    };
+    await page.goto(origin + '/agents/settings#appearance');
+    await expect(page.locator('#appearance').getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
+    await state(page, 'Blue', '#2b61b9');
+    let previous = await primary(page);
+    // No copied cookies or storage: the same account retrieves its color from the server.
+    const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
+    const other = await context.newPage();
+    other.on('pageerror', error => errors.push(error.message));
+    other.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
+    try {
+      await other.goto(origin + '/agents/');
+      await expect(other.getByRole('heading', { name: 'Sign in to Gond Agent', exact: true })).toBeVisible();
+      await other.evaluate(key => localStorage.setItem(key, 'not-an-accent'), cacheKey);
+      await other.reload();
+      await other.getByLabel('Email', { exact: true }).fill('admin@example.test');
+      await other.getByLabel('Password', { exact: true }).fill('test-password-only-123456');
+      await other.getByRole('button', { name: 'Sign in', exact: true }).click();
+      await expect(other.getByRole('heading', { level: 1 })).toContainText(', Test');
+      // Representative choices, not a second copy of the supported-color catalog.
+      for (const [name, color] of [['Purple', '#6747ba'], ['Green', '#17853e'], ['Orange', '#c1450b']]) {
+        await choose(name, name === 'Purple');
+        await state(page, name, color);
+        expect(await primary(page)).not.toBe(previous);
+        previous = color;
+        await page.reload();
+        await state(page, name, color);
+        await page.getByRole('region', { name: 'Personal settings', exact: true }).scrollIntoViewIfNeeded();
+        await selected(page, name, 'accent-' + name.toLowerCase());
+        await other.goto(origin + '/agents/settings#appearance');
+        await other.reload();
+        await state(other, name, color);
+        await selected(other, name);
+      }
+      // Both a valid-but-stale hint and an invalid hint lose to the account response.
+      for (const target of [page, other]) {
+        for (const hint of ['purple', 'not-an-accent']) {
+          await target.evaluate(({ key, hint }) => localStorage.setItem(key, hint), { key: cacheKey, hint });
+          await target.reload();
+          await state(target, 'Orange', previous);
+          await selected(target, 'Orange');
+        }
+      }
+    } finally { await context.close(); }
+
+    // Hold only the failing PUT so the optimistic DOM, control and cache are observable.
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const failSave = async route => {
+      if (route.request().method() !== 'PUT') return route.continue();
+      await pending;
+      await route.fulfill({ status: 500, json: { error: 'Internal server error' } });
+    };
+    await page.route(accentURL, failSave);
+    try {
+      await control(page).click();
+      const requested = page.waitForRequest(request => request.url() === accentURL && request.method() === 'PUT');
+      await page.getByRole('menuitemradio', { name: 'Purple', exact: true }).click();
+      expect((await requested).postDataJSON()).toEqual({ accent: 'purple' });
+      await state(page, 'Purple', '#6747ba');
+      await expect(control(page)).toBeDisabled();
+      const failed = page.waitForResponse(response => response.url() === accentURL && response.request().method() === 'PUT');
+      release();
+      expect((await failed).status()).toBe(500);
+      await expect(page.getByText("Couldn't save your color. Try again.", { exact: true })).toBeVisible();
+      await state(page, 'Orange', previous);
+      await selected(page, 'Orange', 'accent-save-rollback');
+    } finally {
+      release();
+      await page.unroute(accentURL, failSave);
+    }
+    await page.reload();
+    await state(page, 'Orange', previous);
+    await selected(page, 'Orange');
+    // Keep the existing photo and later workspace screenshots on the default palette.
+    await choose('Blue');
+    await page.reload();
+    await state(page, 'Blue', '#2b61b9');
+    await selected(page, 'Blue');
+    await page.goto(origin + '/agents/settings');
+  };
   // UI fixtures exercise API and subscription choices without a paid model call.
   // Registration, provider setup, storage and the rest of onboarding use the real service.
   const verifyComposers = async () => {
@@ -654,6 +783,7 @@ const key = 'fixture-only-provider-key';
       await page.reload();
       await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
       await capture('account-grey-default');
+      await verifyAccents();
     }
     const beforePhoto = await (await page.request.get(origin + '/api/v1/me')).json();
     if (returning) {
