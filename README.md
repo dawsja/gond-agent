@@ -117,7 +117,7 @@ Keys are encrypted in SQLite using the persistent auth secret and never returned
 
 ## Runs and GitHub
 
-Run transcripts keep agent messages readable and group routine activity into expandable summaries. Open a summary for file names, commands, diffs and output. Failed actions stay visible. Runs created by the removed Claude Code and Codex agents keep their transcripts and diffs but can't take follow-ups; start a new run to continue that work.
+Run transcripts keep agent messages readable and group routine activity into expandable summaries. Open a summary for file names, commands, diffs and output. Failed actions stay visible, and API and ChatGPT plan runs use the same plain activity labels. Runs created by the removed Claude Code and Codex agents keep their transcripts and diffs but can't take follow-ups; start a new run to continue that work.
 
 Linked pull requests refresh while viewing the workspace, including after merging or closing them on GitHub. Merged PRs show a purple merge icon in the run list, header and PR panel. Reads share a short cache; if GitHub is unavailable, the last known state stays visible. Active work can finish before its merged run is closed.
 
@@ -133,6 +133,16 @@ The repository archive enters the run's private workspace volume over Docker's a
 Stop only interrupts the current turn; it retains the workspace and uncommitted edits for a follow-up. Follow-ups continue in the same container while it is alive. Runs have no elapsed-time, idle, step or tool-call budget. Idle containers persist until explicitly closed, merged, deleted, or service shutdown/recovery; monitor capacity and disk use. The retired `RUN_IDLE_MINUTES` and `RUN_TURN_MINUTES` settings are ignored. Uncommitted work is lost on shutdown. A service restart marks interrupted runs failed and removes orphaned Docker resources labeled with this instance's persisted identity, without touching other instances. Run history and diffs persist locally. Merging destroys the workspace. Deleting a run hides it immediately; stored history is purged after 30 days.
 
 Automations supports daily/weekly local-time schedules and the automatic pull-request preference. Occurrence claims prevent duplicate scheduled runs. GitHub issue/check/PR polling, issue-triggered runs and automatic check retries have been removed; there is no repository-watch environment variable. Existing run history is preserved and obsolete polling preferences are removed on upgrade. Manual pull-request creation/merge remain available; PR changes made outside Gond Agent are no longer synchronized in the background. Model requests go directly to the configured provider. Local usage records have no account limits or feature gates.
+
+### Commit identity
+
+The service resolves and caches the connected GitHub account's login and numeric ID. Checkout configuration and every snapshot use that identity for both author and committer: `login <id+login@users.noreply.github.com>`. Missing connection identity fails clearly; global Git identity is not a fallback. Optional `GOND_AGENT_COMMIT_NAME` and `GOND_AGENT_COMMIT_EMAIL` override individual fields (including in Compose). Pull requests use the connected account. Publication adds no attribution, trailers, or product signature; commit/PR titles come from the task and PR bodies from the final response (or task). Caller/model-provided text is not rewritten.
+
+### Driving Gond Agent from another bot
+
+Use the authenticated remote MCP tools to discover models, start idempotent sessions, wait for completion, inspect diffs, send follow-ups and open PRs. See [the full contract and JSON examples](protocol/README.md#driving-gond-agent-from-another-bot). Completion ends the current turn, not the session: a follow-up starts more work. Browser, symbols and batch tools are optional; repository instructions still apply.
+
+Finished runs retain capacity: use MCP `close_session` or More → Close workspace to save/push changes and release the slot without deleting history. Busy workspaces cannot close; snapshot/push failure preserves the workspace. Follow-ups reopen the pushed branch. `MODEL_STALL_MINUTES` defaults to 10 (0 disables): requests abort only when headers or stream bytes stop arriving, never because a progressing response takes a long time. Missing GitHub identity intentionally fails checkout with a 409 because publication requires the connection. Identity caches expire after one hour and are invalidated on GitHub command failures (including unauthorized responses).
 
 ## Storage and development
 
