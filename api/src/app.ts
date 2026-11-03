@@ -11,6 +11,7 @@ import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnvFor } from "./github-login";
 import { getSetting, setSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
+import { DEFAULT_THEME, isTheme } from "../../shared/theme-preference";
 import { ApiError } from "./wire";
 import { clearModelCatalog } from "./models";
 import { deletionPolicy } from "./account";
@@ -163,12 +164,21 @@ export function createApp(
       p = runs.profile(u.id);
     return c.json({
       user: { ...u, ...photoFor(db, u) },
+      theme: isTheme(p.theme) ? p.theme : DEFAULT_THEME,
       admin: c.get("admin"),
       setup_required: !setupComplete(db) && !runs.subscriptions.usable(u.id),
       automations: {
         auto_pr: !!p.auto_pr,
       },
     });
+  });
+  app.put("/api/v1/me/theme", async c => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "theme") || !isTheme(body.theme))
+      throw new ApiError(400, "invalid_request", "Choose system, light or dark for your theme.");
+    db.prepare("INSERT INTO profiles(user_id,theme) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme").run(c.get("user").id, body.theme);
+    c.header("Cache-Control", "no-store");
+    return c.json({ theme: body.theme });
   });
   app.get("/api/v1/me/deletion", c => {
     c.header("Cache-Control", "no-store");

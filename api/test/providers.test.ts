@@ -265,7 +265,7 @@ describe("provider settings and request routing", () => {
     old.prepare("INSERT INTO events(run_id,data) VALUES(?,?)").run("historical-run", event);
     old.close();
     db = openStore(dir);
-    expect(db.prepare("SELECT * FROM profiles WHERE user_id='u'").get()).toEqual({ user_id: "u", auto_pr: 0 });
+    expect(db.prepare("SELECT * FROM profiles WHERE user_id='u'").get()).toEqual({ user_id: "u", auto_pr: 0, theme: "system" });
     expect(db.prepare("SELECT value FROM settings WHERE key='kept'").get()).toEqual({ value: "true" });
     expect(db.prepare("SELECT 1 FROM sqlite_master WHERE name='models'").get()).toBeUndefined();
     expect(db.prepare("SELECT data FROM runs WHERE id='historical-run'").get()).toEqual({ data: history });

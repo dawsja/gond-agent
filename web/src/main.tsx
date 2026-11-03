@@ -3,7 +3,11 @@ import { createRoot } from "react-dom/client"
 
 import "./index.css"
 import App from "./App.tsx"
-import "@/lib/theme"
+import { applyTheme, followSystemTheme, readStoredTheme, resolveTheme } from "@/lib/theme"
+
+const theme = readStoredTheme()
+applyTheme(resolveTheme(theme), theme)
+followSystemTheme()
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

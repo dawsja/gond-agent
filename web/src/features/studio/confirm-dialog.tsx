@@ -31,7 +31,7 @@ export function ConfirmDialog({
     <Dialog.Root open={open} onOpenChange={(o) => !o && !busy && onCancel()}>
       <Dialog.Portal>
         <Dialog.Overlay
-          className="fixed inset-0 z-50 bg-black/60"
+          className="fixed inset-0 z-50 bg-overlay/60"
           onClick={(e) => e.stopPropagation()}
         />
         <Dialog.Content

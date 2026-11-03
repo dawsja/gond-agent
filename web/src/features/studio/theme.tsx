@@ -1,7 +1,7 @@
 import type { ReactNode } from "react"
 import { cn } from "@/lib/utils"
 
-// Shared dark-only surface, typography and lifecycle tokens.
+// Shared scheme-aware surface, typography and lifecycle tokens.
 export const STATUS = {
   queued: "var(--status-stopped)",
   working: "var(--status-working)",

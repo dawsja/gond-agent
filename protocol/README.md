@@ -1,5 +1,11 @@
 # Gond Agent protocols
 
+## Theme preference
+
+`GET /api/v1/me` includes a top-level `theme`: `system`, `light` or `dark`. New accounts and missing or invalid stored preferences return `system`.
+
+`PUT /api/v1/me/theme` accepts only `{ "theme": "system" | "light" | "dark" }` and returns `{ "theme": "…" }`. It requires an authenticated browser session and the configured same-origin Origin header, like neighboring account routes. Missing, malformed or unsupported values and extra fields return HTTP 400 (`invalid_request`). The preference is persisted for the caller only, without changing other profile settings, and is returned by subsequent `/me` reads.
+
 ## Remote MCP
 
 `/mcp` serves Streamable HTTP using the official MCP SDK, including its stateless 2025 compatibility transport. Authenticate every request with `Authorization: Bearer gond_mcp_…`. No cookies, query tokens, OAuth flow, or worker tool forwarding are supported. Production clients connect over the instance's configured HTTPS origin. If an Origin header is supplied, it must match that origin.

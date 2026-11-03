@@ -363,6 +363,7 @@ export class Runs {
       .prepare("SELECT * FROM profiles WHERE user_id=?")
       .get(user) as {
       auto_pr: number;
+      theme: unknown;
     };
   }
   validateImages(user: string, images: string[]) {

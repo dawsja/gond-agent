@@ -6,6 +6,7 @@ import { SetupGate } from "@/features/setup/setup-screen"
 import { HomeScreen } from "@/features/home/home-screen"
 import { ApiError } from "@/lib/api"
 import { BASE } from "@/lib/base"
+import { ThemeSync } from "@/components/theme-sync"
 
 const RunScreen = lazy(() =>
   import("@/features/run/run-screen").then((m) => ({ default: m.RunScreen }))
@@ -45,6 +46,7 @@ export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthGate>
+        <ThemeSync />
         <SetupGate>
         <BrowserRouter basename={BASE || undefined}>
           <Suspense fallback={<div className="h-screen bg-background" />}>

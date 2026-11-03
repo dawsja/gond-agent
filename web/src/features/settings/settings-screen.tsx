@@ -11,6 +11,7 @@ import { ProviderSettings } from "./providers"
 import { SessionsSection } from "./sessions"
 import { ProfilePhoto } from "./profile-photo"
 import { DeleteAccount } from "./delete-account"
+import { Appearance } from "./appearance"
 import { Row, Section, SectionHeadingLevel } from "../studio/section"
 import { Shell } from "../studio/shell"
 
@@ -28,6 +29,7 @@ export function SettingsScreen() {
     <h1 className="text-3xl font-semibold">Settings</h1>
     <SettingsCategory id="personal-settings" title="Personal settings">
       <Section title="Account" description="Your account on this Gond Agent server."><ProfilePhoto /><Row label="Name">{me?.user?.name ?? "—"}</Row><Row label="Email">{me?.user?.email ?? "—"}</Row></Section>
+      <div id="appearance"><Appearance /></div>
     </SettingsCategory>
     <SettingsCategory id="model-settings" title="Models">
       <div id="chatgpt"><ChatGPTPlanSettings /></div>
