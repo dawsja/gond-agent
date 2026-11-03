@@ -145,6 +145,64 @@
   --sidebar-border: #1c1c1c;
   --sidebar-ring: var(--ring);
 }
+
+/* Accent choices share the same dark surfaces, status and syntax colors. */
+[data-accent="blue"] {
+  --tint: #2f6fd6;
+  --tint-solid: #2b61b9;
+  --tint-wash: #252f40;
+  --tint-edge: #3d5780;
+  --tint-ink: #8db0e8;
+}
+
+[data-accent="purple"] {
+  --tint: #7650d8;
+  --tint-solid: #6747ba;
+  --tint-wash: #302a40;
+  --tint-edge: #5a4b81;
+  --tint-ink: #b49fea;
+}
+
+[data-accent="pink"] {
+  --tint: #cf3d85;
+  --tint-solid: #b33774;
+  --tint-wash: #3f2733;
+  --tint-edge: #7d4360;
+  --tint-ink: #e594bc;
+}
+
+[data-accent="red"] {
+  --tint: #d03a3a;
+  --tint-solid: #b33434;
+  --tint-wash: #3f2727;
+  --tint-edge: #7e4242;
+  --tint-ink: #e59393;
+}
+
+[data-accent="orange"] {
+  --tint: #e04e0a;
+  --tint-solid: #c1450b;
+  --tint-wash: #412a1f;
+  --tint-edge: #844a2f;
+  --tint-ink: #ee9e78;
+}
+
+[data-accent="amber"] {
+  --tint: #d98a08;
+  --tint-solid: #9f670b;
+  --tint-wash: #40331f;
+  --tint-edge: #81622e;
+  --tint-ink: #eabf77;
+}
+
+[data-accent="green"] {
+  --tint: #189c47;
+  --tint-solid: #17853e;
+  --tint-wash: #213629;
+  --tint-edge: #346947;
+  --tint-ink: #80c99a;
+}
+
 @layer base {
   * { @apply border-border outline-ring/50; }
   html { @apply font-sans; -webkit-font-smoothing: antialiased; }

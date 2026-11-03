@@ -19,6 +19,7 @@ import { listRunners, saveRunner } from "./scheduler";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { join } from "node:path";
 import { createMcp, createToken, listTokens } from "./mcp";
+import { DEFAULT_ACCENT, isAccent } from "../../shared/accents";
 export interface Ticket {
   run: string;
   user: string;
@@ -161,14 +162,23 @@ export function createApp(
   app.get("/api/v1/me", (c) => {
     const u = c.get("user"),
       p = runs.profile(u.id);
+    const accent = (db.prepare("SELECT accent FROM user_accents WHERE user_id=?").get(u.id) as { accent: unknown } | undefined)?.accent;
     return c.json({
       user: { ...u, ...photoFor(db, u) },
       admin: c.get("admin"),
+      accent: isAccent(accent) ? accent : DEFAULT_ACCENT,
       setup_required: !setupComplete(db) && !runs.subscriptions.usable(u.id),
       automations: {
         auto_pr: !!p.auto_pr,
       },
     });
+  });
+  app.put("/api/v1/me/accent", async c => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1 || !isAccent(body.accent))
+      throw new ApiError(400, "invalid_accent", "Choose an available accent color.");
+    db.prepare("INSERT INTO user_accents(user_id,accent) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET accent=excluded.accent").run(c.get("user").id, body.accent);
+    return c.json({ accent: body.accent });
   });
   app.get("/api/v1/me/deletion", c => {
     c.header("Cache-Control", "no-store");
