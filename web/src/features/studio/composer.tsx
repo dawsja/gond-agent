@@ -7,6 +7,7 @@ import { TaskInput } from "@/components/workspace/task-input"
 import { PickerPopover } from "@/components/workspace/picker-popover"
 import { ModelPicker } from "@/components/workspace/model-picker"
 import { useBranches, useCreateRun, useGithub, useModelCatalog, useRefreshModels, useRepos, useRuns } from "@/lib/queries"
+import { PlanIndicator } from "../settings/chatgpt-plan"
 import { Button } from "@shared/ui/button"
 import { useImageAttachments } from "@/lib/images"
 import { cn } from "@/lib/utils"
@@ -160,7 +161,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
                 prefs.set("model", v)
               }}
               loading={models.isPending}
-              footer={<><Button variant="ghost" size="sm" disabled={refreshModels.isPending} onClick={() => refreshModels.mutate()}>{refreshModels.isPending ? "Refreshing…" : "Refresh models"}</Button><Button asChild variant="link" size="sm"><a href="/agents/settings#providers">Providers</a></Button></>}
+              footer={<><Button variant="ghost" size="sm" disabled={refreshModels.isPending} onClick={() => refreshModels.mutate()}>{refreshModels.isPending ? "Refreshing…" : "Refresh models"}</Button><Button asChild variant="link" size="sm"><a href="/agents/settings#model-settings">Models settings</a></Button></>}
             />
             <EffortPicker model={modelInfo} value={effort} onChange={setEffort} />
           </div>
@@ -170,7 +171,8 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
         <p className="mt-2 px-1 text-[13px] text-failed">{attach.error ?? create.error?.message}</p>
       )}
       {(models.error ?? refreshModels.error) && <p role="alert" className="mt-2 px-1 text-[13px] text-failed">{(models.error ?? refreshModels.error)?.message}</p>}
-      {models.data?.connections?.filter(c => c.message && !modelInfo?.backend && (!modelInfo || c.id === modelInfo.connection_id)).map(c => <p key={c.id} role="status" className="mt-2 px-1 text-[12px] text-muted-foreground">{c.name}: {c.message}</p>)}
+      <PlanIndicator model={modelInfo} connections={models.data?.connections} />
+      {models.data?.connections?.filter(c => c.message && !c.limited && (!modelInfo || c.id === modelInfo.connection_id)).map(c => <p key={c.id} role="status" className="mt-2 px-1 text-[12px] text-muted-foreground">{c.name}: {c.message}</p>)}
     </div>
   )
 }

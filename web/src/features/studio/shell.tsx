@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils"
 import { prefs } from "@/lib/prefs"
 import { Dot } from "./parts"
 import { SearchDialog } from "./search-dialog"
+import { ChatGPTWelcome } from "../settings/chatgpt-plan"
 
 const NAV = [
   { label: "Home", icon: House, to: "/" },
@@ -55,5 +56,6 @@ export function Shell({ active, activeRun, crumbs, actions, children, contentCla
       <div className="flex min-w-0 items-center gap-2 text-sm">{crumbs}</div><div className="ml-auto flex shrink-0 items-center gap-2">{actions}</div>
     </header><div className={cn("min-h-0 flex-1", contentClassName)}>{children}</div></main>
     <SearchDialog open={searching} onOpenChange={setSearching} pages={NAV} runs={runs ?? []} />
+    <ChatGPTWelcome />
   </div></TooltipProvider>
 }

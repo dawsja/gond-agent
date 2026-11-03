@@ -262,7 +262,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
   const busyTool = t.items.some(item => item.kind === "tool" ? item.tool.status === "running" : (item.kind === "explore" || item.kind === "edits") && item.tools.some(tool => tool.status === "running"))
   const { data: models } = useModels()
   const provider = models?.find(model => model.id === run.model_id)?.provider ?? providerOf(run.model_id)
-  const agentName = run.backend === "claude-code" ? "Claude" : run.backend === "codex" ? "Codex" : PROVIDER_LABEL[provider] ?? "Agent"
+  const agentName = run.retired_backend === "claude-code" ? "Claude" : run.retired_backend === "codex" ? "Codex" : PROVIDER_LABEL[provider] ?? "Agent"
   const headings = useMemo(() => {
     const keys = new Set<string>()
     let first = true

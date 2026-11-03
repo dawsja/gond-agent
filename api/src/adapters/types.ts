@@ -16,6 +16,8 @@ export interface ModelRow {
   provider: Provider;
   connection_id?: string;
   format?: "anthropic" | "openai" | "openai-responses";
+  /** Set for models reached through a signed-in subscription instead of an API connection. */
+  access?: { provider: string; account: string };
   upstream_id: string;
   display_name: string;
   context_window: number;

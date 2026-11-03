@@ -22,14 +22,12 @@ export function openStore(data: string) {
     CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT REFERENCES runs(id) ON DELETE CASCADE, media_type TEXT NOT NULL, bytes BLOB NOT NULL, created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS runners (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, enabled INTEGER NOT NULL, next_run_at INTEGER NOT NULL, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS occurrences (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS cli_usage_totals(key TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,data TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS cli_usage(event_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,run_id TEXT NOT NULL,model_id TEXT NOT NULL,data TEXT NOT NULL,created_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS cli_accounts (user_id TEXT NOT NULL, backend TEXT NOT NULL, credentials TEXT NOT NULL, connected_at INTEGER NOT NULL DEFAULT 0, models TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(user_id,backend));
-    CREATE TABLE IF NOT EXISTS cli_sessions (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, state TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, run_id TEXT, model_id TEXT NOT NULL, input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cost_micros INTEGER NOT NULL, created_at INTEGER NOT NULL);
-
+    CREATE TABLE IF NOT EXISTS subscription_accounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider TEXT NOT NULL, subject TEXT NOT NULL, email TEXT, client_id TEXT NOT NULL, credentials TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, plan TEXT NOT NULL, limited_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS subscription_accounts_owner ON subscription_accounts(user_id,provider);
+    CREATE TABLE IF NOT EXISTS subscription_notices (user_id TEXT PRIMARY KEY, welcomed_at INTEGER NOT NULL);
   `);
-  if(!(db.pragma("table_info(cli_accounts)") as {name:string}[]).some(c=>c.name==="connected_at"))db.exec("ALTER TABLE cli_accounts ADD COLUMN connected_at INTEGER NOT NULL DEFAULT 0");
+  retireCodingAgents(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
     db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
@@ -40,6 +38,54 @@ export function openStore(data: string) {
   })();
   return db;
 }
+/**
+ * Claude Code and Codex agents were removed in favour of the built-in runner. Idempotently delete
+ * their sealed credentials, session state and runtime records, keep their run history readable,
+ * and record pinned runtime volumes for label-scoped Docker cleanup at startup.
+ */
+export function retireCodingAgents(db: Database.Database) {
+  const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map(t => t.name));
+  const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+  const removed: string[] = [];
+  const secure = db.pragma("secure_delete", { simple: true });
+  db.pragma("secure_delete = ON");
+  try { db.transaction(() => {
+    if (tables.has("cli_usage")) {
+      // Token counts stay in usage history; subscription usage was never billed by Gond Agent.
+      db.exec(`INSERT INTO usage(user_id,run_id,model_id,input,output,cache_read,cost_micros,created_at)
+        SELECT user_id,run_id,model_id,coalesce(json_extract(data,'$.input_uncached'),0),coalesce(json_extract(data,'$.output'),0),coalesce(json_extract(data,'$.cache_read'),0),0,created_at FROM cli_usage`);
+    }
+    if (tables.has("cli_accounts")) removed.push(`${count("SELECT count(*) AS n FROM cli_accounts")} coding-agent sign-ins`);
+    if (tables.has("cli_sessions")) removed.push(`${count("SELECT count(*) AS n FROM cli_sessions")} saved coding-agent sessions`);
+    if ([...tables].some(t => t.startsWith("cli_"))) {
+      db.exec("DROP TRIGGER IF EXISTS gond_agent_delete_account");
+      // Overwrite sealed credentials and session state on disk instead of only unlinking their pages.
+      for (const table of ["cli_sessions", "cli_accounts"]) if (tables.has(table)) db.exec(`DELETE FROM ${table}`);
+      for (const table of ["cli_sessions", "cli_accounts", "cli_usage_totals", "cli_usage"]) db.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    const settings = db.prepare("SELECT key,value FROM settings WHERE key='runtime-instance' OR key GLOB 'runtime:*' OR key GLOB 'runtime-history:*' OR key GLOB 'runtime-staging:*'").all() as { key: string; value: string }[];
+    if (settings.length) {
+      const cleanup = getSetting<{ instance?: string; volumes: string[] }>(db, "retired-runtime-cleanup") ?? { volumes: [] };
+      for (const { key, value } of settings) {
+        const parsed = JSON.parse(value) as unknown;
+        if (key === "runtime-instance" && typeof parsed === "string") cleanup.instance = parsed;
+        const names = key.startsWith("runtime:") ? [(parsed as { volume?: unknown })?.volume] : Array.isArray(parsed) ? parsed : [parsed];
+        if (key !== "runtime-instance") for (const name of names) if (typeof name === "string" && !cleanup.volumes.includes(name)) cleanup.volumes.push(name);
+      }
+      setSetting(db, "retired-runtime-cleanup", cleanup);
+      db.prepare("DELETE FROM settings WHERE key='runtime-instance' OR key GLOB 'runtime:*' OR key GLOB 'runtime-history:*' OR key GLOB 'runtime-staging:*'").run();
+      removed.push(`${settings.filter(s => s.key.startsWith("runtime:")).length} runtime installations`);
+    }
+    const runs = db.prepare(`UPDATE runs SET data=json_set(json_remove(data,'$.runtime_volume','$.runtime_version','$.backend'),'$.backend','builtin','$.retired_backend',json_extract(data,'$.backend'),'$.pending',json('[]'))
+      WHERE json_extract(data,'$.backend') IS NOT NULL AND json_extract(data,'$.backend')<>'builtin'`).run().changes;
+    if (runs) removed.push(`follow-ups for ${runs} coding-agent runs (history kept)`);
+    const schedules = db.prepare(`UPDATE runners SET enabled=0,data=json_set(data,'$.enabled',json('false'),'$.next_run_at',json('null'))
+      WHERE enabled=1 AND json_extract(data,'$.model_id') GLOB 'cli-*'`).run().changes;
+    if (schedules) removed.push(`${schedules} schedules that used coding-agent models (paused)`);
+  })(); } finally { db.pragma(`secure_delete = ${secure ? "ON" : "OFF"}`); }
+  if (removed.length) console.log(`Retired Claude Code and Codex agents: ${removed.join("; ")}.`);
+  return removed;
+}
 // Better Auth creates the user table at startup. Install this afterwards so its
 // deletion and our account data cleanup are one atomic SQLite operation.
 export function installAccountCleanup(db: Store) {
@@ -47,8 +93,8 @@ export function installAccountCleanup(db: Store) {
   CREATE TRIGGER gond_agent_delete_account AFTER DELETE ON "user" BEGIN
     DELETE FROM occurrences WHERE EXISTS (SELECT 1 FROM runners r WHERE r.user_id=OLD.id AND occurrences.key GLOB 'schedule:' || r.id || ':*');
     DELETE FROM runners WHERE user_id=OLD.id;
-    DELETE FROM cli_usage WHERE user_id=OLD.id;
-    DELETE FROM cli_accounts WHERE user_id=OLD.id;
+    DELETE FROM subscription_accounts WHERE user_id=OLD.id;
+    DELETE FROM subscription_notices WHERE user_id=OLD.id;
     DELETE FROM usage WHERE user_id=OLD.id;
     DELETE FROM images WHERE user_id=OLD.id;
     DELETE FROM runs WHERE user_id=OLD.id;
@@ -58,13 +104,13 @@ export function installAccountCleanup(db: Store) {
     DELETE FROM occurrences WHERE NOT EXISTS (SELECT 1 FROM "user");
   END`);
 }
-export function getSetting<T>(db: Store, key: string): T | null {
+export function getSetting<T>(db: Store | Database.Database, key: string): T | null {
   const row = db
     .prepare("SELECT value FROM settings WHERE key = ?")
     .get(key) as { value: string } | undefined;
   return row ? (JSON.parse(row.value) as T) : null;
 }
-export function setSetting(db: Store, key: string, value: unknown) {
+export function setSetting(db: Store | Database.Database, key: string, value: unknown) {
   db.prepare(
     "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
   ).run(key, JSON.stringify(value));

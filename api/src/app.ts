@@ -9,7 +9,6 @@ import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnv } from "./github-login";
 import { getSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
-import { cli } from "./cli-runtime";
 import { ApiError } from "./wire";
 import { clearModelCatalog } from "./models";
 import { deletionPolicy } from "./account";
@@ -149,7 +148,7 @@ export function createApp(
     return c.json({
       user: { ...u, ...photoFor(db, u) },
       admin: c.get("admin"),
-      setup_required: !setupComplete(db) && !runs.cliAccounts.models(u.id).length,
+      setup_required: !setupComplete(db) && !runs.subscriptions.usable(u.id),
       automations: {
         auto_pr: !!p.auto_pr,
       },
@@ -225,41 +224,37 @@ export function createApp(
     return c.body(new Uint8Array(row.bytes));
   });
   app.get("/api/v1/models", async (c) => c.json(await runs.catalog(c.get("user").id,c.req.query("refresh") === "1")));
-  app.use("/api/v1/cli/*",async(c,next)=>{c.header("Cache-Control","no-store");await next();});
-  app.get("/api/v1/cli/runtimes",c=>c.json({runtimes:runs.runtimes.status()}));
-  app.post("/api/v1/cli/runtimes/:backend",async c=>{
-    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can install coding agents.");
-    return c.json(await runs.runtimes.install(cli(c.req.param("backend"))));
+  app.use("/api/v1/subscriptions/*", async (c, next) => { c.header("Cache-Control", "no-store"); await next(); });
+  app.use("/api/v1/subscriptions", async (c, next) => { c.header("Cache-Control", "no-store"); await next(); });
+  const subscriptions = runs.subscriptions;
+  app.get("/api/v1/subscriptions", c => c.json({
+    providers: [{ id: "chatgpt", name: "ChatGPT", usage_url: subscriptions.provider("chatgpt").usageURL }],
+    accounts: subscriptions.list(c.get("user").id),
+    pending: subscriptions.pending(c.get("user").id, c.get("session").token) ?? null,
+    welcome: subscriptions.welcomePending(c.get("user").id),
+  }));
+  app.post("/api/v1/subscriptions/:provider/login", async c => {
+    const body = await c.req.json().catch(() => ({}));
+    if (body?.account_id !== undefined && typeof body.account_id !== "string") throw new ApiError(400, "invalid_account", "Choose a saved account.");
+    return c.json(subscriptions.begin(c.get("user").id, c.get("session").token, c.req.param("provider"), body?.account_id));
   });
-  app.post("/api/v1/cli/runtimes/:backend/close",async c=>{
-    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can close instance workspaces.");
-    return c.json(await runs.closeCLIRuntime(cli(c.req.param("backend"))));
+  app.delete("/api/v1/subscriptions/:provider/login", c => {
+    subscriptions.cancel(c.get("user").id, c.get("session").token);
+    return c.json({ ok: true });
   });
-  app.post("/api/v1/cli/accounts/:backend/close",async c=>c.json(await runs.closeCLIRuntime(cli(c.req.param("backend")),c.get("user").id)));
-  app.delete("/api/v1/cli/runtimes/:backend",async c=>{
-    if(!c.get("admin"))throw new ApiError(403,"forbidden","Only an administrator can uninstall coding agents.");
-    return c.json(await runs.runtimes.uninstall(cli(c.req.param("backend"))));
-  });
-  app.get("/api/v1/cli/accounts",c=>c.json({accounts:runs.cliAccounts.status(c.get("user").id,c.get("session").token).map(a=>{
-    const latest=db.prepare("SELECT e.data FROM events e JOIN runs r ON r.id=e.run_id WHERE r.user_id=? AND json_extract(r.data,'$.backend')=? AND json_extract(e.data,'$.type')='cli.limits' AND json_extract(e.data,'$.ts')>=? ORDER BY e.seq DESC LIMIT 1").get(c.get("user").id,a.backend,a.connectedAt ?? Date.now()) as {data:string}|undefined;
-    const event=latest?JSON.parse(latest.data):undefined;
-    return {...a,limits:a.connected?event?.limits:undefined,limitsUpdatedAt:a.connected?event?.ts:undefined};
-  })}));
-  app.post("/api/v1/cli/accounts/:backend/login",async c=>{
-    const backend=cli(c.req.param("backend"));
-    if(runs.list(c.get("user").id).some(r=>r.backend===backend&&["queued","working"].includes(r.status)))throw new ApiError(409,"cli_in_use","Stop your subscription runs before reconnecting.");
-    return c.json(await runs.cliAccounts.start(c.get("user").id,c.get("session").token,backend,async()=>{
-      const current=await authentication.current.api.getSession({headers:c.req.raw.headers});
-      return current?.user.id===c.get("user").id && current.session.token===c.get("session").token;
+  app.post("/api/v1/subscriptions/:provider/callback", async c => {
+    const body = await c.req.json().catch(() => null);
+    const user = c.get("user").id, session = c.get("session").token;
+    if (subscriptions.pending(user, session)?.provider !== subscriptions.provider(c.req.param("provider")).id)
+      throw new ApiError(409, "signin_expired", "This sign-in expired or was started in another session. Continue with ChatGPT again.");
+    return c.json(await subscriptions.complete(user, session, body?.url, async () => {
+      const current = await authentication.current.api.getSession({ headers: c.req.raw.headers });
+      return current?.user.id === user && current.session.token === session;
     }));
   });
-  app.post("/api/v1/cli/accounts/:backend/code",async c=>c.json(await runs.cliAccounts.code(c.get("user").id,c.get("session").token,cli(c.req.param("backend")),(await c.req.json()).code)));
-  app.delete("/api/v1/cli/accounts/:backend/login",async c=>{await runs.cliAccounts.cancel(c.get("user").id,c.get("session").token,cli(c.req.param("backend")));return c.json({ok:true});});
-  app.delete("/api/v1/cli/accounts/:backend",async c=>{
-    const backend=cli(c.req.param("backend"));
-    if(runs.list(c.get("user").id).some(r=>r.backend===backend && r.phase!=="idle"))throw new ApiError(409,"cli_in_use","Close your subscription workspaces before signing out.");
-    await runs.cliAccounts.logout(c.get("user").id,backend);return c.json({ok:true});
-  });
+  app.post("/api/v1/subscriptions/welcome", c => { subscriptions.acknowledgeWelcome(c.get("user").id); return c.json({ ok: true }); });
+  app.post("/api/v1/subscriptions/accounts/:id/sign-out", async c => c.json(await subscriptions.signOut(c.get("user").id, c.req.param("id"))));
+  app.delete("/api/v1/subscriptions/accounts/:id", async c => c.json(await subscriptions.remove(c.get("user").id, c.req.param("id"))));
   app.get("/api/v1/settings/oidc", (c) => {
     if (!c.get("admin"))
       throw new ApiError(
@@ -512,7 +507,7 @@ export function createApp(
       .all(u, from) as any[];
     return c.json({
       period,
-      subscriptions: (db.prepare("SELECT model_id,sum(json_extract(data,'$.input_uncached')) AS input,sum(json_extract(data,'$.output')) AS output,sum(json_extract(data,'$.cache_read')) AS cache_read,sum(json_extract(data,'$.cache_write')) AS cache_write,sum(json_extract(data,'$.reasoning')) AS reasoning FROM cli_usage WHERE user_id=? AND created_at>=? GROUP BY model_id").all(u,from)),
+      plan_usage_url: subscriptions.provider("chatgpt").usageURL,
       models: rows,
       total: rows.reduce(
         (t, r) => ({

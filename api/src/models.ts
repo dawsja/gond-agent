@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import type { Store } from "./db";
 import type { ModelRow } from "./adapters/types";
 import { discoverProviderModels, modelId, providerSettings, type ProviderConnection, type ProviderModel } from "./providers";
-import { knownReasoning, supportedEfforts } from "./effort";
+import { agentModel, knownImages, knownReasoning, supportedEfforts } from "./effort";
+import { BACKEND } from "./backend";
 import { ApiError } from "./wire";
 import { modelDisplayName } from "../../shared/model-names";
 
@@ -24,10 +25,16 @@ const cached = (db: Store, c: ProviderConnection) => {
 function modelsForConnection(db: Store, c: ProviderConnection) {
   return [...new Map([...(c.discover ? cached(db, c)?.models ?? [] : []), ...c.models].map(m => [m.id, m])).values()];
 }
+/** Maker label used for opaque replay and request options; xAI shares OpenAI's wire formats. */
+export function providerFor(c: Pick<ProviderConnection, "format" | "baseURL">): ModelRow["provider"] {
+  if (c.format === "anthropic") return "anthropic";
+  try { if (new URL(c.baseURL).hostname === "api.x.ai") return "xai"; } catch { /* validated on save */ }
+  return "openai";
+}
 export function modelRows(db: Store): ModelRow[] {
   return providerSettings(db).connections.flatMap(c => modelsForConnection(db, c).map(m => ({
     id: modelId(c.id, m.id), connection_id: c.id, format: c.format,
-    provider: c.format === "anthropic" ? "anthropic" as const : "openai" as const,
+    provider: providerFor(c),
     upstream_id: m.id, display_name: `${modelDisplayName(m.name,m.id)} · ${c.name}`,
     context_window: m.contextWindow, max_output: m.maxOutput,
     capabilities: { reasoning: m.reasoning, images: m.images, efforts: m.efforts },
@@ -51,6 +58,7 @@ export function publicModels(db: Store) {
       resolved_model: m.upstream_id,
       connection_id: m.connection_id, connection_name: settings.connections.find(c => c.id === m.connection_id)?.name,
       context_window: m.context_window, max_output: m.max_output, capabilities: m.capabilities, efforts: supportedEfforts(m),
+      backend: BACKEND, access: "api" as string,
     })),
     connections: settings.connections.map(c => {
       const entry = c.discover ? cached(db, c) : undefined;
@@ -77,9 +85,9 @@ export async function loadModelCatalog(db: Store, secret: string, refresh = fals
     current.pending = (async () => {
       try {
         const result = await discoverProviderModels(db, secret, { id: c.id, format: c.format, baseURL: c.baseURL });
-        if (result.supported) current.models = result.models.map(m => {
+        if (result.supported) current.models = result.models.filter(m => agentModel(c.baseURL, m.id)).map(m => {
           const contextWindow = m.contextWindow ?? 128000;
-          return { id: m.id, name: m.name, contextWindow, maxOutput: Math.min(m.maxOutput ?? 8192, contextWindow), ...knownReasoning(c.format,m.id), images: m.images ?? false };
+          return { id: m.id, name: m.name, contextWindow, maxOutput: Math.min(m.maxOutput ?? 8192, contextWindow), ...knownReasoning(c.format,m.id), images: m.images ?? knownImages(c.format, m.id) };
         });
         current.status = !result.supported ? "unsupported" : current.models.length ? "ready" : "empty";
         current.message = !result.supported ? c.models.length ? "Model discovery is unsupported. Using manual model overrides." : "Model discovery is unsupported. Add manual model IDs in provider settings." : !current.models.length ? "The provider returned no models." : result.truncated ? "Showing the first 500 models. Other IDs can be added as manual overrides." : undefined;

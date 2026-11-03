@@ -1,0 +1,10 @@
+data: {"id":"x1","object":"chat.completion.chunk","model":"grok-3-mini","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Check the failing "}}]}
+
+data: {"id":"x1","object":"chat.completion.chunk","model":"grok-3-mini","choices":[{"index":0,"delta":{"reasoning_content":"assertion first."}}]}
+
+data: {"id":"x1","object":"chat.completion.chunk","model":"grok-3-mini","choices":[{"index":0,"delta":{"content":"The assertion compares strings."}}]}
+
+data: {"id":"x1","object":"chat.completion.chunk","model":"grok-3-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":800,"completion_tokens":40,"total_tokens":1100,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":260}}}
+
+data: [DONE]
+

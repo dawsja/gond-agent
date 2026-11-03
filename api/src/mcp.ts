@@ -4,7 +4,7 @@ import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Store } from "./db";
 import type { Config } from "./config";
-import type { Run, Runs } from "./runs/service";
+import { parseRun, type Run, type Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { gh } from "./github";
 import { githubEnv } from "./github-login";
@@ -115,7 +115,8 @@ function session(r: Run, origin: string) {
     step: r.step,
     model: r.model_id,
     effort: r.effort,
-    backend: r.backend ?? "api",
+    backend: r.backend,
+    retired_backend: r.retired_backend ?? null,
     branch: r.branch,
     base_branch: r.base_branch,
     created_at: r.created_at,
@@ -277,7 +278,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       }
       tool(
         "list_models",
-        "List this account's available models. Use their exact IDs when starting a session.",
+        "List every model this account can use: API connections and signed-in ChatGPT plans. Use their exact IDs when starting a session.",
         {},
         true,
         async () => {
@@ -288,14 +289,18 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
               name: m.display_name,
               resolved_model: m.resolved_model,
               provider: m.provider,
+              backend: m.backend,
+              access: m.access,
+              connection_id: m.connection_id,
               connection_name: m.connection_name,
-              backend: "backend" in m ? m.backend : "api",
               efforts: m.efforts ?? supportedEfforts(m),
             })),
             connections: catalog.connections.map((c) => ({
               id: c.id,
               name: c.name,
+              access: c.access,
               status: c.status,
+              ...("message" in c && c.message ? { message: c.message } : {}),
             })),
           };
         },
@@ -334,6 +339,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
           base_branch: z.string().max(200).optional(),
           ...selection,
           model: z.string().min(1).max(512),
+          backend: z.string().max(40).optional(),
         },
         false,
         (args) =>
@@ -367,7 +373,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
           return {
             sessions: rows
               .slice(0, limit)
-              .map((r) => session(JSON.parse(r.data), cfg.origin)),
+              .map((r) => session(parseRun(r.data), cfg.origin)),
             next_cursor: rows.length > limit ? cursor + limit : null,
           };
         },
@@ -384,9 +390,10 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
               "SELECT model_id,SUM(input) AS input,SUM(output) AS output,SUM(cache_read) AS cache_read FROM usage WHERE run_id=? AND user_id=? GROUP BY model_id",
             )
             .all(session_id, user);
+          // Plan usage is counted by the provider; Gond Agent records tokens without charges.
           const subscription = db
             .prepare(
-              "SELECT model_id,SUM(json_extract(data,'$.input_uncached')) AS input,SUM(json_extract(data,'$.output')) AS output,SUM(json_extract(data,'$.cache_read')) AS cache_read,SUM(json_extract(data,'$.cache_write')) AS cache_write,SUM(json_extract(data,'$.reasoning')) AS reasoning FROM cli_usage WHERE run_id=? AND user_id=? GROUP BY model_id",
+              "SELECT model_id,SUM(input) AS input,SUM(output) AS output,SUM(cache_read) AS cache_read FROM usage WHERE run_id=? AND user_id=? AND (model_id GLOB 'chatgpt.*' OR model_id GLOB 'cli-*') GROUP BY model_id",
             )
             .all(session_id, user);
           return {
@@ -508,7 +515,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "send_session_message",
-        "Queue a follow-up. Model changes must stay within the session's backend.",
+        "Queue a follow-up, optionally with another available model. Sessions created by the removed Claude Code and Codex agents are read-only.",
         { session_id: id, request_id: id, text, ...selection },
         false,
         (args) =>
