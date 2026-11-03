@@ -211,6 +211,6 @@ mod tests {
         assert!(is_blocked_host("http://metadata.google.internal/computeMetadata/v1/"));
         assert!(is_blocked_host("http://0.0.0.0:8080/"));
         assert!(!is_blocked_host("http://127.0.0.1:8787/"));
-        assert!(!is_blocked_host("https://gond.io/agent/docs"));
+        assert!(!is_blocked_host("https://example.com/docs"));
     }
 }

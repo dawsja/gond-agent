@@ -1,5 +1,3 @@
-// Markdown in the landing page's look, for /docs and the legal pages: ruled tables, dark code panels with
-// a Copy button, and headings with ids so they can be linked (#install).
 import { Check, Copy } from "lucide-react"
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react"
 import Markdown, { type Components } from "react-markdown"

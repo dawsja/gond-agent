@@ -27,7 +27,7 @@ export default function Landing() {
       ].map(([n,title,body]) => <article key={n} className="border-t border-(--rule) pt-5"><span className="font-mono text-xs text-(--brand)">{n}</span><h3 className="mt-6 text-2xl font-medium tracking-tight">{title}</h3><p className="mt-4 text-base leading-relaxed text-(--ink-2)">{body}</p></article>)}</div>
     </section>
     <section id="selfhost" className={`${wrap} grid gap-12 border-t border-(--rule) py-20 lg:grid-cols-2`}>
-      <div><div className="mb-6 flex items-center gap-2 text-xs tracking-[0.13em] text-(--ink-3) uppercase"><Server className="size-4" /> Made for your server</div><h2 className="t-h2 max-w-[12ch]">The whole stack.<br />Under your roof.</h2><a href="/docs/self-hosting" className="mt-8 inline-flex items-center gap-2 text-sm underline underline-offset-4">Read the setup guide <ArrowUpRight className="size-4" /></a></div>
+      <div><div className="mb-6 flex items-center gap-2 text-xs tracking-[0.13em] text-(--ink-3) uppercase"><Server className="size-4" /> Made for your server</div><h2 className="t-h2 max-w-[12ch]">The whole stack.<br />Under your roof.</h2></div>
       <div className="space-y-0">{[
         ["Docker deployment", "Pull the published images and start with Docker Compose. Keep configuration and data in your own volumes."],
         ["Local SQLite", "Accounts, run history, images, and usage live in one local database. Simple to back up. Yours to keep."],
