@@ -30,11 +30,8 @@ type Docker = (...args: string[]) => Promise<Buffer>;
 async function waitForContainer(docker: Docker, id: string, timeout = 10_000) {
   const filter = `label=io.gond-agent.run=${id}`;
   const deadline = Date.now() + timeout;
-  let diagnostics = "";
+  const errors: string[] = [];
   while (true) {
-    const ids = (await docker("ps", "-q", "--filter", filter)).toString().trim().split(/\s+/).filter(Boolean);
-    if (ids.length === 1) return ids[0];
-    if (ids.length > 1) throw new Error(`Expected exactly one running container for ${id}, found: ${ids.join(", ")}`);
     const state: string[] = [];
     const diagnose = async (...args: string[]) => {
       try {
@@ -42,18 +39,20 @@ async function waitForContainer(docker: Docker, id: string, timeout = 10_000) {
         state.push(`docker ${args.join(" ")}:\n${output || "(empty)"}`);
         return output;
       } catch (error) {
-        state.push(`docker ${args.join(" ")}: ${String(error)}`);
+        errors.push(`docker ${args.join(" ")}: ${String(error)}`);
         return "";
       }
     };
+    const ids = (await diagnose("ps", "-q", "--filter", filter)).split(/\s+/).filter(Boolean);
+    if (ids.length === 1) return ids[0];
+    if (ids.length > 1) throw new Error(`Expected exactly one running container for ${id}, found: ${ids.join(", ")}`);
     const all = await diagnose("ps", "-a", "--filter", filter, "--format", "{{.ID}} {{.Names}} {{.Status}} {{.State}}");
     for (const line of all.split("\n").filter(Boolean)) {
       const container = line.split(/\s+/)[0];
       await diagnose("inspect", "--format", "{{json .State}}", container);
       await diagnose("logs", "--tail", "50", container);
     }
-    diagnostics = state.join("\n");
-    console.error(`No running container for ${id}:\n${diagnostics}`);
+    const diagnostics = [...errors, ...state].join("\n");
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for exactly one running container for ${id}:\n${diagnostics}`);
     await delay(Math.min(250, deadline - Date.now()));
   }
@@ -65,6 +64,28 @@ describe("container lookup", () => {
     const docker: Docker = async (...args) => Buffer.from(args[1] === "-q" && ++lookups > 1 ? "abc123\n" : "");
     await expect(waitForContainer(docker, "run_fixture")).resolves.toBe("abc123");
     expect(lookups).toBe(2);
+  });
+
+  it("retries a failed ps lookup before returning one running id", async () => {
+    let lookups = 0;
+    const docker: Docker = async (...args) => {
+      if (args[1] !== "-q") return Buffer.from("");
+      if (++lookups === 1) throw new Error("ps temporarily unavailable");
+      return Buffer.from("abc123\n");
+    };
+    await expect(waitForContainer(docker, "run_fixture")).resolves.toBe("abc123");
+    expect(lookups).toBe(2);
+  });
+
+  it("times out retaining ps errors across polls", async () => {
+    let lookups = 0;
+    const docker: Docker = async (...args) => {
+      if (args[1] === "-q") throw new Error(`ps failure ${++lookups}`);
+      return Buffer.from("");
+    };
+    await expect(waitForContainer(docker, "run_fixture", 260))
+      .rejects.toThrow(/Timed out[\s\S]*docker ps -q[\s\S]*ps failure 1[\s\S]*ps failure 2/);
+    expect(lookups).toBeGreaterThanOrEqual(2);
   });
 
   it("times out with stopped-container state and logs", async () => {
@@ -284,7 +305,7 @@ describe.skipIf(!image)("real container workspaces", () => {
       const archive = await command("tar",["-czf","-","-C",shallow,"."]);
       workspace = await pool.start(id,handler);
       await expect(pool.start("run_"+"b".repeat(24),handler)).rejects.toThrow("slots");
-      const container = await waitForContainer((...args) => command(cfg.dockerBin, args, { timeout: 1000 }), id);
+      const container = await waitForContainer((...args) => command(cfg.dockerBin, args, { timeout: 15_000 }), id);
       const inspect = JSON.parse((await docker("inspect",container)).toString())[0];
       expect(inspect.Config.User).toBe("1000:1000");
       expect(inspect.HostConfig.ReadonlyRootfs).toBe(true);
