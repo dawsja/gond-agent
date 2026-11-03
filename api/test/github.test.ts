@@ -63,3 +63,24 @@ it("resolves and caches connected identity, with explicit overrides and no inven
   vi.mocked(command).mockResolvedValueOnce(Buffer.from("{}"));
   await expect(commitIdentity({GH_TOKEN:"missing-identity"})).rejects.toMatchObject({code:"github_identity"});
 });
+
+it("refreshes cached commit identity after one hour", async () => {
+  const env = {GH_TOKEN:"expiring-identity-test"};
+  const now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  try {
+    await commitIdentity(env);
+    clock.mockReturnValue(now + 3600_001);
+    vi.mocked(command).mockResolvedValueOnce(Buffer.from('{"login":"renamed","id":123}'));
+    expect(await commitIdentity(env)).toEqual({name:"renamed",email:"123+renamed@users.noreply.github.com"});
+  } finally { clock.mockRestore(); }
+});
+
+it("invalidates cached identities after a GitHub request failure", async () => {
+  const env = {GH_TOKEN:"revoked-identity-test"};
+  await commitIdentity(env);
+  vi.mocked(command).mockRejectedValueOnce(new Error("HTTP 401"));
+  await expect(gh("user", "GET", undefined, env)).rejects.toThrow("HTTP 401");
+  vi.mocked(command).mockResolvedValueOnce(Buffer.from('{"login":"reconnected","id":456}'));
+  expect(await commitIdentity(env)).toEqual({name:"reconnected",email:"456+reconnected@users.noreply.github.com"});
+});

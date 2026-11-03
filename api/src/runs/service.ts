@@ -72,7 +72,6 @@ export interface Run {
   summary: Summary;
   pending: { text: string; images: string[]; effort?:string; model?:string }[];
   base_sha: string | null;
-  idle_since: number;
   auto_pr: boolean;
 }
 interface Live {
@@ -81,6 +80,7 @@ interface Live {
   cursor: number;
   closed: boolean;
   busy: boolean;
+  closing?: boolean;
 }
 export class Runs {
   events = new EventEmitter();
@@ -251,7 +251,7 @@ export class Runs {
   }
   private checkCapacity() {
     if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
-      throw new ApiError(429, "run_limit", "All workspaces are busy. Wait for a run to finish.");
+      throw new ApiError(429, "run_limit", "All workspaces are busy. Close finished sessions with close_session or in the workspace to free capacity.");
   }
   async create(
     user: string,
@@ -325,7 +325,6 @@ export class Runs {
       summary: emptySummary(),
       pending: [],
       base_sha: null,
-      idle_since: now,
       auto_pr: !!profile.auto_pr,
     };
     this.validateImages(user, input.images ?? []);
@@ -406,6 +405,7 @@ export class Runs {
         "invalid_prompt",
         "Write a message of up to 20,000 characters.",
       );
+    if (this.live.get(id)?.closing) throw new ApiError(409, "workspace_closing", "Wait for the workspace to close before sending a follow-up.");
     const question = r.summary.question;
     const answering = this.live.get(id);
     if (question && answering?.busy && !r.backend) {
@@ -597,7 +597,6 @@ export class Runs {
         if (event.type === "error" && event.agent_id === "main") {
           await this.captureCLI(r,live.workspace);this.releaseCLI(r);
           live.busy = false;
-          r.idle_since = Date.now();
           this.status(r, "failed", null, String(event.message));
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
@@ -605,7 +604,6 @@ export class Runs {
           if (event.stop_reason === "error") continue;
           if (event.stop_reason === "interrupted") {
             live.busy = false;
-            r.idle_since = Date.now();
             r.phase = "agent";
             this.status(r, "stopped");
           } else if (event.stop_reason !== "compacted") {
@@ -624,6 +622,19 @@ export class Runs {
     let r = this.get(id);
     r.phase = "finishing";
     this.status(r, "working", "Pushing changes");
+    await this.publish(id, live);
+    r = this.get(id);
+    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
+    r = this.get(id);
+    live.busy = false;
+    r.phase = "agent";
+    r.finished_at = Date.now();
+    const merged = r.pr_state === "merged" && !r.pending.length;
+    this.status(r, merged ? "merged" : "ready");
+    if (merged) await this.close(id);
+  }
+  private async publish(id: string, live: Live) {
+    let r = this.get(id);
     const snapshot = await live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       { title: r.title, identity: await commitIdentity(githubEnv(this.db, this.cfg.secret)) },
@@ -665,15 +676,6 @@ export class Runs {
       additions: r.additions,
       deletions: r.deletions,
     });
-    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
-    r = this.get(id);
-    live.busy = false;
-    r.phase = "agent";
-    r.idle_since = Date.now();
-    r.finished_at = Date.now();
-    const merged = r.pr_state === "merged" && !r.pending.length;
-    this.status(r, merged ? "merged" : "ready");
-    if (merged) await this.close(id);
   }
   async openPull(id: string, user: string) {
     const r = this.get(id, user);
@@ -724,11 +726,22 @@ export class Runs {
   async stop(id: string, user: string) {
     const r = this.get(id, user);
     r.pending = [];
-    r.idle_since = Date.now();
     this.status(r, "stopped");
     const live = this.live.get(id);
     if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
-    await this.close(id);
+  }
+  async closeSession(id: string, user: string) {
+    const r = this.get(id, user);
+    const live = this.live.get(id);
+    if (this.booting.has(id) || live?.busy || live?.closing || r.pending.length || ["queued", "working"].includes(r.status))
+      throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
+    if (!live) return { closed: true };
+    live.closing = true;
+    try {
+      await this.publish(id, live);
+      await this.close(id);
+      return { closed: true };
+    } finally { live.closing = false; }
   }
   async remove(id: string, user: string) {
     this.get(id, user);
@@ -741,7 +754,7 @@ export class Runs {
       force: true,
     });
   }
-  // Workspaces end only on explicit close/stop/merge/delete, failure, or shutdown/recovery.
+  // Workspaces end only on explicit close/merge/delete, failure, or shutdown/recovery.
   async close(id: string) {
     const live = this.live.get(id);
     if (live) {

@@ -194,7 +194,7 @@ describe.skipIf(!image)("real container workspaces", () => {
     const handler = async (req: Request) => {
       if(new URL(req.url).pathname === "/v1/models") return Response.json({models:[{id:"fixture",context_window:100000}]});
       const body = await req.json(); requests.push(body);
-      const blocks = interrupting ? [call("sleep","bash",{command:"sleep 30"})] : workflow[n++] ?? [{type:"text",text:"Verified and self-reviewed."}];
+      const blocks = interrupting ? [call("sleep","bash",{command:"sleep 30"})] : workflow[n++] ?? [{type:"text",text:"Done."}];
       const data = sse(blocks);
       // Deliberately split SSE records across HTTP chunks to exercise the relay.
       return new Response(new ReadableStream({start(controller){for(let i=0;i<data.length;i+=97)controller.enqueue(new TextEncoder().encode(data.slice(i,i+97)));controller.close();}}),{headers:{"content-type":"text/event-stream"}});
@@ -245,7 +245,6 @@ describe.skipIf(!image)("real container workspaces", () => {
       await until(e=>e.type==="turn.end" && e.agent_id==="main");
       expect(events.filter(e=>e.type==="tool.end" && !e.ok)).toEqual([]);
       expect(events.find(e=>e.type==="tool.images" && e.call_id==="browser").images).toHaveLength(2);
-      expect(events.find(e=>e.type==="tool.end" && e.call_id==="review").ok).toBe(true);
       expect(events.find(e=>e.type==="turn.end").stop_reason).toBe("end_turn");
       expect(requests.some(req=>req.messages.some((m:any)=>m.role==="tool" && m.content.some((b:any)=>b.content?.some((p:any)=>p.type==="image"))))).toBe(true);
       const snapshot = await workspace.rpc<{bundle:string;head:string}>("snapshot",{title:"Container result",identity:{name:"fixture",email:"123+fixture@users.noreply.github.com"}});

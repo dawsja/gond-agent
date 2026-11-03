@@ -19,6 +19,7 @@ Tools return JSON in MCP text content. Tool failures set `isError` and return cu
 | `read_session_event` | `session_id`, `seq`, optional character `cursor`; returns a large event as JSON text in 32,000-character pages. Advance the event sequence only after reading its final page. |
 | `get_session_diff` | `session_id`, optional character `cursor`; 32,000-character diff pages, nullable continuation and `updated_at`. Restart if the revision changes. |
 | `send_session_message` | `session_id`, `text`, `request_id`; optional `model`, `effort`. Backend changes require a new session. |
+| `close_session` | `session_id`; save and push idle/stopped workspace changes, then release capacity. Refuses busy workspaces; preserves history and resumes from pushed branch on follow-up. |
 | `stop_session` | `session_id`; existing run interruption. |
 | `open_session_pull_request` | `session_id`; open or return its existing PR. |
 
@@ -158,4 +159,15 @@ Wait for completion again, then publish when desired (automatic PR creation may 
 {"url":"https://github.com/owner/repo/pull/42","number":42}
 ```
 
-Runs have no elapsed-time, idle, step, token-total or tool-call budgets. Explicit close/stop/merge/delete, failures and shutdown/recovery clean up containers; idle containers do not expire. CPU/memory/PID, archive/frame/body/output sizes, queued-message bounds, MCP traffic and concurrency limits remain resource protections. Bash foreground calls time out after 120 seconds by default (maximum 600 seconds), returning a tool error so the loop continues; long builds can run in the background and be read with `bash_output`. Model requests have no elapsed-time abort; disconnect/cancellation still aborts them. Control RPCs and Git operations retain per-operation timeouts for unavailable infrastructure. Successful turn publication commits as the connected GitHub account using one service identity resolver, never a fixed product author. Optional name/email overrides are documented in README.
+Runs have no elapsed-time, idle, step, token-total or tool-call budgets. Explicit close/merge/delete, failures and shutdown/recovery clean up containers; idle containers do not expire. CPU/memory/PID, archive/frame/body/output sizes, queued-message bounds, MCP traffic and concurrency limits remain resource protections. Bash foreground calls time out after 120 seconds by default (maximum 600 seconds), returning a tool error so the loop continues; long builds can run in the background and be read with `bash_output`. Model requests have no total elapsed-time budget. `MODEL_STALL_MINUTES` (default 10, 0 disables) aborts only after no response headers or body bytes arrive for that interval; each nonempty chunk resets it. Stalls use the existing retryable model-error path; progressing streams are not cut off. Disconnect/cancellation still aborts requests. Control RPCs and Git operations retain per-operation timeouts for unavailable infrastructure. Successful turn publication commits as the connected GitHub account using one service identity resolver, never a fixed product author. Optional name/email overrides are documented in README.
+
+### Release finished sessions
+
+After reading the result and diff and opening any desired PR, call `close_session` to free the workspace slot. Finished sessions do not expire automatically. Stop is non-destructive and does not free a slot. Close refuses while a turn, pending message or startup is active. For stopped work it snapshots and pushes uncommitted edits first; if snapshot or push fails, the workspace stays open. History and diff remain readable, and a follow-up shallow-clones the pushed branch. The workspace's More → Close workspace action and `POST /api/v1/runs/:id/close` use the same owner-scoped operation.
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"close_session","arguments":{"session_id":"run_abc"}}}
+```
+```json
+{"closed":true}
+```

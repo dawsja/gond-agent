@@ -24,6 +24,6 @@ if (args[0] === 'auth' && args[1] === 'login') {
 } else if (args[0] === 'api') {
   if (process.env.GH_TOKEN !== token) process.exit(1);
   const endpoint = args[1];
-  const result = endpoint === 'user' ? { login: 'fixture-operator' } : endpoint.startsWith('user/repos') ? [{ full_name: 'acme/app', private: true, default_branch: 'main', pushed_at: null }] : endpoint.includes('/branches') ? [{ name: 'main' }] : { default_branch: 'main' };
+  const result = endpoint === 'user' ? { login: 'fixture-operator', id: 123 } : endpoint.startsWith('user/repos') ? [{ full_name: 'acme/app', private: true, default_branch: 'main', pushed_at: null }] : endpoint.includes('/branches') ? [{ name: 'main' }] : { default_branch: 'main' };
   process.stdout.write(JSON.stringify(result));
 } else { process.exit(2); }

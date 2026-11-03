@@ -55,7 +55,7 @@ def main():
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 index = len(seen)
                 seen.append(request)
-                blocks = workflow[index] if index < len(workflow) else [{"type": "text", "text": "Verified and self-reviewed."}]
+                blocks = workflow[index] if index < len(workflow) else [{"type": "text", "text": "Done."}]
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()

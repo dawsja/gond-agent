@@ -524,6 +524,13 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
           }),
       );
       tool(
+        "close_session",
+        "Release an idle or stopped workspace after saving and pushing its changes. Busy workspaces are refused. History remains readable; a follow-up resumes from the pushed branch.",
+        { session_id: id },
+        false,
+        ({ session_id }) => runs.closeSession(session_id, user),
+      );
+      tool(
         "stop_session",
         "Stop a session. Disconnecting MCP does not stop runs.",
         { session_id: id },

@@ -11,7 +11,14 @@ export interface Config {
   runCPUs: number;
   runMemoryMB: number;
 }
+export function modelStallMs(): number {
+  const minutes = Number(process.env.MODEL_STALL_MINUTES ?? 10);
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes * 60_000 > 2_147_483_647)
+    throw new Error("Invalid MODEL_STALL_MINUTES");
+  return minutes * 60_000;
+}
 export function configFromEnv(): Config {
+  modelStallMs();
   const secret = process.env.BETTER_AUTH_SECRET ?? "";
   if (secret.length < 32)
     throw new Error("BETTER_AUTH_SECRET must contain at least 32 characters");

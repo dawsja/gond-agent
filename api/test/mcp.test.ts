@@ -217,7 +217,7 @@ it("negotiates with the official HTTP client and reads only owned browser runs",
   expect(tools.tools.map(t => t.name).sort()).toEqual([
     "list_models", "list_repositories", "start_session", "list_sessions", "get_session",
     "read_session_events", "read_session_event", "get_session_diff", "send_session_message",
-    "stop_session", "open_session_pull_request",
+    "stop_session", "close_session", "open_session_pull_request",
   ].sort());
   const list = await call(client, "list_sessions");
   expect(list.body.sessions.map((r: Run) => r.id)).toEqual(["run_test"]);
@@ -446,4 +446,15 @@ it("reports a pending question without calling it done", async () => {
   for (const name of ["get_session", "read_session_events"]) {
     expect((await call(client, name, {session_id:r.id, ...(name === "read_session_events" ? {wait_seconds:30} : {})})).body).toMatchObject({state:"waiting_for_input", done:false, waiting_for_input:true, asking_question:true, question:"Which branch?"});
   }
+});
+
+it("closes only owned idle sessions while preserving readable history", async () => {
+  seed(); seed(other, "foreign");
+  const client = await connect();
+  expect((await call(client, "close_session", {session_id:"foreign"})).body.error).toBe("not_found");
+  expect((await call(client, "close_session", {session_id:"run_test"})).body).toEqual({closed:true});
+  expect((await call(client, "get_session", {session_id:"run_test"})).body.id).toBe("run_test");
+  const r = runs.get("run_test", owner); r.status = "working";
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  expect((await call(client, "close_session", {session_id:r.id})).body.error).toBe("workspace_busy");
 });
