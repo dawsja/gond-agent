@@ -4,11 +4,11 @@ import { type ReactNode, useMemo } from "react"
 import { Activity } from "@/components/workspace/activity"
 import { ProfileAvatar } from "@/components/profile-avatar"
 import type { Run, RunStatus } from "@/lib/api"
-import { ago, avatarColor, duration, initials } from "@/lib/format"
+import { ago, duration } from "@/lib/format"
 import { useMe, useModels, useRunImage } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
-import { Avatar, DiffCounts, Dot, ModelMark, PrChip, StatusPill } from "../studio/parts"
+import { DiffCounts, Dot, ModelMark, PrChip, StatusPill } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
 import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
@@ -220,7 +220,7 @@ function UserMessage({
   return (
     <div className="rounded-[4px] border border-border bg-surface p-4">
       <div className="mb-2 flex items-center gap-2 text-[12px] text-muted-foreground">
-        {authorId === me?.user?.id ? <ProfileAvatar src={me.user.image} size={24} label="Your profile photo" /> : <Avatar initials={initials(author)} color={avatarColor(authorId)} size={20} />}
+        {authorId === me?.user?.id ? <ProfileAvatar src={me.user.image} size={24} label="Your profile photo" /> : <ProfileAvatar size={24} label={`${author} profile photo`} />}
         <span className="font-medium text-foreground">{author}</span>
         <span>· {ago(ts)}</span>
         {first && (

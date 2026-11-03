@@ -26,6 +26,15 @@ const key = 'fixture-only-provider-key';
   const browser = await chromium.launch({ executablePath: process.env.GOND_AGENT_BROWSER_EXECUTABLE, args: ['--no-sandbox'] });
   const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
   const errors = [];
+  const externalRequests = [];
+  page.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
+  const greyAvatar = async locator => {
+    await expect(locator).toBeVisible();
+    await expect(locator).toHaveCSS('background-color', 'rgb(26, 26, 26)');
+    await expect(locator).toHaveCSS('color', 'rgb(138, 138, 138)');
+    await expect(locator.locator('svg.lucide-user-round')).toBeVisible();
+    await expect(locator).toHaveText('');
+  };
   page.on('pageerror', error => errors.push(error.message));
   const capture = async name => screenshots.push({ name: `${name}-${width}.png`, data: (await page.screenshot({ fullPage: true, mask: [page.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
   const settingsURL = origin + '/api/v1/settings/providers';
@@ -175,6 +184,7 @@ const key = 'fixture-only-provider-key';
       sockets.at(-1).send(JSON.stringify({ seq: 3, ts: Date.now(), type: 'text.delta', text: ' now' }));
       sockets.at(-1).send(JSON.stringify({ seq: 2, ts: Date.now(), type: 'text.delta', text: 'Checking' }));
       await expect(page.getByText('Checking now', { exact: true })).toBeVisible();
+      await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
       await capture('streamed-transcript-image');
       if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
       await page.getByRole('link', { name: 'Home', exact: true }).filter({ visible: true }).click();
@@ -571,6 +581,23 @@ const key = 'fixture-only-provider-key';
       await page.goto(origin + '/agents/settings');
     }
     if (!returning) await verifyComposers();
+    if (!returning) {
+      const meURL = origin + '/api/v1/me';
+      const externalAvatar = async route => {
+        const response = await route.fetch();
+        const body = await response.json();
+        await route.fulfill({ response, json: { ...body, user: { ...body.user, image: 'https://www.gravatar.com/avatar/x' } } });
+      };
+      await page.route(meURL, externalAvatar);
+      await page.reload();
+      await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
+      await expect(page.locator('img[src*="gravatar"]')).toHaveCount(0);
+      await capture('external-avatar-ignored');
+      await page.unroute(meURL, externalAvatar);
+      await page.reload();
+      await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
+      await capture('account-grey-default');
+    }
     const beforePhoto = await (await page.request.get(origin + '/api/v1/me')).json();
     if (returning) {
       expect(beforePhoto.user.has_photo).toBe(true);
@@ -701,6 +728,7 @@ const key = 'fixture-only-provider-key';
       await capture('delete-account-fresh-workspace');
     }
     expect(errors).toEqual([]);
+    expect(externalRequests).toEqual([]);
     console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, screenshots }));
   } catch (error) {
     await capture('failure').catch(() => {});

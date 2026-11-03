@@ -1,3 +1,4 @@
+import { isLocalProfilePhoto } from "../../shared/profile-photo";
 import { betterAuth } from "better-auth";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { getMigrations } from "better-auth/db/migration";
@@ -44,6 +45,11 @@ export function unseal(secret: string, value: string): string {
     decipher.final(),
   ]).toString();
 }
+// Better Auth 1.7 accepts undefined, not null, to override the provider image.
+export function oidcProfileToUser(profile: { name?: string | null; email?: string | null }) {
+  return { name: profile.name ?? undefined, email: profile.email ?? undefined, image: undefined };
+}
+
 export async function createAuthentication(db: Store, cfg: Config) {
   const build = (beforeDelete?: (user: { id: string }) => Promise<void>) => {
     const oidc = getSetting<OIDC>(db, "oidc");
@@ -70,8 +76,11 @@ export async function createAuthentication(db: Store, cfg: Config) {
       },
       databaseHooks: {
         user: {
+          update: {
+            before: async (user) => ({ data: { ...user, ...(user.image === undefined ? {} : { image: isLocalProfilePhoto(user.image) ? user.image : null }) } }),
+          },
           create: {
-            before: async () => {
+            before: async (user) => {
               // Closed instance by default. The first account is bootstrapped on a private bind address.
               const n = (
                 db.prepare('SELECT count(*) AS n FROM "user"').get() as {
@@ -79,6 +88,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
                 }
               ).n;
               if (n && !cfg.signup) return false;
+              return { data: { ...user, image: isLocalProfilePhoto(user.image) ? user.image : null } };
             },
             after: async (user) => {
               db.transaction(() => {
@@ -106,6 +116,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
                     oidc.issuer.replace(/\/$/, "") +
                     "/.well-known/openid-configuration",
                   scopes: ["openid", "profile", "email"],
+                  mapProfileToUser: oidcProfileToUser,
                   pkce: true,
                   requireIdTokenVerification: true,
                 },
