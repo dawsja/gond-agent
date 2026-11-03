@@ -1,3 +1,4 @@
+import { WebSearchSettings } from "./web-search"
 import { ChatGPTPlanSettings } from "./chatgpt-plan"
 import { MCPAccess } from "./mcp-access"
 import { useEffect, type ReactNode } from "react"
@@ -35,6 +36,7 @@ export function SettingsScreen() {
       <div id="sessions"><SessionsSection /></div>
     </SettingsCategory>
     <SettingsCategory id="agent-access-settings" title="Agent access">
+      {me?.admin && <div id="web-search"><WebSearchSettings /></div>}
       <div id="mcp"><MCPAccess /></div>
     </SettingsCategory>
     <SettingsCategory id="account-management-settings" title="Account management">

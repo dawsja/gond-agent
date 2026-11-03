@@ -26,13 +26,20 @@ async fn main() -> Result<()> {
     let (extra_tools, status) = mcp::connect_all(&cwd, true).await;
     for s in status { eprintln!("MCP {}: {} ({} tools, ok={})", s.name, s.detail, s.tools, s.ok); }
     let mut tools = tools::builtin(); tools.extend(extra_tools);
+    let search_available = catalog["web_search"].as_bool() == Some(true);
+    if catalog["web_search"].as_bool() == Some(true) {
+        tools.push(tools::bounded(std::sync::Arc::new(tools::web_search::WebSearch { relay: std::env::var("GOND_AGENT_API_URL")? })));
+    } else {
+        eprintln!("web_search is unavailable: configure a provider in Settings > Web search. No fallback is used.");
+    }
     let cfg = AgentConfig {
         model, context_window, mode: Mode::Allow, rules: vec![], cwd: cwd.clone(),
         effort: std::env::var("GOND_AGENT_EFFORT").unwrap_or_else(|_| "high".into()), session_id: uuid::Uuid::new_v4().to_string(), history: vec![],
         plan: initial_plan(&std::env::var("GOND_AGENT_INITIAL_PLAN").unwrap_or_else(|_| "[]".into())),
         plan_reminder_every: plan_setting("GOND_AGENT_PLAN_REMINDER_EVERY", 6),
         plan_nudge_limit: plan_setting("GOND_AGENT_PLAN_NUDGE_LIMIT", 2).min(2),
-        interactive: false, tools, system: format!("{}{}", prompt::main_prompt(&cwd), prompt::AUTONOMOUS),
+        question_wait: std::time::Duration::from_secs(u64::from(plan_setting("GOND_AGENT_QUESTION_WAIT_MINUTES", 240)) * 60),
+        interactive: std::env::var("GOND_AGENT_INTERACTIVE").as_deref() == Ok("true"), tools, system: format!("{}{}{}", prompt::main_prompt(&cwd), prompt::AUTONOMOUS, if search_available { "" } else { "\nweb_search is unavailable because no search provider is configured. An administrator can enable it in Settings > Web search. No fallback is used." }),
         sub_system: prompt::sub_prompt(&cwd), skills: skills::discover(&cwd, &[]),
     };
     std::process::exit(transport::jsonl(agent::spawn(api, cfg)).await?);

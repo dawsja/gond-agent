@@ -114,7 +114,7 @@ export function installAccountCleanup(db: Store) {
     DELETE FROM runs WHERE user_id=OLD.id;
     DELETE FROM profiles WHERE user_id=OLD.id;
     DELETE FROM administrators WHERE user_id=OLD.id;
-    DELETE FROM settings WHERE key IN ('providers','oidc','github') AND NOT EXISTS (SELECT 1 FROM "user");
+    DELETE FROM settings WHERE key IN ('providers','oidc','github','web-search') AND NOT EXISTS (SELECT 1 FROM "user");
     DELETE FROM occurrences WHERE NOT EXISTS (SELECT 1 FROM "user");
   END`);
 }

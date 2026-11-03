@@ -1,4 +1,10 @@
 import base64
+import contextlib
+import http.server
+import json
+import socket
+import threading
+import time
 import importlib.util
 import io
 import json
@@ -23,12 +29,48 @@ class AgentTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_search_relay_cancels_when_worker_disconnects(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), agent.ModelProxy)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        output = io.StringIO()
+        connection = None
+        try:
+            with contextlib.redirect_stdout(output):
+                connection = socket.create_connection(server.server_address)
+                body = b'{"query":"fixture"}'
+                connection.sendall(b"POST /v1/search HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+                deadline = time.monotonic() + 3
+                while not output.getvalue() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                frames = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(frames[0]["model"]["path"], "/v1/search")
+                connection.close()
+                connection = None
+                while "model_cancel" not in output.getvalue() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                frames = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(frames[-1]["model_cancel"], frames[0]["model"]["id"])
+                self.assertNotIn(frames[0]["model"]["id"], agent.models)
+        finally:
+            if connection:
+                connection.close()
+            server.shutdown()
+            server.server_close()
+
     def test_start_environment_restores_plan_and_reminder_settings(self):
         plan = [{"text": "Continue work", "status": "in_progress"}]
         env = agent.worker_env({"model": "fixture", "plan": plan, "plan_reminder_every": 0, "plan_nudge_limit": 2})
         self.assertEqual(json.loads(env["GOND_AGENT_INITIAL_PLAN"]), plan)
         self.assertEqual(env["GOND_AGENT_PLAN_REMINDER_EVERY"], "0")
         self.assertEqual(env["GOND_AGENT_PLAN_NUDGE_LIMIT"], "2")
+
+    def test_questions_require_explicit_interactive_start(self):
+        self.assertEqual(agent.worker_env({"model": "fixture", "question_wait_minutes": 8})["GOND_AGENT_QUESTION_WAIT_MINUTES"], "8")
+        for value in [None, False, "true", 1]:
+            self.assertEqual(agent.worker_env({"model": "fixture", "interactive": value})["GOND_AGENT_INTERACTIVE"], "false")
+        self.assertEqual(agent.worker_env({"model": "fixture", "interactive": True})["GOND_AGENT_INTERACTIVE"], "true")
 
     def test_toolchain_environment_reaches_worker_and_shell(self):
         homes = {"BUN_INSTALL": "bun", "CARGO_HOME": "cargo", "RUSTUP_HOME": "rustup",
@@ -117,7 +159,7 @@ print(output)
         self.assertEqual(env["GOND_AGENT_API_URL"], "http://127.0.0.1:8787")
         self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
         added = set(env) - set(os.environ)
-        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT"})
+        self.assertEqual(added, {"GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES"})
 
 
 if __name__ == "__main__":

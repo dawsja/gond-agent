@@ -1,9 +1,10 @@
+import { searchConfigured, searchResponse } from "../search";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
-import { planSetting, type Config } from "../config";
+import { planSetting, webSearchLimit, questionWaitMinutes, type Config } from "../config";
 import type { Store } from "../db";
 import type { Workspace, WorkspaceFactory } from "../containers";
 import {
@@ -64,6 +65,7 @@ export interface Run {
   plan_done: number;
   plan_total: number;
   source: string;
+  web_search_calls?: number;
   mcp_token_id?: string;
   phase: string;
   pushed: boolean;
@@ -160,6 +162,9 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls FROM runs WHERE id=?").get(r.id) as {calls: number | null} | undefined;
+    // Other lifecycle work may still hold a snapshot from before a search request.
+    if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -481,7 +486,8 @@ export class Runs {
       const owner = r.user_id;
       workspace = await this.workspaceFactory(id, (req) =>
         new URL(req.url).pathname === "/v1/models"
-          ? this.catalog(owner).then(catalog => Response.json(catalog))
+          ? this.catalog(owner).then(catalog => Response.json({ ...catalog, web_search: searchConfigured(this.db) }))
+          : new URL(req.url).pathname === "/v1/search" ? this.search(id, req)
           : modelResponse(this.db, this.cfg.secret, owner, id, req, this.access),
       );
       r = this.get(id);
@@ -497,6 +503,8 @@ export class Runs {
       this.status(r, "working", "Starting the agent");
       await workspace.rpc("start", {
         model: r.model_id, effort: r.effort ?? "high",
+        interactive: r.source === "web" || r.source === "mcp",
+        question_wait_minutes: questionWaitMinutes(),
         ...(r.summary.plan_steps?.length ? { plan: r.summary.plan_steps } : {}),
         ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
         ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
@@ -556,6 +564,18 @@ export class Runs {
         images: message.images.map((id) => ({ id })),
       },
     });
+  }
+  private search(id: string, req: Request): Promise<Response> {
+    const run = this.get(id);
+    const used = run.web_search_calls ?? 0;
+    const limit = webSearchLimit();
+    if (limit !== 0 && used >= limit) {
+      return Promise.resolve(Response.json({ error: "web search limit for this run reached" }, { status: 429 }));
+    }
+    // Persist before awaiting the provider so concurrent requests and reopened workers share the cap.
+    run.web_search_calls = used + 1;
+    this.save(run);
+    return searchResponse(this.db, this.cfg.secret, req);
   }
   private async pump(id: string, live: Live) {
     while (!live.closed) {

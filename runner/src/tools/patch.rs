@@ -116,9 +116,10 @@ fn apply_hunks(text: &str, hunks: &[Vec<(char, String)>], path: &str) -> Result<
         lines.splice(at..at + old.len(), new.iter().cloned());
         cursor = at + new.len();
     }
-    let mut out = lines.join("\n");
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = lines.join(newline);
     if trailing_nl && !out.is_empty() {
-        out.push('\n');
+        out.push_str(newline);
     }
     Ok(out)
 }
@@ -289,6 +290,14 @@ mod tests {
 
         let bad = ApplyPatch.run(&c, json!({"patch": "*** Begin Patch\n*** Update File: a.ts\n@@\n-not there\n+x\n*** End Patch"})).await;
         assert!(!bad.ok && text(&bad).contains("hunk 1 did not match"));
+    }
+
+    #[test]
+    fn hunks_preserve_crlf_and_trailing_newline() {
+        let hunks = vec![vec![('-', "two".into()), ('+', "TWO".into())]];
+        for ending in ["", "\r\n"] {
+            assert_eq!(apply_hunks(&format!("one\r\ntwo{ending}"), &hunks, "a").unwrap(), format!("one\r\nTWO{ending}"));
+        }
     }
 
     #[test]
