@@ -12,6 +12,10 @@ export async function removeRetiredRuntimes(db: Store, cfg: Pick<Config, "docker
   const pending = getSetting<{ instance?: string; volumes: string[] }>(db, "retired-runtime-cleanup");
   if (!pending) return [];
   const removed: string[] = [];
+  if (!pending.instance || !/^[a-f0-9]{24}$/.test(pending.instance)) {
+    console.warn("Retired runtime cleanup deferred: no valid instance identity; cleanup record retained.");
+    return removed;
+  }
   if (pending.instance && /^[a-f0-9]{24}$/.test(pending.instance)) {
     const labelled = (await docker(["volume", "ls", "--quiet", "--filter", "label=io.gond-agent.runtime=true", "--filter", `label=io.gond-agent.runtime-instance=${pending.instance}`]))
       .toString().trim().split(/\s+/).filter(name => /^gond-agent-cli-[a-f0-9]{32}$/.test(name));

@@ -126,3 +126,17 @@ it("removes only this instance's labelled runtime volumes, once, and retries aft
   expect(calls).toEqual([]);
   db.close();
 });
+
+it("retains cleanup records without an instance identity", async () => {
+  const db = openStore(dir);
+  const pending = { volumes: [volume(1)] };
+  db.prepare("INSERT INTO settings(key,value) VALUES('retired-runtime-cleanup',?)").run(JSON.stringify(pending));
+  let called = false;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    expect(await removeRetiredRuntimes(db, { dockerBin: "docker" }, async () => { called = true; return ""; })).toEqual([]);
+    expect(called).toBe(false);
+    expect(getSetting(db, "retired-runtime-cleanup")).toEqual(pending);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("cleanup record retained"));
+  } finally { db.close(); }
+});
