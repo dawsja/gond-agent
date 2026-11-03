@@ -127,7 +127,7 @@ export function PlanIndicator({ model, connections }: { model?: Model; connectio
   if (!model?.access || model.access === "api") return null
   const connection = connections?.find(c => c.id === model.connection_id)
   return <div className="mt-2 flex flex-col gap-2 px-1">
-    <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-muted-foreground"><OpenAIMark inverted className="size-3.5 opacity-80" />Using ChatGPT plan<a className="text-link" href={connection?.usage_url ?? CHATGPT_USAGE_URL} target="_blank" rel="noreferrer">Manage usage</a></p>
+    <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-muted-foreground"><OpenAIMark inverted className="size-3.5 opacity-80" /><span>Using ChatGPT plan</span><a className="text-link" href={connection?.usage_url ?? CHATGPT_USAGE_URL} target="_blank" rel="noreferrer">Manage usage</a></p>
     {connection?.limited && <UsageLimitCard />}
   </div>
 }
