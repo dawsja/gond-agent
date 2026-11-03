@@ -194,6 +194,15 @@ describe("Sign in with ChatGPT by pasting the loopback address", () => {
     expect(mock.count("/v1/models")).toBe(0);
   });
 
+  it("never grants plan permission from the pasted callback scope", async () => {
+    mock.omitTokenScope = true;
+    const { pasted, body } = await signIn();
+    expect(new URL(pasted).searchParams.get("scope")).toContain("chatgpt.tokens.use.direct");
+    expect(body.account.plan).toBe("disabled");
+    expect(tokensOf(account()).scopes).toEqual([]);
+    expect((await runs.catalog(user)).models).toEqual([]);
+  });
+
   it("rejects an ID token whose nonce doesn't match the attempt", async () => {
     mock.wrongNonce = true;
     const { done, body } = await signIn();

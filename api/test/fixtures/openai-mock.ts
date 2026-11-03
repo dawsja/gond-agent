@@ -27,6 +27,7 @@ export class OpenAIMock {
   /** Sign ID tokens with a wrong nonce. */
   wrongNonce = false;
   accessLifetime = 3600;
+  omitTokenScope = false;
   refreshDelay = 0;
   revokeFailures = 0;
   subject: string;
@@ -78,7 +79,7 @@ export class OpenAIMock {
     const access = this.secret("at"), refresh = this.secret("rt");
     this.accessTokens.set(access, { client, expires: Date.now() + this.accessLifetime * 1000, scope });
     this.refreshTokens.set(refresh, { client, subject, scope, state: "active" });
-    return { access_token: access, refresh_token: refresh, ...(nonce !== undefined ? { id_token: this.idToken(client, nonce, subject) } : {}), token_type: "Bearer", expires_in: this.accessLifetime, scope, earliest_refresh_at: Math.floor(Date.now() / 1000) };
+    return { access_token: access, refresh_token: refresh, ...(nonce !== undefined ? { id_token: this.idToken(client, nonce, subject) } : {}), token_type: "Bearer", expires_in: this.accessLifetime, ...(this.omitTokenScope ? {} : { scope }), earliest_refresh_at: Math.floor(Date.now() / 1000) };
   }
 
   /** Expires every issued access token, as if an hour had passed. */

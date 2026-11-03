@@ -134,7 +134,7 @@ export class ChatGPTProvider implements SubscriptionProvider {
       if (error === "invalid_grant") throw new ApiError(400, "chatgpt_code", "That sign-in address was already used or has expired. Start again.");
       throw new ApiError(502, "chatgpt_exchange", "ChatGPT sign-in couldn't be completed. Try again.", true);
     }
-    const tokens = this.tokens(response.body, undefined, params.get("scope"));
+    const tokens = this.tokens(response.body);
     if (!tokens.idToken) throw new ApiError(502, "chatgpt_identity", "ChatGPT's sign-in response couldn't be verified. Try again.");
     let claims;
     try {
@@ -204,12 +204,12 @@ export class ChatGPTProvider implements SubscriptionProvider {
 
   failure(status: number, body: unknown) { return chatgptFailure(status, body); }
 
-  private tokens(body: unknown, old?: Tokens, callbackScope?: string | null): Tokens {
+  private tokens(body: unknown, old?: Tokens): Tokens {
     const b = body as Record<string, unknown> | null;
     if (typeof b?.access_token !== "string" || !b.access_token)
       throw new ApiError(502, "chatgpt_exchange", "ChatGPT sign-in couldn't be completed. Try again.", true);
     const lifetime = typeof b.expires_in === "number" && b.expires_in > 0 ? Math.min(b.expires_in, 86400) : 3600;
-    const scope = typeof b.scope === "string" ? b.scope : callbackScope ?? undefined;
+    const scope = typeof b.scope === "string" ? b.scope : undefined;
     return {
       accessToken: b.access_token,
       refreshToken: typeof b.refresh_token === "string" && b.refresh_token ? b.refresh_token : old?.refreshToken,
