@@ -72,7 +72,16 @@ docker compose pull
 docker compose up -d
 ```
 
-Keep your data volume and `BETTER_AUTH_SECRET`. Do not use `down -v`. Updating the service interrupts active runs; follow-ups resume from their last pushed branch. To pin a release, set the same version tag in both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`. If your `.env` selects `:local` images, change both entries to the GHCR images in `.env.example` to use this pull-only flow.
+Keep your data volume and `BETTER_AUTH_SECRET`. Do not use `down -v`. Updating the service interrupts active runs; follow-ups resume from their last pushed branch. To pin a release, set the same version tag in both `GOND_AGENT_IMAGE` and `GOND_AGENT_WORKER_IMAGE`.
+
+```sh
+GOND_AGENT_IMAGE=ghcr.io/dawsja/gond-agent:0.1.0
+GOND_AGENT_WORKER_IMAGE=ghcr.io/dawsja/gond-agent-worker:0.1.0
+```
+
+The image tag has no `v` (use `0.1.0`, not `v0.1.0`), and both variables must use the same version.
+
+If your `.env` selects `:local` images, change both entries to the GHCR images in `.env.example` to use this pull-only flow.
 
 ### Optional source builds
 
