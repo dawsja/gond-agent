@@ -134,7 +134,7 @@ export class SubscriptionAccounts {
     if (!await authorized()) throw new ApiError(401, "unauthorized", "You're signed out. Sign in again.");
     const now = Date.now(), plan = provider.planEnabled(grant.tokens) ? "enabled" : "disabled";
     const existing = pending.account ? this.owned(user, pending.account)
-      : this.db.prepare("SELECT * FROM subscription_accounts WHERE user_id=? AND provider=? AND client_id=?").get(user, provider.id, grant.registration.clientId) as Row | undefined;
+      : this.db.prepare("SELECT * FROM subscription_accounts WHERE user_id=? AND provider=? AND client_id=? AND subject=?").get(user, provider.id, grant.registration.clientId, grant.registration.subject) as Row | undefined;
     const id = existing?.id ?? randomBytes(8).toString("hex");
     this.db.prepare(`INSERT INTO subscription_accounts(id,user_id,provider,subject,email,client_id,credentials,status,plan,limited_at,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,'active',?,NULL,?,?)

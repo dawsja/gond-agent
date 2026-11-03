@@ -23,6 +23,7 @@ export class OpenAIMock {
   consent: "approve" | "deny" | "no-plan-scope" = "approve";
   /** Force the callback to name a different issued client (reauthorization must reject it). */
   returnClientId?: string;
+  sharedClientId?: string;
   /** Sign ID tokens with a wrong nonce. */
   wrongNonce = false;
   accessLifetime = 3600;
@@ -142,7 +143,7 @@ export class OpenAIMock {
     back.searchParams.set("state", q.get("state")!);
     if (this.consent === "deny") { back.searchParams.set("error", "access_denied"); res.writeHead(302, { location: back.toString() }); return res.end(); }
     let issued = client;
-    if (dynamic) { issued = this.secret("oaiapp"); this.clients.set(issued, { subject: this.subject }); }
+    if (dynamic) { issued = this.sharedClientId ?? this.secret("oaiapp"); this.clients.set(issued, { subject: this.subject }); }
     const scope = this.consent === "no-plan-scope" ? SCOPES.filter(s => s !== "chatgpt.tokens.use.direct").join(" ") : SCOPES.join(" ");
     const code = this.secret("code");
     this.codes.set(code, { client: issued, challenge: q.get("code_challenge")!, redirect, nonce: q.get("nonce")!, subject: this.clients.get(issued)!.subject, scope, used: false });

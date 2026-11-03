@@ -230,6 +230,22 @@ describe("Sign in with ChatGPT by pasting the loopback address", () => {
     expect(db.prepare("SELECT count(*) AS n FROM subscription_accounts").get()).toEqual({ n: 1 });
   });
 
+  it("keeps different subjects separate when the issuer reuses a host client ID", async () => {
+    mock.sharedClientId = "oaiapp_shared_host";
+    const first = (await signIn()).body.account;
+    const before = account().credentials;
+    mock.subject = "second-subject";
+    mock.email = "second@example.test";
+    const second = (await signIn()).body.account;
+    const rows = db.prepare("SELECT * FROM subscription_accounts ORDER BY created_at").all() as Record<string, any>[];
+    expect(rows).toHaveLength(2);
+    expect(first.id).not.toBe(second.id);
+    expect(rows[0]!.credentials).toBe(before);
+    expect(rows[0]!.subject).toBe("user-sub-1");
+    expect(rows[1]!.subject).toBe("second-subject");
+    expect(tokensOf(rows[0]!).refreshToken).not.toBe(tokensOf(rows[1]!).refreshToken);
+  });
+
   it("keeps several ChatGPT accounts separate", async () => {
     const a = (await signIn()).body.account;
     mock.subject = "user-sub-2"; mock.email = "second@example.test";
