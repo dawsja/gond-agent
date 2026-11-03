@@ -274,6 +274,21 @@ describe.skipIf(!image)("real container workspaces", () => {
     const id = "run_" + "a".repeat(24);
     const requests: any[] = [];
     const workflow = [
+      [call("toolchains","bash",{command:`set -eu
+mkdir -p /opt/gond-tools/bin
+cp /bin/true /opt/gond-tools/bin/probe
+probe
+for dir in /tmp "$HOME"; do
+  cp /bin/true "$dir/probe"
+  if "$dir/probe" 2>"$dir/probe.err"; then exit 1; else test "$?" -eq 126; fi
+  grep -q 'Permission denied' "$dir/probe.err"
+done
+if touch /rootfs-probe 2>/tmp/rootfs.err; then exit 1; fi
+grep -q 'Read-only file system' /tmp/rootfs.err
+bun --version
+uv --version
+python3 -c 'import os; expected={"BUN_INSTALL":"bun","CARGO_HOME":"cargo","RUSTUP_HOME":"rustup","UV_INSTALL_DIR":"bin","XDG_BIN_HOME":"bin","npm_config_prefix":"npm","COREPACK_HOME":"corepack","PNPM_HOME":"pnpm"}; assert all(os.environ[k]=="/opt/gond-tools/"+v for k,v in expected.items())'
+echo toolchain-isolation-verified`})],
       [call("symbols","symbols",{action:"outline",path:"app.ts"}), call("batch","batch",{calls:[{tool:"read",input:{path:"app.ts"}},{tool:"symbols",input:{action:"references",symbol:"greet"}}]})],
       [call("write","write",{path:"feature.txt",content:"verified\n"})],
       [call("serve","bash",{command:"python3 -m http.server 3000 --bind 127.0.0.1",run_in_background:true})],
@@ -315,7 +330,13 @@ describe.skipIf(!image)("real container workspaces", () => {
       expect(inspect.HostConfig.PidsLimit).toBe(512);
       expect(inspect.HostConfig.Memory).toBe(2048*1024*1024);
       expect(inspect.HostConfig.PortBindings ?? {}).toEqual({});
-      expect(inspect.Mounts.map((m:any)=>[m.Type,m.Destination])).toEqual([["volume","/workspace/repo"]]);
+      // Add only the private tools volume; all existing hardening assertions stay intact.
+      expect(inspect.Mounts.map((m:any)=>[m.Type,m.Destination]).sort()).toEqual([["volume","/opt/gond-tools"],["volume","/workspace/repo"]]);
+      const tools = inspect.Mounts.find((m:any)=>m.Destination==="/opt/gond-tools");
+      expect(tools.RW).toBe(true);
+      const volume = JSON.parse((await docker("volume","inspect",tools.Name)).toString())[0];
+      expect(volume.Labels["io.gond-agent.instance"]).toBe(inspect.Config.Labels["io.gond-agent.instance"]);
+      expect(volume.Labels["io.gond-agent.run"]).toBe(id);
       expect(JSON.stringify(inspect.Config.Env)).not.toMatch(/host-only|BETTER_AUTH|GH_TOKEN|GITHUB_TOKEN|DOCKER_HOST/);
       await workspace.rpc("setup",{archive:archive.toString("base64")});
       await workspace.rpc("start",{model:"fixture"});
@@ -336,6 +357,7 @@ describe.skipIf(!image)("real container workspaces", () => {
       }
       await until(e=>e.type==="turn.end" && e.agent_id==="main");
       expect(events.filter(e=>e.type==="tool.end" && !e.ok)).toEqual([]);
+      expect(JSON.stringify(requests)).toContain("toolchain-isolation-verified");
       expect(events.find(e=>e.type==="tool.images" && e.call_id==="browser").images).toHaveLength(2);
       expect(events.find(e=>e.type==="turn.end").stop_reason).toBe("end_turn");
       expect(requests.some(req=>req.messages.some((m:any)=>m.role==="tool" && m.content.some((b:any)=>b.content?.some((p:any)=>p.type==="image"))))).toBe(true);
@@ -367,12 +389,28 @@ describe.skipIf(!image)("real container workspaces", () => {
     let a: Workspace|undefined, b: Workspace|undefined;
     try {
       a=await first.start(id,handler); b=await other.start(otherId,handler);
+      const docker = (...args: string[]) => command(config(dir).dockerBin, args);
+      const volumes = async (run: string) => (await docker("volume","ls","-q","--filter",`label=io.gond-agent.run=${run}`)).toString().trim().split(/\s+/).filter(Boolean);
+      expect((await volumes(id)).map(v=>v.split("-").at(-1)).sort()).toEqual(["tools","work"]);
       await new ContainerPool(config(join(dir,"one"))).recover();
+      expect(await volumes(id)).toEqual([]);
+      expect((await volumes(otherId)).map(v=>v.split("-").at(-1)).sort()).toEqual(["tools","work"]);
       expect(await b.rpc("ping")).toEqual({ready:true});
       await expect(a.rpc("ping")).rejects.toThrow();
       const broken=new ContainerPool({...config(join(dir,"bad")),workerImage:"gond-agent-does-not-exist:fixture"});
       await expect(broken.start("run_"+"e".repeat(24),handler)).rejects.toThrow();
       await broken.recover();
+      // Fail after volume/network creation, not just at the image lookup.
+      const badId = "run_"+"e".repeat(24);
+      const invalid = new ContainerPool({...config(join(dir,"invalid")),runMemoryMB: -1});
+      await expect(invalid.start(badId,handler)).rejects.toThrow();
+      expect(await volumes(badId)).toEqual([]);
+      // Recovery also removes labeled volumes with no surviving container.
+      const instance = (await readFile(join(dir,"one","container-instance"),"utf8")).trim();
+      const orphan = `gond-agent-${instance}-orphan-tools`;
+      await docker("volume","create","--label","io.gond-agent.managed=true","--label",`io.gond-agent.instance=${instance}`,"--label",`io.gond-agent.run=${id}`,orphan);
+      await first.recover();
+      expect(await volumes(id)).toEqual([]);
     } finally { await a?.destroy(); await b?.destroy(); await rm(dir,{recursive:true,force:true}); }
   },120000);
 });

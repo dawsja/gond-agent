@@ -30,6 +30,26 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(env["GOND_AGENT_PLAN_REMINDER_EVERY"], "0")
         self.assertEqual(env["GOND_AGENT_PLAN_NUDGE_LIMIT"], "2")
 
+    def test_toolchain_environment_reaches_worker_and_shell(self):
+        keys = ("PATH", "BUN_INSTALL", "CARGO_HOME", "RUSTUP_HOME", "UV_INSTALL_DIR",
+                "XDG_BIN_HOME", "npm_config_prefix", "COREPACK_HOME", "PNPM_HOME")
+        expected = {key: f"/opt/gond-tools/{key.lower()}" for key in keys if key != "PATH"}
+        expected["PATH"] = "/opt/gond-tools/bin:" + os.environ["PATH"]
+        script = """
+import json, subprocess
+from agent import worker_env
+output = subprocess.check_output(
+    ["/bin/bash", "-c", "python3 -c 'import json,os; print(json.dumps(dict(os.environ)))'"],
+    env=worker_env({"model": "fixture"}), text=True)
+print(output)
+"""
+        output = subprocess.check_output(
+            ["python3", "-c", script], cwd=pathlib.Path(__file__).parent,
+            env={**os.environ, **expected}, text=True)
+        shell_env = json.loads(output)
+        for key in keys:
+            self.assertEqual(shell_env[key], expected[key])
+
     def test_archive_rejects_escape_and_unsafe_links(self):
         for symlink in [False, True]:
             body = io.BytesIO()
