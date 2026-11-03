@@ -32,8 +32,8 @@ def emit(frame):
         sys.stdout.flush()
 
 
-def command(args, timeout=120):
-    result = subprocess.run(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+def command(args, timeout=120, env=None):
+    result = subprocess.run(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
     if result.returncode:
         print("Workspace command failed:", args[0], result.stderr.decode(errors="replace")[-1000:], file=sys.stderr)
         raise RuntimeError("The workspace command failed.")
@@ -138,7 +138,12 @@ def dispatch(req):
     if method == "snapshot":
         command(["git", "-c", "core.hooksPath=/dev/null", "add", "--all"])
         if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode:
-            command(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Gond Agent", "-c", "user.email=agent@localhost", "commit", "-m", req.get("title", "Agent changes")])
+            identity = req.get("identity", {})
+            if any(not isinstance(identity.get(key), str) or not identity[key].strip() or any(c in identity[key] for c in "\r\n\0<>") for key in ("name", "email")):
+                raise RuntimeError("A connected GitHub commit identity is required.")
+            env = dict(os.environ)
+            env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER") for key, field in (("NAME", "name"), ("EMAIL", "email"))})
+            command(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", req.get("title", "Changes")], env=env)
         command(["git", "bundle", "create", "/tmp/work.bundle", "HEAD"])
         return {"bundle": base64.b64encode(pathlib.Path("/tmp/work.bundle").read_bytes()).decode(), "head": command(["git", "rev-parse", "HEAD"]).decode().strip()}
     if method == "diff":

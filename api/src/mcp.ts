@@ -92,6 +92,19 @@ export function authenticateToken(db: Store, bearer: string | null): Token {
     );
   return row;
 }
+export function sessionState(r: Run) {
+  const done = ["ready", "failed", "stopped", "merged"].includes(r.status) && !r.pending?.length;
+  const question = !done ? r.summary?.question ?? null : null;
+  return {
+    state: done ? (r.status === "ready" ? "done" : r.status) : question ? "waiting_for_input" : r.status === "queued" || r.pending?.length ? "queued" : "working",
+    done,
+    waiting_for_input: !!question,
+    asking_question: !!question,
+    question: question?.question ?? null,
+    pr_url: r.pr_url ?? null,
+    last_error: r.status === "failed" ? r.error ?? r.summary?.error ?? null : null,
+  };
+}
 function session(r: Run, origin: string) {
   return {
     id: r.id,
@@ -108,7 +121,7 @@ function session(r: Run, origin: string) {
     created_at: r.created_at,
     updated_at: r.updated_at,
     finished_at: r.finished_at,
-    pr_url: r.pr_url,
+    ...sessionState(r),
     files: r.files,
     additions: r.additions,
     deletions: r.deletions,
@@ -401,7 +414,9 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             !db
               .prepare("SELECT 1 FROM events WHERE run_id=? AND seq>? LIMIT 1")
               .get(session_id, after_seq) &&
-            Date.now() < deadline
+            Date.now() < deadline &&
+            !sessionState(runs.get(session_id, user)).done &&
+            !sessionState(runs.get(session_id, user)).waiting_for_input
           ) {
             check();
             runs.get(session_id, user);
@@ -447,6 +462,8 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             large_event: fragment,
             status: r.status,
             phase: r.phase,
+            ...sessionState(r),
+            return_reason: sessionState(r).done ? "done" : sessionState(r).waiting_for_input ? "waiting_for_input" : rows.length ? "events" : "timeout",
           };
         },
       );
@@ -505,6 +522,13 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             })();
             return result;
           }),
+      );
+      tool(
+        "close_session",
+        "Release an idle or stopped workspace after saving and pushing its changes. Busy workspaces are refused. History remains readable; a follow-up resumes from the pushed branch.",
+        { session_id: id },
+        false,
+        ({ session_id }) => runs.closeSession(session_id, user),
       );
       tool(
         "stop_session",

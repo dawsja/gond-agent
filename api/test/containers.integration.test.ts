@@ -12,7 +12,7 @@ import type { Config } from "../src/config";
 const image = process.env.GOND_AGENT_CONTAINER_TEST_IMAGE;
 function config(data: string): Config {
   return {data, origin:"http://localhost:8787", secret:"host-only-test-secret-not-for-containers", signup:true, port:8787,
-    dockerBin:process.env.DOCKER_BIN ?? "docker", workerImage:image!, maxRuns:1, runCPUs:2, runMemoryMB:2048, idleMs:60000, turnMs:60000};
+    dockerBin:process.env.DOCKER_BIN ?? "docker", workerImage:image!, maxRuns:1, runCPUs:2, runMemoryMB:2048};
 }
 const call = (id: string, name: string, input: unknown) => ({type:"tool_call",id,name,input});
 function sse(blocks: any[]) {
@@ -162,7 +162,7 @@ describe.skipIf(!image)("real container workspaces", () => {
           await new Promise(r=>setTimeout(r,100));
         }
         if(!done)throw new Error('No completed worker turn');
-        const snapshot=await workspace.rpc('snapshot');
+        const snapshot=await workspace.rpc('snapshot',{identity:{name:'fixture',email:'123+fixture@users.noreply.github.com'}});
         if(!snapshot.bundle||snapshot.head.length!==40)throw new Error('Git export failed');
         console.log('Packaged service launched worker, relayed model traffic and exported Git');
       }finally{await workspace?.destroy();await rm(dir,{recursive:true,force:true});}
@@ -188,14 +188,13 @@ describe.skipIf(!image)("real container workspaces", () => {
       [call("check","bash",{command:"python3 -c \"import os,pathlib,time,urllib.request; time.sleep(0.3); assert os.getuid()==1000; assert pathlib.Path('feature.txt').read_text().strip()=='verified'; assert urllib.request.urlopen('http://127.0.0.1:3000').status==200\""})],
       [call("browser","browser",{url:"http://127.0.0.1:3000",script:"await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
       [call("diff","bash",{command:"git diff --no-ext-diff; git ls-files --others --exclude-standard; cat feature.txt"})],
-      [call("review","finish_review",{understanding:"Traced greet and save flow",design:"Follow existing flow",checks:["check"],diff_call_id:"diff",review:"Reviewed new file and both screenshots",web_app:true})],
     ];
     let n = 0;
     let interrupting = false;
     const handler = async (req: Request) => {
       if(new URL(req.url).pathname === "/v1/models") return Response.json({models:[{id:"fixture",context_window:100000}]});
       const body = await req.json(); requests.push(body);
-      const blocks = interrupting ? [call("sleep","bash",{command:"sleep 30"})] : workflow[n++] ?? [{type:"text",text:"Verified and self-reviewed."}];
+      const blocks = interrupting ? [call("sleep","bash",{command:"sleep 30"})] : workflow[n++] ?? [{type:"text",text:"Done."}];
       const data = sse(blocks);
       // Deliberately split SSE records across HTTP chunks to exercise the relay.
       return new Response(new ReadableStream({start(controller){for(let i=0;i<data.length;i+=97)controller.enqueue(new TextEncoder().encode(data.slice(i,i+97)));controller.close();}}),{headers:{"content-type":"text/event-stream"}});
@@ -246,10 +245,9 @@ describe.skipIf(!image)("real container workspaces", () => {
       await until(e=>e.type==="turn.end" && e.agent_id==="main");
       expect(events.filter(e=>e.type==="tool.end" && !e.ok)).toEqual([]);
       expect(events.find(e=>e.type==="tool.images" && e.call_id==="browser").images).toHaveLength(2);
-      expect(events.find(e=>e.type==="tool.end" && e.call_id==="review").ok).toBe(true);
       expect(events.find(e=>e.type==="turn.end").stop_reason).toBe("end_turn");
       expect(requests.some(req=>req.messages.some((m:any)=>m.role==="tool" && m.content.some((b:any)=>b.content?.some((p:any)=>p.type==="image"))))).toBe(true);
-      const snapshot = await workspace.rpc<{bundle:string;head:string}>("snapshot",{title:"Container result"});
+      const snapshot = await workspace.rpc<{bundle:string;head:string}>("snapshot",{title:"Container result",identity:{name:"fixture",email:"123+fixture@users.noreply.github.com"}});
       const bundle = join(dir,"result.bundle"); await writeFile(bundle,Buffer.from(snapshot.bundle,"base64"));
       await command("git",["bundle","verify",bundle],{cwd:repo});
       await command("git",["fetch",bundle,"HEAD"],{cwd:repo});

@@ -19,6 +19,7 @@ Tools return JSON in MCP text content. Tool failures set `isError` and return cu
 | `read_session_event` | `session_id`, `seq`, optional character `cursor`; returns a large event as JSON text in 32,000-character pages. Advance the event sequence only after reading its final page. |
 | `get_session_diff` | `session_id`, optional character `cursor`; 32,000-character diff pages, nullable continuation and `updated_at`. Restart if the revision changes. |
 | `send_session_message` | `session_id`, `text`, `request_id`; optional `model`, `effort`. Backend changes require a new session. |
+| `close_session` | `session_id`; save and push idle/stopped workspace changes, then release capacity. Refuses busy workspaces; preserves history and resumes from pushed branch on follow-up. |
 | `stop_session` | `session_id`; existing run interruption. |
 | `open_session_pull_request` | `session_id`; open or return its existing PR. |
 
@@ -46,7 +47,6 @@ Worker stdin accepts newline-delimited JSON: `user` with text and image referenc
 
 Built-in additions: `symbols {action:"outline"|"definitions"|"references",path?,symbol?,limit?}` uses Universal Ctags for declarations and whole-identifier lexical matching for references (not semantic/LSP resolution). Searches cap files at 5000, skip files over 1 MB and honor ignores. `batch {calls:[{tool,input}]}` runs 1–8 independent built-in read calls, retaining order and per-result labels/errors; only read, list_directory, glob, grep, symbols and bash_output are allowed. `browser {url,script}` executes a Playwright test body with page/expect at wide and phone sizes; it is an execution tool, unavailable to read-only explore agents and blocked in plan mode. Chromium runs headlessly without its own sandbox; the non-root, limited container is its containment boundary, not a separate kernel.
 
-`finish_review {understanding,design,checks:[call_id],diff_call_id,review,web_app,limitations?}` gates successful main coding turn ends after execution/writes. Foreground bash checks, a bash git diff inspection and (for detected/declared web apps) successful two-viewport browser evidence must match the current HEAD/diff/untracked-content fingerprint. Evidence must have reached a subsequent model request before review; producing screenshots and approving them in the same response is not accepted. Delegated evidence IDs use `agent_id:call_id`. The gate resets for each user turn, including after compaction; changes after review invalidate approval. The design/review and relevance of checks are agent attestations, not human approval. `finish_review {blocked:true,limitations}` or three unreviewed finish attempts emits turn.end with stop_reason:error and a main error, so the host does not snapshot, push or open a PR. Repository instructions are refreshed each request; no global user memory is read or written.
 
 ## Container control
 
@@ -54,7 +54,7 @@ Before container startup, the service makes a depth-one, single-branch, tag-free
 
 `ContainerPool` creates a labeled per-run bridge network, workspace volume and non-root container from the operator-selected worker image (default `ghcr.io/dawsja/gond-agent-worker:main`). Compose pulls this image alongside the runtime; its one-shot image helper exits without starting the controller. Limits default to 2 CPUs, 2 GiB RAM, 512 processes and 256 MiB shared memory. The root is read-only; home and /tmp are writable tmpfs mounts. All capabilities are dropped, privilege escalation is disabled, Docker's default seccomp policy remains enabled, and no host paths, credentials, devices, Docker socket or published ports are supplied. Containers share the Docker host kernel; network separation does not deny host/LAN egress. Operators should use a dedicated host and suitable egress policy.
 
-The service attaches stdin/stdout with `docker start --attach --interactive`, with no TTY. Newline-delimited JSON requests `{id,method,...args}` receive `{id,result}` or `{id,error}`. Methods: ping; setup (base64 repository tar archive, extracted with Python's data filter); start (model); send (AgentInput); events (zero-based after cursor, at most 200 events and approximately 16 MiB per batch, allowing one larger image event); snapshot (commit with hooks disabled and return base64 git bundle and HEAD); diff. A frame is limited to 256 MiB. Worker stderr stays in /tmp/worker.log; control errors go to service logs, not ordinary customer messages.
+The service attaches stdin/stdout with `docker start --attach --interactive`, with no TTY. Newline-delimited JSON requests `{id,method,...args}` receive `{id,result}` or `{id,error}`. Methods: ping; setup (base64 repository tar archive, extracted with Python's data filter); start (model); send (AgentInput); events (zero-based after cursor, at most 200 events and approximately 16 MiB per batch, allowing one larger image event); snapshot (requires `{identity:{name,email},title?}` resolved by the service; commit as that author and committer with hooks/signing disabled and return base64 git bundle and HEAD); diff. A frame is limited to 256 MiB. Worker stderr stays in /tmp/worker.log; control errors go to service logs, not ordinary customer messages.
 
 Model traffic shares that channel: the controller emits `{model:{id,method,path,body}}` (body is base64), and the service replies with `{model_id,status,headers}`, zero or more `{model_id,chunk}` frames (base64 bytes), and `{model_id,end:true}`. HTTP/SSE chunks are forwarded incrementally with backpressure. `{model_cancel:id}` aborts a disconnected request. Only GET /v1/models and POST /v1/responses are accepted. The run scope is bound by the service closure, not by credentials supplied to the worker.
 
@@ -90,6 +90,84 @@ The workspace uses the same model and effort popovers for tasks, follow-ups and 
 
 `GET /api/v1/cli/runtimes` reports managed installation state and supported release versions. Administrator-only `POST` and `DELETE /api/v1/cli/runtimes/:backend` install/update and uninstall immutable runtime volumes. CLI installation does not configure an API connection. Personal `GET /api/v1/cli/accounts` reports connection status, session-owned pending authorization details, and latest vendor allowance observations. `POST /api/v1/cli/accounts/:backend/login` starts authorization; `POST .../:backend/code {code}` submits Claude's returned authorization code. `DELETE .../:backend/login` cancels the initiating session's flow; `DELETE .../:backend` removes the account's connection. These routes use the existing authentication and origin protections and return no stored credentials.
 
-The container controller supports `cli_prepare` (private credential/session state and backend configuration), `cli_state` (bounded private state), and `cli_stop`. Credentials are encrypted at rest and are never emitted as transcript events. Native runs pin their runtime volume and vendor version. Only the selected account's managed subscription credentials enter a native CLI worker; API keys, host auth directories, and the Docker socket remain excluded. Native events are translated into the existing text/tool/turn protocol, with `cli.usage` and `cli.limits` carrying vendor usage observations. A worker-local MCP tool server exposes Gond tools and `finish_review`; an independent worktree fingerprint check blocks successful completion after unreviewed edits.
+The container controller supports `cli_prepare` (private credential/session state and backend configuration), `cli_state` (bounded private state), and `cli_stop`. Credentials are encrypted at rest and are never emitted as transcript events. Native runs pin their runtime volume and vendor version. Only the selected account's managed subscription credentials enter a native CLI worker; API keys, host auth directories, and the Docker socket remain excluded. Native events are translated into the existing text/tool/turn protocol, with `cli.usage` and `cli.limits` carrying vendor usage observations. A worker-local MCP tool server exposes optional Gond tools. Completion is not gated on tool usage or verification fingerprints.
 
 `POST /api/v1/cli/accounts/:backend/close` closes the account’s idle workspaces without deleting run history. Administrators can close all idle workspaces of a runtime with `POST /api/v1/cli/runtimes/:backend/close`. Both refuse while matching runs are active; neither interrupts other users’ work.
+
+
+## Driving Gond Agent from another bot
+
+Send JSON-RPC MCP `tools/call` requests to `/mcp` using an account-owned bearer token (not cookies). Existing `status` and `phase` fields are unchanged. `get_session`, each entry in `list_sessions`, and `read_session_events` share these additive fields:
+
+| state | Existing status | done | waiting_for_input / asking_question |
+| --- | --- | --- | --- |
+| queued | queued, or pending follow-up | false | false |
+| working | working (including boot/publish) | false | false |
+| waiting_for_input | active with an emitted pending question | false | true |
+| done | ready, no queued work | true | false |
+| failed | failed, no queued work | true | false |
+| stopped | stopped, no queued work | true | false |
+| merged | merged, no queued work | true | false |
+
+`done` means the current work has ended (successfully or otherwise), not that follow-ups are forbidden. `question` is the pending question text or null; `last_error` is the failed run's last error message or null; `pr_url` is a URL or null. Finishing/pushing is still working, not done. Headless API workers do not emit questions: `ask_user` tells them to proceed autonomously. A final response merely phrased as a question is not an input-blocking event. If a worker emits a real pending question, send its answer with `send_session_message`; API-worker answers are routed to that request instead of queued behind the blocked turn.
+
+`read_session_events` accepts `wait_seconds:0..30`. It returns on new events, terminal work, pending input, or the wait deadline, checking persisted state at most every 250 ms even without new events. Result `return_reason` is `done`, `waiting_for_input`, `events`, or `timeout` (in that priority). Read `has_more` and advance `after_seq` to `next_cursor`; large events use `read_session_event`. Completion can be returned alongside unread events: drain remaining pages if the full transcript is needed. Token validity and account ownership are rechecked before returning waited-for data. Disconnecting the client does not stop work.
+
+Typical sequence (responses below show the JSON inside MCP text content, with unrelated fields omitted):
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_models","arguments":{}}}
+```
+```json
+{"models":[{"id":"local:coder","name":"Coder","backend":"api","efforts":["default"]}],"connections":[]}
+```
+Append your own requirements to `prompt`. Reuse `request_id` only for identical retries; changed work needs a new ID.
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_session","arguments":{"request_id":"ticket-123-v1","repo":"owner/repo","model":"local:coder","prompt":"Implement ticket 123. Follow our review and testing rules appended here."}}}
+```
+```json
+{"id":"run_abc","status":"queued","state":"queued","done":false,"waiting_for_input":false,"asking_question":false,"question":null,"pr_url":null,"last_error":null}
+```
+Repeat the event read with the returned cursor until `done` or `waiting_for_input`, rather than assuming an empty page means finished:
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_session_events","arguments":{"session_id":"run_abc","after_seq":0,"wait_seconds":30}}}
+```
+```json
+{"events":[],"next_cursor":0,"has_more":false,"status":"ready","phase":"agent","state":"done","done":true,"waiting_for_input":false,"asking_question":false,"question":null,"pr_url":null,"last_error":null,"return_reason":"done"}
+```
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_session","arguments":{"session_id":"run_abc"}}}
+```
+Use `list_sessions` for the same status contract across your browser and MCP sessions. Inspect the cumulative diff in character-cursor pages; restart at zero if `updated_at` changes:
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_session_diff","arguments":{"session_id":"run_abc","cursor":0}}}
+```
+```json
+{"diff":"diff --git a/file b/file\n...","next_cursor":null,"updated_at":1234567890}
+```
+```json
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"send_session_message","arguments":{"session_id":"run_abc","request_id":"ticket-123-v2","text":"Also cover the empty case."}}}
+```
+```json
+{"accepted":true,"session_id":"run_abc"}
+```
+Wait for completion again, then publish when desired (automatic PR creation may already have supplied `pr_url`):
+```json
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"open_session_pull_request","arguments":{"session_id":"run_abc"}}}
+```
+```json
+{"url":"https://github.com/owner/repo/pull/42","number":42}
+```
+
+Runs have no elapsed-time, idle, step, token-total or tool-call budgets. Explicit close/merge/delete, failures and shutdown/recovery clean up containers; idle containers do not expire. CPU/memory/PID, archive/frame/body/output sizes, queued-message bounds, MCP traffic and concurrency limits remain resource protections. Bash foreground calls time out after 120 seconds by default (maximum 600 seconds), returning a tool error so the loop continues; long builds can run in the background and be read with `bash_output`. Model requests have no total elapsed-time budget. `MODEL_STALL_MINUTES` (default 10, 0 disables) aborts only after no response headers or body bytes arrive for that interval; each nonempty chunk resets it. Stalls use the existing retryable model-error path; progressing streams are not cut off. Disconnect/cancellation still aborts requests. Control RPCs and Git operations retain per-operation timeouts for unavailable infrastructure. Successful turn publication commits as the connected GitHub account using one service identity resolver, never a fixed product author. Optional name/email overrides are documented in README.
+
+### Release finished sessions
+
+After reading the result and diff and opening any desired PR, call `close_session` to free the workspace slot. Finished sessions do not expire automatically. Stop is non-destructive and does not free a slot. Close refuses while a turn, pending message or startup is active. For stopped work it snapshots and pushes uncommitted edits first; if snapshot or push fails, the workspace stays open. History and diff remain readable, and a follow-up shallow-clones the pushed branch. The workspace's More → Close workspace action and `POST /api/v1/runs/:id/close` use the same owner-scoped operation.
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"close_session","arguments":{"session_id":"run_abc"}}}
+```
+```json
+{"closed":true}
+```

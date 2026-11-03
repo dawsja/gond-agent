@@ -16,7 +16,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{AgentEvent, AgentInput, Decision, ImageInput, QuestionOption, TodoItem};
-use super::completion::{self, Completion, Evidence};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
 use crate::permissions::{self, Access, Mode, Rule, Verdict};
@@ -35,8 +34,6 @@ pub struct AgentConfig {
     pub history: Vec<Message>,
     /// When false (headless), permission prompts and questions are answered automatically.
     pub interactive: bool,
-    /// Require verification and self-review before a coding turn may end successfully.
-    pub require_review: bool,
     /// Tools available inside the workspace container.
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
@@ -77,8 +74,6 @@ struct Shared {
     sub_counter: AtomicU32,
     main_context: Mutex<u64>,
     skills: Mutex<Vec<Skill>>,
-    require_review: bool,
-    completion: Mutex<Completion>,
 }
 
 impl Shared {
@@ -148,8 +143,6 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         sub_counter: AtomicU32::new(0),
         main_context: Mutex::new(0),
         skills: Mutex::new(cfg.skills),
-        require_review: cfg.require_review,
-        completion: Mutex::default(),
     });
     shared.emit(AgentEvent::SessionStart {
         session_id: cfg.session_id,
@@ -196,7 +189,6 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 }
                 Work::User(text, images) => (text, images),
             };
-            *s.completion.lock().unwrap() = Completion { web_app: completion::is_web_app(&s.cwd), ..Default::default() };
             // Auto-compact before a turn once the conversation fills most of the window.
             let window = s.model.lock().unwrap().1;
             if window > 0 && *s.main_context.lock().unwrap() * 100 >= window * AUTO_COMPACT_PCT && history.len() > 2 {
@@ -287,7 +279,6 @@ async fn compact(s: &Arc<Shared>, history: &mut Vec<Message>, cancel: &Cancellat
 fn agent_tool_defs(sub: bool) -> Vec<ToolDef> {
     let mut defs = vec![];
     if !sub {
-        defs.push(completion::definition());
         defs.push(ToolDef {
             name: "update_plan".into(),
             description: "Replace the plan shown to the user. Use it for work with several steps; keep exactly one step in_progress while working and mark steps done as soon as they are. Optionally explain what changed.".into(),
@@ -347,11 +338,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
         s.emit(AgentEvent::TurnStart { agent_id: run.id.clone() });
         let started = Instant::now();
         let mut tool_count = 0u32;
-        let mut rejected_finishes = 0;
         loop {
-            if !run.is_sub() {
-                for evidence in s.completion.lock().unwrap().evidence.values_mut() { evidence.observed = true; }
-            }
             let (model, _) = s.model.lock().unwrap().clone();
             let mut tools: Vec<ToolDef> = s.tools.iter().filter(|t| tool_visible(t.as_ref(), run)).map(|t| t.def()).collect();
             tools.extend(agent_tool_defs(run.is_sub()));
@@ -399,20 +386,6 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 .collect();
             history.push(msg);
             if calls.is_empty() {
-                if !run.is_sub() && s.require_review && s.completion.lock().unwrap().required {
-                    let ctx = tool_context(s, run, "finish", cancel);
-                    let fingerprint = completion::fingerprint(&ctx).await;
-                    let approved = fingerprint.is_some() && s.completion.lock().unwrap().approved == fingerprint;
-                    if !approved {
-                        rejected_finishes += 1;
-                        if rejected_finishes >= 3 {
-                            s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "error".into() });
-                            return Err(anyhow!("Verification and self-review are incomplete. The run has not been marked done."));
-                        }
-                        history.push(Message::user_text("Completion blocked: understand the code, justify the design, run relevant verification, inspect the final diff and review your changes. For web apps run browser interactions/assertions and inspect both screenshots. Call finish_review with current successful evidence before ending. If blocked, call finish_review with blocked=true and explain limitations; do not claim done."));
-                        continue;
-                    }
-                }
                 s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: stop });
                 return Ok(text);
             }
@@ -430,11 +403,6 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
             };
             tool_count += results.len() as u32;
             history.push(Message { role: Role::Tool, content: results });
-            let blocker = if !run.is_sub() { s.completion.lock().unwrap().blocker.clone() } else { None };
-            if let Some(blocker) = blocker {
-                s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "error".into() });
-                return Err(anyhow!("Verification blocked: {blocker}"));
-            }
             if cancel.is_cancelled() {
                 s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "interrupted".into() });
                 return Ok(text);
@@ -577,29 +545,6 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
         return result(id, name, "interrupted by the user before this call ran", true);
     }
     match name.as_str() {
-        "finish_review" if !run.is_sub() => {
-            let ctx = tool_context(s, run, &id, cancel);
-            s.emit(AgentEvent::ToolStart { agent_id: run.id.clone(), call_id: id.clone(), name: name.clone(), input: input.clone(), title: "Verification and self-review".into() });
-            let verdict = if input["blocked"] == true {
-                match str_arg(&input,"limitations").filter(|s| !s.trim().is_empty()) {
-                    Some(reason) => { s.completion.lock().unwrap().blocker = Some(reason.chars().take(1000).collect()); Ok(()) }
-                    None => Err("Explain the verification blocker in limitations"),
-                }
-            } else {
-                if completion::is_web_app(&s.cwd) { s.completion.lock().unwrap().web_app = true; }
-                match completion::fingerprint(&ctx).await {
-                    Some(ref hash) => s.completion.lock().unwrap().review(&input, hash),
-                    None => Err("Could not verify the worktree; completion remains blocked"),
-                }
-            };
-            let (ok, text) = match verdict {
-                Ok(()) if input["blocked"] == true => (true, "Blocker recorded; this run will not be marked done or published."),
-                Ok(()) => (true, "Self-review recorded. Summarize the result, verification and limitations; do not claim human approval."),
-                Err(e) => (false,e),
-            };
-            s.emit(AgentEvent::ToolEnd { agent_id: run.id.clone(), call_id: id.clone(), ok, summary: if ok { "self-reviewed".into() } else { "incomplete".into() }, output: text.into(), diff: None });
-            return result(id, name, text, !ok);
-        }
         "update_plan" => return update_plan(s, run, id, name, &input),
         "list_plan" => return list_plan(s, id, name),
         "ask_user" => return ask_user(s, run, id, name, &input, cancel).await,
@@ -709,13 +654,6 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
         _ => None,
     };
     let ctx = tool_context(s, run, &id, cancel);
-    if s.require_review && matches!(tool.access(), Access::Write | Access::Exec) {
-        let mut gate = s.completion.lock().unwrap();
-        gate.required = true;
-        gate.approved = None;
-    }
-    let evidence = s.require_review && (name == "browser" || (name == "bash" && input["run_in_background"] != true));
-    let diff = name == "bash" && str_arg(&input, "command").is_some_and(|c| c.contains("git") && c.contains("diff") && !c.contains("--check"));
     let out = tool.run(&ctx, input).await;
     let images: Vec<_> = out.content.iter().filter_map(|p| match p {
         ResultPart::Image { media_type, data } => Some(ImageInput { media_type: media_type.clone(), data: data.clone(), id: None }),
@@ -723,12 +661,6 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
     }).take(8).collect();
     if !images.is_empty() {
         s.emit(AgentEvent::ToolImages { agent_id: run.id.clone(), call_id: id.clone(), images });
-    }
-    if evidence && out.ok {
-        if let Some(fingerprint) = completion::fingerprint(&ctx).await {
-            let key = if run.is_sub() { format!("{}:{id}", run.id) } else { id.clone() };
-            s.completion.lock().unwrap().evidence.insert(key, Evidence {fingerprint, observed:false, browser: name == "browser", diff});
-        }
     }
     end(out.ok, out.summary.clone(), out.display.clone(), out.diff.clone());
     Block::ToolResult { call_id: id, name, content: out.content, is_error: !out.ok }
@@ -887,7 +819,6 @@ mod tests {
             session_id: "s".into(),
             history: vec![],
             interactive: true,
-            require_review: false,
             tools: crate::tools::builtin(),
             system: "sys".into(),
             sub_system: "sub".into(),
@@ -1071,51 +1002,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_requires_review_and_rejects_later_edits() {
-        for stale in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            for args in [vec!["init"], vec!["-c","user.name=Test","-c","user.email=test@localhost","commit","--allow-empty","-m","init"]] {
-                assert!(tokio::process::Command::new("git").args(args).current_dir(dir.path()).output().await.unwrap().status.success());
-            }
-            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let handler: Handler = Arc::new(move |_: &Value| {
-                let n = count.fetch_add(1, Ordering::Relaxed);
-                let call = match n {
-                    0 => json!({"type":"tool_call","id":"w","name":"write","input":{"path":"new.txt","content":"verified"}}),
-                    // A premature final answer must not finish the turn.
-                    1 => return sse(&[json!({"type":"text","text":"Done too soon"})], "end_turn"),
-                    2 => json!({"type":"tool_call","id":"check","name":"bash","input":{"command":"test -f new.txt"}}),
-                    3 => json!({"type":"tool_call","id":"diff","name":"bash","input":{"command":"git diff; cat new.txt"}}),
-                    4 => json!({"type":"tool_call","id":"review","name":"finish_review","input":{"understanding":"Traced the code","design":"Use the existing pattern","checks":["check"],"diff_call_id":"diff","review":"Reviewed the diff and new file","web_app":false}}),
-                    5 if stale => json!({"type":"tool_call","id":"later","name":"write","input":{"path":"later.txt","content":"unverified"}}),
-                    _ => return sse(&[json!({"type":"text","text":"Finished"})], "end_turn"),
-                };
-                sse(&[call], "tool_use")
-            });
-            let seen = Arc::new(StdMutex::new(vec![]));
-            let url = mock(handler, seen.clone()).await;
-            let mut cfg = config(dir.path(), Mode::Allow);
-            cfg.require_review = true;
-            let mut h = spawn(ApiClient::new(url, None), cfg);
-            h.input.send(AgentInput::User {text:"Implement it".into(), images:vec![]}).unwrap();
-            let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd {agent_id, ..} if agent_id == "main")).await;
-            assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd {call_id, ok:true, ..} if call_id == "review")));
-            assert!(matches!(events.last(), Some(AgentEvent::TurnEnd {stop_reason, ..}) if stop_reason == if stale {"error"} else {"end_turn"}));
-            assert!(seen.lock().unwrap().iter().any(|r| r["messages"].as_array().unwrap().iter().any(|m| m["role"] == "user" && m["content"][0]["text"].as_str().is_some_and(|s| s.contains("Completion blocked")))));
-        }
+    async fn timed_out_tool_returns_error_and_the_turn_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let handler: Handler = Arc::new(|req: &Value| {
+            if req["messages"].as_array().unwrap().len() == 1 {
+                sse(&[json!({"type":"tool_call","id":"slow","name":"bash","input":{"command":"sleep 5","timeout_ms":50}})], "tool_use")
+            } else { sse(&[json!({"type":"text","text":"Continuing after timeout"})], "end_turn") }
+        });
+        let url = mock(handler, seen.clone()).await;
+        let mut h = spawn(ApiClient::new(url, None), config(dir.path(), Mode::Allow));
+        h.input.send(AgentInput::User {text:"Run a slow command".into(), images:vec![]}).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd {agent_id, ..} if agent_id == "main")).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd {call_id, ok:false, ..} if call_id == "slow")));
+        assert!(matches!(events.last(), Some(AgentEvent::TurnEnd {stop_reason, ..}) if stop_reason == "end_turn"));
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["messages"][2]["content"][0]["is_error"], true);
     }
 
     #[tokio::test]
-    async fn explicit_verification_blocker_fails_without_successful_turn_end() {
+    async fn edits_complete_without_a_review_gate() {
         let dir = tempfile::tempdir().unwrap();
-        let url = mock(Arc::new(|_| sse(&[json!({"type":"tool_call","id":"blocker","name":"finish_review","input":{"blocked":true,"limitations":"The required service is unavailable"}})],"tool_use")), Arc::new(StdMutex::new(vec![]))).await;
-        let mut cfg = config(dir.path(), Mode::Allow);
-        cfg.require_review = true;
-        let mut h = spawn(ApiClient::new(url,None),cfg);
-        h.input.send(AgentInput::User {text:"Check it".into(),images:vec![]}).unwrap();
-        let events = until(&mut h, |e| matches!(e, AgentEvent::Error {..})).await;
-        assert!(!events.iter().any(|e| matches!(e, AgentEvent::TurnEnd {stop_reason,..} if stop_reason == "end_turn")));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error {message,..} if message.contains("service is unavailable"))));
+        let handler: Handler = Arc::new(|req: &Value| {
+            if req["messages"].as_array().unwrap().len() == 1 {
+                sse(&[json!({"type":"tool_call","id":"w","name":"write","input":{"path":"new.txt","content":"hello"}})], "tool_use")
+            } else { sse(&[json!({"type":"text","text":"Finished"})], "end_turn") }
+        });
+        let url = mock(handler, Arc::new(StdMutex::new(vec![]))).await;
+        let mut h = spawn(ApiClient::new(url, None), config(dir.path(), Mode::Allow));
+        h.input.send(AgentInput::User {text:"Implement it".into(), images:vec![]}).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd {agent_id, ..} if agent_id == "main")).await;
+        assert!(matches!(events.last(), Some(AgentEvent::TurnEnd {stop_reason, ..}) if stop_reason == "end_turn"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "hello");
     }
 
     #[tokio::test]

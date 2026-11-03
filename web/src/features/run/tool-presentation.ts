@@ -10,7 +10,7 @@ const labels: Record<string, string> = {
   bash: "Command", kill_shell: "Stop command", bash_output: "Command output",
   glob: "Find files", grep: "Search", list_directory: "List files", symbols: "Find symbols",
   batch: "Review files", list_plan: "Read plan", web_search: "Search the web", web_fetch: "Read page",
-  browser: "Browser check", finish_review: "Self-review", skill: "Read instructions",
+  browser: "Browser check", skill: "Read instructions",
   update_plan: "Plan update", task: "Delegate work",
 };
 export const EDIT_TOOLS = new Set(["write", "edit", "multi_edit", "apply_patch"]);
@@ -55,7 +55,6 @@ export function activityLabel(tool: Activity) {
     return running ? `Running ${kind.toLowerCase()}` : `${kind} ${failed ? "failed" : "finished"}`;
   }
   if (tool.name === "browser") return running ? "Checking browser layouts" : `Browser checks ${failed ? "failed" : "finished"}`;
-  if (tool.name === "finish_review") return running ? "Reviewing changes" : `Self-review ${failed ? "failed" : "finished"}`;
   if (tool.name === "update_plan") return running ? "Updating plan" : failed ? "Plan update failed" : "Updated plan";
   if (tool.name === "read") return `${running ? "Reading" : failed ? "Couldn't read" : "Read"}${tool.title ? ` ${tool.title}` : " file"}`;
   if (EXPLORE_TOOLS.has(tool.name)) return running ? "Reviewing files and context" : failed ? "Couldn't finish reviewing context" : "Reviewed context";

@@ -38,7 +38,7 @@ function history(user: User, suffix: string, status = "ready") {
 }
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gond-agent-account-"));
-  cfg = { data: dir, origin: "http://localhost:8787", secret: "fixture-account-secret-at-least-32-characters", signup: true, port: 8787, dockerBin: "docker", workerImage: "unused", maxRuns: 2, runCPUs: 1, runMemoryMB: 2048, idleMs: 60000, turnMs: 60000 };
+  cfg = { data: dir, origin: "http://localhost:8787", secret: "fixture-account-secret-at-least-32-characters", signup: true, port: 8787, dockerBin: "docker", workerImage: "unused", maxRuns: 2, runCPUs: 1, runMemoryMB: 2048, };
   db = openStore(dir); auth = await createAuthentication(db, cfg);
   runs = new Runs(db, cfg, async () => { throw new Error("No worker should start"); });
   instance = createApp(db, cfg, auth, runs);
