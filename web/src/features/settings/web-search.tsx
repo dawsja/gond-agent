@@ -9,7 +9,7 @@ import { Section } from "../studio/section"
 interface SearchSettings { provider: "none" | "brave"; hasKey: boolean; configured: boolean; message: string }
 export function WebSearchSettings() {
   const query = useQuery({ queryKey: ["web-search"], queryFn: () => api<SearchSettings>("/v1/settings/web-search") })
-  return <Section title="Web search" description="Optional web search for new workspaces. Search keys stay encrypted on this server, never in a worker.">
+  return <Section title="Web search" description="Optional web search for new workspaces. Only Brave Search API is supported. Search keys stay encrypted on this server, never in a worker.">
     {query.isPending ? <p className="p-5 text-sm">Loading…</p> : query.isError ? <p role="alert" className="p-5 text-sm text-failed">Could not load web search settings.</p> : <SearchForm key={`${query.data.provider}-${query.data.hasKey}`} initial={query.data} />}
   </Section>
 }
