@@ -22,7 +22,7 @@ Keep changes concise and customer messages plain. Use the custom shadcn controls
 
 Database changes use native SQLite statements in `api/src/db.ts`. Additive schema changes must preserve existing data. Better Auth applies its own migrations at startup. OIDC client secrets are encrypted with the persistent auth secret and never returned in API responses. Provider API keys use the same encryption and must never be returned to browsers or workers. Model IDs belong to a configured connection. Only administrators can change providers or OIDC; every account otherwise has all features.
 
-Never store or load external avatar URLs; ProfileAvatar is the only avatar component.
+Never store or load external avatar URLs; ProfileAvatar is the only avatar component. Render remote Markdown images as links, never image requests. The app sends an image Content-Security-Policy (`img-src` only), not a policy for scripts, frames or other resources.
 
 The profile popup contains Settings and Sign out. Do not duplicate Sign out in Settings. The Account card shows the photo, name and email; omit the Instance/Self-hosted row and the Storage information block. Keep Settings out of the sidebar navigation.
 
