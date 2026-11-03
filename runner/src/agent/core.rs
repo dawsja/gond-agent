@@ -1238,6 +1238,7 @@ mod tests {
         h.input.send(AgentInput::User { text: "continue".into(), images: vec![] }).unwrap();
         until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
         let reqs = seen.lock().unwrap();
+        assert!(reqs[1]["system"].as_str().unwrap().contains("[in_progress] edit"), "plan change reaches the very next request");
         let listed = reqs[1]["messages"][2]["content"][1]["content"][0]["text"].as_str().unwrap();
         assert_eq!(listed, "1. [done] read\n2. [in_progress] edit");
         let last = reqs.last().unwrap()["messages"].as_array().unwrap();

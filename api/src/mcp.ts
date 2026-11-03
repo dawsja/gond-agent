@@ -1,3 +1,4 @@
+import { planState } from "./runs/fold";
 import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
@@ -98,6 +99,7 @@ export function sessionState(r: Run) {
   return {
     state: done ? (r.status === "ready" ? "done" : r.status) : question ? "waiting_for_input" : r.status === "queued" || r.pending?.length ? "queued" : "working",
     done,
+    ...planState(r.summary?.plan_steps),
     waiting_for_input: !!question,
     asking_question: !!question,
     question: question?.question ?? null,

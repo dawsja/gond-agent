@@ -19,6 +19,7 @@ import { githubEnv } from "../github-login";
 import { modelResponse } from "../responses";
 import {
   emptySummary,
+  planState,
   fold,
   slug,
   titleFrom,
@@ -134,7 +135,7 @@ export class Runs {
       )
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
     if (!r) throw new ApiError(404, "not_found", "That run doesn't exist.");
-    return parseRun(r.data);
+    return this.restorePlan(parseRun(r.data));
   }
   list(user: string): Run[] {
     return (
@@ -143,7 +144,17 @@ export class Runs {
           "SELECT data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
         )
         .all(user) as { data: string }[]
-    ).map((r) => parseRun(r.data));
+    ).map((r) => this.restorePlan(parseRun(r.data)));
+  }
+  private restorePlan(r: Run): Run {
+    if (Array.isArray(r.summary?.plan_steps)) return r;
+    const latest = this.db.prepare("SELECT data FROM events WHERE run_id=? AND json_extract(data,'$.type')='todos' AND json_extract(data,'$.agent_id')='main' ORDER BY seq DESC LIMIT 1").get(r.id) as { data: string } | undefined;
+    if (latest) r.summary = fold({ ...emptySummary(), ...r.summary }, JSON.parse(latest.data));
+    if (r.summary) {
+      r.plan_done = r.summary.plan_done;
+      r.plan_total = r.summary.plan_total;
+    }
+    return r;
   }
   save(r: Run) {
     assertBackend(r.backend);
@@ -482,7 +493,12 @@ export class Runs {
       r = this.get(id);
       if (this.shuttingDown || r.status === "stopped") return await workspace.destroy();
       this.status(r, "working", "Starting the agent");
-      await workspace.rpc("start", { model: r.model_id, effort: r.effort ?? "high" });
+      await workspace.rpc("start", {
+        model: r.model_id, effort: r.effort ?? "high",
+        ...(r.summary.plan_steps?.length ? { plan: r.summary.plan_steps } : {}),
+        ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: Number(process.env.GOND_AGENT_PLAN_REMINDER_EVERY) } : {}),
+        ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: Number(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT) } : {}),
+      });
       if (this.shuttingDown) return await workspace.destroy();
       const live: Live = {
         workspace,
@@ -519,7 +535,7 @@ export class Runs {
     }
     r.pending.shift();
     if (live.closed) return;
-    r.summary = emptySummary();
+    r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
     r.phase = "agent";
     this.status(r, "working", "Thinking");
     if(message.effort !== undefined){

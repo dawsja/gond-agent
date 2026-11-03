@@ -5,7 +5,26 @@ export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "
 
 export type Ev = { type: string; [k: string]: any };
 
+export type PlanStep = { text: string; status: "pending" | "in_progress" | "done" };
+
+export function planState(items: unknown) {
+  const plan_steps: PlanStep[] = Array.isArray(items)
+    ? items.slice(0, 50)
+      .filter((i) => i && typeof i.text === "string" && ["pending", "in_progress", "done"].includes(i.status))
+      .map((i) => ({ text: i.text.slice(0, 300), status: i.status }))
+    : [];
+  const index = plan_steps.findIndex((i) => i.status === "in_progress");
+  return {
+    plan_steps,
+    plan_total: plan_steps.length,
+    plan_done: plan_steps.filter((i) => i.status === "done").length,
+    current_step: index < 0 ? null : { text: plan_steps[index].text, index: index + 1 },
+  };
+}
+
 export interface Summary {
+  plan_steps: PlanStep[];
+  current_step: { text: string; index: number } | null;
   step: string | null;
   plan_done: number;
   plan_total: number;
@@ -18,9 +37,8 @@ export interface Summary {
 }
 
 export const emptySummary = (): Summary => ({
+  ...planState([]),
   step: null,
-  plan_done: 0,
-  plan_total: 0,
   files: {},
   text: "",
   error: null,
@@ -85,8 +103,7 @@ export function fold(s: Summary, ev: Ev): Summary {
       return { ...s, step: stepLabel(ev.name, ev.title ?? "") };
     case "todos": {
       if (!main) return s;
-      const items = (ev.items ?? []) as { status: string }[];
-      return { ...s, plan_total: items.length, plan_done: items.filter((i) => i.status === "done").length };
+      return { ...s, ...planState(ev.items) };
     }
     case "tool.end": {
       if (!ev.diff) return s;
