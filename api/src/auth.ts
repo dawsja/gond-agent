@@ -59,7 +59,7 @@ export async function createAuthentication(db: Store, cfg: Config) {
         minPasswordLength: 12,
         maxPasswordLength: 128,
       },
-      session: { expiresIn: 60 * 60 * 24 * 7, freshAge: 10 * 60, updateAge: 60 * 60 * 24 },
+      session: { expiresIn: 60 * 60 * 24 * 7, updateAge: 60 * 60 * 24 },
       account: { accountLinking: { enabled: true, disableImplicitLinking: true, allowDifferentEmails: true, allowUnlinkingAll: false } },
       // HTTP deletion stays disabled. Only the confirmed workspace action enables it.
       user: { deleteUser: { enabled: !!beforeDelete, beforeDelete } },

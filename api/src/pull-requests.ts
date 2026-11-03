@@ -8,7 +8,7 @@ const key = (pull: Pull) => `${pull.repo}#${pull.pr_number}`;
 export class PullRequests {
   private cache = new Map<string, { until: number; state: Promise<PullState | undefined> }>();
   constructor(private credentials: (user: string) => NodeJS.ProcessEnv) {}
-  async states(pulls: Pull[], user = "") {
+  async states(pulls: Pull[], user: string) {
     const cacheKey = (p: Pull) => `${user}:${key(p)}`;
     const now = Date.now();
     const eligible = pulls.filter(p => p.pr_state !== "merged" && validRepo(p.repo) && Number.isInteger(p.pr_number) && p.pr_number! > 0 && p.pr_number! <= 2147483647);

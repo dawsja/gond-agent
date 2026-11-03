@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { openStore, getSetting, setSetting } from "../src/db";
 import { createAuthentication, seal } from "../src/auth";
 import { githubEnvFor } from "../src/github-login";
-import { commitIdentity, gh } from "../src/github";
+import { command } from "../src/command";
+import { checkout, importBundle, commitIdentity, gh } from "../src/github";
 import { PullRequests } from "../src/pull-requests";
 import { createApp } from "../src/app";
 import { Runs } from "../src/runs/service";
@@ -68,6 +69,8 @@ it("isolates repository, branch, PR reads and commit identity by account, with n
 
 it("resolves personal before opt-in shared before explicit service credentials; safely migrates only once", () => {
   expect(getSetting(db, "github-shared-fallback")).toBe(false);
+  vi.stubEnv("GH_CONFIG_DIR", join(dir, "empty-service-config"));
+  expect(() => githubEnvFor(db, cfg.secret, b.id)).toThrow("Connect your GitHub");
   setSetting(db, "github", { token: seal(cfg.secret, "fixture-token-a") });
   expect(() => githubEnvFor(db, cfg.secret, b.id)).toThrow("Connect your GitHub");
   setSetting(db, "github-shared-fallback", true);
@@ -140,4 +143,34 @@ it("requires a fresh signed-in session for linking and cannot unlink the last si
 it("structurally forbids user-less GitHub credential resolution in service source", () => {
   const files = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(dir, entry.name)) : entry.name.endsWith(".ts") ? [join(dir, entry.name)] : []);
   for (const path of files(join(import.meta.dirname, "../src"))) expect(readFileSync(path, "utf8")).not.toMatch(/\bgithubEnv\s*\(/);
+});
+
+it("runs real checkout, push and snapshot commits with A's identity while B has different credentials", async () => {
+  connect(a.id, "fixture-token-a"); connect(b.id, "fixture-token-b");
+  const remote = join(dir, "remote"), worker = join(dir, "worker"); mkdirSync(remote); mkdirSync(worker);
+  const env = { ...githubEnvFor(db, cfg.secret, a.id), GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `url.file://${remote}.insteadOf`, GIT_CONFIG_VALUE_0: "https://github.com/acme/app.git" };
+  const git = async (cwd: string, ...args: string[]) => (await command("/usr/bin/git", args, { cwd, env })).toString().trim();
+  await git(remote, "init", "-b", "main");
+  writeFileSync(join(remote, "base.txt"), "base\n");
+  await git(remote, "add", ".");
+  await git(remote, "-c", "user.name=Initial", "-c", "user.email=initial@example.test", "commit", "-m", "Initial");
+  const trace = join(dir, "git-calls");
+  writeFileSync(join(dir, "bin/git"), `#!/usr/bin/env node
+const fs=require('node:fs'),cp=require('node:child_process');
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({args:process.argv.slice(2), token:process.env.GH_TOKEN})+'\\n');
+const result=cp.spawnSync('/usr/bin/git',process.argv.slice(2),{stdio:'inherit',env:process.env});process.exit(result.status??1);
+`, { mode: 0o700 });
+  const checked = await checkout(dir, "run_real", "acme/app", "main", "gond-agent/test", false, env);
+  await command("tar", ["-xzf", "-", "-C", worker], { input: checked.archive });
+  writeFileSync(join(worker, "change.txt"), "implemented\n");
+  const identity = await commitIdentity(githubEnvFor(db, cfg.secret, a.id));
+  const script = `import importlib.util,json,sys\nspec=importlib.util.spec_from_file_location('control',sys.argv[1]);control=importlib.util.module_from_spec(spec);spec.loader.exec_module(control);control.ROOT=sys.argv[2];print(json.dumps(control.dispatch(json.loads(sys.argv[3]))))`;
+  const output = await command("python3", ["-c", script, join(import.meta.dirname, "../../containers/agent.py"), worker, JSON.stringify({ method: "snapshot", title: "Owned change", identity })]);
+  const snapshot = JSON.parse(output.toString());
+  await importBundle(checked.cwd, Buffer.from(snapshot.bundle, "base64"), "gond-agent/test", env);
+  expect(await git(remote, "log", "-1", "--format=%an <%ae>|%cn <%ce>", "gond-agent/test")).toBe("developer-a <101+developer-a@users.noreply.github.com>|developer-a <101+developer-a@users.noreply.github.com>");
+  const calls = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(calls.filter(call => call.args.includes("clone") || call.args.includes("push")).map(call => call.token)).toEqual(["fixture-token-a", "fixture-token-a"]);
+  expect(readFileSync(join(checked.cwd, ".git/config"), "utf8")).not.toMatch(/fixture-token|credential/);
+  expect(checked.archive.includes(Buffer.from("fixture-token-a"))).toBe(false);
 });
