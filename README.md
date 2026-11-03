@@ -160,3 +160,7 @@ The service resolves and caches the connected GitHub account's login and numeric
 Use the authenticated remote MCP tools to discover models, start idempotent sessions, wait for completion, inspect diffs, send follow-ups and open PRs. See [the full contract and JSON examples](protocol/README.md#driving-gond-agent-from-another-bot). Completion ends the current turn, not the session: a follow-up starts more work. Browser, symbols and batch tools are optional; repository instructions still apply.
 
 Finished runs retain capacity: use MCP `close_session` or More → Close workspace to save/push changes and release the slot without deleting history. Busy workspaces cannot close; snapshot/push failure preserves the workspace. Follow-ups reopen the pushed branch. `MODEL_STALL_MINUTES` defaults to 10 (0 disables): requests abort only when headers or stream bytes stop arriving, never because a progressing response takes a long time. Missing GitHub identity intentionally fails checkout with a 409 because publication requires the connection. Identity caches expire after one hour and are invalidated on GitHub command failures (including unauthorized responses).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
