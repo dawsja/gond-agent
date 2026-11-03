@@ -150,3 +150,7 @@ Subscription tasks run the official agent in the workspace container; API connec
 Managed subscription credential state is encrypted using `BETTER_AUTH_SECRET`. It is temporarily provided only to that account's isolated CLI container, outside the checkout. Subscription session history is encrypted separately from repository exports. Stop and close a runtime's workspaces before signing out or uninstalling. Account deletion removes personal subscription credentials, sessions, and usage.
 
 Usage shows tokens recorded by Gond. Vendor-reported subscription limits are shown in Settings when available, with their observation time; unavailable allowance information is not inferred from token counts. Subscription limits and model access still apply, and Gond never falls back to API billing automatically. Real-account login, coding, quota, and credential-renewal testing requires signing into the relevant subscription; CLI startup tests alone do not verify that complete path.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
