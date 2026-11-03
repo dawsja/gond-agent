@@ -248,6 +248,121 @@
   --elevation-subtle-2: none;
   --elevation-subtle-3: none;
 }
+
+/* Accent choices share the same dark surfaces, status and syntax colors. */
+[data-accent="blue"] {
+  --tint: #2f6fd6;
+  --tint-solid: #2b61b9;
+  --tint-wash: #252f40;
+  --tint-edge: #3d5780;
+  --tint-ink: #8db0e8;
+}
+
+[data-accent="purple"] {
+  --tint: #7650d8;
+  --tint-solid: #6747ba;
+  --tint-wash: #302a40;
+  --tint-edge: #5a4b81;
+  --tint-ink: #b49fea;
+}
+
+[data-accent="pink"] {
+  --tint: #cf3d85;
+  --tint-solid: #b33774;
+  --tint-wash: #3f2733;
+  --tint-edge: #7d4360;
+  --tint-ink: #e594bc;
+}
+
+[data-accent="red"] {
+  --tint: #d03a3a;
+  --tint-solid: #b33434;
+  --tint-wash: #3f2727;
+  --tint-edge: #7e4242;
+  --tint-ink: #e59393;
+}
+
+[data-accent="orange"] {
+  --tint: #e04e0a;
+  --tint-solid: #c1450b;
+  --tint-wash: #412a1f;
+  --tint-edge: #844a2f;
+  --tint-ink: #ee9e78;
+}
+
+[data-accent="amber"] {
+  --tint: #d98a08;
+  --tint-solid: #9f670b;
+  --tint-wash: #40331f;
+  --tint-edge: #81622e;
+  --tint-ink: #eabf77;
+}
+
+[data-accent="green"] {
+  --tint: #189c47;
+  --tint-solid: #17853e;
+  --tint-wash: #213629;
+  --tint-edge: #346947;
+  --tint-ink: #80c99a;
+}
+
+/* Gond's light tint shades override only the root; dark accent blocks stay unchanged. */
+:root:not(.dark)[data-accent="blue"] {
+  --tint: #2f6fd6;
+  --tint-solid: #2c62ba;
+  --tint-wash: #d6dbe0;
+  --tint-edge: #a9b8cd;
+  --tint-ink: #29559d;
+}
+
+:root:not(.dark)[data-accent="purple"] {
+  --tint: #7650d8;
+  --tint-solid: #6848bb;
+  --tint-wash: #ded7e0;
+  --tint-edge: #bdafce;
+  --tint-ink: #5b409e;
+}
+
+:root:not(.dark)[data-accent="pink"] {
+  --tint: #cf3d85;
+  --tint-solid: #b43875;
+  --tint-wash: #e8d5d7;
+  --tint-edge: #d6aab7;
+  --tint-ink: #993364;
+}
+
+:root:not(.dark)[data-accent="red"] {
+  --tint: #d03a3a;
+  --tint-solid: #b53535;
+  --tint-wash: #e8d5cf;
+  --tint-edge: #d6a9a2;
+  --tint-ink: #9a3030;
+}
+
+:root:not(.dark)[data-accent="orange"] {
+  --tint: #e04e0a;
+  --tint-solid: #c2460c;
+  --tint-wash: #ead7c9;
+  --tint-edge: #dbae94;
+  --tint-ink: #9f3d0f;
+}
+
+:root:not(.dark)[data-accent="amber"] {
+  --tint: #d98a08;
+  --tint-solid: #9e670d;
+  --tint-wash: #e9dec9;
+  --tint-edge: #d9bf94;
+  --tint-ink: #83580f;
+}
+
+:root:not(.dark)[data-accent="green"] {
+  --tint: #189c47;
+  --tint-solid: #19863f;
+  --tint-wash: #d4e0d0;
+  --tint-edge: #a3c4a5;
+  --tint-ink: #196d36;
+}
+
 @layer base {
   * { @apply border-border outline-ring/50; }
   html { @apply font-sans; -webkit-font-smoothing: antialiased; }

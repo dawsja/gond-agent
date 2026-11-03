@@ -66,16 +66,17 @@ describe("account theme preference", () => {
   it("saves every supported value and keeps /me and other profile settings intact across restart", async () => {
     const user = await signup("owner@example.test");
     db.prepare("UPDATE profiles SET auto_pr=0 WHERE user_id=?").run(user.id);
+    expect((await request("/api/v1/me/accent", user.cookie, { accent: "purple" })).status).toBe(200);
     for (const theme of THEMES) {
       expect(isTheme(theme)).toBe(true);
       const result = await request("/api/v1/me/theme", user.cookie, { theme });
       expect(result.status).toBe(200);
       expect(await result.json()).toEqual({ theme });
-      expect(await me(user.cookie)).toMatchObject({ theme, automations: { auto_pr: false } });
+      expect(await me(user.cookie)).toMatchObject({ theme, accent: "purple", automations: { auto_pr: false } });
     }
     await stop();
     await start();
-    expect(await me(user.cookie)).toMatchObject({ theme: "dark", automations: { auto_pr: false } });
+    expect(await me(user.cookie)).toMatchObject({ theme: "dark", accent: "purple", automations: { auto_pr: false } });
   });
 
   it("rejects invalid values, body shapes and malformed JSON without changing the saved preference", async () => {

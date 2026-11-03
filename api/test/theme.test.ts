@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_THEME, isTheme, THEMES, themeInitScript } from "../../shared/theme-preference";
+import { ACCENTS, DEFAULT_ACCENT } from "../../shared/accents";
 
 const css = readFileSync(new URL("../../web/src/index.css", import.meta.url), "utf8");
 const tokens = (block: string) => Object.fromEntries(
@@ -255,6 +256,20 @@ describe("browser theme application", () => {
       expect(root.dataset.theme).toBe(preference);
       expect(root.style.colorScheme).toBe(dark ? "dark" : "light");
       expect(meta.setAttribute).toHaveBeenLastCalledWith("content", value(dark ? "dark" : "light", "background"));
+    }
+  });
+
+  it("paints cached accents with Light before modules, defaulting invalid hints to blue", () => {
+    const script = themeInitScript({ light: value("light", "background"), dark: value("dark", "background") });
+    for (const accent of [...ACCENTS, "invalid", null]) {
+      const { root, classes } = browser(true);
+      runInNewContext(script, {
+        document, matchMedia: () => ({ matches: true }),
+        localStorage: { getItem: (key: string) => key === "gond-agent-theme" ? "light" : accent },
+      });
+      expect(classes.has("dark")).toBe(false);
+      expect(root.dataset.theme).toBe("light");
+      expect(root.dataset.accent).toBe(ACCENTS.some(value => value === accent) ? accent : DEFAULT_ACCENT);
     }
   });
 

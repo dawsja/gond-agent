@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { lazy, Suspense } from "react"
+import { lazy, Suspense, useLayoutEffect } from "react"
 import { BrowserRouter, Navigate, Route, Routes } from "react-router"
 import { AuthGate } from "@/app/auth"
 import { SetupGate } from "@/features/setup/setup-screen"
@@ -7,6 +7,14 @@ import { HomeScreen } from "@/features/home/home-screen"
 import { ApiError } from "@/lib/api"
 import { BASE } from "@/lib/base"
 import { ThemeSync } from "@/components/theme-sync"
+import { useMe } from "@/lib/queries"
+import { applyAccent } from "@/lib/accent"
+
+function AccountAccent() {
+  const { data } = useMe()
+  useLayoutEffect(() => { if (data) applyAccent(data.accent) }, [data])
+  return null
+}
 
 const RunScreen = lazy(() =>
   import("@/features/run/run-screen").then((m) => ({ default: m.RunScreen }))
@@ -47,6 +55,7 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <AuthGate>
         <ThemeSync />
+        <AccountAccent />
         <SetupGate>
         <BrowserRouter basename={BASE || undefined}>
           <Suspense fallback={<div className="h-screen bg-background" />}>
