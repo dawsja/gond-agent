@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
-import type { Config } from "../config";
+import { planSetting, type Config } from "../config";
 import type { Store } from "../db";
 import type { Workspace, WorkspaceFactory } from "../containers";
 import {
@@ -147,13 +147,15 @@ export class Runs {
     ).map((r) => this.restorePlan(parseRun(r.data)));
   }
   private restorePlan(r: Run): Run {
-    if (Array.isArray(r.summary?.plan_steps)) return r;
+    if (r.retired_backend || Array.isArray(r.summary?.plan_steps)) return r;
     const latest = this.db.prepare("SELECT data FROM events WHERE run_id=? AND json_extract(data,'$.type')='todos' AND json_extract(data,'$.agent_id')='main' ORDER BY seq DESC LIMIT 1").get(r.id) as { data: string } | undefined;
-    if (latest) r.summary = fold({ ...emptySummary(), ...r.summary }, JSON.parse(latest.data));
+    r.summary = { ...emptySummary(), ...r.summary, ...planState([]) };
+    if (latest) r.summary = fold(r.summary, JSON.parse(latest.data));
     if (r.summary) {
       r.plan_done = r.summary.plan_done;
       r.plan_total = r.summary.plan_total;
     }
+    this.db.prepare("UPDATE runs SET data=? WHERE id=?").run(JSON.stringify(r), r.id);
     return r;
   }
   save(r: Run) {
@@ -496,8 +498,8 @@ export class Runs {
       await workspace.rpc("start", {
         model: r.model_id, effort: r.effort ?? "high",
         ...(r.summary.plan_steps?.length ? { plan: r.summary.plan_steps } : {}),
-        ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: Number(process.env.GOND_AGENT_PLAN_REMINDER_EVERY) } : {}),
-        ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: Number(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT) } : {}),
+        ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
+        ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
       });
       if (this.shuttingDown) return await workspace.destroy();
       const live: Live = {

@@ -17,8 +17,21 @@ export function modelStallMs(): number {
     throw new Error("Invalid MODEL_STALL_MINUTES");
   return minutes * 60_000;
 }
+export function planSetting(name: "GOND_AGENT_PLAN_REMINDER_EVERY" | "GOND_AGENT_PLAN_NUDGE_LIMIT"): number {
+  const fallback = name === "GOND_AGENT_PLAN_REMINDER_EVERY" ? 6 : 2;
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(value) || value > 0xffff_ffff) {
+    console.warn(`Invalid ${name}; using default ${fallback}.`);
+    return fallback;
+  }
+  return name === "GOND_AGENT_PLAN_NUDGE_LIMIT" ? Math.min(value, 2) : value;
+}
 export function configFromEnv(): Config {
   modelStallMs();
+  planSetting("GOND_AGENT_PLAN_REMINDER_EVERY");
+  planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT");
   const secret = process.env.BETTER_AUTH_SECRET ?? "";
   if (secret.length < 32)
     throw new Error("BETTER_AUTH_SECRET must contain at least 32 characters");

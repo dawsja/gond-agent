@@ -456,7 +456,8 @@ impl PlanReminders {
         let pending = plan.iter().filter(|s| s.status != super::events::TodoStatus::Done).count();
         if pending == 0 || self.nudges >= limit.min(2) { return None; }
         self.nudges += 1;
-        Some(format!("{pending} plan steps are still pending: continue, or update the plan if they are no longer needed. You may also end the turn if appropriate."))
+        let remaining = if pending == 1 { "1 plan step is still pending".into() } else { format!("{pending} plan steps are still pending") };
+        Some(format!("{remaining}: continue, or update the plan if they are no longer needed. You may also end the turn if appropriate."))
     }
 }
 
@@ -891,6 +892,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn malformed_initial_plan_starts_and_completes_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let handler: Handler = Arc::new(|_: &Value| sse(&[json!({"type":"text","text":"Finished"})], "end_turn"));
+        let url = mock(handler, seen.clone()).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.plan = crate::initial_plan("garbage");
+        assert!(cfg.plan.is_empty());
+        cfg.plan_nudge_limit = 2;
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        h.input.send(AgentInput::User { text: "Work".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionStart { .. })));
+        assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "end_turn"));
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0]["system"].as_str().unwrap().contains("Current plan"));
+    }
+
     #[test]
     fn plan_reminders_follow_cadence_changes_and_off_setting() {
         let mut reminders = PlanReminders::default();
@@ -924,7 +945,7 @@ mod tests {
             assert_eq!(requests.len(), turn * 3, "one response plus at most two nudges per user turn");
             assert!(requests[(turn - 1) * 3]["system"].as_str().unwrap().contains("Unfinished work"), "plan survives follow-ups");
             let last = requests.last().unwrap()["messages"].as_array().unwrap().last().unwrap();
-            assert!(last["content"][0]["text"].as_str().unwrap().contains("1 plan steps are still pending"));
+            assert!(last["content"][0]["text"].as_str().unwrap().contains("1 plan step is still pending"));
         }
     }
 

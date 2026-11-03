@@ -486,3 +486,15 @@ it("bounds plan state, ignores subagent plans and preserves completion with pend
   }
   expect(runs.list(owner)[0].plan_total).toBe(50);
 });
+
+it("persists an empty legacy plan marker instead of querying events on every read", () => {
+  const r = seed();
+  const prepare = vi.spyOn(db, "prepare");
+  for (let i = 0; i < 3; i++) {
+    expect(runs.get(r.id).summary.plan_steps).toEqual([]);
+    expect(runs.list(owner)[0].summary.plan_steps).toEqual([]);
+  }
+  expect(prepare.mock.calls.filter(([sql]) => sql.includes("json_extract(data,'$.type')='todos'"))).toHaveLength(1);
+  const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+  expect(JSON.parse(stored.data).summary.plan_steps).toEqual([]);
+});
