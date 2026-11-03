@@ -1,7 +1,8 @@
+import { hasServiceGithubCredentials } from "./github-credentials";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { getSetting, setSetting, type Store } from "./db";
@@ -18,7 +19,7 @@ export function githubEnvFor(db: Store, secret: string, userId: string): NodeJS.
   if (saved) {
     delete env.GITHUB_TOKEN;
     env.GH_TOKEN = unseal(secret, saved.token);
-  } else if (!fallback || (!env.GH_TOKEN && !env.GITHUB_TOKEN && !(env.GH_CONFIG_DIR && existsSync(join(env.GH_CONFIG_DIR, "hosts.yml"))))) {
+  } else if (!fallback || !hasServiceGithubCredentials(env)) {
     throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
   }
   return env;

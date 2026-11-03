@@ -218,11 +218,19 @@ it("enables shared fallback on upgrade without service credentials", () => {
   db.close(); db = openStore(dir);
   expect(getSetting(db, "github-shared-fallback")).toBe(true);
   expect(githubEnvFor(db, cfg.secret, a.id).GH_TOKEN).toBe("fixture-shared-token");
+  setSetting(db, "github-shared-fallback", false);
+  db.close(); db = openStore(dir);
+  expect(getSetting(db, "github-shared-fallback")).toBe(false);
 });
 
 it.each(["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"])("enables fallback once when migrating with service %s", key => {
   db.prepare("DELETE FROM settings WHERE key='github-shared-fallback'").run();
-  vi.stubEnv(key, key === "GH_CONFIG_DIR" ? join(dir, "service-config") : "fixture-service-token");
+  const value = key === "GH_CONFIG_DIR" ? join(dir, "service-config") : "fixture-service-token";
+  if (key === "GH_CONFIG_DIR") {
+    mkdirSync(value);
+    writeFileSync(join(value, "hosts.yml"), "github.com:\n  oauth_token: fixture-service-token\n");
+  }
+  vi.stubEnv(key, value);
   db.close(); db = openStore(dir);
   expect(getSetting(db, "github-shared-fallback")).toBe(true);
   setSetting(db, "github-shared-fallback", false);
@@ -232,4 +240,16 @@ it.each(["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"])("enables fallback once wh
 
 it.each([undefined, "header." + Buffer.from("{}").toString("base64url") + ".signature", "malformed", "header." + Buffer.from('{"sub":123}').toString("base64url") + ".signature"])("refuses invalid OIDC account subject from %s", token => {
   expect(() => oidcSubject(token)).toThrow();
+});
+
+it.each(["missing", "empty"])("keeps legacy Compose GH_CONFIG_DIR fallback off when hosts.yml is %s", state => {
+  const config = join(dir, "gh");
+  mkdirSync(config);
+  if (state === "empty") writeFileSync(join(config, "hosts.yml"), "");
+  vi.stubEnv("GH_CONFIG_DIR", config);
+  db.prepare("DELETE FROM settings WHERE key='github-shared-fallback'").run();
+  db.close(); db = openStore(dir);
+  expect(getSetting(db, "github-shared-fallback")).toBe(false);
+  setSetting(db, "github-shared-fallback", true);
+  expect(() => githubEnvFor(db, cfg.secret, a.id)).toThrow("Connect your GitHub");
 });
