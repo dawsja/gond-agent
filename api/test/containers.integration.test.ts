@@ -357,7 +357,7 @@ echo toolchain-isolation-verified`})],
       }
       await until(e=>e.type==="turn.end" && e.agent_id==="main");
       expect(events.filter(e=>e.type==="tool.end" && !e.ok)).toEqual([]);
-      expect(JSON.stringify(requests)).toContain("toolchain-isolation-verified");
+      expect(requests.some(req=>req.messages.some((m:any)=>m.role==="tool" && m.content.some((b:any)=>b.call_id==="toolchains" && JSON.stringify(b.content).includes("toolchain-isolation-verified"))))).toBe(true);
       expect(events.find(e=>e.type==="tool.images" && e.call_id==="browser").images).toHaveLength(2);
       expect(events.find(e=>e.type==="turn.end").stop_reason).toBe("end_turn");
       expect(requests.some(req=>req.messages.some((m:any)=>m.role==="tool" && m.content.some((b:any)=>b.content?.some((p:any)=>p.type==="image"))))).toBe(true);
