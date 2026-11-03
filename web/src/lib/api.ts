@@ -22,6 +22,7 @@ export interface Run {
   status: RunStatus
   step: string | null
   plan_done: number
+  summary?: { plan_steps?: { text: string; status: "pending" | "in_progress" | "done" }[] }
   plan_total: number
   files: number
   additions: number

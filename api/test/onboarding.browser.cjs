@@ -233,6 +233,31 @@ const key = 'fixture-only-provider-key';
       await expect(page.getByText('Expected /agents/; received /login.', { exact: true })).toBeVisible();
       await capture('message-activity-details');
 
+      const tasks = page.getByRole('complementary', { name: 'Tasks', exact: true });
+      await expect(tasks).toHaveCount(0);
+      const plan = [{ text: 'Inspect sign-in flow', status: 'done' }, { text: 'Fix mobile return URL', status: 'in_progress' }, { text: 'Verify redirect behavior', status: 'pending' }];
+      activity('todos', { agent_id: 'main', items: plan });
+      await expect(tasks).toContainText('1 of 3 done');
+      if (width === 390) {
+        await expect(tasks.getByRole('list')).toBeHidden();
+        await tasks.getByRole('button', { name: 'Expand tasks' }).click();
+      }
+      await expect(tasks.getByRole('listitem')).toHaveCount(3);
+      await expect(tasks.locator('[aria-current=step]')).toHaveText('Fix mobile return URL');
+      const top = (await tasks.boundingBox()).y;
+      await page.getByText('Expected /agents/; received /login.', { exact: true }).evaluate(el => {
+        let parent = el.parentElement;
+        while (parent && getComputedStyle(parent).overflowY !== 'auto') parent = parent.parentElement;
+        if (parent) parent.scrollTop = 0;
+      });
+      expect((await tasks.boundingBox()).y).toBe(top);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await capture('pinned-tasks');
+      activity('todos', { agent_id: 'main', items: plan.map((step, i) => ({ ...step, status: i < 2 ? 'done' : 'in_progress' })) });
+      await expect(tasks).toContainText('2 of 3 done');
+      await expect(tasks.locator('[aria-current=step]')).toHaveText('Verify redirect behavior');
+      if (width === 390) await tasks.getByRole('button', { name: 'Expand tasks' }).click();
+
       // A GitHub merge updates the existing PR card and every current-state icon.
       activePreview = false; prState = 'open';
       activity('run.pr', { number: 42, url: 'https://github.com/acme/app/pull/42', state: 'open' });

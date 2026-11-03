@@ -29,8 +29,22 @@ async fn main() -> Result<()> {
     let cfg = AgentConfig {
         model, context_window, mode: Mode::Allow, rules: vec![], cwd: cwd.clone(),
         effort: std::env::var("GOND_AGENT_EFFORT").unwrap_or_else(|_| "high".into()), session_id: uuid::Uuid::new_v4().to_string(), history: vec![],
+        plan: initial_plan(&std::env::var("GOND_AGENT_INITIAL_PLAN").unwrap_or_else(|_| "[]".into())),
+        plan_reminder_every: plan_setting("GOND_AGENT_PLAN_REMINDER_EVERY", 6),
+        plan_nudge_limit: plan_setting("GOND_AGENT_PLAN_NUDGE_LIMIT", 2).min(2),
         interactive: false, tools, system: format!("{}{}", prompt::main_prompt(&cwd), prompt::AUTONOMOUS),
         sub_system: prompt::sub_prompt(&cwd), skills: skills::discover(&cwd, &[]),
     };
     std::process::exit(transport::jsonl(agent::spawn(api, cfg)).await?);
+}
+
+fn plan_setting(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn initial_plan(value: &str) -> Vec<agent::events::TodoItem> {
+    serde_json::from_str(value).unwrap_or_else(|_| {
+        eprintln!("Invalid initial plan; continuing without a plan.");
+        vec![]
+    })
 }

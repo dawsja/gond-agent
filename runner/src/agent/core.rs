@@ -32,6 +32,9 @@ pub struct AgentConfig {
     pub session_id: String,
     /// Earlier messages when resuming a session.
     pub history: Vec<Message>,
+    pub plan: Vec<TodoItem>,
+    pub plan_reminder_every: u32,
+    pub plan_nudge_limit: u32,
     /// When false (headless), permission prompts and questions are answered automatically.
     pub interactive: bool,
     /// Tools available inside the workspace container.
@@ -64,6 +67,8 @@ struct Shared {
     shells: Shells,
     baseline: Baseline,
     plan: Mutex<Vec<TodoItem>>,
+    plan_reminder_every: u32,
+    plan_nudge_limit: u32,
     cwd: PathBuf,
     session_id: String,
     system: String,
@@ -132,7 +137,9 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         reads: ReadSet::default(),
         shells: Shells::default(),
         baseline: Baseline::default(),
-        plan: Mutex::default(),
+        plan: Mutex::new(cfg.plan),
+        plan_reminder_every: cfg.plan_reminder_every,
+        plan_nudge_limit: cfg.plan_nudge_limit.min(2),
         cwd: cfg.cwd.clone(),
         session_id: cfg.session_id.clone(),
         system: cfg.system,
@@ -338,6 +345,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
         s.emit(AgentEvent::TurnStart { agent_id: run.id.clone() });
         let started = Instant::now();
         let mut tool_count = 0u32;
+        let mut reminders = PlanReminders::default();
         loop {
             let (model, _) = s.model.lock().unwrap().clone();
             let mut tools: Vec<ToolDef> = s.tools.iter().filter(|t| tool_visible(t.as_ref(), run)).map(|t| t.def()).collect();
@@ -350,12 +358,14 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 }
                 skills::prompt_section(&sk)
             };
+            let plan = s.plan.lock().unwrap().clone();
+            let reminder = if !run.is_sub() { reminders.context(&plan, s.plan_reminder_every) } else { String::new() };
             let req = ResponsesRequest {
                 model,
                 system: Some(if run.is_sub() {
                     format!("{}{}", s.sub_system, crate::prompt::instructions_section(&s.cwd))
                 } else {
-                    format!("{}{}{skill_section}", s.system, crate::prompt::instructions_section(&s.cwd))
+                    format!("{}{}{skill_section}{reminder}", s.system, crate::prompt::instructions_section(&s.cwd))
                 }),
                 messages: history.clone(),
                 tools,
@@ -386,6 +396,12 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 .collect();
             history.push(msg);
             if calls.is_empty() {
+                if !run.is_sub() && !cancel.is_cancelled() {
+                    if let Some(nudge) = reminders.nudge(&s.plan.lock().unwrap(), s.plan_nudge_limit) {
+                        history.push(Message::user_text(nudge));
+                        continue;
+                    }
+                }
                 s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: stop });
                 return Ok(text);
             }
@@ -409,6 +425,40 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
             }
         }
     })
+}
+
+#[derive(Default)]
+struct PlanReminders {
+    calls: u32,
+    last: Vec<TodoItem>,
+    nudges: u32,
+}
+
+impl PlanReminders {
+    fn context(&mut self, plan: &[TodoItem], every: u32) -> String {
+        let changed = self.last != plan;
+        let due = self.calls.is_multiple_of(every.max(1));
+        self.calls = self.calls.saturating_add(1);
+        self.last = plan.to_vec();
+        if every == 0 || plan.is_empty() || !(changed || due) { return String::new(); }
+        let lines = plan.iter().take(50).enumerate().map(|(i, step)| {
+            let status = match step.status {
+                super::events::TodoStatus::Pending => "pending",
+                super::events::TodoStatus::InProgress => "in_progress",
+                super::events::TodoStatus::Done => "done",
+            };
+            format!("{}. [{}] {}", i + 1, status, step.text.chars().take(300).collect::<String>())
+        }).collect::<Vec<_>>().join("\n");
+        format!("\n\nCurrent plan (keep statuses up to date):\n{lines}")
+    }
+
+    fn nudge(&mut self, plan: &[TodoItem], limit: u32) -> Option<String> {
+        let pending = plan.iter().filter(|s| s.status != super::events::TodoStatus::Done).count();
+        if pending == 0 || self.nudges >= limit.min(2) { return None; }
+        self.nudges += 1;
+        let remaining = if pending == 1 { "1 plan step is still pending".into() } else { format!("{pending} plan steps are still pending") };
+        Some(format!("{remaining}: continue, or update the plan if they are no longer needed. You may also end the turn if appropriate."))
+    }
 }
 
 enum Streamed {
@@ -687,8 +737,9 @@ fn update_plan(s: &Arc<Shared>, run: &Run, id: String, name: String, input: &Val
     let parsed: Option<Vec<TodoItem>> = input.get("plan").and_then(Value::as_array).map(|steps| {
         steps
             .iter()
+            .take(50)
             .filter_map(|st| {
-                let text = st.get("step").or(st.get("text")).and_then(Value::as_str)?.to_owned();
+                let text = st.get("step").or(st.get("text")).and_then(Value::as_str)?.chars().take(300).collect();
                 let status = serde_json::from_value(st.get("status").cloned().unwrap_or(json!("pending"))).ok()?;
                 Some(TodoItem { text, status })
             })
@@ -818,6 +869,9 @@ mod tests {
             effort: "low".into(),
             session_id: "s".into(),
             history: vec![],
+            plan: vec![],
+            plan_reminder_every: 6,
+            plan_nudge_limit: 0,
             interactive: true,
             tools: crate::tools::builtin(),
             system: "sys".into(),
@@ -835,6 +889,63 @@ mod tests {
             if done {
                 return out;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_initial_plan_starts_and_completes_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let handler: Handler = Arc::new(|_: &Value| sse(&[json!({"type":"text","text":"Finished"})], "end_turn"));
+        let url = mock(handler, seen.clone()).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.plan = crate::initial_plan("garbage");
+        assert!(cfg.plan.is_empty());
+        cfg.plan_nudge_limit = 2;
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        h.input.send(AgentInput::User { text: "Work".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionStart { .. })));
+        assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "end_turn"));
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0]["system"].as_str().unwrap().contains("Current plan"));
+    }
+
+    #[test]
+    fn plan_reminders_follow_cadence_changes_and_off_setting() {
+        let mut reminders = PlanReminders::default();
+        let mut plan = vec![TodoItem { text: "Implement".into(), status: super::super::events::TodoStatus::InProgress }];
+        assert!(reminders.context(&plan, 6).contains("[in_progress] Implement"));
+        for _ in 0..5 { assert!(reminders.context(&plan, 6).is_empty()); }
+        assert!(!reminders.context(&plan, 6).is_empty());
+        plan[0].status = super::super::events::TodoStatus::Done;
+        assert!(reminders.context(&plan, 6).contains("[done] Implement"));
+        assert!(reminders.context(&plan, 0).is_empty());
+        assert!(reminders.context(&[], 1).is_empty());
+        for _ in 0..2 { assert!(reminders.nudge(&plan, 2).is_none()); }
+    }
+
+    #[tokio::test]
+    async fn pending_plan_nudges_are_capped_and_never_prevent_completion_or_followups() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let handler: Handler = Arc::new(|_: &Value| sse(&[json!({"type":"text","text":"Finished for now"})], "end_turn"));
+        let url = mock(handler, seen.clone()).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.plan = vec![TodoItem { text: "Unfinished work".into(), status: super::super::events::TodoStatus::InProgress }];
+        cfg.plan_nudge_limit = 100;
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        for turn in 1..=2 {
+            h.input.send(AgentInput::User { text: "continue".into(), images: vec![] }).unwrap();
+            let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
+            assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "end_turn"));
+            assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), turn * 3, "one response plus at most two nudges per user turn");
+            assert!(requests[(turn - 1) * 3]["system"].as_str().unwrap().contains("Unfinished work"), "plan survives follow-ups");
+            let last = requests.last().unwrap()["messages"].as_array().unwrap().last().unwrap();
+            assert!(last["content"][0]["text"].as_str().unwrap().contains("1 plan step is still pending"));
         }
     }
 
@@ -1148,6 +1259,7 @@ mod tests {
         h.input.send(AgentInput::User { text: "continue".into(), images: vec![] }).unwrap();
         until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
         let reqs = seen.lock().unwrap();
+        assert!(reqs[1]["system"].as_str().unwrap().contains("[in_progress] edit"), "plan change reaches the very next request");
         let listed = reqs[1]["messages"][2]["content"][1]["content"][0]["text"].as_str().unwrap();
         assert_eq!(listed, "1. [done] read\n2. [in_progress] edit");
         let last = reqs.last().unwrap()["messages"].as_array().unwrap();

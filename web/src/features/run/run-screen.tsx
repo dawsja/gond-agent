@@ -18,6 +18,7 @@ import { StatusPill } from "../studio/parts"
 import { Shell } from "../studio/shell"
 import { mono, tabs } from "../studio/theme"
 import { Menu, MenuContent, MenuItem, MenuTrigger } from "@shared/menu"
+import { TasksPanel } from "./tasks-panel"
 import { SidePanel } from "./side-panel"
 import { TranscriptView } from "./transcript-view"
 import { prefs } from "@/lib/prefs"
@@ -71,6 +72,7 @@ export function RunScreen() {
   const r = run.data
   if (!r) return <Shell active="Home" crumbs={<span className="text-muted-foreground">Runs</span>} children={null} />
 
+  const planSteps = t.items.find(item => item.kind === "plan")?.steps ?? r.summary?.plan_steps ?? []
   const live = r.status === "working" || r.status === "queued"
   const merged = r.status === "merged" || r.pr_state === "merged"
   const retired = !!r.retired_backend
@@ -188,7 +190,8 @@ export function RunScreen() {
         <span className="shrink-0">{pill}</span>
       </div>
       <section className={cn("relative flex min-h-0 flex-col", view === "details" && "max-md:hidden")}>
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-8 bg-gradient-to-b from-background to-transparent" />
+        <TasksPanel steps={planSteps} />
+        {!planSteps.length && <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-8 bg-gradient-to-b from-background to-transparent" />}
         <div
           ref={scroller}
           onScroll={(e) => {

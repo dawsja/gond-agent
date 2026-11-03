@@ -122,6 +122,24 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 describe("persistent local run lifecycle", () => {
+  it("retains plans across follow-ups, workspace reopen and service recovery", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Work"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const plan = [{text:"Read",status:"done"}, {text:"Implement",status:"in_progress"}];
+    events.push({type:"todos",agent_id:"main",items:plan});
+    await vi.waitFor(() => expect(runs.get(r.id).summary.plan_steps).toEqual(plan));
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary).toMatchObject({plan_steps:plan,plan_done:1,plan_total:2});
+    await runs.close(r.id);
+    await runs.recover();
+    runs.enqueue(r.id, "u", "Reopen");
+    await vi.waitFor(() => expect(log.filter(x => x.method === "start")).toHaveLength(2));
+    expect(log.filter(x => x.method === "start")[1]).toMatchObject({plan});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary.plan_steps).toEqual(plan);
+  });
+
   it("routes a pending question answer to the worker instead of queuing it", async () => {
     const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Explain it"});
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
