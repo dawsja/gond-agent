@@ -182,3 +182,23 @@ After reading the result and diff and opening any desired PR, call `close_sessio
 ```json
 {"closed":true}
 ```
+
+## Task plan state
+
+`update_plan {plan:[{step,status}],explanation?}` replaces the main worker's plan; `list_plan {}` reads it. Statuses are `pending`, `in_progress`, `done`. Multi-step tasks should begin with a plan, keep one step in progress while working, and update statuses as work changes. Plans are bounded to 50 steps and 300 characters per text. `todos {agent_id:"main",items:[{text,status}]}` events replace the displayed plan and persisted summary; subagent plans do not change it.
+
+`get_session`, `list_sessions` entries and `read_session_events` share additive fields:
+- `plan_steps`: up to 50 `{text,status}` entries, text limited to 300 characters.
+- `plan_done`, `plan_total`: counts over those bounded entries.
+- `current_step`: `{text,index}` for the first `in_progress` step (1-based), or `null`.
+
+No plan returns `[]`, `0`, `0`, `null`. These fields are independent of session completion: `done:true` is valid with unfinished plan steps.
+
+Example JSON inside MCP text content:
+```json
+{"id":"run_example","state":"working","done":false,"plan_steps":[{"text":"Inspect code","status":"done"},{"text":"Implement change","status":"in_progress"},{"text":"Run checks","status":"pending"}],"plan_done":1,"plan_total":3,"current_step":{"text":"Implement change","index":2}}
+```
+
+The API folds plan snapshots into durable run summaries and reconstructs older summaries from the latest stored main `todos` event. Follow-ups preserve them. Controller `start` accepts optional `plan` plus `plan_reminder_every` and `plan_nudge_limit`, forwarded as `GOND_AGENT_INITIAL_PLAN`, `GOND_AGENT_PLAN_REMINDER_EVERY` and `GOND_AGENT_PLAN_NUDGE_LIMIT` to the runner. Reopened containers receive the stored plan, including after service recovery; this does not restore lost filesystem changes or the complete model history.
+
+Reminders are main-loop request context, not transcript events or provider-specific behavior. The interval counts main model rounds, resets per user turn, defaults to 6, and 0 disables reminders including change-triggered ones. With reminders enabled the first request and the request immediately after a plan change include current statuses. Pending/in-progress steps may trigger at most two continuation nudges per user turn (configurable down to 0). The counter never resets on plan edits or tool calls. Exhausting nudges ends normally on the next final response, without checking plan completion. Interrupted/error paths do not trigger nudges. No review/completion gate exists.
