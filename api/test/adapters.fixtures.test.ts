@@ -129,6 +129,10 @@ describe("provider errors, discovery and capabilities", () => {
   it.each([
     [401, { error: { code: "invalid_api_key", message: "Incorrect API key provided: sk-proj-abc" } }, "provider_auth", false],
     [400, { type: "error", error: { type: "invalid_request_error", message: "prompt is too long: 210000 tokens > 200000 maximum" } }, "context_exceeded", false],
+    [400, { error: { code: "context_length_exceeded" } }, "context_exceeded", false],
+    [400, { error: { code: "prompt_too_long" } }, "context_exceeded", false],
+    [400, { error: { code: "max_context_length_exceeded" } }, "context_exceeded", false],
+    [400, { error: { code: "invalid_argument", message: "Prompt length exceeds the maximum number of tokens" } }, "context_exceeded", false],
     [429, { error: { code: "insufficient_quota", message: "You exceeded your current quota" } }, "provider_quota", false],
     [429, { error: { type: "rate_limit_error", message: "Too many requests" } }, "provider_rate_limit", true],
     [529, { type: "error", error: { type: "overloaded_error", message: "Overloaded" } }, "provider_unavailable", true],

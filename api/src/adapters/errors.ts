@@ -12,7 +12,8 @@ export function errorParts(body: unknown): { code?: string; message: string } {
 /** A plain message for an API connection's failure. Provider bodies stay in server logs. */
 export function providerFailure(status: number, body: unknown): ApiError {
   const { code, message } = errorParts(body);
-  if (code === "context_length_exceeded" || /prompt is too long|maximum context|context length|context window/i.test(message))
+  if (["context_exceeded", "context_length_exceeded", "prompt_too_long", "max_context_length_exceeded"].includes(code ?? "")
+    || /prompt is too long|maximum context|context length|context window|prompt length exceeds|too many tokens|maximum number of tokens/i.test(message))
     return new ApiError(400, "context_exceeded", "The conversation is too long for this model.");
   if (code === "insufficient_quota" || code === "billing_error")
     return new ApiError(402, "provider_quota", "The provider account has no remaining credit or quota. Check billing with the provider.");

@@ -199,6 +199,10 @@ API: `cd api && npm ci && BETTER_AUTH_SECRET=<random-32+-characters> npm run dev
 
 Validation commands and development rules are in [AGENTS.md](AGENTS.md). CI typechecks/tests the API, lints/builds the workspace frontend, checks/tests the worker and builds both Docker targets. Only the workspace frontend enters the runtime image. Docker CI runs real container lifecycle, model relay, Git export, interruption, recovery and browser tests, including first-administrator registration, provider setup and sign-in after a restart at desktop/phone sizes on HTTP. To run the full suite locally after building both images: `cd api && GOND_AGENT_CONTAINER_TEST_IMAGE=gond-agent-worker:local GOND_AGENT_RUNTIME_TEST_IMAGE=gond-agent:local npm test -- test/containers.integration.test.ts`.
 
+### Long conversations
+
+Long conversations compact automatically near the model's context limit, including between tool rounds, and continue without another prompt. Recent complete rounds stay verbatim; older work becomes a summary with the current plan and explicit file paths. Oversized summary input is clipped and summarized in bounded chunks. Context overflow triggers one automatic compact-and-retry. A turn stops with a plain error after five compactions or a repeated overflow; send a follow-up or choose a larger-window model if the recent context itself is too large. The transcript keeps earlier output and shows a “Context compacted” marker. Task histories receive the same protection.
+
 ### Task plans
 
 For multi-step work, the built-in runner can use `update_plan` and `list_plan`. The plan shows as a checklist in the conversation and is also available to other tools over MCP. Run lists show plan counts while work is active.
