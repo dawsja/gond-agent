@@ -58,6 +58,7 @@ export function createApp(
   });
   app.use("*", async (c, next) => {
     await next();
+    c.header("Content-Security-Policy", "img-src 'self' data: blob:");
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "same-origin");
     c.header("X-Frame-Options", "DENY");

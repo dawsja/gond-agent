@@ -5,7 +5,7 @@ import { ApiError } from "./wire";
 
 export function photoFor(db: Store, user: { id: string; image?: string | null }) {
   const row = db.prepare("SELECT revision FROM profile_photos WHERE user_id=?").get(user.id) as { revision: string } | undefined;
-  return { image: row ? `/api/v1/users/${encodeURIComponent(user.id)}/photo?v=${row.revision}` : user.image ?? null, has_photo: !!row };
+  return { image: row ? `/api/v1/users/${encodeURIComponent(user.id)}/photo?v=${row.revision}` : null, has_photo: !!row };
 }
 
 export async function savePhoto(db: Store, user: string, input: Buffer) {

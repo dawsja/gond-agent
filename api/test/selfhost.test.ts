@@ -76,6 +76,13 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 describe("local authentication and persistence", () => {
+  it("sets an image-only CSP on HTML and SPA responses", async () => {
+    for (const path of ["/agents/", "/agents/settings", "/health"]) {
+      const response = await call(path);
+      expect(response.headers.get("content-security-policy")).toBe("img-src 'self' data: blob:");
+    }
+  });
+
   it("saves sanitized circular photos for the current account and removes them without changing other users", async () => {
     const owner = await signup(), other = await signup("photo-other@example.test");
     const input = await sharp({ create: { width: 300, height: 200, channels: 3, background: "#ff0000" } }).withExif({ IFD0: { Artist: "Private photo metadata" } }).jpeg().toBuffer();
@@ -335,6 +342,7 @@ describe("local authentication and persistence", () => {
           email: "oidc@example.com",
           email_verified: true,
           name: "OIDC User",
+          picture: "https://www.gravatar.com/avatar/x",
         });
       if (url.endsWith("/token")) {
         const now = Math.floor(Date.now() / 1000);
@@ -348,6 +356,7 @@ describe("local authentication and persistence", () => {
             email: "oidc@example.com",
             email_verified: true,
             name: "OIDC User",
+            picture: "https://www.gravatar.com/avatar/x",
             nonce,
             iat: now,
             exp: now + 300,
@@ -390,48 +399,52 @@ describe("local authentication and persistence", () => {
       const target = db.prepare('SELECT id FROM "user" WHERE email=?').get("identity-owner@example.com") as { id: string };
       db.prepare('INSERT INTO account(id,accountId,providerId,userId,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("existing-oidc", "external-user", "oidc", target.id, Date.now(), Date.now());
     }
-    const start = await call(mode === "link" || mode === "conflict" ? "/api/auth/link-social" : "/api/auth/sign-in/social", {
-      provider: "oidc",
-      callbackURL: "http://localhost:8787/agents/",
-    }, mode === "link" || mode === "conflict" ? cookie : "");
-    expect(start.status, await start.clone().text()).toBe(200);
-    const url = new URL((await start.json()).url);
-    expect(url.origin).toBe(issuer);
-    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
-    nonce = url.searchParams.get("nonce")!;
-    expect(nonce).toBeTruthy();
-    const state = url.searchParams.get("state")!;
-    const stateCookie = start.headers
-      .getSetCookie()
-      .map((x) => x.split(";")[0])
-      .join("; ");
-    const result = await call(
-      "/api/auth/callback/oidc?code=test-code&state=" +
-        encodeURIComponent(state),
-      undefined,
-      stateCookie + "; " + cookie,
-    );
-    if (mode === "implicit" || mode === "conflict") {
-      expect(result.headers.get("location")).toContain(mode === "implicit" ? "account_not_linked" : "account_already_linked_to_different_user");
-      expect(db.prepare('SELECT count(*) AS n FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ n: 0 });
-      return;
+    for (let attempt = 0; attempt < (mode === "signup" ? 2 : 1); attempt++) {
+      const start = await call(mode === "link" || mode === "conflict" ? "/api/auth/link-social" : "/api/auth/sign-in/social", {
+        provider: "oidc",
+        callbackURL: "http://localhost:8787/agents/",
+      }, mode === "link" || mode === "conflict" ? cookie : "");
+      expect(start.status, await start.clone().text()).toBe(200);
+      const url = new URL((await start.json()).url);
+      expect(url.origin).toBe(issuer);
+      expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+      nonce = url.searchParams.get("nonce")!;
+      expect(nonce).toBeTruthy();
+      const state = url.searchParams.get("state")!;
+      const stateCookie = start.headers
+        .getSetCookie()
+        .map((x) => x.split(";")[0])
+        .join("; ");
+      const result = await call(
+        "/api/auth/callback/oidc?code=test-code&state=" +
+          encodeURIComponent(state),
+        undefined,
+        stateCookie + "; " + cookie,
+      );
+      if (mode === "implicit" || mode === "conflict") {
+        expect(result.headers.get("location")).toContain(mode === "implicit" ? "account_not_linked" : "account_already_linked_to_different_user");
+        expect(db.prepare('SELECT count(*) AS n FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ n: 0 });
+        return;
+      }
+      if (mode === "link") {
+        expect(db.prepare('SELECT accountId FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ accountId: "external-user" });
+        expect(db.prepare('SELECT count(*) AS n FROM "user"').get()).toEqual({ n: 1 });
+        return;
+      }
+      expect(result.headers.get("location")).toBe(
+        "http://localhost:8787/agents/",
+      );
+      const signed = result.headers
+        .getSetCookie()
+        .map((x) => x.split(";")[0])
+        .join("; ");
+      const session = await auth.current.api.getSession({
+        headers: new Headers({ cookie: signed }),
+      });
+      expect(session?.user.email).toBe("oidc@example.com");
+      expect(session?.user.image).toBeNull();
+      expect(db.prepare('SELECT image FROM "user" WHERE id=?').get(session!.user.id)).toEqual({ image: null });
     }
-    if (mode === "link") {
-      expect(db.prepare('SELECT accountId FROM account WHERE providerId=? AND userId=?').get('oidc', existing!.user.id)).toEqual({ accountId: "external-user" });
-      expect(db.prepare('SELECT count(*) AS n FROM "user"').get()).toEqual({ n: 1 });
-      return;
-    }
-    expect(result.headers.get("location")).toBe(
-      "http://localhost:8787/agents/",
-    );
-    const signed = result.headers
-      .getSetCookie()
-      .map((x) => x.split(";")[0])
-      .join("; ");
-    const session = await auth.current.api.getSession({
-      headers: new Headers({ cookie: signed }),
-    });
-    expect(session?.user.email).toBe("oidc@example.com");
   });
   it("permits only the initial registration when signup is closed", async () => {
     const closed = await createAuthentication(db, { ...cfg(), signup: false });
@@ -521,6 +534,9 @@ describe("container and input boundaries", () => {
     expect(args).toContain("no-new-privileges=true");
     expect(args).toContain("2048m");
     expect(args).toContain("type=volume,source=gond-agent-test-work,target=/workspace/repo");
+    expect(args).toContain("type=volume,source=gond-agent-test-tools,target=/opt/gond-tools");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,noexec,size=1g,uid=1000,gid=1000,mode=1777");
+    expect(args).toContain("/home/gond-agent:rw,nosuid,nodev,noexec,size=256m,uid=1000,gid=1000");
     expect(args).not.toContain("--privileged");
     expect(args.join(" ")).not.toMatch(/docker\.sock|\/data|\/gh|secret|token/);
   });
