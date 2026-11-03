@@ -39,7 +39,7 @@ def main():
              call("defs", "symbols", {"action": "definitions", "symbol": "greet"}),
              call("reads", "batch", {"calls": [{"tool": "read", "input": {"path": "app.ts"}}, {"tool": "symbols", "input": {"action": "references", "symbol": "greet"}}]})],
             [call("write", "write", {"path": "feature.txt", "content": "verified\n"})],
-            [call("check", "bash", {"command": "test \"$(cat feature.txt)\" = verified"})],
+            [call("check", "bash", {"command": "test \"$(cat feature.txt)\" = verified && bun --version && uv --version"})],
             [call("ui", "browser", {"url": f"http://127.0.0.1:{app.server_port}", "script": "await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
             [call("diff", "bash", {"command": "git diff --no-ext-diff; git ls-files --others --exclude-standard; cat feature.txt"})],
         ]

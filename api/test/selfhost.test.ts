@@ -517,6 +517,9 @@ describe("container and input boundaries", () => {
     expect(args).toContain("no-new-privileges=true");
     expect(args).toContain("2048m");
     expect(args).toContain("type=volume,source=gond-agent-test-work,target=/workspace/repo");
+    expect(args).toContain("type=volume,source=gond-agent-test-tools,target=/opt/gond-tools");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,noexec,size=1g,uid=1000,gid=1000,mode=1777");
+    expect(args).toContain("/home/gond-agent:rw,nosuid,nodev,noexec,size=256m,uid=1000,gid=1000");
     expect(args).not.toContain("--privileged");
     expect(args.join(" ")).not.toMatch(/docker\.sock|\/data|\/gh|secret|token/);
   });
