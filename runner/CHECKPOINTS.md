@@ -10,13 +10,13 @@ through the sealed checkpoint store, and coordinates recovery and cleanup.
 
 ```json
 {"type":"export_state","request_id":"save-1","run_id":"run-123","owner_id":"user-456"}
-{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-1","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 ```
 
 Send that **state object**, not its wrapper or a model request, to a fresh worker:
 
 ```json
-{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-1","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 {"type":"state.imported","request_id":"load-1"}
 ```
 
@@ -179,7 +179,9 @@ Once a question resolves, the next checkpoint includes its paired result.
 - Both `SCHEMA_VERSION` and the explicit `RUNNER_STATE_VERSION` compatibility
   epoch must match exactly. The epoch is independent of Cargo's package version;
   **bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. No old-version migration or permissive fallback is provided.
+  incompatible**. Epoch 2 makes `sub_counter` the child-ID sequence and consumed
+  general-purpose delegation allowance; epoch 1's unrestricted ID counter is not
+  compatible. No old-version migration or permissive fallback is provided.
 - Commands supply the expected run and owner. Import checks both against state;
   the first export or successful import binds subsequent controls on that
   worker. This is not authentication: the service must independently check
@@ -188,7 +190,7 @@ Once a question resolves, the next checkpoint includes its paired result.
 ## Restored state and service integration
 
 History preserves compaction's untrusted user-role summary and deterministic
-file notes verbatim. The current plan, main context estimate, subagent ID counter,
+file notes verbatim. The current plan, main context estimate, subagent ID/consumed-allowance counter,
 plan reminder calls/last plan/nudge count, and per-turn compaction count/skip
 length are saved. Imported cadence/nudge/compaction counters are consumed by the
 first subsequent main turn; ordinary later user turns still reset their own
@@ -198,7 +200,8 @@ ordinary transcript frames. The caller must send the intended continuation.
 Runtime configuration (model/effort, prompts/instructions, permission mode/rules,
 skills/tools, cadence interval/nudge limit, question timeout) comes from the new
 worker, not checkpoint JSON. The service must supply the intended configuration.
-Live subagent histories, shells/processes, read sets, edit baselines, pending
+Browser sessions/profiles/refs, LSP processes, live subagent histories,
+shells/processes, read sets, edit baselines, pending
 permissions/questions, filesystem/Git state and external side effects are not
 restored. A checkpoint alone is not exactly-once execution or a filesystem
 snapshot: the service must pair it with the correct checkout/bundle and define

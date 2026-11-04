@@ -75,6 +75,15 @@ jobs:
           tags: gond-agent-worker:test
           cache-from: type=gha,scope=worker-image
           cache-to: type=gha,mode=max,scope=worker-image
+      - name: Smoke the finished worker image
+        run: |
+          docker run --rm --init --network=none --read-only \
+            --cap-drop=ALL --security-opt=no-new-privileges \
+            --memory=2g --cpus=2 --pids-limit=512 --shm-size=256m \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g,uid=1000,gid=1000 \
+            --tmpfs /home/gond-agent:rw,nosuid,nodev,noexec,size=256m,uid=1000,gid=1000 \
+            --volume /opt/gond-tools --volume /workspace/repo \
+            --entrypoint python3 gond-agent-worker:test /opt/gond-agent/smoke-worker-image.py
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24

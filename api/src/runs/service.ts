@@ -106,7 +106,7 @@ export interface Run extends CiInfo {
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
-const RUNNER_STATE_VERSION = "gond-agent-checkpoint-1";
+const RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
 interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
