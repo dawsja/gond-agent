@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
@@ -123,6 +123,13 @@ function queuedIds() {
   return (db.prepare("SELECT id FROM runs WHERE queue_seq IS NOT NULL ORDER BY queue_seq").all() as { id: string }[]).map(row => row.id);
 }
 function countRuns() { return (db.prepare("SELECT count(*) AS n FROM runs").get() as { n: number }).n; }
+function saveCheckpoint(id: string) {
+  const run = runs.get(id);
+  const key = { runId: id, ownerId: run.user_id, runnerVersion: "gond-agent-checkpoint-2" };
+  const checkpoint = runs.checkpoints.save({ ...key, bundle: Buffer.from("opaque checkpoint"), state: "{}",
+    tree: { baseSha: run.base_sha!, headSha: run.head_sha!, checkpointSha: "c".repeat(40) } });
+  return { key, checkpoint, bundlePath: join(dir, "checkpoints", checkpoint.bundle_path), statePath: join(dir, "checkpoints", checkpoint.state_path) };
+}
 
 beforeEach(async () => {
   vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
@@ -259,7 +266,7 @@ describe("persistent workspace queue", () => {
     // restoration is covered by checkpoint-recovery.test.ts; this worker has none.
     expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false });
     expect(releases).toEqual([active.id]);
-    expect(starts).toEqual([active.id, waiting.id]);
+    await vi.waitFor(() => expect(starts).toEqual([active.id, waiting.id]));
   });
 
   it("preserves unpublished work after model failure until explicit close", async () => {
@@ -461,6 +468,7 @@ describe("persistent workspace queue", () => {
 
     // Only the service safety-net timer runs: no manual close, drain or polling.
     await vi.advanceTimersByTimeAsync(120_000); await flush();
+    await vi.waitFor(() => expect(workspaces.get(waiting.id)?.users()).toEqual(["Say OK"]));
     expect(releases).toEqual([oldest.id]);
     expect(reclaim).toHaveBeenCalledWith(oldest.id, true);
     expect(starts).toEqual([oldest.id, newer.id, waiting.id]);
@@ -471,7 +479,7 @@ describe("persistent workspace queue", () => {
     expect(runs.history(oldest.id, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
   });
 
-  it.each(["dirty", "different head", "question", "waiting for input", "CI watch", "pending message", "auto resume", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
+  it.each(["dirty", "different head", "question", "waiting for input", "CI watch", "pending message", "interrupted", "auto resume", "checkpoint resume", "recovery finishing", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
     const active = await create(); await finish(active.id);
     if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;
     else if (unsafe === "different head") workspaces.get(active.id)!.state.head = "c".repeat(40);
@@ -484,7 +492,10 @@ describe("persistent workspace queue", () => {
       }
       if (unsafe === "CI watch") r.ci_active = true;
       if (unsafe === "pending message") r.pending.push({ text: "Pending", images: [] });
-      if (unsafe === "auto resume") r.phase = "auto_resume_pending";
+      if (unsafe === "interrupted") { r.status = "working"; runs.save(r); r.status = "interrupted"; }
+      if (unsafe === "auto resume") { r.phase = "auto_resume_pending"; r.auto_resume_pending = true; }
+      if (unsafe === "checkpoint resume") r.resume_from_checkpoint = true;
+      if (unsafe === "recovery finishing") r.recovery_phase = "finishing";
       if (unsafe === "merged pending") { r.pr_state = "merged"; r.phase = "merged_pending"; }
       runs.save(r);
     }
@@ -496,6 +507,55 @@ describe("persistent workspace queue", () => {
     expect(runs.get(waiting.id).status).toBe("queued");
     expect(runs.get(waiting.id).capacity?.idle_releasable).toBe(0);
     expect(runs.history(active.id, 0).some(e => e.type === "run.released")).toBe(false);
+  });
+
+  it.each([
+    ["before selection", "release"], ["before selection", "consume"],
+    ["during evidence", "release"], ["during publication", "release"],
+  ] as const)("protects a checkpoint claim acquired %s until %s, then uses checkpoint-discarding close", async (when, completion) => {
+    const active = await create(); await finish(active.id);
+    const saved = saveCheckpoint(active.id);
+    let claim: ReturnType<typeof runs.checkpoints.claim> = null;
+    const acquire = () => { claim = runs.checkpoints.claim(saved.key); expect(claim).not.toBeNull(); };
+    if (when === "before selection") acquire();
+    const workspace = workspaces.get(active.id)!;
+    const rpc = workspace.rpc.bind(workspace);
+    vi.spyOn(workspace, "rpc").mockImplementation((method, args) => {
+      if (!claim && ((when === "during evidence" && method === "workspace_state") ||
+          (when === "during publication" && method === "snapshot"))) acquire();
+      return rpc(method, args);
+    });
+    const waiting = await create("b", "Say OK");
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    expect(claim).not.toBeNull();
+    expect(releases).toEqual([]);
+    expect(starts).toEqual([active.id]);
+    expect(runs.get(waiting.id)).toMatchObject({ status: "queued", capacity: { occupied: 1, idle_releasable: 0 } });
+    expect(runs.history(active.id, 0).some(e => e.type === "run.released")).toBe(false);
+    expect(db.prepare("SELECT claimed_by,consumed_at FROM run_checkpoints WHERE seq=?").get(saved.checkpoint.seq))
+      .toMatchObject({ claimed_by: claim!.claimToken, consumed_at: null });
+    expect(existsSync(saved.bundlePath) && existsSync(saved.statePath)).toBe(true);
+
+    if (completion === "consume") runs.checkpoints.consumeClaim(saved.key, saved.checkpoint.seq, claim!.claimToken);
+    else runs.checkpoints.release(saved.key, saved.checkpoint.seq, claim!.claimToken);
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=?").get(active.id)).toBeUndefined();
+    expect(existsSync(saved.bundlePath) || existsSync(saved.statePath)).toBe(false);
+    expect(runs.history(active.id, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
+  });
+
+  it("retains checkpoints on preserving close and discards them on a later ordinary close", async () => {
+    const active = await create(); await finish(active.id);
+    const saved = saveCheckpoint(active.id);
+    await runs.close(active.id, false, true);
+    expect(runs.checkpoints.load(saved.key)?.checkpoint.seq).toBe(saved.checkpoint.seq);
+    expect(existsSync(saved.bundlePath) && existsSync(saved.statePath)).toBe(true);
+    await runs.closeSession(active.id, "a");
+    expect(runs.checkpoints.load(saved.key)).toBeNull();
+    expect(existsSync(saved.bundlePath) || existsSync(saved.statePath)).toBe(false);
   });
 
   it("retains a workspace if publication creates new edits or a background writer", async () => {

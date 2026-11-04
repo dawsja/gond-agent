@@ -21,7 +21,7 @@ const now = 180_000;
 function safe(): ReleaseCandidate {
   return { run: { status: "ready", phase: "agent", pending: [], summary: emptySummary(), pushed: true,
     head_sha: "a".repeat(40), pr_state: "open" }, live: true, busy: false, closing: false, booting: false,
-    publicationPending: false, idleSince: 0, delayMs: 120_000, state: { head: "a".repeat(40), clean: true } };
+    publicationPending: false, checkpointClaimed: false, idleSince: 0, delayMs: 120_000, state: { head: "a".repeat(40), clean: true } };
 }
 
 describe("idle release safety table (shared by reporting and eviction)", () => {
@@ -42,6 +42,9 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
     ["dirty worktree", c => { c.state!.clean = false; }],
     ["unknown worker evidence", c => { c.state = undefined; }],
     ["auto resume pending", c => { c.run.auto_resume_pending = true; }],
+    ["checkpoint resume pending", c => { c.run.resume_from_checkpoint = true; }],
+    ["recovery finishing", c => { c.run.recovery_phase = "finishing"; }],
+    ["interrupted phase", c => { c.run.phase = "interrupted"; }],
     ["finishing", c => { c.run.phase = "finishing"; }],
     ["booting phase", c => { c.run.phase = "booting"; }],
     ["merged pending phase", c => { c.run.phase = "merged_pending"; }],
@@ -51,6 +54,7 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
     ["closing", c => { c.closing = true; }],
     ["reserved boot", c => { c.booting = true; }],
     ["pending publication", c => { c.publicationPending = true; }],
+    ["live checkpoint claim", c => { c.checkpointClaimed = true; }],
     ["unknown idle start", c => { c.idleSince = undefined; }],
     ["not idle long enough", c => { c.idleSince = now - 119_999; }],
     ["disabled", c => { c.delayMs = 0; }],

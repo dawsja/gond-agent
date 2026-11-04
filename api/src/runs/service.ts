@@ -259,6 +259,7 @@ export class Runs {
       run: row ? parseRun(row.data) : { status: "failed", phase: "idle", pending: [], summary: emptySummary(), pushed: false, head_sha: null, pr_state: null },
       live: !!row && this.live.get(id) === live && !live.closed, busy: live.busy, closing: !!live.closing,
       booting: this.booting.has(id), publicationPending: !!live.publishPending,
+      checkpointClaimed: !!this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND claimed_by IS NOT NULL AND consumed_at IS NULL LIMIT 1").get(id),
       idleSince: live.idleSince, delayMs: this.idleDelay, state: live.state,
     };
   }
