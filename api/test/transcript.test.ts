@@ -158,6 +158,30 @@ it("updates the PR presentation after external merges without duplicating the op
   expect(merged.log.at(-1)?.text).toBe("merged pull request #42");
 });
 
+it("keeps CI status compact and automatic follow-ups separate from user messages", () => {
+  const append = createTranscript();
+  const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq, type, ...fields });
+  const pending = event(1, "run.ci", { state: "pending", round: 0, sha: "abc", failing: [] });
+  const before = append([pending]);
+  const updates = [
+    event(2, "run.ci", { state: "failing", round: 0, sha: "abc", failing: ["typecheck"], reason: "Checks failed." }),
+    event(3, "ci", { source: "ci", text: "Fix the failed checks.", images: [] }),
+    event(4, "text.delta", { text: "I will inspect the failure." }),
+    event(5, "run.ci", { state: "passing", round: 1, sha: "def", failing: [] }),
+  ];
+  const after = append(updates);
+  expect(before.items).toMatchObject([{ kind: "ci-status", state: "pending", failing: [] }]);
+  expect(after.items).toMatchObject([
+    { kind: "ci-status", state: "failing", failing: ["typecheck"], reason: "Checks failed." },
+    { kind: "ci", text: "Fix the failed checks." },
+    { kind: "text", text: "I will inspect the failure." },
+    { kind: "ci-status", state: "passing", round: 1, sha: "def" },
+  ]);
+  expect(after.items.some(item => item.kind === "user")).toBe(false);
+  expect(append([pending, ...updates])).toEqual(after);
+  expect(createTranscript()([pending, ...updates])).toEqual(after);
+});
+
 it("refreshes queue metadata on position changes and dequeue without duplicating replay", () => {
   const append = createTranscript();
   const queued = {seq:1, ts:1, type:"run.queued", position:2, length:3};

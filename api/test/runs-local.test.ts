@@ -66,6 +66,8 @@ const cfg = (): Config => ({
   runMemoryMB: 2048,
 });
 beforeEach(async () => {
+  // This suite covers retained live workspaces; enabled CI release/reopen is in ci-service.test.ts.
+  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
   db = openStore(dir);
   await createAuthentication(db, cfg());
@@ -471,7 +473,9 @@ describe("persistent local run lifecycle", () => {
       vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"network",retryable:true,reason:"Connection reset"}, 5));
       const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Publish this",branch});
       await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
-      expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,work_kept:true,head_sha:"b".repeat(40)});
+      // An imported candidate is not a confirmed remote head; retry metadata
+      // retains its SHA until publication succeeds (including reconciliation).
+      expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,work_kept:true,head_sha:null});
       expect(vi.mocked(importBundle).mock.calls[0]?.slice(2)).toEqual([
         branch, expect.objectContaining({GH_TOKEN:"test-managed-github-token"}), undefined,
         {lease:"create-only",beforePush:undefined},
