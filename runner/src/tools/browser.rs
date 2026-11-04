@@ -1,5 +1,4 @@
 //! The browser stays inside the workspace container. The model receives screenshots as image result parts.
-use base64::Engine;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -36,7 +35,7 @@ impl Tool for Browser {
                 let label = serde_json::to_string(&details).unwrap_or_default();
                 reports.push(label.clone());
                 content.push(ResultPart::Text { text: label });
-                if let Some(data) = image.filter(|s| s.len() <= 6_000_000 && base64::engine::general_purpose::STANDARD.decode(s).is_ok()) {
+                if let Some(data) = image {
                     content.push(ResultPart::Image { media_type: "image/jpeg".into(), data });
                 }
             }

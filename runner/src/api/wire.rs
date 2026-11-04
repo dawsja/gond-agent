@@ -44,7 +44,7 @@ pub enum Block {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
-    /// `data` is base64; `id` names an image uploaded to Gond Agent instead (the API fills in the bytes).
+    /// `data` is base64. Upload IDs must be resolved by the service before entering the worker.
     Image {
         media_type: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -106,6 +106,7 @@ pub struct ResponsesRequest {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    #[serde(serialize_with = "crate::images::serialize_request_images")]
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDef>,
