@@ -1,4 +1,5 @@
 import { Checkpoints } from "../checkpoints";
+import { CheckpointCaptureError, checkpointFailureReason } from "../checkpoint-failures";
 import { storeSharedImage } from "./shared-images";
 import { listRunPage, type RunListOptions } from "./list";
 import { runDiff, preferPullDiff, type PullDiff } from "./diff";
@@ -127,7 +128,12 @@ const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
 const EVIDENCE_EXPORT_TIMEOUT_MS = 10_000;
 const EVIDENCE_FLUSH_TIMEOUT_MS = 30_000;
 const EVIDENCE_SETTLE_TIMEOUT_MS = 30_000;
-class EvidenceTimeout extends Error {}
+const FAILED_CHECKPOINT_TIMEOUT_MS = 10_000;
+const FAILED_CHECKPOINT_SAVED = "Your changes and the conversation are saved; send a follow-up to continue.";
+const CHECKPOINT_CLOSED = "The workspace was closed; send a follow-up to retry from the last pushed branch.";
+class EvidenceTimeout extends CheckpointCaptureError {
+  constructor(message: string) { super("timeout", message); }
+}
 /** Evidence is advisory; bound each operation without cancelling its underlying work. */
 async function evidenceRequest<T>(request: () => Promise<T>, timeoutMs = EVIDENCE_EXPORT_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -165,6 +171,10 @@ interface Live {
   destroyRetry?: ReturnType<typeof setTimeout>;
   destroyGaveUp?: boolean;
   releaseForWaiting?: boolean;
+  /** Fence late saves after a failed-release capture times out. Never reuse this worker. */
+  checkpointDisabled?: boolean;
+  /** Active user delivery has not been acknowledged; a failure capture must not consume it. */
+  pendingDeliveryId?: string;
   keepTimer?: ReturnType<typeof setTimeout>;
   keptSince?: number;
   idleSince?: number;
@@ -461,6 +471,12 @@ export class Runs {
   private discardCheckpoint(id: string, user: string) {
     // Legacy/imported IDs outside the checkpoint namespace cannot own store files.
     if (/^run_[a-f0-9]{24}$/.test(id)) this.checkpoints.deleteRun(id, user);
+  }
+  private closeCheckpointRecovery(r: Run) {
+    this.discardCheckpoint(r.id, r.user_id);
+    r.resume_from_checkpoint = false;
+    r.error = r.error?.replace(FAILED_CHECKPOINT_SAVED, CHECKPOINT_CLOSED) ?? null;
+    this.save(r);
   }
   private checkpointKey(r: Run) { return { runId: r.id, ownerId: r.user_id, runnerVersion: RUNNER_STATE_VERSION }; }
   private latestCheckpoint(r: Run) {
@@ -1138,7 +1154,7 @@ export class Runs {
       r.phase = "agent";
       this.save(r);
       try { await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
-        if (live.closed || this.live.get(id) !== live) return;
+        if (live.closed || live.checkpointDisabled || this.live.get(id) !== live) return;
         const current = this.get(id);
         if (current.status === "stopped" || current.status === "merged") return;
         // Stop may have removed the predecessor while retaining this worker for a follow-up.
@@ -1146,15 +1162,20 @@ export class Runs {
         const predecessor = claimed;
         if (capture.state.runner_state_version !== RUNNER_STATE_VERSION) throw new Error("Incompatible runner checkpoint");
         this.checkpoints.save({ ...this.checkpointKey(current), bundle: Buffer.from(capture.bundle, "base64"),
-          state: JSON.stringify({ runner: capture.state, service: { active_message_id: current.active_message?.id } } satisfies SavedState),
+          state: JSON.stringify({ runner: capture.state, service: {
+            // A final capture before delivery acknowledgement cannot assert that
+            // this request is in history. Leave it eligible for recovery replay.
+            active_message_id: current.status === "failed" && live.pendingDeliveryId === current.active_message?.id
+              ? undefined : current.active_message?.id,
+          } } satisfies SavedState),
           tree: { baseSha: capture.base_sha, headSha: capture.head_sha, checkpointSha: capture.checkpoint_sha } }, () => {
           if (predecessor) this.checkpoints.consumeClaim(claimKey!, predecessor.checkpoint.seq, predecessor.claimToken);
           current.replay_answers = [];
           this.save(current);
         });
         if (predecessor) claimed = null;
-      }, () => this.checkpointUnavailable(id)); }
-      catch { this.checkpointUnavailable(id); }
+      }, error => this.checkpointUnavailable(id, error)); }
+      catch (error) { this.checkpointUnavailable(id, error); }
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         live.closed = true;
@@ -1208,9 +1229,9 @@ export class Runs {
       }
     } catch (e) {
       const current = this.get(id);
-      if (!bootReady && current.status !== "stopped" && this.usableCheckpoint(current)) {
-        const live = this.live.get(id);
-        if (live && live.workspace === workspace) { live.closed = true; this.live.delete(id); }
+      if (!bootReady && !this.live.has(id) && current.status !== "stopped" && this.usableCheckpoint(current)) {
+        // Once registered, even initial-delivery failures must use fail/close's
+        // shared final-capture guard instead of destroying the live workspace here.
         current.resume_from_checkpoint = true;
         this.save(current);
       }
@@ -1268,6 +1289,7 @@ export class Runs {
     r.pending.shift();
     message.id ??= randomBytes(12).toString("hex");
     r.active_message = message;
+    live.pendingDeliveryId = message.id;
     if (!message.recovery) {
       r.recovery_task = message;
       delete r.recovery_phase;
@@ -1305,6 +1327,7 @@ export class Runs {
         }),
       },
     });
+    live.pendingDeliveryId = undefined;
     live.resumeFrame = undefined;
   }
   private search(id: string, req: Request): Promise<Response> {
@@ -1443,7 +1466,7 @@ export class Runs {
     try { await evidenceRequest(() => flush, EVIDENCE_FLUSH_TIMEOUT_MS); }
     catch (error) {
       if (live.closed || this.live.get(id) !== live) return;
-      this.checkpointUnavailable(id);
+      this.checkpointUnavailable(id, error);
       // Timing out does not cancel tree export/persistence or release its hold.
       // Give that same operation a separate bounded drain before publication's
       // snapshot. Persistence failures already settle after release in the pool.
@@ -1496,7 +1519,7 @@ export class Runs {
     if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     if (!this.workerAlive(live)) { await this.workerLost(id, live); return; }
     try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
-    catch { this.checkpointUnavailable(id); }
+    catch (error) { this.checkpointUnavailable(id, error); }
     r = this.get(id);
     if (live.closed || this.live.get(id) !== live || r.status === "stopped" || r.status === "merged") { live.busy = false; await this.observeIdle(id, live); return; }
     if (published && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
@@ -1562,8 +1585,10 @@ export class Runs {
       if (this.workerAlive(live) && this.live.get(id) === live && !live.busy && live.idleSince === since) live.state = state;
     } catch { /* Unknown worker evidence fails closed and is reprobed on drain. */ }
   }
-  private checkpointUnavailable(id: string) {
-    this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
+  private checkpointUnavailable(id: string, error?: unknown) {
+    const reason = checkpointFailureReason(error);
+    console.error("Checkpoint unavailable", id, reason); // Never log exception text or state.
+    this.append(id, { type: "run.checkpoint_unavailable", reason, message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
   }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
@@ -1749,21 +1774,25 @@ export class Runs {
     if (this.booting.has(id) || live?.busy || (live?.closing && !live.closed) || r.pending.length || ["queued", "working"].includes(r.status))
       throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
     if (!live) {
-      this.discardCheckpoint(id, user);
-      r.resume_from_checkpoint = false;
-      this.save(r);
+      this.closeCheckpointRecovery(r);
       return { closed: true };
     }
     // A failed destroy retains its capacity reservation. Retry teardown instead
     // of reporting success or accepting a message into a closed worker.
     if (live.closed) {
-      this.discardCheckpoint(id, user);
-      r.resume_from_checkpoint = false;
-      this.save(r);
+      this.closeCheckpointRecovery(r);
       if (!live.destruction) await this.close(id);
       return { closed: true };
     }
-    if (r.work_kept) { await this.close(id); return { closed: true }; }
+    if (r.work_kept) {
+      try { await this.close(id); }
+      finally {
+        // Explicit Close ends recovery even if destruction needs a retry. The
+        // closed-worker fence is already in place before destruction can reject.
+        this.closeCheckpointRecovery(this.get(id));
+      }
+      return { closed: true };
+    }
     live.closing = true;
     try {
       // Both explicit Close and demand-driven idle release settle the public
@@ -1819,23 +1848,61 @@ export class Runs {
       this.drain();
     }
   }
+  /** All live failure releases pass here, independent of the failed operation.
+   * Capture only at release: an in-window follow-up keeps the original live-workspace semantics.
+   * The closing reservation excludes new delivery until the paired capture has settled. */
+  private async checkpointFailedWorkspace(id: string, live: Live | undefined) {
+    if (!live || !this.workerAlive(live) || this.get(id).status !== "failed") return;
+    live.closing = true;
+    try {
+      await evidenceRequest(async () => {
+        if (!live.workspace.captureCheckpoint) throw new Error("Workspace checkpoints unavailable");
+        // Keep the last authenticated checkout/published baseline. A failed push's
+        // local HEAD must never become a prerequisite fetched from upstream.
+        await live.workspace.captureCheckpoint();
+      }, FAILED_CHECKPOINT_TIMEOUT_MS);
+      if (!this.usableCheckpoint(this.get(id))) throw new Error("Workspace checkpoint unavailable");
+      return { saved: true, message: FAILED_CHECKPOINT_SAVED };
+    } catch (error) {
+      // Caller timeout does not cancel the RPC. Fence its save callback before
+      // deleting artifacts, so a late reply cannot resurrect a closed run's pair.
+      live.checkpointDisabled = true;
+      if (live.workspace.captureCheckpoint) this.checkpointUnavailable(id, error);
+      const failureReason = checkpointFailureReason(error);
+      const reason = error instanceof EvidenceTimeout ? " within 10 seconds" :
+        ["tree_too_large", "state_too_large", "storage_limit"].includes(failureReason) ? " because the checkpoint exceeds the size or storage limit" : "";
+      return { saved: false, message: `Your changes and the conversation could not be saved${reason}. Send a follow-up to retry from the last pushed branch.` };
+    }
+  }
   private async closeWorkspace(id: string, forCapacity: boolean, preserveCheckpoint: boolean) {
     const live = this.live.get(id);
+    // Reserve delivery synchronously, before any checkpoint await.
+    if (live) live.closing = true;
     let r: Run | undefined;
     try { r = this.get(id); }
     catch (error) {
       // Account cleanup includes soft-deleted runs, which get() deliberately hides.
       if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
     }
+    // This is the sole live-failure teardown boundary, including zero keep time,
+    // timer expiry, capacity reclaim, shutdown and explicit close-after-failure.
+    const failedCheckpoint = r ? await this.checkpointFailedWorkspace(id, live) : undefined;
     if (r) {
+      r = this.get(id); // Stop/merge may have arrived while capture was in flight.
+      if (failedCheckpoint && r.status === "failed") {
+        preserveCheckpoint = failedCheckpoint.saved;
+        const prefix = r.error?.split(/Your changes are kept;|Your changes and the conversation|Send a follow-up to retry from the last pushed branch\./)[0] ?? "";
+        r.error = prefix + failedCheckpoint.message;
+      }
       if (!preserveCheckpoint) {
         this.discardCheckpoint(id, r.user_id);
         r.resume_from_checkpoint = false;
+        r.error = r.error?.replace(FAILED_CHECKPOINT_SAVED, CHECKPOINT_CLOSED) ?? null;
       } else r.resume_from_checkpoint = !!this.usableCheckpoint(r);
       if (forCapacity && live?.publishPending?.imported)
         r.kept_commit = live.publishPending.snapshot?.head;
       r.phase = "idle";
-      if (r.work_kept && r.error)
+      if (r.work_kept && r.error && !failedCheckpoint)
         r.error = r.error.replace("Your changes are kept; send a follow-up to try again.", r.kept_commit
           ? "The workspace was released; send a follow-up to publish the saved commit and continue."
           : "The kept workspace was released; send a follow-up to retry from the last pushed branch.");

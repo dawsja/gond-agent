@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { CheckpointCaptureError, type CheckpointFailureReason } from "./checkpoint-failures";
 import { createHash, randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { seal, unseal } from "./auth";
@@ -45,9 +46,9 @@ interface Envelope {
   created_at: number;
   tree: CheckpointTree;
 }
-export class CheckpointError extends Error {
-  constructor(readonly code: "invalid" | "limit" | "unavailable" | "corrupt", message: string) {
-    super(message);
+export class CheckpointError extends CheckpointCaptureError {
+  constructor(readonly code: "invalid" | "limit" | "unavailable" | "corrupt", message: string, reason: CheckpointFailureReason = "unknown") {
+    super(reason, message);
   }
 }
 const unavailable = () => new CheckpointError("unavailable", "Checkpoint is unavailable.");
@@ -105,8 +106,10 @@ export class Checkpoints {
     this.authorize(input);
     if (!Buffer.isBuffer(input.bundle) || typeof input.state !== "string" || !validTree(input.tree))
       throw new CheckpointError("invalid", "Invalid checkpoint data.");
-    if (input.bundle.length > CHECKPOINT_BUNDLE_MAX || Buffer.byteLength(input.state) > CHECKPOINT_STATE_MAX)
-      throw new CheckpointError("limit", "Checkpoint exceeds the size limit.");
+    if (input.bundle.length > CHECKPOINT_BUNDLE_MAX)
+      throw new CheckpointError("limit", "Checkpoint exceeds the size limit.", "tree_too_large");
+    if (Buffer.byteLength(input.state) > CHECKPOINT_STATE_MAX)
+      throw new CheckpointError("limit", "Checkpoint exceeds the size limit.", "state_too_large");
     const createdAt = this.now();
     if (!Number.isSafeInteger(createdAt) || createdAt < 0)
       throw new CheckpointError("invalid", "Invalid checkpoint creation time.");
@@ -117,7 +120,7 @@ export class Checkpoints {
     // A one-line binding header avoids JSON-escaping (and expanding) the opaque UTF-8 state.
     const sealed = Buffer.from(seal(this.secret, `${JSON.stringify(envelope)}\n${input.state}`));
     if (sealed.length > SEALED_MAX || input.bundle.length + sealed.length > this.maxBytes)
-      throw new CheckpointError("limit", "Checkpoint exceeds the storage limit.");
+      throw new CheckpointError("limit", "Checkpoint exceeds the storage limit.", "storage_limit");
     const dir = join(this.root, input.runId);
     this.directory(dir);
     let published = false;
