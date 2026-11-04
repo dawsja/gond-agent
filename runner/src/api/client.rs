@@ -26,6 +26,7 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    pub status: Option<u16>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -85,6 +86,7 @@ impl ApiClient {
         let body: Value = res.json().await.unwrap_or(Value::Null);
         let e = &body["error"];
         Err(ApiError {
+            status: Some(status),
             code: e["code"].as_str().unwrap_or(if status == 401 { "unauthorized" } else { "http_error" }).into(),
             message: e["message"].as_str().map(str::to_owned).unwrap_or_else(|| status_message(status).into()),
             retryable: e["retryable"].as_bool().unwrap_or(status == 429 || status >= 500),
@@ -179,7 +181,7 @@ mod tests {
         let e = api.get::<Value>("/v1/me").await.unwrap_err();
         assert_eq!(api.describe(&e), "Can't reach Gond Agent. Check your internet connection and try again.");
 
-        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false }.into();
+        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false, status: Some(401) }.into();
         assert_eq!(api.describe(&signed_out), "You're not signed in.");
         assert_eq!(status_message(502), "Gond Agent is having trouble right now. Try again in a moment.");
     }
