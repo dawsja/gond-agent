@@ -6,7 +6,8 @@
 `persistent.cjs` is a separate typed JSON-lines daemon. The runner starts
 `node /opt/gond-agent-browser/persistent.cjs <unique-profile-directory>` lazily,
 owns its private stdio and process group, and removes the profile even after a
-forced kill. Main work and subagents serialize requests to the same page. There
+forced kill. Tool contexts internally share and serialize requests to the same
+page; current subagent policies do not grant browser tools. There
 is no TCP control listener, evaluate method or page-supplied script execution
 interface. Request names/arguments match the `browser_*` tools documented in
 `protocol/README.md`; responses are `{ok,text,image?}` (JPEG base64). Maximum

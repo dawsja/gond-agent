@@ -1,4 +1,4 @@
-// Runs through task -> general subagent -> bash -> actual shell, with the parent worker
+// Runs through task -> scoped test_writer -> run_checks -> bash -> actual shell, with the parent worker
 // test process holding the relay token. Subagents share ApiClient, not child credentials.
 #[tokio::test]
 async fn subagent_shell_children_cannot_inherit_relay_authentication() {
@@ -13,24 +13,34 @@ async fn subagent_shell_children_cannot_inherit_relay_authentication() {
         let first = body["messages"].as_array().unwrap().len() == 1;
         let reply = match (agent, first) {
             ("main", true) => sse(&[json!({"type":"tool_call","id":"delegate","name":"task","input":{
-                "description":"Check child environment","prompt":"Run the child probe","kind":"general"
+                "description":"Check child environment","prompt":"Run the child probe","kind":"test_writer"
             }})], "tool_use"),
             ("main", false) => sse(&[json!({"type":"text","text":"Done"})], "end_turn"),
-            (_, true) => sse(&[json!({"type":"tool_call","id":"probe","name":"bash","input":{
-                "command":"test \"${GOND_AGENT_RELAY_TOKEN+x}\" != x && printf subagent-child-scrubbed > child-probe.txt"
+            (_, true) => sse(&[json!({"type":"tool_call","id":"probe","name":"run_checks","input":{
+                "command":"python3 -m unittest discover -s containers -p 'test_*.py'"
             }})], "tool_use"),
-            (_, false) => sse(&[json!({"type":"text","text":"Child checked"})], "end_turn"),
+            (_, false) => sse(&[json!({"type":"text","text":"{\"added\":[],\"results\":[\"Child checked\"]}"})], "end_turn"),
         };
         seen.lock().unwrap().push(req);
         Res::new(200, "text/event-stream", reply)
     }).await;
     let dir = tempfile::tempdir().unwrap();
+    // A repository test script exercises the unchanged exec environment scrubbing.
+    std::fs::create_dir(dir.path().join("containers")).unwrap();
+    std::fs::write(dir.path().join("containers/test_environment.py"), r#"import os
+from pathlib import Path
+import unittest
+class ChildEnvironment(unittest.TestCase):
+    def test_relay_not_inherited(self):
+        self.assertNotIn("GOND_AGENT_RELAY_TOKEN", os.environ)
+        Path("child-probe.txt").write_text("subagent-child-scrubbed")
+"#).unwrap();
     let mut cfg = config(dir.path(), Mode::Allow);
     cfg.context_window = 200_000;
     let mut h = spawn(ApiClient::new(url, Some(token.clone())), cfg);
     h.input.send(AgentInput::User { text: "Delegate the probe".into(), images: vec![] }).unwrap();
     let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { agent_id, ok: true, .. } if agent_id.starts_with("general-"))));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { agent_id, ok: true, .. } if agent_id.starts_with("test_writer-"))));
     assert_eq!(std::fs::read_to_string(dir.path().join("child-probe.txt")).unwrap(), "subagent-child-scrubbed");
     assert!(!format!("{events:?}").contains(&token));
     let requests = recorded.lock().unwrap();

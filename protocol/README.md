@@ -106,7 +106,7 @@ The worker's built-in `lsp {op,path,line?,column?}` accepts `diagnostics`, `defi
 
 One lazy actor per repository/language owns the server, closes its process group on stop/cancellation or ten-minute idle expiry, and bounds calls to 20 seconds, 200 items and 30,000 characters (also below the shared 30,000-byte preview). It retains at most 16 open documents, 1 MiB each, 200 diagnostics/document and 2,000 characters/message; incoming frames are limited to 8 MiB. Unversioned push diagnostics settle for 500 ms after the latest notification and at least one second from the diagnostics wait's start, with a ten-second wait bound inside the call deadline. “No diagnostics yet” is distinct from an empty reported snapshot; neither snapshots nor settled unversioned notifications guarantee compiler-clean code. Results outside the repository, including external dependency definitions, are dropped; server text has absolute paths redacted and control characters stripped except newline/tab, and is explicitly framed as untrusted data. Mutating server requests and dynamic watcher registration are rejected. The pinned image TypeScript SDK is used without project-local plugins or automatic typing acquisition. Child environment, process limits and Cargo target scoping are documented in [the LSP guide](../containers/lsp/README.md).
 
-Persistent browser execution tools use one page shared by a turn and its subagents:
+Persistent browser execution tools use one page per turn. Child tool contexts share the session internally, but current subagent policies grant no browser tools:
 
 - `browser_open {url}`: HTTP(S) only, no embedded credentials; lazy startup.
 - `browser_snapshot {}`: bounded visible text and interactive `[eN]` refs, stable for live elements and invalidated by navigation. Truncation is noted.
@@ -318,6 +318,39 @@ The worker's loopback relay accepts POST `/v1/search` alongside model requests, 
 Built-in text results pass through one shared output wrapper (30,000-byte previews). Large results include an ephemeral path under `/tmp/gond-agent-output/` and read offset/limit or grep instructions. Shell producers spill before dropping their head/tail buffers. Files are capped at 32 MiB, total storage at 128 MiB including active reservations; oldest inactive outputs are cleaned first. A cap/busy-store failure is reported as incomplete, with narrowing/paging guidance. Paths include a sanitized call ID and unique suffix to avoid concurrent or batched collisions.
 
 `grep` supports `context_before`/`context_after`/`context`, files/content/count modes and zero-based result-line `offset`/`head_limit` paging; context lines are page rows too. Ordinary reads are streamed, at most 1 MiB per line; optional multiline searches require files no larger than 8 MiB. `bash_output` adds `wait_seconds` (0–120) and `until` (regex over unread buffered output); `bash_list` lists shells. Read-only `git` offers status/diff/log/show/blame. Optional `run_checks` reports exit_code (null for timeout/interruption), duration_seconds, summary, detected failures and an output tail; background calls return bash shell IDs. None changes completion behavior. All images use the shared worker image limits described above; `web_fetch` remains text-only and rejects raster responses.
+
+## Bounded delegation
+
+The existing worker `task` accepts `{description,prompt,kind?}`. `description` is at most 300 bytes; `prompt` at most 32000 bytes and must include the complete task plus current diff or relevant paths. There is no parent conversation copied into the child. Kinds are `reviewer`, `test_writer`, and existing read-only `explore`; legacy `general`/omitted kind now maps to `test_writer`'s narrower policy. Unknown kinds fail closed. No separate delegation transport is introduced: existing `agent.spawn`, child tool/activity/turn events and `agent.end` remain unchanged.
+
+`runner/src/agent/subagents.rs` is the single typed capability/limits table:
+
+| Kind | Capabilities | Report JSON |
+| --- | --- | --- |
+| `reviewer` | `read`, `list_directory`, `glob`, `grep`, `symbols` (ctags), read-only `git` | `{findings:[{file,line,severity:"high|medium|low",message}],verdict:"pass|changes_required|inconclusive"}` |
+| `test_writer` | Same reads; `write`, `edit`, `multi_edit`, `apply_patch` only for test paths; `run_checks` only for exact foreground test commands | `{added:["path and behavior"],results:["command, exit status and result"]}` |
+| `explore` | Same reads as reviewer | Concise text |
+
+The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. The parent-state dispatch denylist also reserves `declare_task`, `declare_unverified`, and `skip_repro` for a future evidence gate, even before those tools exist. Optional tools (including browser and language-server execution) are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
+
+The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Both lexical and resolved paths must qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
+
+Exact test command allow-list (no added shell syntax/arguments or background execution):
+
+```text
+npm test
+cd api && npm test
+cd web && npm test
+cargo test --locked -- --test-threads=1
+cd runner && cargo test --locked -- --test-threads=1
+python3 -m unittest discover -s containers -p 'test_*.py'
+```
+
+These commands use the existing `run_checks` exec/permission path and relay-token scrubbing. Test code and package scripts execute with normal workspace trust; this is not a hostile-code filesystem/network sandbox. The container remains the boundary.
+
+Named global bounds: `MAX_CALLS=4` total call slots per parent worker lifetime, split into `MAX_GENERAL_CALLS=3` general-purpose calls shared by all current kinds (including follow-ups and failed children) plus `RESERVED_REVIEWER_CALLS=1` for a future reviewer kind. The reserved slot is unavailable to all current `task` calls. Other bounds: `MAX_CONCURRENT=2`, `MAX_DEPTH=1`, `MAX_ROUNDS=48`, `MAX_TOOL_CALLS=128`, `MAX_SECONDS=180` including queued time, `CANCEL_GRACE_MILLIS=1000`, `MAX_OUTPUT_TOKENS=2048` requested per response, `MAX_RESPONSE_BYTES=131072` independent streamed-event guard, `MAX_REPORT_BYTES=8192`, `MAX_INPUT_BYTES=32000`. Saturated calls fail before spawn; queued calls consume allowance/time but not active slots. Parent cancellation cancels queued/active children; active work receives at most the cancellation grace to terminate/reap command groups before its future is dropped. No background child commands survive normally. Checkpoint `sub_counter` preserves consumed allowance on import; existing checkpoint foundation is not yet wired into service recovery, so a fresh worker without import does not retain it.
+
+Child histories are discarded after completion and never appended to the parent's model history. Only the bounded report returns as a tool result (child events still appear in the transcript). Structured reports are validated; invalid/oversized reports return bounded tool errors. Every child response is framed with a fresh UUID-based delimiter, an explicit untrusted-data warning, stripped Unicode Cf/tag/variation-selector characters and a UTF-8-safe length cap. The parent prompt says reviewer output is advice, not instructions. This framing is defense in depth, not a guarantee of review accuracy or injection immunity. None of these bounds gates main-turn completion.
 
 ## Task plan state
 
