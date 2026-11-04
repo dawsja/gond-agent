@@ -47,6 +47,29 @@ ChatGPT plan models do not require API connections. Provider settings accept an 
 
 The internal container worker calls `GET /v1/models` and `POST /v1/responses` through its loopback proxy at 127.0.0.1:8787. The service receives those requests over Docker's attached stdio channel and scopes them to that run; no network-facing model/control ports or provider keys are needed inside workers. Schemas: `api/src/wire.ts` and `runner/src/api/wire.rs`. Model responses use SSE (`event: <name>`, `data: <JSON>`): response/block starts, block deltas/ends, errors, and response.end with token usage and a stop reason. Opaque reasoning blocks retain their provider and connection-scoped model identity. Provider API URLs, formats, encrypted keys and model IDs live in SQLite; only administrators can edit them. The service translates to Anthropic Messages, OpenAI Chat Completions or OpenAI Responses and sends keys only to the configured endpoint.
 
+## Checkpoint controls (foundation)
+
+These internal controls are implemented; checkpoint scheduling and RunService recovery are **not yet integrated**. Existing run statuses and restart behavior remain unchanged. The planned additive `interrupted` state (including checkpoint age), `run.interrupted` and `run.resumed` events must be added to HTTP/MCP/UI together with transactional resume claims; they are not emitted by this slice. Never-started queued runs must remain queued across restart.
+
+The Docker controller accepts these separate RPC methods:
+
+| Method | Input / result |
+| --- | --- |
+| `checkpoint_tree` | `base_sha`, connected-owner `identity:{name,email}` → base64 `bundle`, `base_sha`, `head_sha`, `checkpoint_sha`. |
+| `restore_checkpoint` | The above bundle and **trusted persisted** revision pins → validated pins after tree-only application; worker must not be running. |
+| `export_state` | `run_id`, `owner_id` → `{state:…}` at a safe runner round boundary. |
+| `import_state` | `run_id`, `owner_id`, `state` → `true` after strict validation in a fresh idle runner. |
+
+Tree export uses an isolated repository and temporary `GIT_INDEX_FILE`, `add --all` honoring `.gitignore`, `commit-tree`, and exactly `refs/gond-agent/checkpoint`. It changes neither clone HEAD/index nor branch, and does not publish. The bundle requires the saved HEAD; the pinned original base must also already exist in the clone. Restore caps base64 before decoding, verifies refs/prerequisites/objects in a throwaway repository with hooks/fsmonitor disabled and fsck enabled, validates pins and parent, checks paths, and applies a binary tree patch inside the worker only. Failure is an error seam: the eventual orchestrator must discard a partially restored worker and fall back to the last pushed branch. Compressed bundles are capped at 64 MiB, not their expanded size; worker resource limits still apply.
+
+Runner JSONL uses `export_state {request_id,run_id,owner_id}` and `import_state {request_id,run_id,owner_id,state}`. Replies are `state.exported {request_id,state}`, `state.imported {request_id}`, or `state.error {request_id,operation,code}` with fixed safe codes. These are **control frames, never transcript events**. The controller generates correlation IDs, bounds in-flight controls, drops late/unsolicited/stale replies, caps state at 4 MiB and filters all `state.*` frames from ordinary event reads. Generic `send` rejects state controls. See [runner/CHECKPOINTS.md](../runner/CHECKPOINTS.md) for schemas, error codes and admission rules.
+
+State schema version 1 / runner compatibility epoch `gond-agent-checkpoint-1` contains run/owner binding, stored `history`, `plan` and counters (subagent ID, context estimate, plan cadence/nudges and turn-compaction budget). The summary is preserved in stored user-role history. This is not a `ResponsesRequest`: old images are not removed. Only user/assistant/tool roles are allowed, nested schema fields are strict, tool rounds must pair fully and images are normalized on import. Import does not run a model or restore processes, tools, subagent histories or pending questions. Export waits through streaming/tools/compaction/questions to a safe main-round boundary. The caller must coordinate the matching tree snapshot before allowing further tool mutations; merely exporting state then snapshotting a changing tree is insufficient.
+
+The API storage module stores opaque bundles and auth-secret-sealed state in private, atomically published files with SQLite metadata. The bundle is **not encrypted**; the API data volume is its trust boundary. Save requires base/HEAD/checkpoint SHA pins; load verifies those sealed pins, owner/run/version, creation time and bundle digest, but bundle structural validation belongs in the worker. The module is not constructed by production RunService yet. Application deletion/retention hooks and startup construction must be wired before checkpoint persistence is enabled.
+
+CI handoff seam: PR #22's CI loop is not on this base. Before a future release-after-push, save a coordinated checkpoint; import it on the CI-fix reopen so earlier conversation survives. Keep the default CI-fix-round flip behind a named constant for Board review; this foundation does not change that default.
+
 ## Agent events
 
 Worker stdin accepts newline-delimited JSON: `user` with text and inline base64 image bytes (the service resolves owner/run-scoped upload IDs before sending), `interrupt`, `compact`, and model/mode/skill controls. Output is newline-delimited JSON: session.start, turn.start/end, text.delta, reasoning.delta, stream.reset, tool.start/output/images/end, todos, agent.spawn/status/end, usage, compacted and error. Main-agent events use `agent_id: main`. The container worker runs autonomously with all tools allowed inside its workspace. Agent schemas live in `runner/src/agent/events.rs`.

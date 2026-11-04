@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::permissions::Mode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TodoItem {
     pub text: String,
     pub status: TodoStatus,
@@ -80,6 +81,13 @@ pub enum AgentEvent {
     /// Older history was summarized; estimated history token sizes before and after.
     #[serde(rename = "compacted")]
     Compacted { agent_id: String, reason: String, before: u64, after: u64 },
+    /// Control frames; never append these to the user/model transcript.
+    #[serde(rename = "state.exported")]
+    StateExported { request_id: String, state: Box<super::checkpoint::Checkpoint> },
+    #[serde(rename = "state.imported")]
+    StateImported { request_id: String },
+    #[serde(rename = "state.error")]
+    StateError { request_id: String, operation: String, code: String },
     #[serde(rename = "error")]
     Error { agent_id: String, message: String, retryable: bool },
 }
@@ -105,8 +113,12 @@ pub struct ImageInput {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum AgentInput {
+    #[serde(rename = "export_state")]
+    ExportState { request_id: String, run_id: String, owner_id: String },
+    #[serde(rename = "import_state")]
+    ImportState { request_id: String, run_id: String, owner_id: String, state: Value },
     #[serde(rename = "user")]
     User {
         text: String,
