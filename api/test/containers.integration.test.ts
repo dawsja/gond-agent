@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { ContainerPool, type Workspace } from "../src/containers";
 import { command } from "../src/command";
+import { performance } from "node:perf_hooks";
+import { dockerCommand, onboardingTimeouts, onboardingTestTimeout, remainingTimeout, waitForOnboarding } from "./helpers/onboarding";
 import type { Config } from "../src/config";
 
 const image = process.env.GOND_AGENT_CONTAINER_TEST_IMAGE;
@@ -121,6 +123,8 @@ describe.skipIf(!image)("real container workspaces", () => {
   it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE).each([1440, 390])("completes first-account and provider setup on HTTP at %ipx and survives restart", async (width) => {
     const dir = await mkdtemp(join(tmpdir(), "gond-agent-onboarding-"));
     const root = fileURLToPath(new URL("../../", import.meta.url));
+    // Each viewport owns a fresh Compose project/network/data volume. Only its
+    // bootstrap and returning phases deliberately share persisted account state.
     const project = dir.split("/").at(-1)!.toLowerCase();
     const fixture = join(dir, "fixture"); await mkdir(fixture);
     await mkdir(join(fixture, "fixtures"));
@@ -140,24 +144,35 @@ describe.skipIf(!image)("real container workspaces", () => {
       BETTER_AUTH_URL: "http://gond-agent:8787", ALLOW_SIGNUP: "false", PORT: "0", BIND_ADDRESS: "127.0.0.1",
       GOND_AGENT_IMAGE: process.env.GOND_AGENT_RUNTIME_TEST_IMAGE!, GOND_AGENT_WORKER_IMAGE: image! };
     const docker = process.env.DOCKER_BIN ?? "docker";
-    const compose = (...args: string[]) => command(docker, ["compose", "--project-name", project, "--env-file", "/dev/null", "-f", join(root, "docker-compose.yml"), "-f", override, ...args], { env, timeout: 90000 });
+    const deadline = performance.now() + onboardingTimeouts.workflow;
+    const browserLabel = `io.gond-agent.onboarding=${project}`;
+    const compose = (args: string[], ceiling = onboardingTimeouts.command, until = deadline) => dockerCommand(docker,
+      ["compose", "--project-name", project, "--env-file", "/dev/null", "-f", join(root, "docker-compose.yml"), "-f", override, ...args],
+      { env, label: `docker compose ${args[0]}${args.includes("--force-recreate") ? " --force-recreate" : ""} (${width}px)`, timeout: remainingTimeout(until, ceiling) });
+    const ready = async (firstAccount: boolean) => {
+      const address = (await compose(["port", "gond-agent", "8787"])).toString().trim();
+      await waitForOnboarding(`http://${address}`, firstAccount, { timeout: remainingTimeout(deadline, onboardingTimeouts.ready) });
+    };
     const browser = async (phase: string) => {
       const script = await readFile(new URL("./onboarding.browser.cjs", import.meta.url), "utf8");
-      const result = JSON.parse((await command(docker, ["run", "--rm", "--network", `${project}_default`, "--network-alias", "provider-fixture",
+      const result = JSON.parse((await dockerCommand(docker, ["run", "--rm", "--label", browserLabel, "--network", `${project}_default`, "--network-alias", "provider-fixture",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges=true", "--shm-size", "256m",
         "--mount", `type=bind,source=${fixture},target=/fixture`,
-        "--env", `WIDTH=${width}`, "--env", `PHASE=${phase}`, "--entrypoint", "node", image!, "-e", script], { timeout: 90000 })).toString());
+        "--env", `WIDTH=${width}`, "--env", `PHASE=${phase}`, "--entrypoint", "node", image!, "-e", script],
+        { label: `docker run browser ${phase} (${width}px)`, timeout: remainingTimeout(deadline, onboardingTimeouts.browser) })).toString());
       const evidence = process.env.GOND_AGENT_BROWSER_ARTIFACTS ?? join(dir, "evidence");
       await mkdir(evidence, { recursive: true });
       for (const shot of result.screenshots ?? []) await writeFile(join(evidence, shot.name), Buffer.from(shot.data, "base64"));
       expect(result.error, JSON.stringify(result.diagnostics)).toBeUndefined();
       expect(result.passed).toBe(true);
     };
+    let failure: unknown;
     try {
-      await compose("up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60");
-      await compose("exec", "-T", "gond-agent", "node", "-e", "if(require('node:fs').existsSync('/app/site'))process.exit(1)");
+      await compose(["up", "-d", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "60"], onboardingTimeouts.compose);
+      await ready(true);
+      await compose(["exec", "-T", "gond-agent", "node", "-e", "if(require('node:fs').existsSync('/app/site'))process.exit(1)"]);
       await browser("bootstrap");
-      await compose("exec", "-T", "gond-agent", "node", "--input-type=module", "-e", `
+      await compose(["exec", "-T", "gond-agent", "node", "--input-type=module", "-e", `
         import Database from 'better-sqlite3';
         const db = new Database('/data/gond-agent.sqlite'), now=Date.now();
         db.transaction(() => {
@@ -167,14 +182,35 @@ describe.skipIf(!image)("real container workspaces", () => {
           // Independent browser phases share saved application data, not request budgets.
           // Better Auth's database-backed per-IP limits survive service/container restarts.
           db.prepare('DELETE FROM "rateLimit"').run();
-        })(); db.close();`);
-      await compose("up", "-d", "--no-build", "--pull", "never", "--force-recreate", "--wait", "--wait-timeout", "60");
+        })(); db.close();`]);
+      await compose(["up", "-d", "--no-build", "--pull", "never", "--force-recreate", "--wait", "--wait-timeout", "60"], onboardingTimeouts.compose);
+      await ready(false);
       await browser("returning");
-    } finally {
-      await compose("down", "--volumes", "--remove-orphans");
-      await rm(dir, { recursive: true, force: true });
+    } catch (error) { failure = error; throw error; }
+    finally {
+      // Killing the attached `docker run` CLI need not remove its container.
+      // Remove only this viewport's labeled browsers before removing its network.
+      const cleanupDeadline = performance.now() + onboardingTimeouts.browserCleanup;
+      const cleanupErrors: unknown[] = [];
+      try {
+        const ids = (await dockerCommand(docker, ["ps", "-aq", "--filter", `label=${browserLabel}`],
+          { label: `docker ps browser cleanup (${width}px)`, timeout: remainingTimeout(cleanupDeadline, onboardingTimeouts.command) }))
+          .toString().trim().split(/\s+/).filter(Boolean);
+        if (ids.length) await dockerCommand(docker, ["rm", "--force", ...ids],
+          { label: `docker rm browser cleanup (${width}px)`, timeout: remainingTimeout(cleanupDeadline, onboardingTimeouts.command) });
+      } catch (error) { cleanupErrors.push(error); }
+      try {
+        // Always reserve a full stop/teardown budget, even if browser cleanup
+        // exhausted its own budget. Neither one borrows from the workflow.
+        await compose(["down", "--volumes", "--remove-orphans"], onboardingTimeouts.cleanup, performance.now() + onboardingTimeouts.cleanup);
+      } catch (error) { cleanupErrors.push(error); }
+      finally { await rm(dir, { recursive: true, force: true }); }
+      if (cleanupErrors.length) {
+        const errors = failure ? [failure, ...cleanupErrors] : cleanupErrors;
+        throw new AggregateError(errors, errors.map(String).join("\n"));
+      }
     }
-  }, 240000);
+  }, onboardingTestTimeout);
 
   it.skipIf(!process.env.GOND_AGENT_RUNTIME_TEST_IMAGE)("starts Compose without builds, includes both images and preserves data on repeated up", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gond-agent-compose-"));
