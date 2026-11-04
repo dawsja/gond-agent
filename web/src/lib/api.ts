@@ -56,6 +56,15 @@ export interface Run {
   live?: { phase: "idle" | "booting" | "agent" | "finishing"; pushed?: boolean }
 }
 
+export interface RunPage {
+  runs: Run[]
+  total: number
+  limit: number
+  offset: number
+  counts: Record<"all" | "working" | "ready" | "merged" | "active" | "queued", number>
+  repositories: string[]
+}
+
 export interface Me {
   theme: Theme
   accent: Accent
