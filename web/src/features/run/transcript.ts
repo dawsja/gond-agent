@@ -111,6 +111,20 @@ export function createTranscript() {
           else items.push({ kind: "text", key: `t${ev.seq}`, text: ev.text })
           break
         }
+        case "stream.reset": {
+          if (!main) break
+          let remaining = ev.text_length
+          // Queued follow-ups can insert user items in the middle of this attempt.
+          for (let i = items.length - 1; i >= 0 && remaining > 0; i--) {
+            const item = items[i]
+            if (item.kind !== "text") continue
+            const removed = Math.min(remaining, item.text.length)
+            remaining -= removed
+            if (removed === item.text.length) items.splice(i, 1)
+            else { mark(item); item.text = item.text.slice(0, -removed) }
+          }
+          break
+        }
         case "tool.start": {
           if (!main) break
           const call: ToolCall = { callId: ev.call_id, ...presentTool(ev.name, ev.title ?? "", ev.input), status: "running", summary: "", output: "", start: ev.ts }

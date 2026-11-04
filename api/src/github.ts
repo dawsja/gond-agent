@@ -37,25 +37,40 @@ export const validBranch = (b: string) =>
   !b.includes("@{") &&
   !b.endsWith("/") &&
   !b.endsWith(".lock");
+export const GITHUB_INTERACTIVE_TIMEOUT_MS = 60_000;
+export interface GitHubOptions {
+  timeout?: number;
+  maxBuffer?: number;
+  retry?: RetryOptions;
+  /** Only unattended publication should opt out of the interactive total deadline. */
+  backgroundPublication?: boolean;
+}
+
 export async function gh<T>(
   endpoint: string,
   method = "GET",
   body?: unknown,
   env?: NodeJS.ProcessEnv,
-  options: { timeout?: number; maxBuffer?: number; retry?: RetryOptions } = {},
+  options: GitHubOptions = {},
 ): Promise<T> {
   const args = ["api", endpoint, "--method", method, "--include"];
   if (body !== undefined) args.push("--input", "-");
-  return withRetry("github_api", async () => {
+  return withRetry("github_api", async (_attempt, remainingMs) => {
     let output = (
       await githubCommand("gh", args, {
-        timeout: options.timeout,
+        timeout: Math.min(options.timeout ?? 120_000, remainingMs),
         maxBuffer: options.maxBuffer,
         input: body === undefined ? undefined : JSON.stringify(body),
         env,
       }).catch(error => {
         identities.clear();
-        throw error;
+        const failure = classifyRetryFailure(error);
+        // A lost response to a mutation is ambiguous: only replay proven pre-send
+        // failures or an explicit 429/503 server wait, never ambiguous timeouts/resets.
+        throw new ClassifiedRetryFailure({
+          ...failure,
+          retryable: failure.retryable && (method.toUpperCase() === "GET" || failure.safeToReplay === true),
+        });
       })
     ).toString();
     // gh has no pagination here. Strip response blocks (including interim headers),
@@ -66,7 +81,11 @@ export async function gh<T>(
       output = output.slice(boundary.index + boundary[0].length);
     }
     return JSON.parse(output) as T;
-  }, options.retry);
+  }, {
+    ...options.retry,
+    totalTimeoutMs: options.backgroundPublication ? options.retry?.totalTimeoutMs
+      : Math.min(options.retry?.totalTimeoutMs ?? GITHUB_INTERACTIVE_TIMEOUT_MS, GITHUB_INTERACTIVE_TIMEOUT_MS),
+  });
 }
 export async function githubStatus(env?: NodeJS.ProcessEnv) {
   try {
@@ -78,12 +97,13 @@ export async function githubStatus(env?: NodeJS.ProcessEnv) {
 }
 export interface CommitIdentity { name: string; email: string }
 const identities = new Map<string, {expires: number; value: Promise<CommitIdentity>}>();
-export function commitIdentity(env: NodeJS.ProcessEnv = process.env): Promise<CommitIdentity> {
-  const key = createHash("sha256").update(JSON.stringify([env.GH_TOKEN ?? env.GITHUB_TOKEN, env.GH_CONFIG_DIR, env.HOME])).digest("hex");
+export function commitIdentity(env: NodeJS.ProcessEnv = process.env, options: GitHubOptions = {}): Promise<CommitIdentity> {
+  // Do not let an interactive lookup inherit an in-flight publication's longer budget.
+  const key = createHash("sha256").update(JSON.stringify([env.GH_TOKEN ?? env.GITHUB_TOKEN, env.GH_CONFIG_DIR, env.HOME, !!options.backgroundPublication])).digest("hex");
   for (const [cachedKey, cached] of identities) if (cached.expires <= Date.now()) identities.delete(cachedKey);
   let identity = identities.get(key)?.value;
   if (!identity) {
-    identity = gh<{ login: string; id: number }>("user", "GET", undefined, env).then(user => {
+    identity = gh<{ login: string; id: number }>("user", "GET", undefined, env, options).then(user => {
       if (!user.login || !Number.isSafeInteger(user.id) || user.id <= 0) throw new Error("Missing GitHub identity");
       return { name: user.login, email: `${user.id}+${user.login}@users.noreply.github.com` };
     }).catch(error => {

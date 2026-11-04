@@ -16,6 +16,7 @@ import {
   commitIdentity,
   validRepo,
   validBranch,
+  type GitHubOptions,
 } from "../github";
 import { githubEnvFor } from "../github-login";
 import { modelResponse } from "../responses";
@@ -62,6 +63,8 @@ export interface Run {
   head_sha: string | null;
   error: string | null;
   work_kept?: boolean;
+  /** Imported commit awaiting publication after capacity reclaimed its workspace. */
+  kept_commit?: string;
   last_error?: { step: string; class: string; attempts: number };
   files: number;
   additions: number;
@@ -93,6 +96,7 @@ interface Live {
   busy: boolean;
   closing?: boolean;
   keepTimer?: ReturnType<typeof setTimeout>;
+  keptSince?: number;
   publishPending?: { snapshot?: { bundle: string; head: string }; imported?: boolean };
 }
 export class Runs {
@@ -101,6 +105,7 @@ export class Runs {
   private live = new Map<string, Live>();
   private booting = new Set<string>();
   private launches = new Map<string, Promise<void>>();
+  private releasing = new Set<Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
@@ -266,9 +271,20 @@ export class Runs {
       );
     }
   }
-  private checkCapacity() {
-    if (new Set([...this.live.keys(), ...this.booting]).size >= this.cfg.maxRuns)
+  private checkCapacity(reclaim = true) {
+    if (new Set([...this.live.keys(), ...this.booting]).size < this.cfg.maxRuns) return;
+    const oldest = [...this.live].filter(([id, live]) =>
+      live.keptSince !== undefined && !live.busy && !live.closing && !this.booting.has(id) && this.get(id).work_kept,
+    ).sort((a, b) => a[1].keptSince! - b[1].keptSince!)[0];
+    if (!oldest)
       throw new ApiError(429, "run_limit", "All workspaces are busy. Close finished sessions with close_session or in the workspace to free capacity.");
+    if (!reclaim) return;
+    // Detach synchronously so enqueue can reserve the slot without yielding. Boot
+    // waits for destruction before allocating a replacement container.
+    const release = this.close(oldest[0], true);
+    this.releasing.add(release);
+    void release.catch(() => console.error("Couldn't release failed workspace", oldest[0]))
+      .finally(() => this.releasing.delete(release));
   }
   async create(
     user: string,
@@ -298,7 +314,7 @@ export class Runs {
       );
     githubEnvFor(this.db, this.cfg.secret, user);
     const selectedModel = await this.resolveSelection(user,input.model);
-    this.checkCapacity();
+    this.checkCapacity(false);
     const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, user)),
       base = input.base_branch || info.default_branch;
     if (!validBranch(base))
@@ -352,6 +368,7 @@ export class Runs {
     this.db.transaction(() => {
       // Repository/model lookups yield: simultaneous requests may have filled
       // the remaining slots before this run reserves one through enqueue.
+      if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
       this.checkCapacity();
       this.db
         .prepare(
@@ -441,18 +458,18 @@ export class Runs {
         "queue_full",
         "Wait for queued messages to finish.",
       );
+    if (images.length) this.validateImages(user, images);
+    if(effort !== undefined){
+      if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
+    }
     if (!this.live.has(id) && !this.booting.has(id)) this.checkCapacity();
     if (images.length) {
-      this.validateImages(user, images);
       for (const image of images)
         this.db
           .prepare("UPDATE images SET run_id=? WHERE id=? AND user_id=?")
           .run(id, image, user);
     }
     if (!this.live.has(id) && r.status === "stopped") r.status = "queued";
-    if(effort !== undefined){
-      if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
-    }
     r.pending.push({ text, images, effort, model });
     this.save(r);
     this.append(id, {
@@ -472,10 +489,33 @@ export class Runs {
     this.booting.add(id);
     let workspace: Workspace | undefined;
     try {
+      if (this.releasing.size) await Promise.all(this.releasing);
       let r = this.get(id);
       assertActive(r);
+      if (this.shuttingDown || r.status === "stopped") {
+        r.phase = "idle";
+        r.pending = [];
+        this.status(r, "stopped");
+        return;
+      }
       r.phase = "booting";
       r.started_at ??= Date.now();
+      if (r.kept_commit) {
+        const head = r.kept_commit;
+        this.status(r, "working", "Pushing kept changes");
+        await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
+        r = this.get(id); // Stop and additional follow-ups may have arrived during publication.
+        r.pushed = true;
+        r.head_sha = head;
+        delete r.kept_commit;
+        this.save(r);
+        if (this.shuttingDown || r.status === "stopped") {
+          r.phase = "idle";
+          r.pending = [];
+          this.status(r, "stopped");
+          return;
+        }
+      }
       this.status(r, "working", "Cloning repository");
       const checked = await checkout(
         this.cfg.data,
@@ -554,6 +594,7 @@ export class Runs {
     live.busy = true;
     clearTimeout(live.keepTimer);
     live.keepTimer = undefined;
+    live.keptSince = undefined;
     // Publication belongs to the previous turn. Never send more work until its
     // exact kept commit is pushed, even if a follow-up chooses another model.
     if (r.work_kept || live.publishPending) {
@@ -673,7 +714,7 @@ export class Runs {
     this.status(r, "working", "Pushing changes");
     await this.publish(id, live);
     r = this.get(id);
-    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
+    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
     r = this.get(id);
     live.busy = false;
     r.phase = "agent";
@@ -682,12 +723,14 @@ export class Runs {
     this.status(r, merged ? "merged" : "ready");
     if (merged) await this.close(id);
   }
-  private async publish(id: string, live: Live) {
+  private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
     const pending = live.publishPending ??= {};
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
-      { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
+      options.backgroundPublication
+        ? { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options) }
+        : { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     ), { maxAttempts: 1 });
     if (pending.imported) await pushBranch(live.cwd, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     else try { await importBundle(
@@ -702,8 +745,13 @@ export class Runs {
         snapshot.bundle = ""; // The imported commit, not another in-memory bundle, is the retry source.
         await this.recordDiff(id, live, snapshot.head, false).catch(() => console.error("Couldn't read kept changes", id));
       }
+      // Import failures can be re-snapshotted from the still-kept worker. Never
+      // pin a potentially 128 MiB base64 bundle on the live retention record.
+      snapshot.bundle = "";
+      if (!pending.imported) pending.snapshot = undefined;
       throw error;
     }
+    snapshot.bundle = "";
     await this.recordDiff(id, live, snapshot.head, true);
     live.publishPending = undefined;
   }
@@ -740,7 +788,7 @@ export class Runs {
       deletions: r.deletions,
     });
   }
-  async openPull(id: string, user: string) {
+  async openPull(id: string, user: string, options: Pick<GitHubOptions, "backgroundPublication"> = {}) {
     const r = this.get(id, user);
     if (!r.pushed)
       throw new ApiError(
@@ -750,11 +798,11 @@ export class Runs {
       );
     const body = r.summary.text || r.prompt;
     if (r.pr_number)
-      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnvFor(this.db, this.cfg.secret, r.user_id));
+      await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnvFor(this.db, this.cfg.secret, r.user_id), options);
     else {
       const existing = await gh<{ number: number; html_url: string }[]>(
         `repos/${r.repo}/pulls?head=${encodeURIComponent(r.repo.split("/")[0] + ":" + r.branch)}&state=open`,
-        "GET", undefined, githubEnvFor(this.db, this.cfg.secret, r.user_id),
+        "GET", undefined, githubEnvFor(this.db, this.cfg.secret, r.user_id), options,
       );
       const pr =
         existing[0] ??
@@ -763,6 +811,7 @@ export class Runs {
           "POST",
           { head: r.branch, base: r.base_branch, title: r.title, body },
           githubEnvFor(this.db, this.cfg.secret, r.user_id),
+          options,
         ));
       r.pr_number = pr.number;
       r.pr_url = pr.html_url;
@@ -804,7 +853,7 @@ export class Runs {
     if (r.work_kept) { await this.close(id); return { closed: true }; }
     live.closing = true;
     try {
-      await this.publish(id, live);
+      await this.publish(id, live, {});
       await this.close(id);
       return { closed: true };
     } catch (error) {
@@ -824,29 +873,42 @@ export class Runs {
     });
   }
   // Failed workspaces have a bounded grace period; successful idle work does not expire.
-  async close(id: string) {
+  async close(id: string, forCapacity = false) {
     const live = this.live.get(id);
+    let r: Run | undefined;
+    try { r = this.get(id); }
+    catch (error) {
+      // Account cleanup includes soft-deleted runs, which get() deliberately hides.
+      if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
+    }
+    if (r) {
+      if (forCapacity && live?.publishPending?.imported)
+        r.kept_commit = live.publishPending.snapshot?.head;
+      r.phase = "idle";
+      if (r.work_kept && r.error)
+        r.error = r.error.replace("Your changes are kept; send a follow-up to try again.", r.kept_commit
+          ? "The workspace was released; send a follow-up to publish the saved commit and continue."
+          : "The kept workspace was released; send a follow-up to retry from the last pushed branch.");
+      r.work_kept = false;
+      this.save(r);
+    }
     if (live) {
       clearTimeout(live.keepTimer);
       live.closed = true;
+      live.publishPending = undefined;
       this.live.delete(id);
       await live.workspace.destroy();
     }
-    try {
-      const r = this.get(id);
-      r.phase = "idle";
-      if (r.work_kept && r.error)
-        r.error = r.error.replace("Your changes are kept; send a follow-up to try again.", "The kept workspace was released; send a follow-up to retry from the last pushed branch.");
-      r.work_kept = false;
-      this.save(r);
-    } catch {}
-    await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    // Only an imported commit survives capacity eviction, not the worker's
+    // uncommitted edits or a bundle that could not be imported.
+    if (!r?.kept_commit) await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
   }
   async shutdown() {
     this.shuttingDown = true;
     this.subscriptions.close();
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));
+    await Promise.allSettled(this.releasing);
   }
   private async fail(id: string, error: unknown) {
     const failure = error instanceof RetryError ? error : error instanceof ApiError && error.cause instanceof RetryError ? error.cause :
@@ -862,7 +924,7 @@ export class Runs {
       r.work_kept = !!live && keep > 0;
       r.last_error = { step: failure.step, class: failure.class, attempts: failure.attempts };
       const label = ({ push: "Pushing the branch", snapshot: "Saving workspace changes", import: "Importing workspace changes", clone: "Cloning the repository", fetch: "Fetching the repository", github_api: "The GitHub request", model: "The model connection", turn: "The turn" } as Record<string, string>)[failure.step] ?? "The operation";
-      const message = `${label} failed after ${failure.attempts} attempt${failure.attempts === 1 ? "" : "s"} (${failure.reason}). ${r.work_kept ? "Your changes are kept; send a follow-up to try again." : "Send a follow-up to retry from the last pushed branch."}`;
+      const message = `${label} failed after ${failure.attempts} attempt${failure.attempts === 1 ? "" : "s"} (${failure.reason}). ${r.work_kept ? "Your changes are kept; send a follow-up to try again." : r.kept_commit ? "Your saved commit is kept; send a follow-up to publish it and continue." : "Send a follow-up to retry from the last pushed branch."}`;
       this.append(id, { type: "run.error", ...r.last_error });
       this.status(
         r,
@@ -871,6 +933,7 @@ export class Runs {
         message,
       );
       if (r.work_kept && live) {
+        live.keptSince = Date.now();
         live.keepTimer = setTimeout(() => {
           if (this.live.get(id) === live && this.get(id).work_kept && !live.busy)
             void this.close(id).catch(() => console.error("Couldn't release failed workspace", id));

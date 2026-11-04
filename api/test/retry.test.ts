@@ -1,6 +1,6 @@
 import { inspect } from "node:util";
 import { describe, expect, it, vi } from "vitest";
-import { classifyRetryFailure, retryDelayMs, RetryError, withRetry } from "../src/retry";
+import { ClassifiedRetryFailure, classifyRetryFailure, retryDelayMs, RetryError, withRetry } from "../src/retry";
 
 describe("bounded safe retries", () => {
   it("bounds full jitter and caps exponential backoff at 30 seconds", () => {
@@ -78,6 +78,27 @@ describe("bounded safe retries", () => {
       return true;
     }, { sleep, now: () => 0, random: () => 0.5 });
     expect(sleep).toHaveBeenCalledWith(12_000);
+  });
+
+  it("honors an explicit HTTP-date wait on 503 without losing replay safety at the command boundary", async () => {
+    const failure = classifyRetryFailure({ status: 503, headers: { "Retry-After": "Thu, 01 Jan 1970 00:00:12 GMT" } }, 0);
+    expect(failure).toMatchObject({ class: "server", retryable: true, retryAfterMs: 12_000, safeToReplay: true });
+    const sleep = vi.fn(async (_ms: number) => {});
+    await withRetry("github_api", async attempt => {
+      if (attempt === 1) throw new ClassifiedRetryFailure(failure);
+      return true;
+    }, { sleep, now: () => 0, random: () => 0 });
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(12_000);
+  });
+
+  it("does not start another attempt if a retry timer overshoots the total deadline", async () => {
+    let elapsed = 0;
+    const fn = vi.fn(async () => { throw { status: 502 }; });
+    const sleep = vi.fn(async (_ms: number) => { elapsed = 1500; });
+    await expect(withRetry("github_api", fn, { totalTimeoutMs: 1000, sleep, now: () => elapsed, random: () => 0.5 }))
+      .rejects.toMatchObject({ class: "server", attempts: 1 });
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(500);
   });
 
   it("does not multiply nested retry budgets", async () => {

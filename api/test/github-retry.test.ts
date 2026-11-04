@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { command } from "../src/command";
-import { checkout, gh, importBundle, pushBranch } from "../src/github";
+import { checkout, commitIdentity, gh, GITHUB_INTERACTIVE_TIMEOUT_MS, importBundle, pushBranch } from "../src/github";
 import { RetryError } from "../src/retry";
 
 vi.mock("../src/command", async original => {
@@ -32,6 +32,108 @@ describe("GitHub retry integration", () => {
     expect(mocked.mock.calls.length - before).toBe(1);
     if (!(error instanceof Error)) throw new Error("Expected a safe GitHub error");
     expect(error.message).not.toMatch(/secret|private\.test/);
+  });
+
+  it.each<[string, unknown, number]>([
+    ["POST", { code: "ECONNREFUSED" }, 0],
+    ["POST", new Error("dial tcp: lookup api.github.com: no such host"), 0],
+    ["POST", new Error("tls: failed to verify certificate: x509: certificate has expired"), 0],
+    ["PATCH", { status: 429, headers: { "Retry-After": "2" } }, 2000],
+    ["PUT", { status: 503, headers: { "Retry-After": "3" } }, 3000],
+  ])("replays %s only for proven pre-send failures or an explicit server wait (%j)", async (method, failure, wait) => {
+    const mocked = vi.mocked(command).mockClear();
+    mocked.mockRejectedValueOnce(failure);
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(gh("repos/acme/app/pulls", method, { title: "fixture" }, {}, { retry: { ...retry, sleep } }))
+      .resolves.toMatchObject({ login: "retry-fixture" });
+    expect(mocked).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(wait);
+  });
+
+  it.each([
+    [{ timedOut: true }, "timeout"],
+    [new Error("net/http: TLS handshake timeout"), "timeout"],
+    [{ code: "ECONNRESET" }, "network"],
+    [new Error("TLS read failed: connection reset by peer"), "tls"],
+    [new Error("unexpected EOF"), "network"],
+    [{ status: 502, headers: { "Retry-After": "1" } }, "server"],
+    [{ status: 503 }, "server"],
+    [{ status: 503, headers: { "Retry-After": "not a wait" } }, "server"],
+    [{ status: 429 }, "rate_limit"],
+    [{ status: 403, headers: { "Retry-After": "1" } }, "auth"],
+  ])("never replays an ambiguous/permanent POST, even in background publication (%j)", async (failure, kind) => {
+    const mocked = vi.mocked(command).mockClear();
+    mocked.mockRejectedValueOnce(failure);
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(gh("repos/acme/app/pulls", "POST", {}, {}, { backgroundPublication: true, retry: { ...retry, sleep } }))
+      .rejects.toMatchObject({ step: "github_api", class: kind, attempts: 1, retryable: false });
+    expect(mocked).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([{ timedOut: true }, { status: 502 }, { status: 503 }, { status: 429 }])("keeps GET replay classification unchanged (%j)", async failure => {
+    const mocked = vi.mocked(command).mockClear();
+    mocked.mockRejectedValueOnce(failure);
+    await expect(gh("user", "GET", undefined, {}, { retry })).resolves.toMatchObject({ login: "retry-fixture" });
+    expect(mocked).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares one interactive budget across command attempts and backoff", async () => {
+    let elapsed = 0;
+    const mocked = vi.mocked(command).mockClear();
+    mocked.mockImplementationOnce(async () => {
+      elapsed += 45_000;
+      throw { code: "ECONNRESET" };
+    }).mockImplementationOnce(async (_file, _args, options) => {
+      elapsed += options!.timeout!;
+      throw { timedOut: true };
+    });
+    const sleep = vi.fn(async (ms: number) => { elapsed += ms; });
+    await expect(gh("user", "GET", undefined, {}, { retry: { sleep, now: () => elapsed, random: () => 1 } }))
+      .rejects.toMatchObject({ step: "github_api", class: "timeout", attempts: 2 });
+    expect(mocked.mock.calls.map(([, , options]) => options?.timeout)).toEqual([GITHUB_INTERACTIVE_TIMEOUT_MS, 14_000]);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([1000]);
+    expect(elapsed).toBe(GITHUB_INTERACTIVE_TIMEOUT_MS);
+  });
+
+  it("does not wait past the interactive deadline or shorten Retry-After", async () => {
+    const mocked = vi.mocked(command).mockClear();
+    mocked.mockRejectedValueOnce({ status: 429, headers: { "Retry-After": "61" } });
+    const sleep = vi.fn(async (_ms: number) => {});
+    await expect(gh("user", "GET", undefined, {}, { retry: { sleep, now: () => 0, random: () => 0, totalTimeoutMs: GITHUB_INTERACTIVE_TIMEOUT_MS * 10 } }))
+      .rejects.toMatchObject({ class: "rate_limit", attempts: 1 });
+    expect(mocked).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("preserves shorter command limits and requires explicit publication opt-in for the full schedule", async () => {
+    const mocked = vi.mocked(command).mockClear();
+    await gh("user", "GET", undefined, {}, { timeout: 5000, retry: { now: () => 0 } });
+    expect(mocked.mock.calls[0][2]?.timeout).toBe(5000);
+    mocked.mockClear();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      mocked.mockRejectedValueOnce({ status: 503, headers: { "Retry-After": "65" } });
+    }
+    let elapsed = 0;
+    const sleep = vi.fn(async (ms: number) => { elapsed += ms; });
+    await expect(commitIdentity({ GH_TOKEN: "background-identity-fixture" }, {
+      backgroundPublication: true, retry: { sleep, now: () => elapsed, random: () => 0 },
+    })).resolves.toEqual({ name: "retry-fixture", email: "765+retry-fixture@users.noreply.github.com" });
+    expect(mocked).toHaveBeenCalledTimes(5);
+    expect(mocked.mock.calls.map(([, , options]) => options?.timeout)).toEqual(Array(5).fill(120_000));
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual(Array(4).fill(65_000));
+  });
+
+  it("does not share an in-flight publication identity lookup with an interactive lookup", async () => {
+    const mocked = vi.mocked(command).mockClear();
+    let complete!: (value: Buffer) => void;
+    mocked.mockImplementationOnce(() => new Promise<Buffer>(resolve => { complete = resolve; }));
+    const env = { GH_TOKEN: "concurrent-identity-fixture" }, timing = { now: () => 0 };
+    const background = commitIdentity(env, { backgroundPublication: true, retry: timing });
+    const interactive = commitIdentity(env, { retry: timing });
+    complete(Buffer.from('{"login":"retry-fixture","id":765}'));
+    await Promise.all([background, interactive]);
+    expect(mocked.mock.calls.map(([, , options]) => options?.timeout)).toEqual([120_000, GITHUB_INTERACTIVE_TIMEOUT_MS]);
   });
 
   it("cleans partial clones, retries fetch, and can push an imported retained commit after exhaustion", async () => {

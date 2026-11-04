@@ -494,6 +494,7 @@ async fn stream_once(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel:
     let mut builder = MessageBuilder::default();
     // Each block's kind by its index (the model's numbers: a map, so a huge one can't allocate).
     let mut kinds: HashMap<usize, String> = HashMap::new();
+    let (mut text_length, mut reasoning_length) = (0, 0);
     loop {
         let next = tokio::select! {
             n = stream.next() => n,
@@ -512,8 +513,10 @@ async fn stream_once(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel:
                 let agent_id = run.id.clone();
                 let text = t.clone();
                 s.emit(if kinds.get(index).is_some_and(|k| k == "reasoning") {
+                    reasoning_length += text.encode_utf16().count();
                     AgentEvent::ReasoningDelta { agent_id, text }
                 } else {
+                    text_length += text.encode_utf16().count();
                     AgentEvent::TextDelta { agent_id, text }
                 });
             }
@@ -544,6 +547,10 @@ async fn stream_once(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel:
             StreamEvent::Start => {
                 // The client can restart an interrupted attempt. Nothing from that attempt may
                 // enter history or execute: tools are dispatched only after Streamed::Done.
+                if text_length > 0 || reasoning_length > 0 {
+                    s.emit(AgentEvent::StreamReset { agent_id: run.id.clone(), text_length, reasoning_length });
+                }
+                (text_length, reasoning_length) = (0, 0);
                 builder = MessageBuilder::default();
                 kinds.clear();
             }
