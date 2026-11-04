@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seal, unseal } from "../src/auth";
@@ -326,6 +327,34 @@ it("rejects symlinked storage directories and tampered stored paths without touc
   expect(() => store.deleteRun(runId(1), "alice")).toThrow("Unsafe checkpoint directory");
   expect(fs.readFileSync(join(target, runId(1), "keep"), "utf8")).toBe("untouched");
 });
+
+it.each(["bundle", "state"] as const)("rejects a FIFO %s without blocking load or startup cleanup", kind => {
+  const saved = save();
+  // Synchronous FIFO opens block the event loop, so bound the entire probe in a killable child.
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { execFileSync } from "node:child_process";
+    import { Checkpoints } from ${JSON.stringify(new URL("../src/checkpoints.ts", import.meta.url).href)};
+    import { openStore } from ${JSON.stringify(new URL("../src/db.ts", import.meta.url).href)};
+    const dir = ${JSON.stringify(dir)}, secret = ${JSON.stringify(secret)}, now = ${now};
+    const db = openStore(dir);
+    try {
+      const store = new Checkpoints(db, dir, secret, { now: () => now });
+      const path = ${JSON.stringify(join(root(), saved[`${kind}_path`]))};
+      fs.unlinkSync(path);
+      execFileSync("mkfifo", [path], { timeout: 1000 });
+      assert(fs.lstatSync(path).isFIFO());
+      assert.throws(() => store.load(${JSON.stringify(key())}), { code: "corrupt" });
+      new Checkpoints(db, dir, secret, { now: () => now });
+      assert.deepEqual(db.prepare("SELECT * FROM run_checkpoints").all(), []);
+      assert.deepEqual(fs.readdirSync(${JSON.stringify(root())}), []);
+    } finally { db.close(); }
+  `], { cwd: new URL("..", import.meta.url), encoding: "utf8", timeout: 5000, killSignal: "SIGKILL" });
+  expect(result.error, result.stderr).toBeUndefined();
+  expect(result.signal, result.stderr).toBeNull();
+  expect(result.status, result.stderr).toBe(0);
+}, 10_000);
 
 it.each(["symlink", "hardlink"])("rejects a %s checkpoint file without reading or chmodding its target", kind => {
   const saved = save();

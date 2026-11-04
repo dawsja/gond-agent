@@ -32,7 +32,7 @@ export const validRepo = (repo: string) =>
   !repo.endsWith("/.") &&
   !repo.endsWith("/..");
 export const validBranch = (b: string) =>
-  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(b) &&
+  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,334}$/.test(b) &&
   !b.includes("..") &&
   !b.includes("@{") &&
   !b.endsWith("/") &&

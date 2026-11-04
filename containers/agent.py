@@ -2,6 +2,7 @@
 """Container control + loopback model relay. Only Docker's attached stdio reaches the host."""
 import base64
 import contextlib
+import hmac
 import http.server
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import pathlib
 import queue
 import re
+import secrets
 import tempfile
 import select
 import socket
@@ -31,6 +33,7 @@ state_waiters = {}  # At most one RPC, separate from worker/event/model locks.
 CHECKPOINT_REF = "refs/gond-agent/checkpoint"
 checkpoint_lock = threading.Lock()
 worker = None
+relay_token = None
 events = []
 event_lock = threading.Lock()
 worker_lock = threading.Lock()
@@ -159,6 +162,19 @@ def checkpoint_tree(req):
         raise RuntimeError("A connected GitHub commit identity is required.")
     with checkpoint_lock, checkpoint_repository() as (git, env, scratch, head):
         checkpoint_commit(git, base)
+        # Staging metadata is deliberately not restored. A newly force-added
+        # ignored file would otherwise vanish from export or later publication.
+        index = clone_git_file(pathlib.Path(ROOT).resolve() / ".git", "index")
+        if index.exists():
+            temporary_index = env["GIT_INDEX_FILE"]
+            try:
+                env["GIT_INDEX_FILE"] = str(index)
+                ignored = set(git("ls-files", "--cached", "--ignored", "--exclude-standard", "-z").split(b"\0")) - {b""}
+            finally:
+                env["GIT_INDEX_FILE"] = temporary_index
+            tracked = set(git("ls-tree", "-rz", "--name-only", head).split(b"\0"))
+            if ignored - tracked:
+                raise RuntimeError("Newly staged ignored files are not supported by checkpoints.")
         git("read-tree", head)
         git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
         tree = git("write-tree").decode().strip()
@@ -252,8 +268,29 @@ def fail_state_waiters(source):
                     replies.put_nowait(None)
 
 
+def write_state_frame(source, frame, deadline):
+    """Bound pipe backpressure too; worker_lock serializes this with ordinary sends."""
+    body = memoryview((json.dumps(frame, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8"))
+    fd = source.stdin.fileno()
+    blocking = os.get_blocking(fd)
+    os.set_blocking(fd, False)
+    try:
+        while body:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
+                raise TimeoutError()
+            try:
+                written = os.write(fd, body[:4096])
+                body = body[written:]
+            except BlockingIOError:
+                continue
+    finally:
+        os.set_blocking(fd, blocking)
+
+
 def state_rpc(req):
     """Export returns {state: ...}; import returns True. Correlation stays internal."""
+    global worker, relay_token
     operation = req["method"]
     frame = {"type": operation, "request_id": uuid.uuid4().hex,
              "run_id": req.get("run_id"), "owner_id": req.get("owner_id")}
@@ -264,6 +301,7 @@ def state_rpc(req):
         frame["state"] = req["state"]
     replies = queue.Queue(maxsize=1)
     key = frame["request_id"]
+    deadline = time.monotonic() + STATE_TIMEOUT
     try:
         with worker_lock:
             if not worker or worker.poll() is not None:
@@ -273,14 +311,20 @@ def state_rpc(req):
                     raise RuntimeError("A worker state operation is already pending.")
                 state_waiters[key] = (worker, operation, replies)
             try:
-                worker.stdin.write(json.dumps(frame, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
-                worker.stdin.flush()
+                write_state_frame(worker, frame, deadline)
             except Exception:
+                # A partial JSONL frame cannot be reused safely. Discard this worker
+                # rather than concatenate a later interrupt/import onto private state.
+                source, worker, relay_token = worker, None, None
+                fail_state_waiters(source)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(source.pid, signal.SIGKILL)
+                source.wait(timeout=5)
                 raise RuntimeError("The worker state request failed.") from None
         # Never hold worker_lock while waiting: interrupts, drains and replacement
         # must remain available even when the runner cannot reach an export seam.
         try:
-            reply = replies.get(timeout=STATE_TIMEOUT)
+            reply = replies.get(timeout=max(0, deadline - time.monotonic()))
         except queue.Empty:
             raise RuntimeError("The worker state request timed out.") from None
         if not reply or reply["type"] == "state.error":
@@ -329,14 +373,16 @@ def drain(stream, source=None):
 
 def worker_env(req):
     """The built-in runner reaches models only through the loopback relay; no model credentials exist here."""
-    return {**os.environ, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
+    if not relay_token:
+        raise RuntimeError("The model relay is not ready.")
+    return {**os.environ, "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
             "GOND_AGENT_QUESTION_WAIT_MINUTES": str(req.get("question_wait_minutes", 240)),
             "GOND_AGENT_INTERACTIVE": "true" if req.get("interactive") is True else "false",
             "GOND_AGENT_PLAN_REMINDER_EVERY": str(req.get("plan_reminder_every", 6)), "GOND_AGENT_PLAN_NUDGE_LIMIT": str(req.get("plan_nudge_limit", 2))}
 
 
 def dispatch(req):
-    global worker
+    global worker, relay_token
     method = req["method"]
     if method == "ping":
         return {"ready": True}
@@ -351,10 +397,16 @@ def dispatch(req):
         with worker_lock:
             if worker and worker.poll() is None:
                 raise RuntimeError("The worker is already running.")
-            pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
-            with open("/tmp/worker.log", "ab") as log:
-                replacement = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            relay_token = secrets.token_urlsafe(32)
+            try:
+                pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                with open("/tmp/worker.log", "ab") as log:
+                    replacement = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            except Exception:
+                # No worker owns this credential if startup fails. Keep the relay closed.
+                relay_token = None
+                raise
             fail_state_waiters(worker)
             worker = replacement
             threading.Thread(target=drain, args=(worker.stdout, worker), daemon=True).start()
@@ -417,6 +469,29 @@ def handle(req):
 
 
 class ModelProxy(http.server.BaseHTTPRequestHandler):
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        # Check every method/path before routing, including unsupported endpoints.
+        authorization = self.headers.get_all("Authorization", [])
+        if not relay_token or len(authorization) != 1 or not hmac.compare_digest(
+                authorization[0].encode("utf-8"), ("Bearer " + relay_token).encode("utf-8")):
+            self.send_error(401, "Unauthorized")
+            return False
+        if self.headers.get_all("Origin") is not None or self.headers.get_all("Host", []) not in (
+                ["127.0.0.1:8787"], ["localhost:8787"]):
+            self.send_error(403)
+            return False
+        if self.command == "POST":
+            content_types = self.headers.get_all("Content-Type", [])
+            if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
+                self.send_error(415)
+                return False
+        if self.command not in ("GET", "POST"):
+            self.send_error(403)
+            return False
+        return True
+
     def relay(self):
         if (self.command, self.path) not in [("GET", "/v1/models"), ("POST", "/v1/responses"), ("POST", "/v1/search")]:
             self.send_error(403)

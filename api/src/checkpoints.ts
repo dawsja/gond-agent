@@ -260,7 +260,7 @@ export class Checkpoints {
     const dir = join(this.root, row.run_id);
     if (!fs.lstatSync(dir).isDirectory()) throw new Error("Unsafe checkpoint directory");
     fs.chmodSync(dir, 0o700);
-    const fd = fs.openSync(join(this.root, row[`${kind}_path`]), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const fd = fs.openSync(join(this.root, row[`${kind}_path`]), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
       const stat = fs.fstatSync(fd), size = row[`${kind}_size`];
       if (!stat.isFile() || stat.nlink !== 1 || stat.size !== size || size < 0 || size > (kind === "bundle" ? CHECKPOINT_BUNDLE_MAX : SEALED_MAX))

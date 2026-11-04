@@ -100,3 +100,10 @@ content and must not enter normal logs or browser transcripts.
 The root guide, README and protocol describe this foundation and the remaining
 lifecycle work. RunService must pair these primitives under a quiescent tree/history
 boundary and wire recovery and cleanup before enabling persistence.
+
+The controller bounds both state pipe writes and reply waits with one 120-second
+deadline. Failed writes discard the worker/process group and its relay credential:
+a partial JSONL frame must never be followed by new work. Reply timeout alone
+leaves the worker alive and late replies are dropped. Tree restore deliberately
+does not restore staging metadata; export rejects newly staged ignored files to
+avoid silently losing them during capture or later publication.

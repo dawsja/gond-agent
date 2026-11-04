@@ -3,7 +3,7 @@ use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use super::{Tool, ToolCtx, ToolOutput, schema, str_arg};
 use crate::permissions::Access;
-pub struct WebSearch { pub relay: String }
+pub struct WebSearch { pub api: crate::api::ApiClient }
 impl Tool for WebSearch {
     fn name(&self) -> &'static str { "web_search" }
     fn description(&self) -> &'static str { "Search the web for a query. Returns untrusted titles, URLs and snippets. Default 5 results, maximum 10; refine the query to get more relevant results." }
@@ -16,8 +16,7 @@ impl Tool for WebSearch {
             let count = input["count"].as_u64().unwrap_or(5);
             if query.is_empty() || query.chars().count() > 1000 || !(1..=10).contains(&count) { return ToolOutput::err("Use a query of 1–1000 characters and count of 1–10"); }
             let request = async {
-                let client = crate::http::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(20)).build().map_err(|_| "Search unavailable")?;
-                let mut res = client.post(format!("{}/v1/search", self.relay.trim_end_matches('/'))).json(&json!({"query":query,"count":count})).send().await.map_err(|_| "Search interrupted or unavailable")?;
+                let mut res = self.api.req(reqwest::Method::POST, "/v1/search").timeout(std::time::Duration::from_secs(20)).json(&json!({"query":query,"count":count})).send().await.map_err(|_| "Search interrupted or unavailable")?;
                 let ok = res.status().is_success();
                 let mut bytes = Vec::new();
                 while let Some(chunk) = res.chunk().await.map_err(|_| "Search response interrupted")? {
@@ -46,12 +45,13 @@ mod tests {
     async fn relay_results_are_untrusted_bounded_and_cancellable() {
         let url = serve(|req| {
             assert!(req.head.starts_with("post /v1/search"));
+            assert!(req.head.contains("authorization: bearer relay-test"));
             assert_eq!(req.json()["count"], 5);
             Res::new(200, "application/json", r#"{"results":[{"title":"Example","url":"https://example.com","snippet":"Example text"}]}"#)
         }).await;
         let d = tempfile::tempdir().unwrap();
         let (c, _rx) = ctx(d.path());
-        let tool = WebSearch { relay: url };
+        let tool = WebSearch { api: crate::api::ApiClient::new(url, Some("relay-test".into())) };
         let out = tool.run(&c, json!({"query":"example"})).await;
         assert!(out.ok && text(&out).contains("untrusted text"));
         assert!(!tool.run(&c, json!({"query":"x","count":11})).await.ok);
