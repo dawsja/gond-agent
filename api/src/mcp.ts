@@ -107,6 +107,8 @@ export function sessionState(r: Run) {
     question: question?.question ?? null,
     pr_url: r.pr_url ?? null,
     last_error: r.status === "failed" ? r.error ?? r.summary?.error ?? null : null,
+    last_error_details: r.status === "failed" ? r.last_error ?? null : null,
+    work_kept: !!r.work_kept,
   };
 }
 function session(r: Run, origin: string) {

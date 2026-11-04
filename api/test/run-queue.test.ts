@@ -3,13 +3,16 @@ import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
+import { RetryError } from "../src/retry";
 import { createAuthentication, seal } from "../src/auth";
 import { queueSettings, type Config } from "../src/config";
 import type { Workspace, WorkspaceFactory } from "../src/containers";
 import { migrateRunQueue, openStore, setSetting } from "../src/db";
-import { checkout, gh, importBundle } from "../src/github";
+import { checkout, gh, importBundle, pushBranch } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
+import { RunQueue } from "../src/runs/queue";
 import { createApp } from "../src/app";
 import { createToken } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -20,6 +23,7 @@ vi.mock("../src/github", async (original) => ({
   checkout: vi.fn(async () => ({ cwd: "/fake", archive: Buffer.from("repo") })),
   commitIdentity: vi.fn(async () => ({ name: "fixture", email: "123+fixture@users.noreply.github.com" })),
   importBundle: vi.fn(async () => {}),
+  pushBranch: vi.fn(async () => {}),
   git: vi.fn(async (_cwd: string, ...args: string[]) => Buffer.from(args[0] === "rev-parse" ? "a".repeat(40) : "")),
 }));
 
@@ -27,14 +31,16 @@ type Event = Record<string, unknown>;
 type Batch = { events: Event[]; alive: boolean };
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(done => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 // Long-poll events stay pending until the test explicitly releases them. No worker,
 // Git checkout, network request, real-time polling or automatic turn completion.
 class ControlledWorkspace implements Workspace {
   readonly calls: { method: string; args?: Record<string, unknown> }[] = [];
+  rejectEventsOnDestroy = false;
   private batches: Batch[] = [];
   private poll?: ReturnType<typeof deferred<Batch>>;
   constructor(readonly id: string, private starts: string[], private releases: string[]) {}
@@ -64,7 +70,10 @@ class ControlledWorkspace implements Workspace {
     this.releases.push(this.id);
     // A real workspace resolves an outstanding RPC on teardown. A nonempty batch
     // lets the pump see live.closed before attempting another database read.
-    this.emit({ type: "turn.start", agent_id: "main" });
+    if (this.rejectEventsOnDestroy && this.poll) {
+      this.poll.reject(new Error("Workspace was destroyed"));
+      this.poll = undefined;
+    } else this.emit({ type: "turn.start", agent_id: "main" });
   }
   users() {
     return this.calls.filter(call => call.method === "send")
@@ -82,9 +91,9 @@ const factory: WorkspaceFactory = async id => {
   workspaces.set(id, workspace);
   return workspace;
 };
-// Boot and publication are promise chains; flush them without advancing the clock
-// or waiting for wall time. Worker event RPCs remain under test control.
-async function flush() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
+// Flush promise chains and asynchronous checkout cleanup without advancing the
+// fake clock. Worker event RPCs remain under test control.
+async function flush() { for (let i = 0; i < 100; i++) await setImmediate(); }
 async function create(user = "a", prompt = "Implement it") {
   const run = await runs.create(user, input(prompt));
   await flush();
@@ -201,7 +210,7 @@ describe("persistent workspace queue", () => {
     expect(queuedIds()).toEqual([]);
   });
 
-  it.each(["ready", "stopped", "failed"])("keeps a live %s workspace counted until explicitly closed", async status => {
+  it.each(["ready", "stopped", "failed"])("counts a live %s workspace until close or kept-failure reclamation", async status => {
     const active = await create(), waiting = await create("b");
     if (status === "ready") await finish(active.id);
     else if (status === "stopped") { await runs.stop(active.id, "a"); await flush(); }
@@ -214,9 +223,15 @@ describe("persistent workspace queue", () => {
     }
     expect(runs.get(active.id).status).toBe(status);
     runs.drain(); await flush();
-    expect(starts).toEqual([active.id]);
-    expect(releases).toEqual([]);
-    expect(runs.get(waiting.id).status).toBe("queued");
+    if (status === "failed") {
+      // A kept failure still owns a slot, but queued work now reclaims it.
+      expect(runs.get(active.id).work_kept).toBe(false);
+      expect(releases).toEqual([active.id]);
+    } else {
+      expect(starts).toEqual([active.id]);
+      expect(releases).toEqual([]);
+      expect(runs.get(waiting.id).status).toBe("queued");
+    }
     await runs.closeSession(active.id, "a"); await flush();
     expect(starts).toEqual([active.id, waiting.id]);
   });
@@ -520,6 +535,105 @@ describe("persistent workspace queue", () => {
     const scheduled = await runs.create("c", { ...input(), source }); await flush();
     expect(starts.at(-1)).toBe(scheduled.id);
     expect(workspaces.get(scheduled.id)!.calls.find(call => call.method === "start")?.args).toMatchObject({ interactive: false });
+  });
+
+  it.each(["close", "stop", "expiry"])("drains waiting work when a kept failed workspace finishes releasing after %s", async action => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "1");
+    const failed = await create();
+    workspaces.get(failed.id)!.emit({ type: "error", agent_id: "main", message: "The model connection failed." });
+    await flush();
+    expect(runs.get(failed.id).work_kept).toBe(true);
+    const gate = deferred<void>();
+    gates.push(gate);
+    const workspace = workspaces.get(failed.id)!;
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    let closing: Promise<unknown> | undefined;
+    if (action === "close") closing = runs.closeSession(failed.id, "a");
+    else if (action === "stop") closing = runs.stop(failed.id, "a");
+    else await vi.advanceTimersByTimeAsync(60_000);
+    const waiting = await create("b");
+    expect(runs.get(waiting.id).status).toBe("queued");
+    expect(starts).toEqual([failed.id]);
+    gate.resolve();
+    await closing; await flush();
+    expect(starts).toEqual([failed.id, waiting.id]);
+    expect(runs.get(failed.id).work_kept).toBe(false);
+  });
+
+  it("reclaims a failure for already queued work and reserves the reclaimed slot only once", async () => {
+    const active = await create(), first = await create("b"), second = await create("c");
+    const gate = deferred<void>();
+    gates.push(gate);
+    const workspace = workspaces.get(active.id)!;
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    // Publication imported this commit before its push failed. Capacity eviction
+    // must retain the API clone/commit, as in the retry/keep-work contract.
+    vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", { class: "server", retryable: true, reason: "GitHub returned 500" }, 5));
+    workspace.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await flush();
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false, kept_commit: "b".repeat(40) });
+    expect(membership(first.id).queue_seq).toBeNull();
+    expect(queuedIds()).toEqual([second.id]);
+    expect(starts).toEqual([active.id]); // Replacement waits for destruction.
+    const third = await create("a");
+    runs.drain();
+    expect(queuedIds()).toEqual([second.id, third.id]);
+    gate.resolve(); await flush();
+    expect(starts).toEqual([active.id, first.id]);
+    expect(queuedIds()).toEqual([second.id, third.id]);
+  });
+
+  it.each(["membership", "status"])("does not boot a stale queue selection after another claimant changes its %s", async changed => {
+    const active = await create(), waiting = await create("b");
+    const queue = new RunQueue(db);
+    const claim = RunQueue.prototype.claim;
+    vi.spyOn(RunQueue.prototype, "claim").mockImplementationOnce(function (this: RunQueue, id) {
+      expect(id).toBe(waiting.id);
+      // Simulate the durable result of a different process winning after selection.
+      if (changed === "membership") db.prepare("UPDATE runs SET queue_seq=NULL WHERE id=?").run(id);
+      else db.prepare("UPDATE runs SET status='working' WHERE id=?").run(id);
+      return claim.call(this, id);
+    });
+    await runs.close(active.id); await flush();
+    expect(queue.claim(waiting.id)).toBe(false);
+    expect(starts).toEqual([active.id]);
+    expect(vi.mocked(checkout).mock.calls.map(call => call[1])).toEqual([active.id]);
+    expect(runs.history(waiting.id, 0).filter(event => event.type === "run.dequeued")).toEqual([]);
+  });
+
+  it("preserves replacement messages accepted after Stop during kept-commit publication", async () => {
+    const original = await create();
+    await runs.close(original.id);
+    const saved = runs.get(original.id);
+    saved.kept_commit = "b".repeat(40);
+    saved.status = "failed";
+    runs.save(saved);
+    const gate = deferred<void>();
+    gates.push(gate);
+    vi.mocked(pushBranch).mockImplementationOnce(() => gate.promise);
+    runs.enqueue(original.id, "a", "Cancelled retry");
+    await flush();
+    expect(pushBranch).toHaveBeenCalledTimes(1);
+    await runs.stop(original.id, "a");
+    runs.enqueue(original.id, "a", "Replacement", [], undefined, undefined, "replacement-id");
+    gate.resolve(); await flush();
+    expect(starts).toEqual([original.id, original.id]);
+    expect(workspaces.get(original.id)!.users()).toEqual(["Replacement"]);
+    expect(membership(original.id).queue_seq).toBeNull();
+    expect(runs.get(original.id).kept_commit).toBeUndefined();
+    expect(runs.get(original.id).pending).toEqual([]);
+  });
+
+  it("does not turn intentional teardown RPC errors into a kept failure", async () => {
+    const active = await create();
+    await finish(active.id);
+    await vi.advanceTimersByTimeAsync(50); await flush();
+    workspaces.get(active.id)!.rejectEventsOnDestroy = true;
+    await runs.closeSession(active.id, "a"); await flush();
+    expect(runs.get(active.id)).toMatchObject({ status: "ready", work_kept: false });
+    expect(runs.history(active.id, 0).filter(event => event.type === "run.error")).toEqual([]);
   });
 
   it("claims each run only once when releases, drains and new admissions race", async () => {

@@ -26,6 +26,9 @@ export class RunQueue {
     this.db.prepare("UPDATE runs SET queue_seq=?,queued_at=? WHERE id=?").run(seq, Date.now(), id);
   }
   leave(id: string) { this.db.prepare("UPDATE runs SET queue_seq=NULL,queued_at=NULL WHERE id=?").run(id); }
+  claim(id: string) {
+    return this.db.prepare("UPDATE runs SET queue_seq=NULL,queued_at=NULL,status='working' WHERE id=? AND queue_seq IS NOT NULL AND status='queued' AND deleted_at IS NULL").run(id).changes === 1;
+  }
   /** Fewest occupied workspaces first; oldest account head breaks ties, FIFO within each account. */
   first(occupied: Map<string, number>, reserved: Set<string>) {
     const seen = new Set<string>();
