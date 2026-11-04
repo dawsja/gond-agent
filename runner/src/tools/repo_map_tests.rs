@@ -2,6 +2,14 @@ use super::*;
 use crate::tools::testutil::{ctx, text};
 
 fn repo() -> tempfile::TempDir {
+    static CTAGS: LazyLock<()> = LazyLock::new(|| {
+        let required = "repo_map parser fixtures require Universal Ctags with JSON support; install universal-ctags (also required on the CI host, not just in the worker image)";
+        let version = std::process::Command::new("ctags").args(["--options=NONE", "--version"]).output().expect(required);
+        assert!(version.status.success() && String::from_utf8_lossy(&version.stdout).contains("Universal Ctags"), "{required}");
+        let features = std::process::Command::new("ctags").args(["--options=NONE", "--list-features"]).output().expect(required);
+        assert!(features.status.success() && String::from_utf8_lossy(&features.stdout).lines().any(|line| line.split_whitespace().next() == Some("json")), "{required}");
+    });
+    LazyLock::force(&CTAGS);
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git").args(["init", "--quiet", "--template="]).arg(dir.path()).status().unwrap().success());
     dir
