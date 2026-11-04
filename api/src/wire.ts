@@ -62,6 +62,15 @@ export type StreamEvent =
 
 export const emptyUsage = (): Usage => ({ input_uncached: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0 });
 
+/** Deliberately aggregate shared-instance workspace load; only queue totals are account-scoped. */
+export interface Capacity {
+  max: number;
+  occupied: number;
+  working: number;
+  idle_releasable: number;
+  queued_total_for_account: number;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,

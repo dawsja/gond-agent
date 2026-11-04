@@ -3,6 +3,18 @@ import { createTranscript, type StreamEvent } from "../../web/src/features/run/t
 import { activityLabel, groupLabel, presentTool } from "../../web/src/features/run/tool-presentation";
 import { emptySummary, fold } from "../src/runs/fold";
 
+it("shows teardown give-up once without changing the run status on replay", () => {
+  const append = createTranscript();
+  const events: StreamEvent[] = [
+    { seq: 1, ts: 1, type: "run.status", status: "ready" },
+    { seq: 2, ts: 2, type: "run.cleanup", state: "gave_up", attempts: 5 },
+  ];
+  const result = append(events);
+  expect(result.status).toBe("ready");
+  expect(result.items).toEqual([expect.objectContaining({ kind: "run-message", text: expect.stringContaining("Try Close workspace again") })]);
+  expect(append(events)).toEqual(result);
+});
+
 it("preserves transcript snapshots across batches and deduplicates reconnect replay", () => {
   const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq * 100, type, ...fields });
   const initial = [

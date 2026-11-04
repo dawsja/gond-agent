@@ -152,6 +152,69 @@ def checkpoint_repository():
         yield git, env, scratch, head
 
 
+def workspace_quiescent():
+    """No tool/background processes may outlive the clean observation and snapshot.
+
+    Workers have a private PID namespace: only init, this controller and the idle
+    runner may remain. Count detached/reparented processes too; unknown fails closed.
+    """
+    allowed = {1, os.getpid()}
+    if worker is not None:
+        allowed.add(worker.pid)
+    try:
+        return all(not entry.name.isdecimal() or int(entry.name) in allowed for entry in pathlib.Path("/proc").iterdir())
+    except OSError:
+        return False
+
+
+def workspace_state():
+    """Fail-closed release evidence using private Git config/index, without staging edits."""
+    with checkpoint_lock, checkpoint_repository() as (git, env, scratch, head):
+        # Release evidence must not trust clone-local exclusions, even if paired
+        # capture chooses to copy them. Otherwise hidden work could be discarded.
+        (scratch / "repo/.git/info/exclude").unlink(missing_ok=True)
+        gitdir = pathlib.Path(ROOT).resolve() / ".git"
+        # Publication exports HEAD only. Stashes, tags/notes and commits on other
+        # local branches must not disappear just because the current tree is clean.
+        refs = {}
+        packed = clone_git_file(gitdir, "packed-refs")
+        if packed.exists():
+            for line in packed.read_text().splitlines():
+                if line and not line.startswith(("#", "^")):
+                    sha, name = line.split()
+                    refs[name] = sha
+        root = clone_git_file(gitdir, "refs")
+        for entry in root.rglob("*"):
+            entry = clone_git_file(gitdir, str(entry.relative_to(gitdir)))
+            if entry.is_file():
+                name = entry.relative_to(gitdir).as_posix()
+                if not name.startswith("refs/remotes/"):
+                    refs[name] = entry.read_text().strip()
+        for name, sha in refs.items():
+            if name.startswith("refs/remotes/"):
+                continue
+            if not name.startswith("refs/heads/") or git("rev-list", "--max-count=1", checkpoint_sha(sha), "--not", head).strip():
+                return {"head": head, "clean": False}
+        # Parent snapshots cannot preserve dirty submodule contents. Be conservative
+        # even for apparently clean gitlinks, rather than trust submodule config.
+        submodules = any(entry.startswith(b"160000 ") for entry in git("ls-tree", "-rz", head).split(b"\0"))
+        if submodules or not workspace_quiescent():
+            return {"head": head, "clean": False}
+        index = clone_git_file(gitdir, "index")
+        if not index.exists():
+            return {"head": head, "clean": False}
+        private_index = env["GIT_INDEX_FILE"]
+        try:
+            env["GIT_INDEX_FILE"] = str(index)
+            staged = git("diff", "--cached", "--no-ext-diff", "--name-only", head, "--")
+        finally:
+            env["GIT_INDEX_FILE"] = private_index
+        git("read-tree", head)
+        git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
+        tree = git("write-tree").strip()
+        return {"head": head, "clean": not staged and tree == git("rev-parse", head + "^{tree}").strip() and workspace_quiescent()}
+
+
 def checkpoint_message(base, head):
     return f"Gond Agent checkpoint\n\nbase_sha: {base}\nhead_sha: {head}\n"
 
@@ -515,6 +578,8 @@ def dispatch(req):
                 batch.append(event)
                 size += length
         return {"events": batch, "alive": worker is not None and worker.poll() is None}
+    if method == "workspace_state":
+        return workspace_state()
     if method == "checkpoint_tree":
         with worker_lock:
             if worker and worker.poll() is None:
