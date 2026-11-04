@@ -145,7 +145,9 @@ alone does not imply that its release acknowledgement has reached the API. The
 postpublication capture pins the pushed HEAD, not its prepublication parent.
 RunService catches save/flush/capture failures and emits
 `run.checkpoint_unavailable`: checkpoint availability must never block publishing
-completed work. Recovery may instead use an older pair or fail after restart.
+completed work. Failed saves leave the previously saved pair intact; recovery
+never searches behind an invalid latest pair and may fall back to the last pushed
+branch or fail after restart.
 The optional capture argument updates the saved handler options inside the
 serialized explicit capture, after prior captures flush and before requesting the
 idle export/hold. It applies to that capture and all later captures; overlapping
@@ -201,13 +203,17 @@ Once a question resolves, the next checkpoint includes its paired result.
   incompatible**. Service and runner both use epoch 3, retaining epoch 2's
   `sub_counter` as the child-ID sequence and consumed general-purpose delegation
   allowance. **Epoch 1 is rejected**: its unrestricted ID counter is incompatible.
-  Only the runner's direct codec may accept ledgerless epoch-2 input, without
-  supplying prior execution evidence; ledger-bearing epoch-2 input is rejected.
-  **Service sealed-checkpoint orchestration requires exact epoch 3**. Old epoch-2
-  checkpoints fall back to the last pushed branch rather than recovering their
-  sealed tree/history pair. This is a deliberate compatibility limitation, not
-  a silent checkpoint upgrade; direct codec compatibility does not widen service
-  admission.
+  Service recovery also accepts the **latest authenticated ledgerless epoch-2
+  sealed pair**, with `evidence` absent or null only. Its shared validator requires
+  the payload version to match the authenticated row/envelope version. Epoch-2
+  ledgers, future epochs and version mismatches are rejected. Load authenticates
+  under the original epoch-2 storage key; never relabel ciphertext/rows or search
+  older checkpoints when the latest is unavailable or incompatible. Claim,
+  release, quarantine and consume retain the original epoch-2 key. The runner
+  codec upgrades accepted state in memory to epoch 3 without supplying prior
+  execution evidence. The next normal paired capture seals a new epoch-3
+  checkpoint and transactionally consumes the claimed predecessor; the old
+  ciphertext and row version are not rewritten.
 - Controls supply the expected run and owner; initialization binds the signing
   authority to them, and import checks both against state. Subsequent controls
   must respect the worker's binding. This is not authentication: the service must
@@ -289,7 +295,8 @@ crash/publication ordering, continuation, persistence, retention and version
 upgrade behavior. State payloads may contain private repository/tool/provider
 content and must not enter normal logs or browser transcripts.
 
-RunService exclusively claims the latest usable checkpoint, restores the paired
+RunService exclusively claims the latest checkpoint admitted by the shared
+validator (epoch 3 or authenticated ledgerless epoch 2), restores the paired
 tree/history into a fresh worker and sends explicit continuation framing. A failed
 prerequisite checkout, tree restore or history import falls back to a fresh checkout
 of the last pushed branch and records `run.checkpoint_fallback`. The predecessor
@@ -305,6 +312,16 @@ stored human/CI messages. Finishing-phase recovery verifies publication and
 finishes instead of replaying the original task. Pending live request IDs are
 never reused. MCP has no explicit resume tool: `send_session_message` resumes;
 `state:interrupted,done:true` is not successful completion.
+
+The active RunService finish path persists the finishing marker before awaiting
+checkpoint flush, then exports private evidence before publication. Missing or
+throwing exports and malformed evidence preserve durable budgets; no exported
+key can replace service signing authority. They do not prevent publication or
+the post-push paired capture. A failed flush also does not suppress that later
+capture attempt; flush/capture failures report `run.checkpoint_unavailable` rather
+than fail the run. Reloading run state after awaits preserves follow-ups and Stop
+accepted while finish is settling. These are orchestration guarantees, not just
+runner codec validation, and do not promise recovery beyond the last durable pair.
 
 At startup, eligible interactive runs resume through the ordinary queue one at a
 time, at most twice while their checkpoint is under 24 hours old. Scheduled,

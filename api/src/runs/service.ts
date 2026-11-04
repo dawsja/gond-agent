@@ -111,9 +111,8 @@ export interface Run extends CiInfo {
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
-// Fail closed: sealed epoch-2 checkpoints are not relabeled or auto-recovered on
-// upgrade, even if ledgerless. Safe legacy service migration is not implemented.
 const RUNNER_STATE_VERSION = "gond-agent-checkpoint-3";
+const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
 interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
@@ -379,10 +378,28 @@ export class Runs {
     if (/^run_[a-f0-9]{24}$/.test(id)) this.checkpoints.deleteRun(id, user);
   }
   private checkpointKey(r: Run) { return { runId: r.id, ownerId: r.user_id, runnerVersion: RUNNER_STATE_VERSION }; }
+  private latestCheckpoint(r: Run) {
+    const latest = this.db.prepare("SELECT seq,runner_version FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(r.id) as { seq: number; runner_version: string } | undefined;
+    // Authenticate legacy ciphertext under its original version; never relabel it
+    // or search older pairs when the latest one is incompatible/unavailable.
+    const key = this.checkpointKey(r);
+    if (latest?.runner_version === LEGACY_RUNNER_STATE_VERSION) key.runnerVersion = LEGACY_RUNNER_STATE_VERSION;
+    return { latest, key };
+  }
+  private savedState(state: string, runnerVersion: string): SavedState {
+    const saved = JSON.parse(state) as SavedState;
+    if (!saved?.runner || !saved.service || saved.runner.runner_state_version !== runnerVersion ||
+        (runnerVersion !== RUNNER_STATE_VERSION && runnerVersion !== LEGACY_RUNNER_STATE_VERSION) ||
+        (runnerVersion === LEGACY_RUNNER_STATE_VERSION && saved.runner.evidence != null))
+      throw new Error("Invalid service checkpoint");
+    return saved;
+  }
   private usableCheckpoint(r: Run) {
     try {
-      const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(r.id) as { seq: number } | undefined;
-      return latest ? this.checkpoints.load(this.checkpointKey(r), latest.seq) : null;
+      const { latest, key } = this.latestCheckpoint(r);
+      const loaded = latest ? this.checkpoints.load(key, latest.seq) : null;
+      if (loaded) this.savedState(loaded.state, loaded.checkpoint.runner_version);
+      return loaded;
     } catch { return null; }
   }
   async recover() {
@@ -793,10 +810,10 @@ export class Runs {
         if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
         if ((r.auto_resumes ?? 0) >= 2 || !["web", "mcp"].includes(r.source)) throw new Error("Automatic resume is unavailable");
       }
-      claimKey = this.checkpointKey(r);
+      claimKey = this.latestCheckpoint(r).key;
       try { if (/^run_[a-f0-9]{24}$/.test(id)) claimed = this.checkpoints.claim(claimKey); }
       catch {
-        const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? AND claimed_by IS NULL ORDER BY seq DESC LIMIT 1").get(id) as { seq: number } | undefined;
+        const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(id) as { seq: number } | undefined;
         if (latest) this.checkpoints.quarantine(claimKey, latest.seq);
         this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint is invalid. Continuing from a fresh checkout of the last pushed branch." });
       }
@@ -938,8 +955,7 @@ export class Runs {
       if (claimed) {
         let startingWorker = false;
         try {
-          const state = JSON.parse(claimed.state) as SavedState;
-          if (!state.runner || state.runner.runner_state_version !== RUNNER_STATE_VERSION || !state.service) throw new Error("Invalid service checkpoint");
+          const state = this.savedState(claimed.state, claimed.checkpoint.runner_version);
           await workspace.rpc("restore_checkpoint", { bundle: claimed.bundle.toString("base64"), base_sha: claimed.tree.baseSha, head_sha: claimed.tree.headSha, checkpoint_sha: claimed.tree.checkpointSha, ...(r.pushed && r.head_sha ? { published_head: r.head_sha } : {}) });
           r = this.get(id);
           if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();

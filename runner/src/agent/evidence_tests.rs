@@ -1000,7 +1000,20 @@ async fn service_rekey_on_resume_preserves_counters_and_does_not_refresh_histori
 async fn old_checkpoint_without_ledger_and_missing_key_restore_without_trusting_history() {
     let dir = repository();
     let mut old = serde_json::to_value(checkpoint_fixture(dir.path())).unwrap();
+    old["runner_state_version"] = json!("gond-agent-checkpoint-2");
+    assert_eq!(
+        Checkpoint::import(old.clone(), "run", "owner")
+            .await
+            .unwrap_err(),
+        "incompatible_version",
+        "Only ledgerless epoch-2 state is compatible"
+    );
     old.as_object_mut().unwrap().remove("evidence");
+    old["counters"]["sub_counter"] = json!(3);
+    old["counters"]["main_context"] = json!(12345);
+    old["counters"]["plan_calls"] = json!(7);
+    old["counters"]["plan_nudges"] = json!(2);
+    old["counters"]["turn_compactions"] = json!(1);
     old["runner_state_version"] = json!("gond-agent-checkpoint-1");
     assert!(
         Checkpoint::import(old.clone(), "run", "owner")
@@ -1018,8 +1031,15 @@ async fn old_checkpoint_without_ledger_and_missing_key_restore_without_trusting_
         checkpoint::RUNNER_STATE_VERSION
     );
     let restored = restore(dir.path(), old).await;
+    assert_eq!(restored.counters, decoded.counters);
+    assert_eq!(
+        restored.counters.sub_counter, 3,
+        "Migration must preserve consumed delegation allowance"
+    );
+    assert_eq!(restored.history, decoded.history);
     let ledger = restored.evidence.as_ref().unwrap();
     assert!(ledger.records.is_empty());
+    assert_eq!(ledger.resumes, 1);
     assert!(
         ledger
             .unverified

@@ -388,6 +388,10 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                         Ok(()) => {
                             let mut ledger = state.evidence.unwrap_or_else(|| {
                                 let mut ledger = evidence::Ledger::new(&s.cwd);
+                                // Legacy state has no prior resume count. Reconcile
+                                // against the initialized service floor below,
+                                // rather than incrementing that floor twice.
+                                ledger.resumes = 0;
                                 ledger.unverified.push("State predates the evidence ledger; re-run a check.".into());
                                 ledger
                             });
