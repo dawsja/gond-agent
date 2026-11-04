@@ -16,6 +16,7 @@ import { Prose as SharedProse } from "@shared/prose"
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceLine, TraceTitle } from "@shared/ui/trace"
 import { AgentLabel } from "./agent-label"
 import { activityLabel, groupLabel } from "./tool-presentation"
+import { SharedImage } from "./shared-image"
 
 /* ───────────── transcript pieces (TUI language, softened) ───────────── */
 
@@ -288,6 +289,8 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
             first={it.key === firstUser}
           />
         )
+      case "shared-image":
+        return <SharedImage key={it.key} runId={run.id} imageId={it.imageId} caption={it.caption} />
       case "run-message":
         return <p key={it.key} role="status" className="text-xs text-muted-foreground">{it.text}</p>
       case "text": {

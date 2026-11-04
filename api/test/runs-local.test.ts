@@ -1055,6 +1055,45 @@ describe("persistent local run lifecycle", () => {
     expect(row.bytes.toString()).toBe("jpeg fixture");
     expect(runs.history(r.id, 0).find((e) => e.type === "tool.images").images).toEqual(images);
   });
+  it("bounds shared images durably across turns and worker/checkpoint replacement", async () => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Share images" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const data = Buffer.alloc(1024 * 1024, 1).toString("base64");
+    const share = (overrides = {}) => runs.append(r.id, { type: "image.shared", agent_id: "main", caption: "Desktop", image: { media_type: "image/jpeg", data }, ...overrides }) as any;
+    expect(share({ agent_id: "child" })).toBeUndefined();
+    expect(share({ image: { media_type: "image/svg+xml", data } })).toBeUndefined();
+    expect(share({ image: { media_type: "image/jpeg", data: "invalid" } })).toBeUndefined();
+    expect(share({ image: { media_type: "image/jpeg", data: Buffer.alloc(1024 * 1024 + 1).toString("base64") } })).toBeUndefined();
+    for (let turn = 0; turn < 4; turn++) {
+      runs.append(r.id, { type: "turn.start", agent_id: "main" });
+      for (let i = 0; i < 4; i++) expect(share().type).toBe("image.shared");
+      expect(share().type).toBe("image.share_rejected");
+    }
+    runs.append(r.id, { type: "turn.start", agent_id: "main" });
+    expect(share().type).toBe("image.share_rejected"); // 16 MiB total
+    const small = Buffer.from("small").toString("base64");
+    expect(share({ image: { media_type: "image/png", data: small } }).type).toBe("image.share_rejected");
+    expect(db.prepare("SELECT count(*) AS n FROM images WHERE run_id=?").get(r.id)).toEqual({ n: 16 });
+    // A new service has no live worker or checkpoint counters to consult.
+    const reopened = new Runs(db, cfg(), async () => { throw new Error("No worker needed for quota admission"); });
+    expect((reopened.append(r.id, { type: "image.shared", agent_id: "main", image: { media_type: "image/png", data: small } }) as any).type).toBe("image.share_rejected");
+    await reopened.shutdown();
+    const second = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Small images" });
+    await vi.waitFor(() => expect(runs.get(second.id).status).toBe("ready"));
+    const next = () => runs.append(second.id, { type: "image.shared", agent_id: "main", image: { media_type: "image/png", data: small } }) as any;
+    for (let turn = 0; turn < 8; turn++) {
+      runs.append(second.id, { type: "turn.start", agent_id: "main" });
+      for (let i = 0; i < 4; i++) {
+        // Queued follow-ups and question answers must not reset the active turn.
+        runs.append(second.id, { type: "user", text: "Queued follow-up" });
+        expect(next().type).toBe("image.shared");
+      }
+      runs.append(second.id, { type: "turn.start", agent_id: "child" });
+      expect(next().type).toBe("image.share_rejected");
+    }
+    runs.append(second.id, { type: "turn.start", agent_id: "main" });
+    expect(next().type).toBe("image.share_rejected"); // 32 images, below byte cap
+  });
   it("starts a container, streams, pushes and creates a PR without giving the worker credentials", async () => {
     const r = await runs.create("u", {
       repo: "acme/app",

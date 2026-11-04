@@ -522,7 +522,7 @@ export function createApp(
     return new Response(new Uint8Array(img.bytes), {
       headers: {
         "content-type": img.media_type,
-        "cache-control": "private, max-age=3600",
+        "cache-control": "private, no-store",
       },
     });
   });

@@ -2,6 +2,18 @@
 
 Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, pull requests, images and profile photos.
 
+## Images in replies
+
+Images shared in replies appear as captioned cards on the run page, with click or
+keyboard enlargement. Use `share_image {path, caption?}` for screenshots or other
+raster files in the workspace or `/tmp`; local Markdown paths cannot be served
+and now show “image not available (local path)”. Remote Markdown images remain
+links, never automatic requests. Shared images survive workspace release and
+follow the run's owner-only access and retention rules. Limits: four sharing
+attempts per execution turn, 32 saved images / 16 MiB per run; 20 MiB input,
+1568px longest side and 1 MiB normalized JPEG/PNG output per image. No new
+network access or dependencies are needed.
+
 ## Connect an external agent with MCP
 
 Open **Settings → MCP access**, name a token, and copy it when it is created. Tokens expire after 90 days and can manage all sessions owned by their account, including browser-created runs. Revoke tokens from the same section; revocation does not stop existing runs.

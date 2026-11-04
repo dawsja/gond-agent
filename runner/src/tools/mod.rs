@@ -13,6 +13,7 @@ pub mod patch;
 pub mod persistent_browser;
 pub(crate) mod process;
 pub mod search;
+pub mod share_image;
 pub mod symbols;
 pub mod web;
 pub mod web_search;
@@ -118,6 +119,8 @@ pub trait Tool: Send + Sync {
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput>;
     /// Stop long-lived services even when no tool call is currently active.
     fn stop(&self) {}
+    /// Reset only per-turn allowances, never model or checkpoint state.
+    fn begin_turn(&self) {}
 
     fn def(&self) -> ToolDef {
         ToolDef { name: self.name().into(), description: self.description().into(), input_schema: self.schema() }
@@ -134,6 +137,7 @@ impl Tool for Bounded {
     fn target(&self, input: &Value) -> String { self.0.target(input) }
     fn paths(&self, input: &Value) -> Vec<String> { self.0.paths(input) }
     fn stop(&self) { self.0.stop(); }
+    fn begin_turn(&self) { self.0.begin_turn(); }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
@@ -151,7 +155,7 @@ pub fn bounded(tool: Arc<dyn Tool>) -> Arc<dyn Tool> { Arc::new(Bounded(tool)) }
 
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(fs::Read), Arc::new(git::Git), Arc::new(checks::RunChecks),
+        Arc::new(fs::Read), Arc::new(share_image::ShareImage::default()), Arc::new(git::Git), Arc::new(checks::RunChecks),
         Arc::new(fs::Write), Arc::new(fs::Edit), Arc::new(fs::MultiEdit),
         Arc::new(patch::ApplyPatch), Arc::new(search::ListDir), Arc::new(search::Glob),
         Arc::new(search::Grep), Arc::new(symbols::Symbols), Arc::new(lsp::Lsp::default()), Arc::new(batch::Batch),

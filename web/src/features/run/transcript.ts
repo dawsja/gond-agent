@@ -46,6 +46,7 @@ export type Item =
       images: { id: string; media_type: string }[]
     }
   | { kind: "text"; key: string; text: string }
+  | { kind: "shared-image"; key: string; imageId: string; mediaType: string; caption: string }
   | { kind: "run-message"; key: string; text: string }
   | { kind: "explore"; key: string; tools: ToolCall[] }
   | { kind: "edits"; key: string; tools: ToolCall[] }
@@ -165,6 +166,14 @@ export function createTranscript() {
           if (c) c.output = (c.output + ev.chunk).slice(-OUTPUT_CAP)
           break
         }
+        case "image.shared":
+          if (main && typeof ev.image_id === "string" && ["image/png", "image/jpeg"].includes(ev.media_type)) {
+            items.push({ kind: "shared-image", key: `image${ev.seq}`, imageId: ev.image_id, mediaType: ev.media_type, caption: typeof ev.caption === "string" ? ev.caption : "" })
+          }
+          break
+        case "image.share_rejected":
+          if (main) items.push({ kind: "run-message", key: `image-error${ev.seq}`, text: "Image sharing limit reached. This image was not saved." })
+          break
         case "tool.images": {
           const c = calls.get(ev.call_id)
           if (c) c.images = Array.isArray(ev.images) ? ev.images : []

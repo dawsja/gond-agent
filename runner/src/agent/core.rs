@@ -701,6 +701,7 @@ fn tool_visible(t: &dyn Tool, run: &Run) -> bool {
 
 fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>, cancel: &'a CancellationToken) -> BoxFuture<'a, Result<String>> {
     Box::pin(async move {
+        if run.id == "main" { for tool in &s.tools { tool.begin_turn(); } }
         s.emit(AgentEvent::TurnStart { agent_id: run.id.clone() });
         if let Some(message) = history.last_mut() {
             for block in &mut message.content {

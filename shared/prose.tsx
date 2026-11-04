@@ -19,18 +19,16 @@ export function Prose({ text, small, className }: { text: string; small?: boolea
     <div className={cn("space-y-3 leading-[1.65] text-foreground", small && "text-[13px] text-muted-foreground", className)}>
       <Markdown
         remarkPlugins={[remarkGfm]}
-        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^(data|blob):/i.test(url) ? url : defaultUrlTransform(url)}
+        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" ? url : defaultUrlTransform(url)}
         components={{
           img: ({ src, alt, title }) => {
-            if (typeof src !== "string" || !src) return <span>{alt}</span>
-            let local = false
-            try {
-              const url = new URL(src, window.location.href)
-              local = url.origin === window.location.origin || url.protocol === "data:" || url.protocol === "blob:"
-            } catch { /* Invalid image URLs render as text links, never image requests. */ }
-            return local ? <img src={src} alt={alt} title={title} /> : (
-              <a href={src} target="_blank" rel="noreferrer" className="break-all text-link underline-offset-2 hover:underline">{alt || src}</a>
+            // File paths and remote URLs never trigger image requests. Existing
+            // inline data/blob images stay compatible; saved attachments use IDs.
+            if (typeof src === "string" && /^https?:\/\//i.test(src)) return (
+              <a href={defaultUrlTransform(src)} target="_blank" rel="noreferrer" className="break-all text-link underline-offset-2 hover:underline">{alt || src}</a>
             )
+            if (typeof src === "string" && /^(data|blob):/i.test(src)) return <img src={src} alt={alt} title={title} />
+            return <span>{alt} <span className="text-muted-foreground">image not available (local path)</span></span>
           },
           code: ({ className, children }) =>
             className ? (
