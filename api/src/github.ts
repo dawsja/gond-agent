@@ -3,6 +3,28 @@ import { command } from "./command";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ApiError } from "./wire";
+import { ClassifiedRetryFailure, classifyRetryFailure, RetryError, withRetry, type RetryOptions } from "./retry";
+
+// Keep bounded classification for alternate command adapters; command() itself
+// classifies raw diagnostics before discarding them.
+async function githubCommand(file: string, args: string[], options: NonNullable<Parameters<typeof command>[2]> = {}) {
+  let stderr = "";
+  const started = Date.now();
+  try {
+    return await command(file, args, { ...options, onStderr: text => {
+      stderr = (stderr + text).slice(-64 * 1024);
+      options.onStderr?.(text);
+    } });
+  } catch (error) {
+    if (error instanceof ClassifiedRetryFailure) throw error;
+    const fields = error && typeof error === "object" ? error : {};
+    const message = error instanceof Error ? error.message : "message" in fields ? fields.message : "";
+    throw new ClassifiedRetryFailure(classifyRetryFailure({
+      ...fields, message, stderr: stderr || ("stderr" in fields ? fields.stderr : ""),
+      timedOut: ("timedOut" in fields && fields.timedOut === true) || Date.now() - started >= (options.timeout ?? 120_000),
+    }));
+  }
+}
 // Base64 plus JSON framing must fit below the 256 MiB controller-frame limit.
 const MAX_ARCHIVE = 128 * 1024 * 1024;
 export const validRepo = (repo: string) =>
@@ -20,22 +42,31 @@ export async function gh<T>(
   method = "GET",
   body?: unknown,
   env?: NodeJS.ProcessEnv,
-  options: { timeout?: number; maxBuffer?: number } = {},
+  options: { timeout?: number; maxBuffer?: number; retry?: RetryOptions } = {},
 ): Promise<T> {
-  const args = ["api", endpoint, "--method", method];
+  const args = ["api", endpoint, "--method", method, "--include"];
   if (body !== undefined) args.push("--input", "-");
-  return JSON.parse(
-    (
-      await command("gh", args, {
-        ...options,
+  return withRetry("github_api", async () => {
+    let output = (
+      await githubCommand("gh", args, {
+        timeout: options.timeout,
+        maxBuffer: options.maxBuffer,
         input: body === undefined ? undefined : JSON.stringify(body),
         env,
       }).catch(error => {
         identities.clear();
         throw error;
       })
-    ).toString(),
-  ) as T;
+    ).toString();
+    // gh has no pagination here. Strip response blocks (including interim headers),
+    // accepting both CRLF and LF without touching JSON body content.
+    while (/^HTTP\/\d(?:\.\d)?\s+\d{3}\b/.test(output)) {
+      const boundary = /\r?\n\r?\n/.exec(output);
+      if (!boundary) break;
+      output = output.slice(boundary.index + boundary[0].length);
+    }
+    return JSON.parse(output) as T;
+  }, options.retry);
 }
 export async function githubStatus(env?: NodeJS.ProcessEnv) {
   try {
@@ -55,9 +86,11 @@ export function commitIdentity(env: NodeJS.ProcessEnv = process.env): Promise<Co
     identity = gh<{ login: string; id: number }>("user", "GET", undefined, env).then(user => {
       if (!user.login || !Number.isSafeInteger(user.id) || user.id <= 0) throw new Error("Missing GitHub identity");
       return { name: user.login, email: `${user.id}+${user.login}@users.noreply.github.com` };
-    }).catch(() => {
+    }).catch(error => {
       identities.delete(key);
-      throw new ApiError(409, "github_identity", "Connect a GitHub account before publishing changes.");
+      const failure = new ApiError(409, "github_identity", "Connect a GitHub account before publishing changes.");
+      if (error instanceof RetryError) failure.cause = error;
+      throw failure;
     });
     identities.set(key, {expires:Date.now() + 3600_000, value:identity});
   }
@@ -68,7 +101,7 @@ export function commitIdentity(env: NodeJS.ProcessEnv = process.env): Promise<Co
   });
 }
 const gitEnv = (env: NodeJS.ProcessEnv, cwd: string, args: string[], timeout = 120_000, onStderr?: (text: string) => void) =>
-  command(
+  githubCommand(
     "git",
     [
       "-c",
@@ -115,6 +148,7 @@ export async function checkout(
   env: NodeJS.ProcessEnv = process.env,
   progress: (step: string) => void = () => {},
   baseSHA?: string,
+  retryOptions?: RetryOptions,
 ) {
   if (!validRepo(repo) || !validBranch(base) || !validBranch(branch))
     throw new Error("Invalid repository or branch");
@@ -125,14 +159,23 @@ export async function checkout(
   // Command-scoped helper and HTTPS remote: no credentials are written into the repository.
   progress("Cloning repository");
   try {
-    await authenticatedGit({ ...env, LC_ALL: "C" }, data,
-      ["clone", "--depth", "1", "--single-branch", "--no-tags", "--progress", "--branch", resume ? branch : base, `https://github.com/${repo}.git`, cwd], cloneProgress(progress));
+    await withRetry("clone", async () => {
+      // A failed clone may leave .git and partial objects; each attempt starts clean.
+      await rm(cwd, { recursive: true, force: true });
+      await authenticatedGit({ ...env, LC_ALL: "C" }, data,
+        ["clone", "--depth", "1", "--single-branch", "--no-tags", "--progress", "--branch", resume ? branch : base, `https://github.com/${repo}.git`, cwd], cloneProgress(progress));
+    }, retryOptions);
     if (resume && baseSHA) {
       progress("Loading the run's base revision");
-      await authenticatedGit(env, cwd, ["fetch", "--depth", "1", "--no-tags", "origin", baseSHA]);
+      await withRetry("fetch", () => authenticatedGit(env, cwd, ["fetch", "--depth", "1", "--no-tags", "origin", baseSHA]), retryOptions);
     }
-  } catch {
-    throw new ApiError(502, "checkout_failed", "Couldn't download the repository. Check its GitHub access and the server's connection, then retry.");
+  } catch (error) {
+    // Cleanup must not replace the safe operation failure with a filesystem path/error.
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    // Preserve the existing checkout API contract and expose safe retry metadata to callers.
+    const failure = new ApiError(502, "checkout_failed", "Couldn't download the repository. Check its GitHub access and the server's connection, then retry.");
+    failure.cause = error;
+    throw failure;
   }
   const identity = await commitIdentity(env);
   await git(cwd, "config", "user.name", identity.name);
@@ -154,14 +197,25 @@ export async function importBundle(
   bundle: Buffer,
   branch: string,
   env: NodeJS.ProcessEnv = process.env,
+  retryOptions?: RetryOptions,
 ) {
+  if (!validBranch(branch)) throw new Error("Invalid branch");
   const path = join(cwd, ".git", "gond-agent.bundle");
-  await writeFile(path, bundle, { mode: 0o600 });
   try {
-    await git(cwd, "fetch", "--no-tags", path, "HEAD");
-    await git(cwd, "reset", "--hard", "FETCH_HEAD");
-    await authenticatedGit(env, cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]);
+    // Import is local and must not replay arbitrary bundle failures. Name it for service errors.
+    await withRetry("import", async () => {
+      await writeFile(path, bundle, { mode: 0o600 });
+      await git(cwd, "fetch", "--no-tags", path, "HEAD");
+      await git(cwd, "reset", "--hard", "FETCH_HEAD");
+    }, { maxAttempts: 1 });
+    await pushBranch(cwd, branch, env, retryOptions);
   } finally {
-    await rm(path, { force: true });
+    await withRetry("import", () => rm(path, { force: true }), { maxAttempts: 1 });
   }
+}
+
+/** Retry publication of an already imported commit without needing the worker bundle again. */
+export async function pushBranch(cwd: string, branch: string, env: NodeJS.ProcessEnv = process.env, retryOptions?: RetryOptions) {
+  if (!validBranch(branch)) throw new Error("Invalid branch");
+  await withRetry("push", () => authenticatedGit(env, cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]), retryOptions);
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use futures::{FutureExt, StreamExt};
@@ -470,102 +470,75 @@ enum Streamed {
     Failed(anyhow::Error),
 }
 
-fn retryable(e: &anyhow::Error) -> bool {
-    match e.downcast_ref::<ApiError>() {
-        Some(a) => a.retryable,
-        None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request()),
-    }
-}
-
 async fn stream_once(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel: &CancellationToken) -> Streamed {
-    const ATTEMPTS: u32 = 4;
-    'attempt: for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))) => {}
-                _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
-            }
-        }
-        let opened = tokio::select! {
-            r = s.api.responses(req) => r,
-            _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
+    let opened = tokio::select! {
+        r = s.api.responses(req) => r,
+        _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
+    };
+    let mut stream = match opened {
+        Ok(st) => st,
+        Err(e) => return Streamed::Failed(e),
+    };
+    let mut builder = MessageBuilder::default();
+    // Each block's kind by its index (the model's numbers: a map, so a huge one can't allocate).
+    let mut kinds: HashMap<usize, String> = HashMap::new();
+    loop {
+        let next = tokio::select! {
+            n = stream.next() => n,
+            _ = cancel.cancelled() => return Streamed::Cancelled(builder.finish()),
         };
-        let mut stream = match opened {
-            Ok(st) => st,
-            Err(e) if retryable(&e) && attempt + 1 < ATTEMPTS => continue 'attempt,
-            Err(e) => return Streamed::Failed(e),
+        let ev = match next {
+            None => return Streamed::Failed(anyhow!("The connection to the model dropped before the reply finished.")),
+            Some(Err(e)) => return Streamed::Failed(e),
+            Some(Ok(ev)) => ev,
         };
-        let mut builder = MessageBuilder::default();
-        // Each block's kind by its index (the model's numbers: a map, so a huge one can't allocate).
-        let mut kinds: HashMap<usize, String> = HashMap::new();
-        let mut produced = false;
-        loop {
-            let next = tokio::select! {
-                n = stream.next() => n,
-                _ = cancel.cancelled() => return Streamed::Cancelled(builder.finish()),
-            };
-            let ev = match next {
-                None => {
-                    if !produced && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(anyhow!("The connection to Gond Agent dropped before the reply finished. Try again."));
-                }
-                Some(Err(e)) => {
-                    if !produced && retryable(&e) && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(e);
-                }
-                Some(Ok(ev)) => ev,
-            };
-            match &ev {
-                StreamEvent::BlockStart { index, kind, .. } => {
-                    kinds.insert(*index, kind.clone());
-                }
-                StreamEvent::BlockDelta { index, text: Some(t), .. } => {
-                    produced = true;
-                    let agent_id = run.id.clone();
-                    let text = t.clone();
-                    s.emit(if kinds.get(index).is_some_and(|k| k == "reasoning") {
-                        AgentEvent::ReasoningDelta { agent_id, text }
-                    } else {
-                        AgentEvent::TextDelta { agent_id, text }
-                    });
-                }
-                StreamEvent::BlockDelta { .. } => produced = true,
-                StreamEvent::End { stop_reason, usage } => {
-                    let context_used = if run.is_sub() {
-                        *s.main_context.lock().unwrap()
-                    } else {
-                        let used = usage.context_tokens();
-                        *s.main_context.lock().unwrap() = used;
-                        used
-                    };
-                    let (_, window) = s.model.lock().unwrap().clone();
-                    s.emit(AgentEvent::Usage {
-                        input: usage.input_uncached + usage.cache_read + usage.cache_write,
-                        output: usage.output,
-                        cache_read: usage.cache_read,
-                        context_used,
-                        context_window: window,
-                    });
-                    let stop = stop_reason.clone();
-                    builder.apply(&ev);
-                    return Streamed::Done(builder.finish(), stop);
-                }
-                StreamEvent::Error { code, message, retryable } => {
-                    if *retryable && !produced && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(ApiError { code: code.clone(), message: message.clone(), retryable: *retryable }.into());
-                }
-                StreamEvent::Start | StreamEvent::BlockEnd { .. } => {}
+        match &ev {
+            StreamEvent::BlockStart { index, kind, .. } => {
+                kinds.insert(*index, kind.clone());
             }
-            builder.apply(&ev);
+            StreamEvent::BlockDelta { index, text: Some(t), .. } => {
+                let agent_id = run.id.clone();
+                let text = t.clone();
+                s.emit(if kinds.get(index).is_some_and(|k| k == "reasoning") {
+                    AgentEvent::ReasoningDelta { agent_id, text }
+                } else {
+                    AgentEvent::TextDelta { agent_id, text }
+                });
+            }
+            StreamEvent::BlockDelta { .. } => {}
+            StreamEvent::End { stop_reason, usage } => {
+                let context_used = if run.is_sub() {
+                    *s.main_context.lock().unwrap()
+                } else {
+                    let used = usage.context_tokens();
+                    *s.main_context.lock().unwrap() = used;
+                    used
+                };
+                let (_, window) = s.model.lock().unwrap().clone();
+                s.emit(AgentEvent::Usage {
+                    input: usage.input_uncached + usage.cache_read + usage.cache_write,
+                    output: usage.output,
+                    cache_read: usage.cache_read,
+                    context_used,
+                    context_window: window,
+                });
+                let stop = stop_reason.clone();
+                builder.apply(&ev);
+                return Streamed::Done(builder.finish(), stop);
+            }
+            StreamEvent::Error { code, message, retryable } => {
+                return Streamed::Failed(ApiError { code: code.clone(), message: message.clone(), retryable: *retryable }.into());
+            }
+            StreamEvent::Start => {
+                // The client can restart an interrupted attempt. Nothing from that attempt may
+                // enter history or execute: tools are dispatched only after Streamed::Done.
+                builder = MessageBuilder::default();
+                kinds.clear();
+            }
+            StreamEvent::BlockEnd { .. } => {}
         }
+        builder.apply(&ev);
     }
-    Streamed::Failed(anyhow!("Gond Agent didn't respond after {ATTEMPTS} tries. Try again in a moment."))
 }
 
 /// Keep only what can be replayed from an interrupted response: text, no half-written tool calls.
@@ -841,6 +814,9 @@ mod tests {
     use crate::agent::events::Decision;
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    include!("stream_retry_tests.rs");
 
     type Handler = Arc<dyn Fn(&Value) -> String + Send + Sync>;
 
