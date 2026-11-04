@@ -30,8 +30,8 @@ function fixture() {
     const diff = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,${del} +1,${add} @@\n${'-old\n'.repeat(del)}${'+new\n'.repeat(add)}`;
     step(`edit-${i}`, 'Edit', { file_path: path }, { diff });
   }
-  step('command-3', 'commandExecution', { command: 'git diff --check' }, { ok: false, output: 'Trailing whitespace in service.ts' });
-  step('command-4', 'bash', { command: 'git status --short' });
+  step('command-3', 'commandExecution', { command: 'git status --short' });
+  step('command-4', 'bash', { command: 'git diff --check' }, { ok: false, output: 'Trailing whitespace in service.ts' });
   for (const [i, path] of ['api/src/runs/service.ts', 'web/src/features/run/transcript.ts', 'web/src/features/run/tool-presentation.ts', 'web/test/timeline.test.mjs'].entries()) step(`read-${i}`, i === 0 ? 'Read' : 'mcp__gond__read', { path });
   step('context', 'batch', {});
   step('checks', 'run_checks', { command: 'npm run typecheck' }, { summary: '1.2s', output: 'No type errors.' });
@@ -103,7 +103,7 @@ for (const width of [1440, 390]) for (const theme of ['light', 'dark']) {
         await expect(failure.locator('[data-slot=trace-line]')).toHaveAttribute('data-status', 'error');
         await expect(page.getByRole('button', { name: /Edited 3 files.*api\/src\/runs\/service.ts.*\+94.*−10/ })).toBeVisible();
         await expect(page.getByRole('button', { name: 'Explored 4 files api/src/runs/service.ts', exact: true })).toBeVisible();
-        await expect(page.getByRole('button', { name: 'Checks finished · Passed npm run typecheck', exact: true })).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Checks finished · exit 0 npm run typecheck', exact: true })).toBeVisible();
         await command.focus(); await page.keyboard.press('Tab'); await page.keyboard.press('Shift+Tab');
         await expect(command).toBeFocused();
         assert.notEqual(await command.evaluate(el => getComputedStyle(el).boxShadow), 'none', 'focus ring');
@@ -147,7 +147,7 @@ for (const width of [1440, 390]) for (const theme of ['light', 'dark']) {
         await expect(page.getByRole('button', { name: 'Explored 3 files a.ts', exact: true })).toHaveAttribute('aria-expanded', 'false');
         append('tool.start', { call_id: 'failed-check', name: 'run_checks', input: { command: 'npm test' } });
         append('tool.end', { call_id: 'failed-check', ok: false, summary: 'exit 1 · 0.2s', output: '1 test failed' });
-        const failedCheck = page.getByRole('button', { name: 'Checks failed · Failed npm test', exact: true });
+        const failedCheck = page.getByRole('button', { name: 'Checks failed · exit 1 npm test', exact: true });
         await expect(failedCheck.locator('[data-slot=trace-line]')).toHaveAttribute('data-status', 'error');
         append('tool.start', { call_id: 'open-live', name: 'bash', input: { command: 'echo complete' } });
         const openLive = page.getByRole('button', { name: 'Running command', exact: true });
@@ -156,6 +156,22 @@ for (const width of [1440, 390]) for (const theme of ['light', 'dark']) {
         append('tool.end', { call_id: 'open-live', ok: true, output: 'Completion output stays visible' });
         await expect(page.getByRole('button', { name: 'Ran 1 command echo complete', exact: true })).toHaveAttribute('aria-expanded', 'true');
         await expect(page.getByText('Completion output stays visible', { exact: true })).toBeVisible();
+        append('text.delta', { text: 'Check display safety without changing raw details.' });
+        const unsafeCommand = 'printf \u202E\u200Bsafe';
+        append('tool.start', { call_id: 'unsafe-command', name: 'bash', input: { command: unsafeCommand } });
+        append('tool.end', { call_id: 'unsafe-command', ok: true });
+        const safeCommand = page.getByRole('button', { name: 'Ran 1 command printf safe', exact: true });
+        await expect(safeCommand).toHaveAttribute('aria-expanded', 'false');
+        await safeCommand.click();
+        const rawCommand = page.locator(`[id="${await safeCommand.getAttribute('aria-controls')}"] code`);
+        assert.equal(await rawCommand.textContent(), unsafeCommand, 'expanded command stays raw');
+        append('tool.start', { call_id: 'trivial-check', name: 'run_checks', input: { command: 'true\u202E\u200B' } });
+        append('tool.end', { call_id: 'trivial-check', ok: true, summary: '0.0s' });
+        const trivialCheck = page.getByRole('button', { name: 'Checks finished · exit 0 true', exact: true });
+        await expect(trivialCheck).toHaveAttribute('aria-expanded', 'false');
+        await trivialCheck.click();
+        const rawCheck = page.locator(`[id="${await trivialCheck.getAttribute('aria-controls')}"] code`);
+        assert.equal(await rawCheck.textContent(), 'true\u202E\u200B', 'expanded check command stays raw');
       }
       assert.deepEqual(errors, []);
     } finally { await page.close(); }

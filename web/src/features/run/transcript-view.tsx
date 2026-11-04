@@ -15,7 +15,7 @@ import { type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./
 import { Prose as SharedProse } from "@shared/prose"
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceLine, TraceTitle } from "@shared/ui/trace"
 import { AgentLabel } from "./agent-label"
-import { activityLabel, groupLabel } from "./tool-presentation"
+import { activityLabel, displayText, groupLabel } from "./tool-presentation"
 import { SharedImage } from "./shared-image"
 import { groupTranscriptItems, type ActivityGroup, type TimelineItem } from "./group-transcript"
 
@@ -143,7 +143,7 @@ function ToolActivity({ tools, runId, live, group, activity, open, onOpenChange 
           <TraceTitle className="break-all">
             {label}
             {activity?.failed ? <span className="font-medium"> · {activity.failed} failed</span> : null}
-            {(activity?.detail || (!group && tools[0].name === "run_checks" && tools[0].title)) && <> <code className="ml-2 text-muted-foreground">{activity?.detail || tools[0].title}</code></>}
+            {(activity?.detail || (!group && tools[0].name === "run_checks" && tools[0].title)) && <> <code className="ml-2 text-muted-foreground">{activity?.detail || displayText(tools[0].title)}</code></>}
           </TraceTitle>
           {files.length > 0 && <TraceDescription><DiffCounts add={files.reduce((n, f) => n + f.add, 0)} del={files.reduce((n, f) => n + f.del, 0)} /></TraceDescription>}
         </TraceLine>

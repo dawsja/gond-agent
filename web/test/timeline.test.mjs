@@ -39,11 +39,26 @@ test('only consecutive kinds collapse, preserving chronological steps and check 
   assert.deepEqual(rows[0].tools.map(t => t.callId), ['a', 'b'])
 })
 
-test('failed member is exposed in the collapsed group model with its output intact', () => {
-  const failed = { ...call('bad', 'bash', 'failed'), output: 'Permission denied' }
-  const [row] = group([call('a'), failed, call('b')])
+test('only the second command fails: collapsed detail names the first failure, not the first command', () => {
+  const failed = { ...call('bad', 'bash', 'failed', { command: 'npm run build' }), output: 'Permission denied' }
+  const [row] = group([call('a'), failed])
+  assert.equal(row.label, 'Ran 2 commands')
   assert.equal(row.failed, 1)
+  assert.equal(row.detail, 'npm run build')
   assert.equal(row.tools[1].output, 'Permission denied')
+  const [moreFailures] = group([call('a'), failed, call('bad2', 'bash', 'failed', { command: 'git diff --check' })])
+  assert.equal(moreFailures.failed, 2)
+  assert.equal(moreFailures.detail, 'npm run build')
+})
+
+test('collapsed command detail strips display controls, bidi, tags and variation selectors without changing raw details', () => {
+  const command = 'printf \u202E\u200B\u2066ok\u2069\u{E0000}\u{E0061}\u{E007F}\uFE0F\u{E0100}\u0000\u001B\u007F\u0085\t\n'
+  const tool = call('unsafe', 'bash', 'done', { command })
+  Object.freeze(tool.paths); Object.freeze(tool)
+  const [row] = group([tool])
+  assert.equal(row.detail, 'printf ok')
+  assert.equal(row.tools[0], tool)
+  assert.equal(row.tools[0].title, command, 'expanded details retain the original command')
 })
 
 test('stable first-call ID retains keyed expansion as terminal steps append', () => {
@@ -127,14 +142,18 @@ test('grouping streamed snapshots matches replay, including legacy aliases and l
   assert.equal(rows[2].tool.status, 'running')
 })
 
-test('check names remain detailed and only terminal shell success implies pass', () => {
+test('check names remain detailed and report exit status, never a verification verdict', () => {
   const check = call('check', 'run_checks')
   assert.equal(check.title, 'npm test')
   assert.equal(activityLabel(check), 'Checks finished')
-  assert.equal(activityLabel({ ...check, summary: '1.2s', output: 'No type errors.' }), 'Checks finished · Passed')
+  assert.equal(activityLabel({ ...check, summary: '1.2s', output: 'No type errors.' }), 'Checks finished · exit 0')
+  const trivial = call('trivial', 'run_checks', 'done', { command: 'true' })
+  assert.equal(activityLabel({ ...trivial, summary: '0.0s' }), 'Checks finished · exit 0')
   assert.equal(activityLabel({ ...check, summary: 'background · bg-1' }), 'Checks finished')
   assert.equal(activityLabel({ ...check, output: '{"exit_code":0}' }), 'Checks finished')
-  assert.equal(activityLabel({ ...check, status: 'failed' }), 'Checks failed · Failed')
+  assert.equal(activityLabel({ ...check, status: 'failed' }), 'Checks failed')
+  assert.equal(activityLabel({ ...check, status: 'failed', summary: 'exit 2 · 0.2s' }), 'Checks failed · exit 2')
+  assert.equal(activityLabel({ ...check, status: 'failed', summary: 'timed out after 30s' }), 'Checks failed')
   assert.equal(activityLabel({ ...check, status: 'running' }), 'Running checks')
   assert.equal(group([call('a'), check, call('b')]).length, 3)
 })

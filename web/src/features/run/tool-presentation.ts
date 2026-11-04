@@ -1,4 +1,6 @@
 // Presentation only: stored events and the worker's tool identities stay unchanged.
+// For compact labels only; expanded details keep the original text.
+export const displayText = (value: string) => value.replace(/[\p{Cc}\p{Cf}]|[\u{E0000}-\u{E007F}]|[\uFE00-\uFE0F]|[\u{E0100}-\u{E01EF}]/gu, "");
 const aliases: Record<string, string> = {
   Read: "read", Write: "write", Edit: "edit", MultiEdit: "multi_edit",
   Bash: "bash", Grep: "grep", Glob: "glob", WebSearch: "web_search", WebFetch: "web_fetch",
@@ -51,9 +53,13 @@ interface Activity { name: string; label: string; title: string; status: "runnin
 
 // run_checks emits raw stdout, not its model-facing JSON result. The shell's
 // terminal summary is a duration only for exit 0 (runner/src/tools/bash.rs).
-// Background launches and legacy completions without this signal are NOT passes.
-function checkResult(tool: Activity): "Passed" | undefined {
-  return tool.status === "done" && /^\d+\.\d+s$/.test(tool.summary ?? "") ? "Passed" : undefined
+// Report process status, never a verification verdict (even `true` exits 0).
+// Background launches and legacy completions without this signal stay Finished.
+function checkResult(tool: Activity): string | undefined {
+  const summary = tool.summary ?? ""
+  if (tool.status === "done" && /^\d+\.\d+s$/.test(summary)) return "exit 0"
+  const exit = /^exit (-?\d+) · \d+\.\d+s$/.exec(summary)
+  return tool.status === "failed" && exit && exit[1] !== "0" ? `exit ${exit[1]}` : undefined
 }
 export function activityLabel(tool: Activity) {
   const running = tool.status === "running", failed = tool.status === "failed";
@@ -63,7 +69,7 @@ export function activityLabel(tool: Activity) {
   }
   if (tool.name === "run_checks") {
     const result = checkResult(tool)
-    return running ? "Running checks" : failed ? "Checks failed · Failed" : result === "Passed" ? "Checks finished · Passed" : "Checks finished"
+    return running ? "Running checks" : `${failed ? "Checks failed" : "Checks finished"}${result ? ` · ${result}` : ""}`
   }
   if (tool.name === "browser") return running ? "Checking browser layouts" : `Browser checks ${failed ? "failed" : "finished"}`;
   if (tool.name === "update_plan") return running ? "Updating plan" : failed ? "Plan update failed" : "Updated plan";

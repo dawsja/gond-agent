@@ -1,5 +1,5 @@
 import type { Item, ToolCall } from "./transcript"
-import { EDIT_TOOLS, EXPLORE_TOOLS } from "./tool-presentation"
+import { displayText, EDIT_TOOLS, EXPLORE_TOOLS } from "./tool-presentation"
 
 export interface ActivityGroup {
   kind: "activity-group"
@@ -42,13 +42,14 @@ export function groupTranscriptItems(items: readonly Item[]): TimelineItem[] {
       // Retain disclosure state even when out-of-order completions merge groups.
       group.expansionKeys.push(`activity:${activity}:${tool.callId}`)
       if (tool.status === "failed") group.failed++
-      group.detail ||= tool.paths[0] || tool.title || ""
     }
   }
   for (const item of result) {
     if (item.kind !== "activity-group") continue
     const files = new Set(item.tools.flatMap(tool => tool.paths)).size
     const count = files || item.tools.length
+    const detail = item.tools.find(tool => tool.status === "failed") ?? item.tools.find(tool => tool.paths[0] || tool.title)
+    item.detail = displayText(detail?.paths[0] || detail?.title || "")
     item.label = item.activity === "commands" ? `Ran ${item.tools.length} ${item.tools.length === 1 ? "command" : "commands"}`
       : item.activity === "edits" ? `Edited ${files} ${files === 1 ? "file" : "files"}`
       : files ? `Explored ${files} ${files === 1 ? "file" : "files"}` : `Explored context · ${count} ${count === 1 ? "step" : "steps"}`
