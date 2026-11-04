@@ -6,7 +6,7 @@ import ts from 'typescript'
 const files = dir => readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
   entry.isDirectory() ? files(new URL(`${entry.name}/`, dir)) : entry.name.endsWith('.tsx') ? [new URL(entry.name, dir)] : [])
 
-// Settings also renders GitHub from plugins; saved schedules live in automations.
+// Boolean settings also live in Plugins and saved schedules.
 const sources = ['settings', 'plugins', 'automations'].flatMap(dir => files(new URL(`../src/features/${dir}/`, import.meta.url)))
 
 test('boolean settings use the shared Switch, not checkboxes or local switches', () => {

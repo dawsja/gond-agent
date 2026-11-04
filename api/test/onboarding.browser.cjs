@@ -85,6 +85,7 @@ const key = 'fixture-only-provider-key';
     await expect.poll(() => page.evaluate(() => localStorage.getItem('gond-agent-theme'))).toBe(theme.toLowerCase());
   };
   const verifyTheme = async () => {
+     await page.goto(origin + '/agents/settings/appearance');
     await expect(page.getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
     await chooseTheme('Light');
     await resolvedTheme('light');
@@ -122,7 +123,7 @@ const key = 'fixture-only-provider-key';
     fresh.on('pageerror', error => errors.push(error.message));
     fresh.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
     try {
-      await fresh.goto(origin + '/agents/settings');
+      await fresh.goto(origin + '/agents/settings/appearance');
       await expect(fresh.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText('Light');
       await resolvedTheme('light', fresh);
       expect((await (await fresh.request.get(origin + '/api/v1/me')).json()).user.id).toBe((await (await page.request.get(origin + '/api/v1/me')).json()).user.id);
@@ -203,7 +204,9 @@ const key = 'fixture-only-provider-key';
     const primary = target => target.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--primary').trim());
     const unchangedIdentity = async target => {
       const scheme = await target.locator('html').evaluate(element => element.classList.contains('dark') ? 'dark' : 'light');
-      await greyAvatar(target.getByRole('region', { name: 'Personal settings', exact: true }).getByLabel('No profile photo', { exact: true }), scheme);
+      const inSheet = width < 768;
+      if (inSheet) await target.getByRole('button', { name: 'Open navigation', exact: true }).click();
+      await greyAvatar(target.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last(), scheme);
       const marks = target.locator('[aria-label="Gond Agent"] svg');
       expect(await marks.count()).toBeGreaterThan(0);
       for (const mark of await marks.all()) {
@@ -212,6 +215,7 @@ const key = 'fixture-only-provider-key';
         await expect(mark.locator('path')).toHaveCSS('stroke', 'rgb(255, 255, 255)');
         await expect(mark.locator('circle')).toHaveCSS('fill', 'rgb(255, 255, 255)');
       }
+      if (inSheet) await target.keyboard.press('Escape');
     };
     const state = async (target, name, color) => {
       const accent = name.toLowerCase();
@@ -246,7 +250,7 @@ const key = 'fixture-only-provider-key';
       expect(response.status()).toBe(200);
       expect(await response.json()).toEqual({ accent: name.toLowerCase() });
     };
-    await page.goto(origin + '/agents/settings#appearance');
+    await page.goto(origin + '/agents/settings/appearance#appearance');
     await expect(page.locator('#appearance').getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
     await state(page, 'Blue', '#2b61b9');
     let previous = await primary(page);
@@ -272,9 +276,9 @@ const key = 'fixture-only-provider-key';
         previous = color;
         await page.reload();
         await state(page, name, color);
-        await page.getByRole('region', { name: 'Personal settings', exact: true }).scrollIntoViewIfNeeded();
+        await page.getByRole('region', { name: 'Appearance', exact: true }).scrollIntoViewIfNeeded();
         await selected(page, name, 'accent-' + name.toLowerCase());
-        await other.goto(origin + '/agents/settings#appearance');
+        await other.goto(origin + '/agents/settings/appearance#appearance');
         await other.reload();
         await state(other, name, color);
         await selected(other, name);
@@ -287,7 +291,7 @@ const key = 'fixture-only-provider-key';
       await page.reload();
       await resolvedTheme('light', page, 'system');
       await state(page, 'Orange', '#c2460c');
-      await page.getByRole('region', { name: 'Personal settings', exact: true }).scrollIntoViewIfNeeded();
+      await page.getByRole('region', { name: 'Appearance', exact: true }).scrollIntoViewIfNeeded();
       await selected(page, 'Orange', 'accent-orange-light');
       await page.emulateMedia({ colorScheme: 'dark' });
       await resolvedTheme('dark', page, 'system');
@@ -810,7 +814,7 @@ const key = 'fixture-only-provider-key';
       const original = await (await page.request.get(settingsURL)).json();
       await page.route(meURL, meRoute);
       try {
-        await page.goto(origin + '/agents/settings');
+        await page.goto(origin + '/agents/settings/models#providers');
         const providers = page.locator('#providers');
         await expect(providers.getByRole('button', { name: 'Save changes', exact: true })).toBeVisible();
         while (await providers.locator('fieldset').count()) {
@@ -959,13 +963,13 @@ const key = 'fixture-only-provider-key';
     expect(Math.abs(menuWidth - accountWidth)).toBeLessThanOrEqual(1);
     await capture('account-menu');
     await page.getByRole('menuitem', { name: 'Settings', exact: true }).click();
-    await expect(page).toHaveURL(origin + '/agents/settings');
+    await expect(page).toHaveURL(origin + '/agents/settings/account');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     await verifyTheme();
     if (!returning) {
-      const categoryNames = ['Personal settings', 'Models', 'Security', 'Connections', 'People', 'Agent access', 'Account management'];
-      await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
-      for (const name of categoryNames) {
+      const topics = [['account', 'Account'], ['appearance', 'Appearance'], ['models', 'Models'], ['agent-access', 'Agent access'], ['sign-in-people', 'Sign-in & people'], ['danger-zone', 'Danger zone']];
+      for (const [id, name] of topics) {
+        await page.goto(origin + '/agents/settings/' + id);
         const heading = page.getByRole('heading', { name, exact: true, level: 2 });
         await heading.scrollIntoViewIfNeeded();
         const category = page.getByRole('region', { name, exact: true });
@@ -976,12 +980,12 @@ const key = 'fixture-only-provider-key';
         expect(style.color).toBe(await page.locator('body').evaluate(element => getComputedStyle(element).color));
         expect(style.right).toBeLessThanOrEqual(width);
         expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
-        // Three overviews cover the page; repeat screenshots after restart add
-        // no coverage for layout that does not depend on persisted state.
-        if (['Personal settings', 'Security', 'Account management'].includes(name)) await captureThemes('settings-category-' + name.toLowerCase().replaceAll(' ', '-'));
+        await captureThemes('settings-page-' + id);
       }
     }
+    await page.goto(origin + '/agents/settings/models');
     await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['ChatGPT plan', 'Model providers']);
+    await page.goto(origin + '/agents/settings/agent-access#mcp');
     const mcp = page.locator('#mcp');
     await mcp.scrollIntoViewIfNeeded();
     if (!returning) {
@@ -1029,7 +1033,7 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('button', { name: 'Fixture coder · Second provider', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toContainText('Second provider');
     await capture(returning ? 'workspace-after-restart' : 'workspace');
-    await page.goto(origin + '/agents/settings');
+    await page.goto(origin + '/agents/settings/models#providers');
     const firstProvider = page.locator('#providers fieldset').first();
     await advanced(firstProvider, true);
     await expect(firstProvider.getByLabel('Connection name', { exact: true })).toHaveValue('Fixture provider');
@@ -1110,6 +1114,7 @@ const key = 'fixture-only-provider-key';
       await capture('account-grey-default');
       await verifyAccents();
     }
+    await page.goto(origin + '/agents/settings/account');
     const beforePhoto = await (await page.request.get(origin + '/api/v1/me')).json();
     if (returning) {
       expect(beforePhoto.user.has_photo).toBe(true);
@@ -1148,7 +1153,10 @@ const key = 'fixture-only-provider-key';
     await captureThemes('automations-switches');
     await capture('automations');
     await page.goto(origin + '/agents/plugins');
-    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Plugins', exact: true })).toBeVisible();
+    await page.getByRole('link', { name: /GitHub Manage your GitHub connection/ }).click();
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
+    await expect(page.getByRole('heading', { name: 'GitHub', level: 1, exact: true })).toBeVisible();
     if (!returning) {
       await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
@@ -1174,6 +1182,7 @@ const key = 'fixture-only-provider-key';
     expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
     await capture(returning ? 'github-after-restart' : 'github-connected');
     await page.goto(origin + '/agents/settings#connections');
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
     const sharedFallback = page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true });
     await expect(sharedFallback).not.toBeChecked();
     await expect(sharedFallback).toBeEnabled();
@@ -1186,9 +1195,12 @@ const key = 'fixture-only-provider-key';
       await expect(sharedFallback).toBeEnabled();
       await expect(sharedFallback).toHaveAttribute('aria-checked', String(checked));
     }
-    await expect(page.getByText('Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on.', { exact: true })).toBeVisible();
+    await expect(page.getByText('Administrators manage this connection for accounts without their own GitHub connection. When enabled, those accounts can use the shared connection or service credentials configured on this server.', { exact: true })).toBeVisible();
     await page.getByRole('heading', { name: 'Shared connection', exact: true }).scrollIntoViewIfNeeded();
     await captureThemes('github-admin-shared-switch');
+    await page.goto(origin + '/agents/settings#oidc');
+    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(0);
     const singleSignOn = page.getByRole('switch', { name: 'Enable single sign-on', exact: true });
     await singleSignOn.scrollIntoViewIfNeeded();
     await expect(singleSignOn).toBeEnabled();
@@ -1208,6 +1220,7 @@ const key = 'fixture-only-provider-key';
         expect((await (await member.request.get(origin + '/api/v1/me')).json()).theme).toBe('light');
         expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
         await member.goto(origin + '/agents/settings#connections');
+        await expect(member).toHaveURL(origin + '/agents/plugins/github');
         await resolvedTheme('light', member);
         await expect(member.getByText('Connect your own GitHub account here. Your runs and pull requests use it.', { exact: true })).toBeVisible();
         await expect(member.getByRole('button', { name: 'Connect GitHub', exact: true })).toBeVisible();
@@ -1246,13 +1259,15 @@ const key = 'fixture-only-provider-key';
       await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
       await page.getByRole('textbox', { name: 'Search', exact: true }).fill('delete account');
       await page.getByRole('option', { name: 'Delete account', exact: true }).click();
-      await expect(page).toHaveURL(origin + '/agents/settings#delete');
+      await expect(page).toHaveURL(origin + '/agents/settings/danger-zone#delete');
       await expect(page.locator('#delete').getByRole('heading', { name: 'Delete account', exact: true })).toBeVisible();
+      await page.goto(origin + '/agents/settings/models#chatgpt');
       await page.locator('#chatgpt').scrollIntoViewIfNeeded();
       await expect(page.getByText('ChatGPT plan', { exact: true })).toBeVisible();
       await expect(page.locator('#chatgpt').getByRole('button', { name: 'Continue with ChatGPT', exact: true })).toBeVisible();
       await expect(page.locator('#chatgpt').getByText('No ChatGPT accounts. Sign in to use your plan with the built-in agent.', { exact: true })).toBeVisible();
       await capture('subscription-settings');
+      await page.goto(origin + '/agents/settings/danger-zone#delete');
       await page.locator('#delete').scrollIntoViewIfNeeded();
       await capture('delete-account-settings');
       await page.getByRole('button', { name: 'Delete account', exact: true }).click();

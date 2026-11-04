@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { MemoryRouter } from "react-router"
 import { Switch } from "@shared/ui/switch"
-import { SettingsScreen } from "@/features/settings/settings-screen"
+import { SettingsRoute } from "@/app/settings-route"
 import { AutomationsScreen } from "@/features/automations/automations-screen"
 import "@/index.css"
 
@@ -26,4 +26,4 @@ document.documentElement.classList.toggle("dark", query.get("theme") === "dark")
 document.documentElement.dataset.accent = query.get("accent") ?? "blue"
 const view = query.get("view")
 const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-createRoot(document.getElementById("root")!).render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[view === "automations" ? "/automations" : "/settings"]}>{view === "component" ? <SwitchFixture /> : view === "automations" ? <AutomationsScreen /> : <SettingsScreen />}</MemoryRouter></QueryClientProvider>)
+createRoot(document.getElementById("root")!).render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[view === "automations" ? "/automations" : "/settings/sign-in-people"]}>{view === "component" ? <SwitchFixture /> : view === "automations" ? <AutomationsScreen /> : <SettingsRoute />}</MemoryRouter></QueryClientProvider>)
