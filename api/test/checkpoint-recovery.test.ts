@@ -7,10 +7,11 @@ import type { Checkpoint } from "../src/checkpoints";
 import type { Config } from "../src/config";
 import type { Workspace, WorkspaceCheckpoint, WorkspaceCheckpointOptions, WorkspaceFactory } from "../src/containers";
 import { openStore } from "../src/db";
-import { branchHead, checkout, importBundle, pushBranch } from "../src/github";
+import { branchHead, checkout, gh, importBundle, pushBranch } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
 import { Runs, parseRun } from "../src/runs/service";
 import { ApiError } from "../src/wire";
+import { RetryError } from "../src/retry";
 import { verificationBlock } from "../src/runs/evidence";
 import { evidenceState, signedRecord } from "./fixtures/evidence";
 
@@ -67,6 +68,8 @@ class FakeWorkspace implements Workspace {
   checkpointError?: unknown;
   captureGate?: Promise<void>;
   checkpointBundle = Buffer.from("opaque-checkpoint-bundle");
+  tree?: Record<string, string>;
+  finalCaptures = 0;
   boundary = 0;
   destroyed = false;
   destroy = vi.fn(async () => { this.destroyed = true; });
@@ -103,7 +106,11 @@ class FakeWorkspace implements Workspace {
     }
   }
 
-  async captureCheckpoint() { await this.capture(); await this.flushCheckpoints(); }
+  async captureCheckpoint() {
+    this.finalCaptures++;
+    await this.capture(this.tree ? Buffer.from(JSON.stringify(this.tree)) : this.checkpointBundle);
+    await this.flushCheckpoints();
+  }
   async flushCheckpoints() { if (this.checkpointError) throw this.checkpointError; }
 
   exportEvidence() {
@@ -134,6 +141,8 @@ class FakeWorkspace implements Workspace {
       if (ledger) ledger.historical_ids = (ledger.records as { id: string }[]).map(record => record.id);
       result = { type: "state.imported", request_id: args?.request_id };
     } else if (method === "restore_checkpoint") {
+      const bundle = Buffer.from(args!.bundle as string, "base64").toString();
+      if (bundle.startsWith("{")) this.tree = JSON.parse(bundle);
       result = { base_sha: BASE, head_sha: HEAD, checkpoint_sha: TREE };
     } else if (method === "events") {
       result = { events: this.events.splice(0), alive: !this.destroyed };
@@ -216,6 +225,7 @@ beforeEach(async () => {
   runs = new Runs(db, cfg, factory);
 });
 afterEach(async () => {
+  vi.useRealTimers();
   await runs.shutdown();
   db.close();
   rmSync(dir, { recursive: true, force: true });
@@ -225,6 +235,188 @@ afterEach(async () => {
 });
 
 describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", () => {
+  async function failLive(step: "model" | "push" | "turn" | "snapshot" | "import", fakeTimers = false) {
+    const { run, worker } = await checkpointed();
+    // These changes happened AFTER the last periodic pair; retaining that pair is insufficient.
+    worker.tree = { "unpushed.txt": "work after the periodic checkpoint\n" };
+    worker.history.push(message("assistant", "Remember the unpublished parser decision."));
+    const history = structuredClone(worker.history);
+    if (fakeTimers) vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    if (step === "model") {
+      worker.events.push({ type: "error", agent_id: "main", code: "provider_unavailable", attempts: 5 });
+    } else if (step === "push" || step === "import") {
+      vi.mocked(importBundle).mockRejectedValueOnce(new RetryError(step,
+        { class: "network", retryable: true, reason: "Connection reset" }, 5));
+      worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    } else {
+      const rpc = worker.rpc.bind(worker);
+      vi.spyOn(worker, "rpc").mockImplementation(async (method, args) => {
+        if (method === (step === "snapshot" ? "snapshot" : "events"))
+          throw new RetryError(step, { class: "unknown", retryable: false, reason: "Operation failed" }, 1);
+        return rpc(method, args);
+      });
+      if (step === "snapshot") worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    }
+    await vi.waitFor(() => expect(runs.get(run.id)).toMatchObject({ status: "failed", work_kept: true, last_error: { step } }));
+    return { run, worker, history };
+  }
+
+  it.each(["model", "push", "turn", "snapshot", "import"] as const)("checkpoints a live %s failure before keep expiry destroys it, then restores tree AND history", async step => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "1");
+    const { run, worker, history } = await failLive(step, true);
+    const imports = vi.mocked(importBundle).mock.calls.length;
+    const pushes = vi.mocked(pushBranch).mock.calls.length;
+    const snapshots = worker.calls.filter(call => call.method === "snapshot").length;
+    expect(worker.finalCaptures).toBe(0); // Kept workspace is not disturbed.
+    const destroy = worker.destroy.getMockImplementation()!;
+    worker.destroy.mockImplementation(async () => {
+      expect(worker.finalCaptures).toBeGreaterThan(0); // Structural release guard, for every failure step.
+      expect(storedState(rows(run.id).at(-1)!).runner.history).toEqual(history);
+      await destroy();
+    });
+    // Fire the actual keep timer, not a direct teardown call.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.waitFor(() => expect(worker.destroyed).toBe(true));
+    vi.useRealTimers();
+    expect(runs.get(run.id)).toMatchObject({ status: "failed", work_kept: false, resume_from_checkpoint: true });
+    expect(runs.get(run.id).error).toContain("Your changes and the conversation are saved; send a follow-up to continue");
+    expect(importBundle).toHaveBeenCalledTimes(imports);
+    expect(pushBranch).toHaveBeenCalledTimes(pushes);
+    expect(worker.calls.filter(call => call.method === "snapshot")).toHaveLength(snapshots);
+    expect(vi.mocked(gh).mock.calls.filter(call => ["POST", "PATCH"].includes(String(call[1])))).toEqual([]);
+    // Reopen SQLite and the service to prove this does not depend on worker/API memory.
+    await restart();
+    runs.enqueue(run.id, "u", "Continue with the saved decision.");
+    await vi.waitFor(() => expect(workers).toHaveLength(2));
+    const resumed = workers.at(-1)!;
+    await vi.waitFor(() => expect(resumed.imported?.history).toEqual(history));
+    expect(resumed.tree).toEqual(worker.tree);
+    expect(resumed.calls.map(call => call.method).indexOf("restore_checkpoint"))
+      .toBeLessThan(resumed.calls.map(call => call.method).indexOf("import_state"));
+    console.info(`[failed checkpoint ${step}] released=true restored_unpushed_edit=${!!resumed.tree?.["unpushed.txt"]} restored_history=${resumed.imported!.history.length}/${history.length} release_publication_calls=0`);
+  });
+
+  it("routes an initial-delivery failure through the same final-capture guard with zero keep time", async () => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "0");
+    const rpc = FakeWorkspace.prototype.rpc;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      const result = await rpc.call(this, method, args);
+      if (method === "send" && (args?.input as { type: string }).type === "user") {
+        this.tree = { "initial.txt": "unpublished initial delivery" };
+        this.history.push(message("assistant", "Initial delivery failed after this decision."));
+        throw new Error("Delivery connection failed");
+      }
+      return result;
+    });
+    const run = await create();
+    await vi.waitFor(() => expect(workers[0]?.destroyed).toBe(true));
+    const worker = workers[0]!;
+    expect(worker.finalCaptures).toBe(1);
+    expect(runs.get(run.id)).toMatchObject({ status: "failed", work_kept: false, resume_from_checkpoint: true });
+    expect(storedState(rows(run.id).at(-1)!).runner.history).toEqual(worker.history);
+    expect(JSON.parse(readFileSync(join(dir, "checkpoints", rows(run.id).at(-1)!.bundle_path), "utf8"))).toEqual(worker.tree);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(pushBranch).not.toHaveBeenCalled();
+  });
+
+  it.each(["model", "effort", "user"])("does not consume an initial request when %s input delivery fails before acceptance", async inputType => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "0");
+    const rpc = FakeWorkspace.prototype.rpc;
+    let rejectDelivery = true;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      if (rejectDelivery && method === "send" && (args?.input as { type: string }).type === inputType) {
+        rejectDelivery = false;
+        this.tree = { "before-delivery.txt": "local initialization work" };
+        throw new Error("Delivery failed before acceptance");
+      }
+      return rpc.call(this, method, args);
+    });
+    const run = await create();
+    await vi.waitFor(() => expect(workers[0]?.destroyed).toBe(true));
+    expect(workers[0]!.finalCaptures).toBe(1);
+    const saved = storedState(rows(run.id).at(-1)!);
+    expect(saved.runner.history).toEqual([]);
+    expect(saved.service.active_message_id).toBeUndefined();
+    await restart();
+    finishUsers = true;
+    runs.enqueue(run.id, "u", "Continue after delivery failed.");
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"), { timeout: 5000 });
+    const resumed = workers.at(-1)!;
+    expect(resumed.imported?.history).toEqual([]);
+    expect(resumed.tree).toEqual({ "before-delivery.txt": "local initialization work" });
+    expect(resumed.users().filter(text => text.includes(PROMPT))).toHaveLength(1);
+    expect(resumed.users().filter(text => text.includes("Continue after delivery failed."))).toHaveLength(1);
+  });
+
+  it.each(["timeout", "size cap"] as const)("bounds failed-release capture and reports %s fallback without late resurrection", async outcome => {
+    if (outcome === "size cap") {
+      await runs.shutdown();
+      vi.stubEnv("GOND_AGENT_CHECKPOINT_MAX_MB", "1");
+      runs = new Runs(db, cfg, factory);
+    }
+    const { run, worker } = await failLive("model");
+    const gate = deferred();
+    if (outcome === "timeout") worker.captureGate = gate.promise;
+    else worker.tree = { oversized: "x".repeat(1024 * 1024) };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const closing = runs.close(run.id);
+    try {
+      await vi.advanceTimersByTimeAsync(10_001);
+      await closing;
+      expect(worker.destroyed).toBe(true);
+      expect(runs.get(run.id)).toMatchObject({ work_kept: false, resume_from_checkpoint: false });
+      expect(runs.get(run.id).error).toContain("could not be saved");
+      expect(runs.get(run.id).error).toContain(outcome === "timeout" ? "within 10 seconds" : "size or storage limit");
+      expect(runs.get(run.id).error).toContain("last pushed branch");
+      expect(rows(run.id)).toHaveLength(0);
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rows(run.id)).toHaveLength(0); // A late private reply cannot recreate the deleted pair.
+      expect(importBundle).not.toHaveBeenCalled();
+      expect(pushBranch).not.toHaveBeenCalled();
+    } finally { gate.resolve(); vi.useRealTimers(); }
+  });
+
+  it("serializes follow-up admission against a failed close capture, and explicit Close deletes the saved pair", async () => {
+    const { run, worker } = await failLive("model");
+    const gate = deferred();
+    worker.captureGate = gate.promise;
+    const closing = runs.close(run.id);
+    try {
+      await vi.waitFor(() => expect(worker.finalCaptures).toBe(1));
+      expect(() => runs.enqueue(run.id, "u", "Do not race the capture")).toThrow(/workspace is closing/i);
+      expect(worker.destroy).not.toHaveBeenCalled();
+    } finally { gate.resolve(); await closing; }
+    expect(runs.get(run.id).pending).toEqual([]);
+    expect(rows(run.id).length).toBeGreaterThan(0);
+    await runs.closeSession(run.id, "u");
+    expect(rows(run.id)).toHaveLength(0);
+  });
+
+  it.each([false, true])("explicit Close of a kept failure deletes the final pair even when destruction fails: %s", async destroyFails => {
+    const { run, worker } = await failLive("model");
+    if (destroyFails) worker.destroy.mockRejectedValueOnce(new Error("Destroy unavailable"));
+    const closing = runs.closeSession(run.id, "u");
+    if (destroyFails) await expect(closing).rejects.toThrow("Destroy unavailable");
+    else await closing;
+    expect(worker.finalCaptures).toBe(1);
+    expect(rows(run.id)).toHaveLength(0);
+    expect(runs.get(run.id).resume_from_checkpoint).toBe(false);
+    expect(runs.get(run.id).error).not.toContain("are saved");
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(pushBranch).not.toHaveBeenCalled();
+  });
+
+  it("keeps workerLost on the existing last-checkpoint path without asking a dead worker to capture", async () => {
+    const { run, worker } = await checkpointed();
+    const history = storedState(rows(run.id).at(-1)!).runner.history;
+    worker.destroyed = true;
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("interrupted"));
+    expect(worker.finalCaptures).toBe(0);
+    expect(storedState(rows(run.id).at(-1)!).runner.history).toEqual(history);
+    expect(runs.get(run.id).resume_from_checkpoint).toBe(true);
+  });
+
   it("finishes, publishes and captures checkpoints without starting post-push automation", async () => {
     const { run, worker } = await checkpointed();
     const flushed = vi.spyOn(worker, "flushCheckpoints");
