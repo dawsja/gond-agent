@@ -63,6 +63,8 @@ A successful restore emits `run.resumed {checkpoint_seq,automatic,message}`. An 
 
 RunService's active finish path persists the finishing marker before awaiting checkpoint flush, then exports private evidence before publication. Unavailable/throwing exports and malformed evidence preserve durable budgets and cannot replace the service-issued signing authority; publication and the post-push paired capture still proceed. Flush/capture failures emit `run.checkpoint_unavailable`, not a run failure; a failed flush does not skip the later capture attempt. Run state is reloaded after awaits to retain concurrently accepted follow-ups and Stop. A failed save leaves the previous pair intact, but this is not permission to search older pairs after a latest-pair validation/restore failure.
 
+RunService bounds each evidence initialization/export and the evidence path's flush wait to one second. A failed flush skips the private export to avoid racing a possibly held boundary; normal publication and post-push capture remain separate attempts with existing snapshot/hold safeguards. These caller-side limits do not cancel underlying RPCs. Error paths record unavailable policy status without evidence RPCs. `events.alive=false` applies before processing terminal events: retain transcript events and clean-turn finishing recovery, but skip evidence, publication and delivery to the exited worker. Destroyed-worker slots drain before asynchronous checkout deletion; teardown and deletion reserve only the closing run against reopening, not unrelated queue entries.
+
 The Docker controller accepts these separate RPC methods:
 
 | Method | Input / result |

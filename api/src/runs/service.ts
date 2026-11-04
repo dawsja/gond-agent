@@ -113,6 +113,16 @@ export interface Run extends CiInfo {
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
 const RUNNER_STATE_VERSION = "gond-agent-checkpoint-3";
 const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
+const EVIDENCE_TIMEOUT_MS = 1000;
+/** Evidence is advisory: a missing control reply must not hold capacity or publication. */
+async function evidenceRequest<T>(request: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([request(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Workspace evidence unavailable")), EVIDENCE_TIMEOUT_MS);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
 interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
@@ -127,6 +137,7 @@ interface Live {
   workspace: Workspace;
   cwd: string;
   cursor: number;
+  exited?: boolean;
   closed: boolean;
   busy: boolean;
   closing?: boolean;
@@ -145,6 +156,8 @@ export class Runs {
   private launches = new Map<string, Promise<void>>();
   private pumps = new Map<string, Promise<void>>();
   private releasing = new Set<Promise<void>>();
+  private closingWorkspaces = new Map<string, Promise<void>>();
+  private checkoutCleanup = new Map<string, Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
@@ -531,7 +544,7 @@ export class Runs {
       }
       // Check for an eligible head before reclaiming: a cancelled boot's
       // replacement can be queued while still reserved by the old startup.
-      const reserved = () => new Set([...this.occupied(), ...this.queue.waiting().filter(e => this.autoResuming.size && this.get(e.id).auto_resume_pending).map(e => e.id)]);
+      const reserved = () => new Set([...this.occupied(), ...this.closingWorkspaces.keys(), ...this.checkoutCleanup.keys(), ...this.queue.waiting().filter(e => this.autoResuming.size && this.get(e.id).auto_resume_pending).map(e => e.id)]);
       while (this.queue.first(new Map(), reserved()) && this.hasCapacity(true)) {
         const accounts = new Map<string, number>();
         for (const id of this.occupied()) {
@@ -962,7 +975,7 @@ export class Runs {
         // Only the service chooses authority. Wait for the private acknowledgement
         // before import_state or delivery, on restored AND replacement workers.
         signingKey = randomBytes(32);
-        await workspace!.rpc("init_evidence", { run_id: id, owner_id: r.user_id, key: signingKey.toString("hex") });
+        await evidenceRequest(() => workspace!.rpc("init_evidence", { run_id: id, owner_id: r.user_id, key: signingKey!.toString("hex") }));
       };
       this.status(r, "working", "Loading repository into the workspace");
       await workspace.rpc("setup", { archive: checked.archive.toString("base64") });
@@ -1009,13 +1022,17 @@ export class Runs {
       // Keep the initial private export for policy inspection, never key acquisition.
       // Older exports may be unavailable; no control reply is logged or published.
       let initialEvidence: unknown;
-      try { initialEvidence = await workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable */ }
+      try {
+        if (workspace.isAlive?.() !== false)
+          initialEvidence = await evidenceRequest(() => workspace!.rpc("export_state", { run_id: id, owner_id: r.user_id }));
+      } catch { /* unavailable */ }
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
         evidenceKey: signingKey!,
         workspace,
         cwd: checked.cwd,
         cursor: 0,
+        exited: false,
         closed: false,
         busy: true, // Delivery stays reserved through checkpoint/replay initialization.
         releaseClaim: () => {
@@ -1032,7 +1049,7 @@ export class Runs {
       r.evidence = finishEvidence(r.evidence, initialEvidence, signingKey!);
       r.phase = "agent";
       this.save(r);
-      await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
+      try { await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
         if (live.closed || this.live.get(id) !== live) return;
         const current = this.get(id);
         if (current.status === "stopped" || current.status === "merged") return;
@@ -1048,7 +1065,8 @@ export class Runs {
           this.save(current);
         });
         if (predecessor) claimed = null;
-      }, () => this.checkpointUnavailable(id));
+      }, () => this.checkpointUnavailable(id)); }
+      catch { this.checkpointUnavailable(id); }
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         live.closed = true;
@@ -1214,6 +1232,8 @@ export class Runs {
     return searchResponse(this.db, this.cfg.secret, req);
   }
   private async workerLost(id: string, live: Live) {
+    live.exited = true;
+    this.saveEvidence(id, live);
     if (this.get(id).status !== "working") {
       live.releaseClaim?.();
       await this.close(id, false, true);
@@ -1236,6 +1256,9 @@ export class Runs {
         alive: boolean;
       }>("events", { after: live.cursor });
       if (live.closed) return;
+      // Liveness applies to the entire batch, including terminal events buffered
+      // before exit. Do not ask an exited worker to export, publish or take work.
+      live.exited = !batch.alive || live.workspace.isAlive?.() === false;
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
@@ -1252,7 +1275,15 @@ export class Runs {
         });
         this.save(r);
         if (r.status === "failed") continue;
+        if (live.exited) {
+          if (event.type === "turn.end" && event.agent_id === "main" && event.stop_reason === "end_turn") {
+            r.recovery_phase = "finishing"; // Recovery must not replay completed work.
+            this.save(r);
+          }
+          continue;
+        }
         if (event.type === "error" && event.agent_id === "main") {
+          this.saveEvidence(id, live);
           const dropped = modelDropped;
           await this.fail(id, new RetryError("model", {
             class: dropped ? "network" : "unknown", retryable: !!event.retryable,
@@ -1261,7 +1292,7 @@ export class Runs {
           continue;
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
-          if (event.stop_reason === "error") { await this.captureEvidence(id, live); continue; }
+          if (event.stop_reason === "error") { this.saveEvidence(id, live); continue; }
           if (event.stop_reason === "interrupted") {
             await this.captureEvidence(id, live);
             live.busy = false;
@@ -1276,25 +1307,37 @@ export class Runs {
         }
       }
       if (live.closed) return;
-      const r = this.get(id);
-      if(!live.busy && r.pending.length)await this.next(id,live);
-      if (!batch.alive) {
+      if (!batch.alive || live.workspace.isAlive?.() === false) {
         await this.workerLost(id, live);
         return;
       }
+      const r = this.get(id);
+      if(!live.busy && r.pending.length)await this.next(id,live);
       await delay(batch.events.length ? 50 : 300);
     }
   }
   private async captureEvidence(id: string, live: Live) {
+    if (live.closed) return;
+    if (live.exited || live.workspace.isAlive?.() === false) { this.saveEvidence(id, live); return; }
     // Boundary exports and private exports share runner control state. Settle
     // checkpoint capture first so the evidence export cannot race a held boundary.
-    try { await live.workspace.flushCheckpoints?.(); }
-    catch { this.checkpointUnavailable(id); }
+    try { await evidenceRequest(async () => { await live.workspace.flushCheckpoints?.(); }); }
+    catch {
+      if (live.closed || this.live.get(id) !== live) return;
+      this.checkpointUnavailable(id);
+      this.saveEvidence(id, live);
+      return; // A timed-out flush may still hold the boundary; do not race it.
+    }
     if (live.closed) return;
-    let r = this.get(id);
+    if (live.exited || live.workspace.isAlive?.() === false) { this.saveEvidence(id, live); return; }
+    const r = this.get(id);
     let reply: unknown;
-    try { reply = await live.workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable; no private reply is logged */ }
-    r = this.get(id);
+    try { reply = await evidenceRequest(() => live.workspace.rpc("export_state", { run_id: id, owner_id: r.user_id })); } catch { /* unavailable; no private reply is logged */ }
+    this.saveEvidence(id, live, reply);
+  }
+  private saveEvidence(id: string, live: Live, reply?: unknown) {
+    if (live.closed || this.live.get(id) !== live) return;
+    const r = this.get(id);
     r.evidence = finishEvidence(r.evidence, reply, live.evidenceKey);
     this.save(r);
   }
@@ -1307,6 +1350,7 @@ export class Runs {
     await this.captureEvidence(id, live);
     r = this.get(id); // Capture yields: preserve messages and Stop accepted meanwhile.
     if (live.closed || r.status === "stopped") { live.busy = false; return; }
+    if (live.exited || live.workspace.isAlive?.() === false) { await this.workerLost(id, live); return; }
     delete r.active_message;
     this.autoResuming.delete(id);
     r.auto_resume_pending = false;
@@ -1650,6 +1694,20 @@ export class Runs {
       const r = this.get(id);
       await this.stop(id, r.user_id);
     }
+    let closing = this.closingWorkspaces.get(id);
+    if (!closing && !this.checkoutCleanup.has(id)) {
+      closing = this.closeWorkspace(id, forCapacity, preserveCheckpoint);
+      this.closingWorkspaces.set(id, closing);
+    }
+    try {
+      await closing;
+      if (!forCapacity) await this.checkoutCleanup.get(id);
+    } finally {
+      if (closing && this.closingWorkspaces.get(id) === closing) this.closingWorkspaces.delete(id);
+      this.drain();
+    }
+  }
+  private async closeWorkspace(id: string, forCapacity: boolean, preserveCheckpoint: boolean) {
     const live = this.live.get(id);
     let r: Run | undefined;
     try { r = this.get(id); }
@@ -1681,9 +1739,18 @@ export class Runs {
     }
     // Only an imported commit survives capacity eviction, not the worker's
     // uncommitted edits or a bundle that could not be imported.
-    if (!r?.kept_commit) await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    const cleanup = r?.kept_commit ? Promise.resolve() : rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    const cleaned = cleanup.finally(() => {
+      if (this.checkoutCleanup.get(id) === cleaned) this.checkoutCleanup.delete(id);
+      this.drain();
+    });
+    this.checkoutCleanup.set(id, cleaned);
     this.autoResuming.delete(id);
+    // Destruction has freed the worker slot. Unrelated waiting work must not sit
+    // behind filesystem cleanup; reserve only this run until its clone is gone.
     this.drain();
+    if (forCapacity) void cleaned.catch(() => console.error("Couldn't clean released workspace checkout", id));
+    else await cleaned;
   }
   async shutdown() {
     this.shuttingDown = true;
@@ -1695,6 +1762,7 @@ export class Runs {
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id, false, true)));
     await Promise.allSettled([...this.pumps.values()]);
     await Promise.allSettled(this.releasing);
+    await Promise.allSettled(this.checkoutCleanup.values());
   }
   private async fail(id: string, error: unknown, workerLost = false) {
     const failure = error instanceof RetryError ? error : error instanceof ApiError && error.cause instanceof RetryError ? error.cause :
