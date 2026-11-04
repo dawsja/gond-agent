@@ -75,7 +75,11 @@ beforeEach(async () => {
   const subscriptions = new SubscriptionAccounts(db, secret, [new ChatGPTProvider({ issuer: mock.url, baseURL: `${mock.url}/v1` })]);
   runs = new Runs(db, cfg(), async (_id, modelHandler) => {
     handler = modelHandler;
-    return { destroy: async () => {}, rpc: async (method: string, args?: Record<string, unknown>) => { rpcs.push({ method, args }); return (method === "events" ? { events: [], alive: true } : true) as never; } };
+    return { destroy: async () => {}, rpc: async (method: string, args?: Record<string, unknown>) => {
+      rpcs.push({ method, args });
+      if (method === "export_state") return { state: {} } as never; // Legacy worker: no evidence key.
+      return (method === "events" ? { events: [], alive: true } : true) as never;
+    } };
   }, subscriptions);
   ({ app, mcp } = createApp(db, cfg(), await createAuthentication(db, cfg()), runs));
   ({ cookie, id: user } = await signUp("plan@example.test"));
@@ -322,6 +326,7 @@ describe("ChatGPT plan models and inference", () => {
     if (!server.listening) await new Promise<void>(resolve => server.once("listening", resolve));
     const client = new Client({ name: "plan", version: "1" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${createToken(db, user, "bot").token}` } } }));
+    let runId!: string;
     try {
       const tool = async (name: string, args: Record<string, unknown>) => JSON.parse(((await client.callTool({ name, arguments: args })).content as { text: string }[])[0]!.text);
       const listed = await tool("list_models", {});
@@ -329,13 +334,29 @@ describe("ChatGPT plan models and inference", () => {
       expect(listed.connections).toContainEqual(expect.objectContaining({ id: `chatgpt.${id}`, access: "chatgpt", status: "ready" }));
       const started = await tool("start_session", { request_id: "plan-1", repo: "acme/app", model, effort: "xhigh", prompt: "Use my plan" });
       expect(started).toMatchObject({ model, effort: "xhigh", backend: "builtin" });
+      runId = started.id;
+      expect(runId).toEqual(expect.any(String));
       expect((await tool("start_session", { request_id: "plan-2", repo: "acme/app", model: "cli-codex:default", prompt: "Old id" })).error).toBe("retired_model");
     } finally { await client.close(); }
     await vi.waitFor(() => expect(rpcs.some(r => r.method === "send")).toBe(true));
     // Structural guard: the worker gets model IDs and the loopback relay, never plan credentials.
     const workerTraffic = JSON.stringify(rpcs);
     for (const value of mock.issued) expect(workerTraffic).not.toContain(value);
-    expect(rpcs.find(r => r.method === "start")!.args).toEqual({ model, effort: "xhigh", interactive: true, question_wait_minutes: 240 });
+    expect(rpcs.filter(r => r.method === "start")).toEqual([{ method: "start", args: {
+      model, effort: "xhigh", interactive: true, question_wait_minutes: 240,
+      evidence_seq: 0, evidence_gate_rounds: 0, evidence_resumes: 0,
+      evidence_base_sha: "a".repeat(40), evidence_mode: "on", evidence_repo_policy: "",
+    } }]);
+    expect(rpcs.filter(r => r.method === "export_state")).toEqual([
+      { method: "export_state", args: { run_id: runId, owner_id: user } },
+    ]);
+    expect(rpcs.filter(r => r.method === "init_evidence")).toEqual([
+      { method: "init_evidence", args: { run_id: runId, owner_id: user, key: expect.stringMatching(/^[a-f0-9]{64}$/) } },
+    ]);
+    expect(rpcs.findIndex(r => r.method === "init_evidence")).toBeGreaterThan(rpcs.findIndex(r => r.method === "start"));
+    expect(rpcs.findIndex(r => r.method === "init_evidence")).toBeLessThan(rpcs.findIndex(r => r.method === "export_state"));
+    expect(rpcs.findIndex(r => r.method === "export_state")).toBeGreaterThan(rpcs.findIndex(r => r.method === "start"));
+    expect(rpcs.findIndex(r => r.method === "export_state")).toBeLessThan(rpcs.findIndex(r => r.method === "send"));
     const relayed = await (await handler!(runnerRequest(model))).text();
     for (const value of mock.issued) expect(relayed).not.toContain(value);
     expect(relayed).toContain('"name":"read"');

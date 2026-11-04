@@ -7,10 +7,12 @@ import type { Checkpoint } from "../src/checkpoints";
 import type { Config } from "../src/config";
 import type { Workspace, WorkspaceCheckpoint, WorkspaceCheckpointOptions, WorkspaceFactory } from "../src/containers";
 import { openStore } from "../src/db";
-import { branchHead, checkout, importBundle } from "../src/github";
+import { branchHead, checkout, importBundle, pushBranch } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import { ApiError } from "../src/wire";
+import { verificationBlock } from "../src/runs/evidence";
+import { evidenceState, signedRecord } from "./fixtures/evidence";
 
 // Same command-scoped GitHub fixtures as runs-local: no Docker, Git or model network calls.
 // SQLite, checkpoint encryption, claims and on-disk artifacts remain real.
@@ -34,7 +36,9 @@ vi.mock("../src/github", async original => {
 });
 
 const BASE = "a".repeat(40), HEAD = "b".repeat(40), TREE = "c".repeat(40);
-const VERSION = "gond-agent-checkpoint-2";
+const VERSION = "gond-agent-checkpoint-3", LEGACY_VERSION = "gond-agent-checkpoint-2";
+const COUNTERS = { sub_counter: 3, main_context: 12345, plan_calls: 7,
+  plan_last: [{ text: "Inspect parser", status: "done" }], plan_nudges: 2, turn_compactions: 1, skipped_history_len: 2 };
 const PROMPT = "Repair the checkout without losing the original requirements.";
 const EARLIER = "I inspected the original requirements and found the failing parser.";
 const QUESTION = "Should the parser retain empty fields?";
@@ -54,6 +58,8 @@ class FakeWorkspace implements Workspace {
   events: Record<string, unknown>[] = [];
   history: Message[] = [];
   imported?: State;
+  stateFixture?: Partial<State>;
+  evidenceKey?: string;
   options?: WorkspaceCheckpointOptions;
   save?: (value: WorkspaceCheckpoint) => void | Promise<void>;
   onError?: (error: unknown) => void;
@@ -77,11 +83,13 @@ class FakeWorkspace implements Workspace {
   async capture(bundle = this.checkpointBundle) {
     if (!this.options || !this.save) throw new Error("Checkpoints must be enabled before user delivery");
     const state: State = {
-      schema_version: 1, runner_state_version: VERSION, run_id: this.id, owner_id: this.options.owner_id,
-      history: structuredClone(this.history), plan: [],
+      schema_version: 1, run_id: this.id, owner_id: this.options.owner_id, plan: [],
       counters: { sub_counter: 0, main_context: 0, plan_calls: 0, plan_last: [], plan_nudges: 0,
         turn_compactions: 0, skipped_history_len: null },
+      ...structuredClone(this.stateFixture),
+      runner_state_version: VERSION, history: structuredClone(this.history),
     };
+    if (state.evidence != null) state.evidence = this.exportEvidence().state.evidence;
     try {
       await this.captureGate;
       await this.save({ boundary_id: `boundary-${++this.boundary}`, bundle: bundle.toString("base64"),
@@ -98,12 +106,32 @@ class FakeWorkspace implements Workspace {
   async captureCheckpoint() { await this.capture(); await this.flushCheckpoints(); }
   async flushCheckpoints() { if (this.checkpointError) throw this.checkpointError; }
 
+  exportEvidence() {
+    const reply = evidenceState(this.evidenceKey);
+    const ledger = this.stateFixture?.evidence as Record<string, unknown> | undefined;
+    const start = this.calls.find(call => call.method === "start")?.args;
+    reply.state.evidence = { ...reply.state.evidence, ...structuredClone(ledger), key: this.evidenceKey!,
+      gate_rounds: Math.max(Number(ledger?.gate_rounds ?? 0), Number(start?.evidence_gate_rounds ?? 0)),
+      resumes: Math.max(Number(ledger?.resumes ?? 0), Number(start?.evidence_resumes ?? 0)) };
+    return reply;
+  }
+
   async rpc<T = any>(method: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push(structuredClone({ method, args }));
     let result: unknown = true;
-    if (method === "import_state") {
+    if (method === "init_evidence") {
+      if (typeof args?.key !== "string" || !/^[a-f0-9]{64}$/.test(args.key)) throw new Error("Invalid evidence key");
+      this.evidenceKey = args.key;
+      result = { type: "state.evidence_initialized" };
+    } else if (method === "export_state") {
+      result = this.exportEvidence();
+    } else if (method === "import_state") {
+      if (!this.evidenceKey) throw new Error("Evidence must be initialized before import");
       this.imported = structuredClone(args!.state as State);
       this.history = structuredClone(this.imported.history);
+      this.stateFixture = structuredClone(this.imported);
+      const ledger = this.stateFixture.evidence as Record<string, unknown> | undefined;
+      if (ledger) ledger.historical_ids = (ledger.records as { id: string }[]).map(record => record.id);
       result = { type: "state.imported", request_id: args?.request_id };
     } else if (method === "restore_checkpoint") {
       result = { base_sha: BASE, head_sha: HEAD, checkpoint_sha: TREE };
@@ -114,6 +142,7 @@ class FakeWorkspace implements Workspace {
     } else if (method === "send") {
       const input = args?.input as { type: string; text?: string };
       if (input.type === "user") {
+        if (!this.evidenceKey) throw new Error("Evidence must be initialized before delivery");
         this.history.push(message("user", input.text!));
         this.events.push({ type: "turn.start", agent_id: "main" });
         const text = this.history.length === 1 ? EARLIER : "Completed the next parser step.";
@@ -199,6 +228,272 @@ afterEach(async () => {
 });
 
 describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", () => {
+  it("keeps a valid checkpoint and delivers no work when private key initialization fails on recovery", async () => {
+    const { run } = await checkpointed();
+    const predecessor = rows(run.id).at(-1)!;
+    await restart();
+    const rpc = FakeWorkspace.prototype.rpc;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      const reply = await rpc.call(this, method, args);
+      if (method === "init_evidence") throw new Error("Private control initialization failed");
+      return reply;
+    });
+    await runs.recover();
+    await vi.waitFor(() => expect(workers).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("interrupted"));
+    const failed = workers.at(-1)!;
+    expect(failed.users()).toEqual([]);
+    expect(failed.imported).toBeUndefined();
+    expect(failed.destroy).toHaveBeenCalled();
+    expect(rows(run.id).find(row => row.seq === predecessor.seq)).toMatchObject({ consumed_at: null, invalid_reason: null, claimed_by: null });
+    expect(runs.history(run.id, 0).some(event => event.type === "run.checkpoint_fallback")).toBe(false);
+  });
+
+  it.each([false, true])("acknowledges a new service key before restore import and fallback delivery (import fails: %s)", async failImport => {
+    const { run, worker } = await checkpointed();
+    const oldKey = worker.evidenceKey;
+    await restart();
+    const gates = [deferred(), deferred()];
+    const rpc = FakeWorkspace.prototype.rpc;
+    let initializing = 0;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      const reply = await rpc.call(this, method, args);
+      if (method === "init_evidence") await gates[initializing++]!.promise;
+      if (method === "import_state" && failImport) throw new Error("Rejected checkpoint state");
+      return reply;
+    });
+    try {
+      await runs.recover();
+      await vi.waitFor(() => expect(initializing).toBe(1));
+      const restored = workers.at(-1)!;
+      expect(restored.evidenceKey).toMatch(/^[a-f0-9]{64}$/);
+      expect(restored.evidenceKey).not.toBe(oldKey);
+      expect(restored.imported).toBeUndefined();
+      expect(restored.users()).toEqual([]);
+      expect(restored.calls.find(call => call.method === "start")?.args).toMatchObject({
+        evidence_base_sha: BASE, evidence_seq: 0, evidence_gate_rounds: 2, evidence_resumes: 1,
+      });
+      expect(runs.get(run.id).base_sha).toBe(BASE);
+      gates[0]!.resolve();
+      if (failImport) {
+        await vi.waitFor(() => expect(initializing).toBe(2));
+        const fallback = workers.at(-1)!;
+        expect(restored.destroy).toHaveBeenCalled();
+        expect(fallback.evidenceKey).not.toBe(restored.evidenceKey);
+        expect(fallback.evidenceKey).not.toBe(oldKey);
+        expect(fallback.users()).toEqual([]);
+        expect(fallback.imported).toBeUndefined();
+        expect(fallback.calls.find(call => call.method === "start")?.args).toMatchObject({ evidence_base_sha: BASE, evidence_resumes: 2 });
+        gates[1]!.resolve();
+      }
+      await vi.waitFor(() => expect(workers.at(-1)!.users()).toHaveLength(1));
+      const active = workers.at(-1)!;
+      const methods = active.calls.map(call => call.method);
+      expect(methods.indexOf("start")).toBeLessThan(methods.indexOf("init_evidence"));
+      expect(methods.indexOf("init_evidence")).toBeLessThan(methods.indexOf("send"));
+      if (!failImport) {
+        expect(methods.indexOf("init_evidence")).toBeLessThan(methods.indexOf("import_state"));
+        expect(runs.get(run.id).active_message?.recovery).toBe(true);
+      }
+      // The synthetic restore task and fallback's original task both reserve budget.
+      expect(runs.get(run.id).evidence?.gate_budget).toBe(4);
+      for (const key of [oldKey, restored.evidenceKey, active.evidenceKey]) {
+        expect(JSON.stringify(runs.get(run.id))).not.toContain(key!);
+        expect(JSON.stringify(runs.history(run.id, 0))).not.toContain(key!);
+      }
+    } finally { for (const gate of gates) gate.resolve(); }
+  });
+
+  it.each(["missing key", "changed key", "malformed metadata"])("keeps public evidence ahead of the checkpoint historical despite %s and stale saves", async invalid => {
+    const { run, worker } = await checkpointed();
+    const record = signedRecord({ run_id: run.id, seq: 8 }, Buffer.from(worker.evidenceKey!, "hex"));
+    // This authenticated event arrived after the saved boundary; it is not in its state.
+    runs.append(run.id, { type: "evidence.recorded", record });
+    const stale = runs.get(run.id);
+    expect(stale.evidence?.recorded_before_restart).not.toContain(record.id);
+    const checkpoint = rows(run.id).at(-1)!;
+    expect(storedState(checkpoint).runner).not.toHaveProperty("evidence");
+    await restart();
+    const rpc = FakeWorkspace.prototype.rpc;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      const reply = await rpc.call(this, method, args);
+      if (method !== "export_state") return reply;
+      const evidence = (reply as ReturnType<typeof evidenceState>).state.evidence;
+      if (invalid === "missing key") return { state: { evidence: { ...evidence, key: null } } };
+      if (invalid === "changed key") return { state: { evidence: { ...evidence, key: "bad-key", gate_rounds: 100 } } };
+      return { state: { evidence: { ...evidence, policy: { enabled: "invalid" }, historical_ids: [42], resumes: -1 } } };
+    });
+    await runs.recover();
+    await vi.waitFor(() => expect(workers).toHaveLength(2));
+    await vi.waitFor(() => expect(workers.at(-1)!.users()).toHaveLength(1));
+    const resumed = workers.at(-1)!;
+    expect(resumed.calls.find(call => call.method === "start")?.args).toMatchObject({ evidence_seq: 8 });
+    expect(runs.get(run.id).evidence?.policy).toBeUndefined();
+    runs.save(stale); // Same sequence, pre-restart freshness: must not erase historical marks.
+    let current = runs.get(run.id);
+    expect(current.evidence).toMatchObject({ last_seq: 8, records: [record], recorded_before_restart: [record.id], gate_budget: 4, resumes: 1 });
+    // Old worker credentials cannot authorize new events after restore.
+    const next = { run_id: run.id, seq: 9, id: "00000000-0000-4000-8000-000000000002" };
+    runs.append(run.id, { type: "evidence.recorded", record: signedRecord(next, Buffer.from(worker.evidenceKey!, "hex")) });
+    expect(runs.get(run.id).evidence?.last_seq).toBe(8);
+    current = runs.get(run.id);
+    expect(verificationBlock({ ...current.evidence!, publication_tree: record.tree_hash_after })).toContain("recorded before restart; re-run required");
+    expect(verificationBlock({ ...current.evidence!, publication_tree: record.tree_hash_after })).not.toContain("1 fresh successful check(s)");
+    runs.append(run.id, { type: "evidence.recorded", record: signedRecord(next, Buffer.from(resumed.evidenceKey!, "hex")) });
+    expect(runs.get(run.id).evidence).toMatchObject({ last_seq: 9, recorded_before_restart: [record.id] });
+  });
+
+  it.each(["absent", "null"])("authenticates ledgerless epoch-2 recovery (evidence %s) and consumes the original claim with an epoch-3 replacement", async evidence => {
+    const { run } = await checkpointed();
+    const saved = storedState(rows(run.id).at(-1)!);
+    saved.runner.runner_state_version = LEGACY_VERSION;
+    saved.runner.counters = COUNTERS;
+    if (evidence === "null") saved.runner.evidence = null;
+    const legacy = runs.checkpoints.save({ runId: run.id, ownerId: "u", runnerVersion: LEGACY_VERSION,
+      bundle: Buffer.from("legacy-bundle"), state: JSON.stringify(saved), tree: { baseSha: BASE, headSha: HEAD, checkpointSha: TREE } });
+    const sealed = readFileSync(join(dir, "checkpoints", legacy.state_path));
+    await restart();
+    const load = vi.spyOn(runs.checkpoints, "load"), consume = vi.spyOn(runs.checkpoints, "consumeClaim");
+    const capture = deferred();
+    factory.mockImplementationOnce(async id => {
+      const worker = new FakeWorkspace(id);
+      worker.captureGate = capture.promise;
+      workers.push(worker);
+      return worker;
+    });
+    try {
+      await runs.recover();
+      await vi.waitFor(() => expect(workers.at(-1)!.imported).toEqual(saved.runner));
+      const restored = workers.at(-1)!;
+      await vi.waitFor(() => expect(restored.users()).toHaveLength(1));
+      expect(restored.users()[0]).not.toContain(PROMPT);
+      expect(restored.calls.find(call => call.method === "restore_checkpoint")?.args).toMatchObject({
+        bundle: Buffer.from("legacy-bundle").toString("base64"), base_sha: BASE, head_sha: HEAD, checkpoint_sha: TREE,
+      });
+      expect(load.mock.calls.every(([key, seq]) => key.runnerVersion === LEGACY_VERSION && seq === legacy.seq)).toBe(true);
+      expect(rows(run.id).find(row => row.seq === legacy.seq)).toMatchObject({ runner_version: LEGACY_VERSION,
+        consumed_at: null, claimed_by: expect.any(String), invalid_reason: null });
+      expect(readFileSync(join(dir, "checkpoints", legacy.state_path))).toEqual(sealed);
+      capture.resolve();
+      await vi.waitFor(() => expect(rows(run.id).at(-1)?.runner_version).toBe(VERSION));
+      expect(consume).toHaveBeenCalledWith({ runId: run.id, ownerId: "u", runnerVersion: LEGACY_VERSION }, legacy.seq, expect.any(String));
+      expect(rows(run.id).find(row => row.seq === legacy.seq)).toMatchObject({ runner_version: LEGACY_VERSION, consumed_at: expect.any(Number), invalid_reason: null });
+      expect(readFileSync(join(dir, "checkpoints", legacy.state_path))).toEqual(sealed);
+      expect(storedState(rows(run.id).at(-1)!).runner).toMatchObject({ runner_state_version: VERSION, counters: COUNTERS });
+      expect(runs.history(run.id, 0).filter(event => event.type === "run.resumed")).toHaveLength(1);
+      expect(runs.history(run.id, 0).some(event => event.type === "run.checkpoint_fallback")).toBe(false);
+    } finally { capture.resolve(); }
+  });
+
+  it.each([
+    { name: "epoch-2 ledger", envelope: LEGACY_VERSION, payload: LEGACY_VERSION, ledger: {} },
+    { name: "epoch-1", envelope: "gond-agent-checkpoint-1", payload: "gond-agent-checkpoint-1" },
+    { name: "future epoch", envelope: "gond-agent-checkpoint-4", payload: "gond-agent-checkpoint-4" },
+    { name: "epoch-2 envelope/epoch-3 payload", envelope: LEGACY_VERSION, payload: VERSION },
+    { name: "epoch-3 envelope/epoch-2 payload", envelope: VERSION, payload: LEGACY_VERSION },
+    { name: "row/envelope mismatch", envelope: VERSION, payload: VERSION, relabel: true },
+  ])("rejects $name without importing or searching an older checkpoint", async fixture => {
+    const { run } = await checkpointed();
+    const older = rows(run.id).at(-1)!;
+    const saved = storedState(older);
+    saved.runner.runner_state_version = fixture.payload;
+    if (fixture.ledger) saved.runner.evidence = fixture.ledger;
+    const rejected = runs.checkpoints.save({ runId: run.id, ownerId: "u", runnerVersion: fixture.envelope,
+      bundle: Buffer.from("rejected-bundle"), state: JSON.stringify(saved), tree: { baseSha: BASE, headSha: HEAD, checkpointSha: TREE } });
+    if (fixture.relabel) db.prepare("UPDATE run_checkpoints SET runner_version=? WHERE seq=?").run(LEGACY_VERSION, rejected.seq);
+    await restart();
+    const load = vi.spyOn(runs.checkpoints, "load");
+    await runs.recover();
+    expect(runs.get(run.id).status).toBe("failed");
+    expect(workers).toHaveLength(1);
+    await runs.validateFollowUp(run.id, "u");
+    runs.enqueue(run.id, "u", "Continue from the pushed branch.");
+    await vi.waitFor(() => { expect(workers.length).toBeGreaterThan(1); expect(workers.at(-1)!.users()).toHaveLength(1); });
+    expect(workers.at(-1)!.imported).toBeUndefined();
+    expect(workers.slice(1).some(worker => worker.calls.some(call => call.method === "restore_checkpoint" || call.method === "import_state"))).toBe(false);
+    expect(load.mock.calls.some(([, seq]) => seq === older.seq)).toBe(false);
+    expect(rows(run.id).find(row => row.seq === rejected.seq)).toMatchObject({ consumed_at: expect.any(Number), invalid_reason: "restore_failed", claimed_by: null });
+    expect(runs.history(run.id, 0).some(event => event.type === "run.checkpoint_fallback")).toBe(true);
+    expect(runs.history(run.id, 0).some(event => event.type === "run.resumed")).toBe(false);
+  });
+
+  it("preserves nonzero counters, signed ledger and snapshot metadata through sealed storage and recovery", async () => {
+    const { run, worker } = await checkpointed();
+    // The fake transports opaque runner state; real HMAC acceptance, encryption,
+    // SQLite and claim consumption remain in use. This does not replace real-runner import/HMAC tests.
+    const record = signedRecord({ run_id: run.id, seq: 11 }, Buffer.from(worker.evidenceKey!, "hex"));
+    runs.append(run.id, { type: "evidence.recorded", record });
+    const current = runs.get(run.id);
+    current.evidence = { ...current.evidence!, gate_rounds: 5, gate_budget: 6, resumes: 2 };
+    runs.save(current);
+    worker.stateFixture = { counters: COUNTERS, plan: COUNTERS.plan_last, evidence: {
+      ...evidenceState(worker.evidenceKey).state.evidence, run_id: run.id, records: [record], seq: 11,
+      gate_rounds: 5, resumes: 2, fix_rounds: 1, reviews: 1, stale_ids: [], historical_ids: [], declared: true, turn_tree: TREE,
+    } };
+    await worker.capture();
+    const checkpoint = rows(run.id).at(-1)!;
+    const saved = storedState(checkpoint);
+    expect(saved.service).toEqual({ active_message_id: current.active_message!.id, automatic: false });
+    expect(saved.runner).toMatchObject({ counters: COUNTERS, evidence: { seq: 11, gate_rounds: 5, records: [record] } });
+    const ciphertext = readFileSync(join(dir, "checkpoints", checkpoint.state_path));
+    expect(ciphertext.toString()).not.toContain(worker.evidenceKey!);
+    await restart();
+    await runs.recover();
+    await vi.waitFor(() => expect(workers.at(-1)!.imported).toEqual(saved.runner));
+    await vi.waitFor(() => expect(rows(run.id).at(-1)!.seq).toBeGreaterThan(checkpoint.seq));
+    const restored = workers.at(-1)!;
+    expect(restored.evidenceKey).not.toBe(worker.evidenceKey);
+    expect(restored.calls.find(call => call.method === "start")?.args).toMatchObject({
+      evidence_seq: 11, evidence_gate_rounds: 6, evidence_resumes: 3,
+    });
+    const replacement = rows(run.id).at(-1)!;
+    const loaded = runs.checkpoints.load({ runId: run.id, ownerId: "u", runnerVersion: VERSION }, replacement.seq)!;
+    expect(loaded.tree).toEqual({ baseSha: BASE, headSha: HEAD, checkpointSha: TREE });
+    expect(storedState(replacement)).toMatchObject({ runner: { counters: COUNTERS, plan: COUNTERS.plan_last,
+      evidence: { seq: 11, gate_rounds: 6, resumes: 3, records: [record], historical_ids: [record.id], key: restored.evidenceKey } },
+      service: { active_message_id: runs.get(run.id).active_message!.id, automatic: false } });
+    expect(readFileSync(join(dir, "checkpoints", checkpoint.state_path))).toEqual(ciphertext);
+    expect(rows(run.id).find(row => row.seq === checkpoint.seq)?.consumed_at).toEqual(expect.any(Number));
+    expect(runs.get(run.id).evidence).toMatchObject({ records: [record], last_seq: 11, gate_rounds: 6, gate_budget: 6, resumes: 3,
+      recorded_before_restart: [record.id] });
+  });
+
+  it.each(["export throws", "malformed metadata"])("finishes and captures after %s without resetting budgets, flushing before export", async failure => {
+    const { run, worker } = await checkpointed();
+    const current = runs.get(run.id);
+    current.evidence = { ...current.evidence!, gate_rounds: 5, gate_budget: 6, resumes: 3 };
+    runs.save(current);
+    const flush = deferred();
+    const flushing = vi.spyOn(worker, "flushCheckpoints").mockImplementationOnce(() => flush.promise);
+    const capture = vi.spyOn(worker, "captureCheckpoint");
+    const rpc = worker.rpc.bind(worker);
+    const exporting = vi.spyOn(worker, "rpc").mockImplementation(async (method, args) => {
+      if (method === "export_state") {
+        if (failure === "export throws") throw new Error("private export unavailable");
+        return { state: { evidence: { ...evidenceState(worker.evidenceKey).state.evidence,
+          policy: { enabled: "invalid" }, gate_rounds: 0, resumes: 0, historical_ids: [42] } } };
+      }
+      return rpc(method, args);
+    });
+    try {
+      worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+      await vi.waitFor(() => expect(flushing).toHaveBeenCalledTimes(1));
+      expect(exporting.mock.calls.some(([method]) => method === "export_state")).toBe(false);
+      expect(importBundle).not.toHaveBeenCalled();
+      flush.resolve();
+      await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+      expect(exporting.mock.calls.filter(([method]) => method === "export_state")).toHaveLength(1);
+      expect(importBundle).toHaveBeenCalledTimes(1); // importBundle is the first publication/push path.
+      expect(pushBranch).not.toHaveBeenCalled();
+      expect(capture).toHaveBeenCalledWith({ head_sha: HEAD });
+      expect(rows(run.id).at(-1)!.seq).toBeGreaterThan(rows(run.id)[0]!.seq);
+      expect(runs.get(run.id)).toMatchObject({ pushed: true, head_sha: HEAD,
+        evidence: { gate_rounds: 5, gate_budget: 6, resumes: 3 } });
+      expect(runs.get(run.id).evidence?.policy).toBeUndefined();
+      expect(runs.history(run.id, 0).some(event => event.type === "run.error")).toBe(false);
+    } finally { flush.resolve(); }
+  });
+
   it("publishes a finished turn despite failed flush and post-publication capture", async () => {
     vi.stubEnv("GOND_AGENT_CHECKPOINT_MAX_MB", "1");
     await restart();
@@ -257,6 +552,26 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
       expect(runs.get(run.id).pending.map(message => message.text)).toContain(followUp);
       expect(runs.get(run.id).recovery_task?.text).toBe(followUp);
     }
+  });
+
+  it("restores sealed mid-review counters without replaying the author turn", async () => {
+    const { run, worker } = await checkpointed();
+    const current = runs.get(run.id);
+    current.phase = "finishing";
+    current.recovery_phase = "finishing";
+    current.review = { status: "running", revision: 2, attempts: 1, fix_rounds: 0,
+      considered: 0, valid: 0, unconfirmed: 0, dropped: 0, findings: [] };
+    runs.save(current);
+    await worker.capture();
+    const sealed = storedState(rows(run.id).at(-1)!) as unknown as { service: { review: { attempts: number; status: string } } };
+    expect(sealed.service.review).toMatchObject({ attempts: 1, status: "running" });
+    await restart();
+    await runs.recover();
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    const restored = workers.at(-1)!;
+    expect(restored.imported).toBeDefined();
+    expect(restored.users()).toEqual([]);
+    expect(runs.get(run.id).review).toMatchObject({ status: "skipped", attempts: 1, reason: "Separate-container review backend unavailable." });
   });
 
   it.each([false, true])("quarantines a failed restore without replaying a finished task (queued follow-up: %s)", async queuedFollowUp => {
@@ -412,15 +727,19 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
   it("preserves a follow-up accepted while finish is flushing checkpoints", async () => {
     const { run, worker } = await checkpointed();
     const flush = deferred(), publication = deferred();
+    const exportsBefore = worker.calls.filter(call => call.method === "export_state").length;
     const flushing = vi.spyOn(worker, "flushCheckpoints").mockImplementationOnce(() => flush.promise);
     vi.mocked(importBundle).mockImplementationOnce(() => publication.promise);
     const followUp = "Keep the follow-up accepted during checkpoint flush.";
     try {
       worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
       await vi.waitFor(() => expect(flushing).toHaveBeenCalledTimes(1));
+      expect(runs.get(run.id).recovery_phase).toBe("finishing");
+      expect(worker.calls.filter(call => call.method === "export_state")).toHaveLength(exportsBefore);
       runs.enqueue(run.id, "u", followUp);
       flush.resolve();
       await vi.waitFor(() => expect(importBundle).toHaveBeenCalledTimes(1));
+      expect(worker.calls.filter(call => call.method === "export_state")).toHaveLength(exportsBefore + 1);
       // get() reloads SQLite, including the write performed by finish after flush.
       expect(runs.get(run.id).pending.map(item => item.text)).toEqual([followUp]);
       publication.resolve();

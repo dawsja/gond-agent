@@ -9,7 +9,7 @@ use crate::agent::events::{AgentEvent, AgentInput};
 // Never include checkpoint contents (or serde errors containing field names) in logs.
 fn decode_input(line: &str) -> std::result::Result<AgentInput, Option<Box<AgentEvent>>> {
     let value: serde_json::Value = serde_json::from_str(line).map_err(|_| None)?;
-    let correlation = value["type"].as_str().filter(|op| matches!(*op, "export_state" | "import_state" | "checkpoint.release"))
+    let correlation = value["type"].as_str().filter(|op| matches!(*op, "export_state" | "import_state" | "init_evidence" | "authorize_review" | "checkpoint.release"))
         .zip(value["request_id"].as_str().filter(|id| id.len() <= 256))
         .map(|(op, id)| (op.to_owned(), id.to_owned()));
     serde_json::from_value(value).map_err(|_| correlation.map(|(operation, request_id)| {
@@ -44,7 +44,7 @@ async fn jsonl_inner(agent: &mut AgentHandle) -> Result<i32> {
             }
             match decode_input(&line) {
                 Ok(i) => {
-                    if matches!(i, AgentInput::ExportState(_) | AgentInput::ImportState(_) | AgentInput::CheckpointRelease(_)) {
+                    if matches!(i, AgentInput::ExportState(_) | AgentInput::ImportState(_) | AgentInput::InitEvidence(_) | AgentInput::AuthorizeReview(_) | AgentInput::CheckpointRelease(_)) {
                         let _ = control_tx.send(Control::Pending);
                     }
                     let _ = input.send(i);
@@ -74,7 +74,7 @@ async fn jsonl_inner(agent: &mut AgentHandle) -> Result<i32> {
                 match &ev {
                     AgentEvent::TurnStart { agent_id } if agent_id == "main" => busy += 1,
                     AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main" => busy -= 1,
-                    AgentEvent::StateExported { .. } | AgentEvent::StateImported { .. } | AgentEvent::StateError { .. } | AgentEvent::CheckpointReleased { .. } => pending_controls -= 1,
+                    AgentEvent::StateExported { .. } | AgentEvent::StateImported { .. } | AgentEvent::EvidenceInitialized { .. } | AgentEvent::ReviewAuthorized { .. } | AgentEvent::StateError { .. } | AgentEvent::CheckpointReleased { .. } => pending_controls -= 1,
                     _ => {}
                 }
                 writeln!(out, "{}", serde_json::to_string(&ev)?)?;

@@ -76,6 +76,7 @@ describe("shared run lifecycle", () => {
       next: { working: ["working", "ready"] },
       poll: { stopped: ["working"] },
       finish: { working: ["working"], ready: ["working"], stopped: ["stopped"], merged: ["working"] },
+      reviewBeforePublish: { working: ["working"] },
       resumeAfterCiRefusal: { failed: ["working", "stopped"], queued: ["working", "stopped"], ready: ["working"], stopped: ["stopped"] },
       merge: { merged: ["ready", "failed", "stopped", "interrupted"] },
       stop: { stopped: ["queued", "working", "ready", "failed", "stopped", "interrupted"] },

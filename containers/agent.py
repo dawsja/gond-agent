@@ -78,7 +78,7 @@ def clone_git_file(gitdir, name):
     return path
 
 
-def clone_head(gitdir, git):
+def clone_head(gitdir, git, allow_unborn=False):
     """Resolve only ordinary clone HEADs, without ever loading checkout configuration."""
     head = clone_git_file(gitdir, "HEAD").read_text().strip()
     if head.startswith("ref: "):
@@ -93,6 +93,8 @@ def clone_head(gitdir, git):
             packed = clone_git_file(gitdir, "packed-refs")
             matches = [line.split()[0] for line in packed.read_text().splitlines()
                        if len(line.split()) == 2 and line.split()[1] == ref] if packed.exists() else []
+            if not matches and allow_unborn:
+                return None
             if len(matches) != 1:
                 raise RuntimeError("Missing checkpoint HEAD.")
             head = matches[0]
@@ -100,7 +102,7 @@ def clone_head(gitdir, git):
 
 
 @contextlib.contextmanager
-def checkpoint_repository():
+def checkpoint_repository(allow_unborn=False):
     """Private Git config, refs, objects and index; the clone is only an object source.
 
     In particular, do not run Git with the clone's git-dir: even local config can
@@ -136,24 +138,108 @@ def checkpoint_repository():
         env.update({"GIT_DIR": str(scratch / "repo/.git"), "GIT_WORK_TREE": str(root),
                     "GIT_INDEX_FILE": str(scratch / "index"),
                     "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(gitdir / "objects")})
-        excludes = clone_git_file(gitdir, "info/exclude")
-        if excludes.exists():
-            target = scratch / "repo/.git/info/exclude"
-            target.parent.mkdir(exist_ok=True)
-            target.write_bytes(excludes.read_bytes())
         shallow = clone_git_file(gitdir, "shallow")
         if shallow.exists():
             content = shallow.read_text()
             for line in content.splitlines():
                 checkpoint_sha(line)
             (scratch / "repo/.git/shallow").write_text(content)
-        head = clone_head(gitdir, git)
-        checkpoint_commit(git, head)
+        head = clone_head(gitdir, git, allow_unborn=allow_unborn)
+        if head is not None:
+            checkpoint_commit(git, head)
         yield git, env, scratch, head
 
 
 def checkpoint_message(base, head):
     return f"Gond Agent checkpoint\n\nbase_sha: {base}\nhead_sha: {head}\n"
+
+
+def capture_tree(git, env, head):
+    """Canonical evidence/publication tree: HEAD-tracked + non-ignored worktree files.
+
+    Only worktree .gitignore rules apply, never clone info/exclude or user config.
+    The real index is not a source of content, but reject force-added ignored files
+    rather than silently dropping work that ordinary publication used to include.
+    Ignored paths are outside this evidence boundary, even if executed by a check.
+    """
+    index = clone_git_file(pathlib.Path(ROOT).resolve() / ".git", "index")
+    if index.exists():
+        temporary_index = env["GIT_INDEX_FILE"]
+        try:
+            env["GIT_INDEX_FILE"] = str(index)
+            ignored = set(git("ls-files", "--cached", "--ignored", "--exclude-standard", "-z").split(b"\0")) - {b""}
+        finally:
+            env["GIT_INDEX_FILE"] = temporary_index
+        tracked = set(git("ls-tree", "-rz", "--name-only", head).split(b"\0")) if head else set()
+        if ignored - tracked:
+            raise RuntimeError("Newly staged ignored files are not supported by checkpoints.")
+    git("read-tree", head if head else "--empty")
+    git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
+    return git("write-tree").decode().strip()
+
+
+def tree_hash():
+    """Read-only counterpart of runner evidence_tree::tree_hash."""
+    with checkpoint_lock, checkpoint_repository(allow_unborn=True) as (git, env, _, head):
+        return capture_tree(git, env, head)
+
+
+def snapshot_tree(req):
+    """Publish the canonical tree without loading clone config or running hooks."""
+    with checkpoint_lock, checkpoint_repository(allow_unborn=True) as (git, env, scratch, head):
+        gitdir = pathlib.Path(ROOT).resolve() / ".git"
+        original_head = clone_git_file(gitdir, "HEAD").read_text().strip()
+        tree = capture_tree(git, env, head)
+        commit = head
+        if not head or tree != git("rev-parse", head + "^{tree}").decode().strip():
+            identity = req.get("identity", {})
+            if any(not isinstance(identity.get(key), str) or not identity[key].strip() or
+                   any(c in identity[key] for c in "\r\n\0<>") for key in ("name", "email")):
+                raise RuntimeError("A connected GitHub commit identity is required.")
+            env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER")
+                        for key, field in (("NAME", "name"), ("EMAIL", "email"))})
+            parent = ("-p", head) if head else ()
+            commit = git("commit-tree", tree, *parent,
+                         input=(req.get("title", "Changes") + "\n").encode()).decode().strip()
+        git("update-ref", "HEAD", commit)
+        bundle = scratch / "publication.bundle"
+        git("bundle", "create", "--version=2", str(bundle), "HEAD")
+        body = bundle.read_bytes()
+        # Import only objects. index-pack still runs against private config/refs;
+        # GIT_OBJECT_DIRECTORY selects the clone's storage, not its Git config.
+        pack = scratch / "publication.pack"
+        with pack.open("wb") as output:
+            revisions = commit + "\n" + ("^" + head + "\n" if head else "")
+            git("pack-objects", "--stdout", "--revs", input=revisions.encode(), output=output)
+        env["GIT_OBJECT_DIRECTORY"] = str(gitdir / "objects")
+        git("index-pack", "--stdin", input=pack.read_bytes())
+        # Write the original ref via an exclusive lock, not a Git invocation that
+        # could read local config/includes. A packed branch gets a loose override.
+        target = clone_git_file(gitdir, original_head[5:] if original_head.startswith("ref: ") else "HEAD")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lock = target.with_name(target.name + ".lock")
+        # Match ordinary git add/commit publication: leave the index at this tree.
+        # Acquire both locks before changing either, so a busy index cannot cause
+        # an error after HEAD has already been published.
+        index = clone_git_file(gitdir, "index")
+        index_lock = index.with_name("index.lock")
+        with index_lock.open("xb") as index_output:
+            try:
+                with lock.open("x") as ref_output:
+                    try:
+                        if clone_head(gitdir, git, allow_unborn=True) != head or clone_git_file(gitdir, "HEAD").read_text().strip() != original_head:
+                            raise RuntimeError("The publication HEAD changed.")
+                        index_output.write(pathlib.Path(env["GIT_INDEX_FILE"]).read_bytes())
+                        index_output.flush()
+                        ref_output.write(commit + "\n")
+                        ref_output.flush()
+                        os.replace(index_lock, index)
+                        os.replace(lock, target)
+                    finally:
+                        lock.unlink(missing_ok=True)
+            finally:
+                index_lock.unlink(missing_ok=True)
+        return {"bundle": base64.b64encode(body).decode(), "head": commit}
 
 
 def checkpoint_tree(req, state_digest=None):
@@ -169,22 +255,7 @@ def checkpoint_tree(req, state_digest=None):
         # not a possibly unpublished local HEAD. The tree still starts at HEAD.
         parent = checkpoint_sha(req["head_sha"]) if "head_sha" in req else head
         checkpoint_commit(git, parent)
-        # Staging metadata is deliberately not restored. A newly force-added
-        # ignored file would otherwise vanish from export or later publication.
-        index = clone_git_file(pathlib.Path(ROOT).resolve() / ".git", "index")
-        if index.exists():
-            temporary_index = env["GIT_INDEX_FILE"]
-            try:
-                env["GIT_INDEX_FILE"] = str(index)
-                ignored = set(git("ls-files", "--cached", "--ignored", "--exclude-standard", "-z").split(b"\0")) - {b""}
-            finally:
-                env["GIT_INDEX_FILE"] = temporary_index
-            tracked = set(git("ls-tree", "-rz", "--name-only", head).split(b"\0"))
-            if ignored - tracked:
-                raise RuntimeError("Newly staged ignored files are not supported by checkpoints.")
-        git("read-tree", head)
-        git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
-        tree = git("write-tree").decode().strip()
+        tree = capture_tree(git, env, head)
         fingerprint = hashlib.sha256(f"{base}:{parent}:{tree}:{state_digest}".encode()).hexdigest() if state_digest else None
         if fingerprint and fingerprint == req.get("previous_fingerprint"):
             return {"unchanged": True}
@@ -201,7 +272,7 @@ def checkpoint_tree(req, state_digest=None):
         if bundle.stat().st_size > MAX_CHECKPOINT_BUNDLE:
             raise RuntimeError("The checkpoint bundle is too large.")
         return {**({"fingerprint": fingerprint} if fingerprint else {}), "bundle": base64.b64encode(bundle.read_bytes()).decode(),
-                "base_sha": base, "head_sha": parent, "checkpoint_sha": commit}
+                "base_sha": base, "head_sha": parent, "checkpoint_sha": commit, "tree_hash": tree}
 
 
 def restore_checkpoint(req):
@@ -335,6 +406,11 @@ def state_rpc(req, expected_worker=None):
             raise RuntimeError("Missing worker state.")
         state_json(req["state"])
         frame["state"] = req["state"]
+    if operation == "init_evidence":
+        key = req.get("key")
+        if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
+            raise RuntimeError("Invalid evidence initialization.")
+        frame["key"] = key
     replies = queue.Queue(maxsize=1)
     key = frame["request_id"]
     deadline = time.monotonic() + STATE_TIMEOUT
@@ -365,6 +441,8 @@ def state_rpc(req, expected_worker=None):
             raise RuntimeError("The worker state request timed out.") from None
         if not reply or reply["type"] == "state.error":
             raise RuntimeError("The worker state request failed.")
+        if operation == "authorize_review":
+            return {k: reply[k] for k in ("allowed", "mode", "reason")}
         if operation == "export_state":
             if "state" not in reply:
                 raise RuntimeError("Invalid worker state reply.")
@@ -405,6 +483,7 @@ def drain(stream, source=None):
                     if source is not None and source is worker and pending and pending[0] is source:
                         _, operation, replies = pending
                         expected = {"export_state": "state.exported", "import_state": "state.imported",
+                                    "init_evidence": "state.evidence_initialized", "authorize_review": "state.review_authorized",
                                     "checkpoint.release": "checkpoint.released"}[operation]
                         if kind == expected or (kind == "state.error" and event.get("operation") == operation):
                             with contextlib.suppress(queue.Full):
@@ -446,11 +525,217 @@ def checkpoint_rpc(req):
         capture_lock.release()
 
 
+class ReviewError(RuntimeError):
+    MESSAGES = {
+        "review_size_cap": "Review copy exceeds size cap or contains hard links.",
+        "review_tree_size_cap": "Review tree exceeds the 256 MiB size cap.",
+        "review_unsupported_runner": "Review skipped: no supported base-pinned Vitest test command with a lockfile.",
+        "review_provisioning_failed": "Review skipped: dependency provisioning failed.",
+    }
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(self.MESSAGES[code])
+
+
+def review_test_path(path):
+    return bool(re.fullmatch(r"(?:api/test/.+\.test\.ts|web/src/.+\.(?:test|spec)\.tsx?|runner/tests/.+\.rs|runner/src/.+_tests\.rs|containers/test_[^/]+\.py)", path))
+
+
+def review_test_artifact(path):
+    # The write allow-list is deliberately narrower than the test-artifact deny-list.
+    # A proof patch must not "fix" a fixture, helper or unlisted test extension.
+    return bool(re.search(r"(?:^|/)(?:test|tests|__tests__|fixtures)(?:/|$)|(?:^|[/_.-])(?:test|tests|spec|specs|fixture|fixtures)(?:[_.-]|$)", path))
+
+
+def review_path(path):
+    if (not isinstance(path, str) or len(path) > 300 or
+            not re.fullmatch(r"[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*", path) or
+            any(p in (".", "..") or p.lower() == ".git" for p in path.split("/"))):
+        raise RuntimeError("Invalid review path.")
+    target = pathlib.Path(ROOT) / path
+    if not target.resolve().is_relative_to(pathlib.Path(ROOT).resolve()):
+        raise RuntimeError("Review path escapes checkout.")
+    if any(p.is_symlink() for p in (target, *target.parents)):
+        raise RuntimeError("Review symlinks are not supported.")
+    return target
+
+
+def review_run(args, cwd, timeout):
+    # No inherited credentials/configuration. Repo code still has network access,
+    # and same-UID access inside this disposable container is not a trust boundary.
+    env = {k: v for k, v in os.environ.items() if k in (
+        "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "npm_config_cache")}
+    env.update({"CI": "true", "NO_COLOR": "1", "npm_config_ignore_scripts": "true"})
+    # Review uses a fresh tmpfs at /opt/gond-tools, hiding image-created dirs.
+    # Provisioning happens BEFORE a runner starts, so recreate installer scratch here.
+    if env.get("TMPDIR"):
+        pathlib.Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(args, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + timeout
+        try:
+            while process.poll() is None:
+                if time.monotonic() >= deadline or output.tell() > 1024 * 1024:
+                    raise RuntimeError("Review execution exceeded its time/output budget.")
+                time.sleep(0.02)
+            if output.tell() > 1024 * 1024:
+                raise RuntimeError("Review output exceeded its budget.")
+            output.seek(0)
+            return process.returncode, output.read().decode(errors="replace")
+        finally:
+            # Reap descendants too, including successful scripts that leave children.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def review_prepare(req):
+    # Only a fixed, base-pinned Vitest grammar is currently supported. Other
+    # ecosystems fail closed with a recorded provisioning skip, never a shell.
+    base = checkpoint_sha(req.get("base_sha"))
+    with checkpoint_repository() as (git, env, _, head):
+        checkpoint_commit(git, base)
+        tree = capture_tree(git, env, head)
+        entries = git("ls-tree", "-rlz", tree).split(b"\0")
+        size = 0
+        for entry in entries:
+            if not entry:
+                continue
+            meta, _ = entry.split(b"\t", 1)
+            fields = meta.split()
+            if fields[0] == b"160000":
+                raise RuntimeError("Review does not support gitlinks.")
+            if fields[3] != b"-":
+                size += int(fields[3])
+        if size > 256 * 1024 * 1024:
+            raise ReviewError("review_tree_size_cap")
+        configured = []
+        for directory in (".", "api", "web"):
+            relative = "package.json" if directory == "." else directory + "/package.json"
+            target = review_path(relative)
+            if not target.is_file():
+                continue
+            try:
+                manifest = json.loads(git("show", base + ":" + relative))
+                script = manifest.get("scripts", {}).get("test")
+                current = json.loads(target.read_text())
+                if script not in ("vitest", "vitest run") or current.get("scripts", {}).get("test") != script:
+                    continue
+                # No local symlink dependencies or lifecycle scripts are provisioned.
+                lock = target.parent / "package-lock.json"
+                if not lock.is_file() or lock.is_symlink():
+                    continue
+                data = json.loads(lock.read_text())
+                if any(p.get("link") or str(p.get("resolved", "")).startswith(("file:", "git", "/", ".."))
+                       for p in data.get("packages", {}).values()):
+                    continue
+                configured.append(directory)
+            except (RuntimeError, ValueError, OSError):
+                continue
+    if not configured:
+        raise ReviewError("review_unsupported_runner")
+    requested = req.get("directory")
+    if requested is not None:
+        if requested not in configured:
+            if "." not in configured:
+                raise RuntimeError("Review proof has no supported pinned test command.")
+            requested = "."
+        configured = [requested]
+    for directory in configured:
+        cwd = pathlib.Path(ROOT) / directory
+        try:
+            code, _ = review_run(["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd, 90)
+        except RuntimeError:
+            raise ReviewError("review_provisioning_failed") from None
+        if code:
+            raise ReviewError("review_provisioning_failed")
+    return {"directories": configured}
+
+
+def review_proof(req):
+    if req.get("mode") not in ("allow", "ask"):
+        raise RuntimeError("Review execution requires parent permission.")
+    finding = req.get("finding", {})
+    tests = finding.get("proof_test_files", [])
+    if not isinstance(tests, list) or not 1 <= len(tests) <= 4:
+        raise RuntimeError("Invalid proof tests.")
+    paths = []
+    for test in tests:
+        path = test.get("path")
+        target = review_path(path)
+        contents = test.get("contents")
+        if (not review_test_path(path) or target.exists() or not isinstance(contents, str) or
+                not contents or len(contents.encode()) > 16000 or path in paths):
+            raise RuntimeError("Proof tests must be bounded new test files.")
+        paths.append(path)
+    directory = paths[0].split("/", 1)[0]
+    if directory not in ("api", "web") or any(not p.startswith(directory + "/") for p in paths):
+        raise RuntimeError("Review proof runner is unsupported.")
+    prepared = review_prepare({"base_sha": req["base_sha"], "directory": directory})
+    directory = prepared["directories"][0]
+    # Validate all paths before writing any file. No author volume is mounted here.
+    for test in tests:
+        target = review_path(test["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("x") as output:
+            output.write(test["contents"])
+    if req.get("patched") is True:
+        patch = finding.get("suggested_patch")
+        if not isinstance(patch, str) or not patch or len(patch.encode()) > 16000:
+            raise RuntimeError("Invalid review patch.")
+        with checkpoint_repository() as (git, _, _, _):
+            # Git's parser, not a regex over diff headers, owns the destination list.
+            records = git("apply", "--numstat", "-z", input=patch.encode()).split(b"\0")
+            changed = []
+            for record in records:
+                if not record:
+                    continue
+                fields = record.split(b"\t", 2)
+                if len(fields) != 3 or fields[0] == b"-" or fields[1] == b"-":
+                    raise RuntimeError("Review requires a minimal text patch.")
+                path = fields[2].decode()
+                review_path(path)
+                if (review_test_artifact(path) or re.search(r"(?:^|/)(?:package(?:-lock)?\.json|[^/]*config[^/]*|\.gond-agent|\.github)(?:/|$)", path) or
+                        re.search(r"^(?:new|deleted) file mode|^(?:old|new) mode|^rename |^copy ", patch, re.M)):
+                    raise RuntimeError("Review patch may only change ordinary non-test source files.")
+                changed.append(path)
+            if not changed or len(changed) > 8 or finding.get("file") not in changed:
+                raise RuntimeError("Review patch must change the claimed source file.")
+            git("apply", "--check", input=patch.encode())
+            git("apply", input=patch.encode())
+    args = ["npm", "test", "--", *[p if directory == "." else p[len(directory) + 1:] for p in paths], "--reporter=json"]
+    code, output = review_run(args, pathlib.Path(ROOT) / directory, min(90, max(1, req.get("timeout", 90))))
+    report = None
+    # npm emits a script preamble. Accept one complete structured JSON report,
+    # not arbitrary stderr assertions or a compile error's nonzero exit status.
+    for offset, char in enumerate(output):
+        if char == "{":
+            try:
+                value = json.loads(output[offset:])
+                if isinstance(value, dict) and "testResults" in value:
+                    report = value
+                    break
+            except ValueError:
+                pass
+    return {"exit_code": code, "report": report}
+
+
 def worker_env(req):
     """The built-in runner reaches models only through the loopback relay; no model credentials exist here."""
     if not relay_token:
         raise RuntimeError("The model relay is not ready.")
     return {**os.environ, "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
+            "GOND_AGENT_REVIEW_WORKER": "true" if req.get("review") is True else "false",
+            "GOND_AGENT_PARENT_MODE": req.get("mode", "allow"),
+            "GOND_AGENT_EVIDENCE_BASE_SHA": req.get("evidence_base_sha", ""),
+            "GOND_AGENT_EVIDENCE": "off" if req.get("evidence_mode") == "off" else "on",
+            "GOND_AGENT_EVIDENCE_REPO_POLICY": "allow-weaken" if req.get("evidence_repo_policy") == "allow-weaken" else "",
+            "GOND_AGENT_EVIDENCE_SEQ": str(req.get("evidence_seq", 0)),
+            "GOND_AGENT_EVIDENCE_GATE_ROUNDS": str(req.get("evidence_gate_rounds", 0)),
+            "GOND_AGENT_EVIDENCE_RESUMES": str(req.get("evidence_resumes", 0)),
             "GOND_AGENT_QUESTION_WAIT_MINUTES": str(req.get("question_wait_minutes", 240)),
             "GOND_AGENT_INTERACTIVE": "true" if req.get("interactive") is True else "false",
             "GOND_AGENT_PLAN_REMINDER_EVERY": str(req.get("plan_reminder_every", 6)), "GOND_AGENT_PLAN_NUDGE_LIMIT": str(req.get("plan_nudge_limit", 2))}
@@ -461,11 +746,32 @@ def dispatch(req):
     method = req["method"]
     if method == "ping":
         return {"ready": True}
+    if method == "review_diff":
+        base = checkpoint_sha(req.get("base_sha"))
+        with checkpoint_repository() as (git, env, _, head):
+            tree = capture_tree(git, env, head)
+            files = git("diff", "--no-renames", "--name-only", "-z", base, tree).decode().split("\0")
+            files = [p for p in files if p]
+            docs = bool(files) and all(p.endswith(".md") and ("/" not in p or p.startswith("docs/")) and
+                                      all(not row or row.startswith((b"100644 ", b"100755 "))
+                                          for row in (git("ls-tree", revision, "--", p) for revision in (base, tree))) for p in files)
+            return {"tree": tree, "files": files, "docs_only": docs,
+                    "diff": git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, tree).decode(errors="replace")[:32000]}
+    if method == "review_prepare":
+        return review_prepare(req)
+    if method == "review_proof":
+        return review_proof(req)
     if method == "setup":
         with worker_lock:
             if worker and worker.poll() is None:
                 raise RuntimeError("The worker is already running.")
             with tarfile.open(fileobj=io.BytesIO(base64.b64decode(req["archive"], validate=True)), mode="r:gz") as tar:
+                if req.get("review") is True:
+                    total = 0
+                    for index, member in enumerate(tar):
+                        total += member.size
+                        if member.islnk() or index >= 100000 or total > 256 * 1024 * 1024:
+                            raise ReviewError("review_size_cap")
                 tar.extractall(ROOT, filter="data")
         return True
     if method == "start":
@@ -486,14 +792,14 @@ def dispatch(req):
             worker = replacement
             threading.Thread(target=drain, args=(worker.stdout, worker), daemon=True).start()
         return True
-    if method in ("export_state", "import_state"):
+    if method in ("export_state", "import_state", "init_evidence", "authorize_review"):
         return state_rpc(req)
     if method in ("checkpoint", "checkpoint.release"):
         return checkpoint_rpc(req)
     if method == "send":
         value = req["input"]
         kind = value.get("type") if isinstance(value, dict) else None
-        if not isinstance(kind, str) or kind in ("export_state", "import_state") or kind.startswith(("state.", "checkpoint.")):
+        if not isinstance(kind, str) or kind in ("export_state", "import_state", "init_evidence", "authorize_review") or kind.startswith(("state.", "checkpoint.")):
             raise RuntimeError("Invalid worker input; state controls require a dedicated request.")
         with worker_lock:
             if not worker or worker.poll() is not None:
@@ -529,16 +835,7 @@ def dispatch(req):
             with worker_lock:
                 if held_boundary:
                     raise RuntimeError("The worker is held for a checkpoint.")
-            command(["git", "-c", "core.hooksPath=/dev/null", "add", "--all"])
-            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode:
-                identity = req.get("identity", {})
-                if any(not isinstance(identity.get(key), str) or not identity[key].strip() or any(c in identity[key] for c in "\r\n\0<>") for key in ("name", "email")):
-                    raise RuntimeError("A connected GitHub commit identity is required.")
-                env = dict(os.environ)
-                env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER") for key, field in (("NAME", "name"), ("EMAIL", "email"))})
-                command(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", req.get("title", "Changes")], env=env)
-            command(["git", "bundle", "create", "/tmp/work.bundle", "HEAD"])
-            return {"bundle": base64.b64encode(pathlib.Path("/tmp/work.bundle").read_bytes()).decode(), "head": command(["git", "rev-parse", "HEAD"]).decode().strip()}
+            return snapshot_tree(req)
         finally:
             capture_lock.release()
     if method == "diff":
@@ -552,7 +849,7 @@ def handle(req):
     except Exception as error:
         print("Workspace request failed:", req.get("method"), type(error).__name__, file=sys.stderr)
         traceback.print_exc()
-        response = {"id": req.get("id"), "error": "The workspace request failed."}
+        response = {"id": req.get("id"), "error": error.code if isinstance(error, ReviewError) else "The workspace request failed."}
     emit(response)
 
 

@@ -14,7 +14,7 @@ const cfg = configFromEnv(),
   pool = new ContainerPool(cfg);
 await pool.recover();
 await removeRetiredRuntimes(db, cfg).catch(() => console.error("Couldn't remove retired coding-agent runtime volumes yet; retrying at the next start."));
-const runs = new Runs(db, cfg, (id, handler) => pool.start(id, handler));
+const runs = new Runs(db, cfg, (id, handler) => pool.start(id, handler), undefined, (id, handler, signal) => pool.startReview(id, handler, signal));
 await runs.recover();
 const { app, tickets, githubLogin, mcp } = createApp(db, cfg, auth, runs);
 const server = serve({

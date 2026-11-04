@@ -25,20 +25,27 @@ pub struct RunChecks;
 impl Tool for RunChecks {
     fn name(&self) -> &'static str { "run_checks" }
     fn description(&self) -> &'static str { "Run a supplied command with a timeout and return its exit status, duration and detected failures. Optional; background commands return a shell id for bash_output." }
-    fn schema(&self) -> Value { schema(json!({"command":{"type":"string"},"timeout_ms":{"type":"integer"},"run_in_background":{"type":"boolean"}}), &["command"]) }
+    fn schema(&self) -> Value { schema(json!({"command":{"type":"string"},"cwd":{"type":"string","description":"Repository-relative working directory; default ."},"timeout_ms":{"type":"integer"},"run_in_background":{"type":"boolean"}}), &["command"]) }
     fn access(&self) -> Access { Access::Exec }
     fn title(&self, input: &Value) -> String { super::str_arg(input, "command").unwrap_or("?").into() }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let background = input["run_in_background"].as_bool().unwrap_or(false);
-            let out = super::bash::Bash.run(ctx, input).await;
+            let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or(".");
+            if cwd != "." && (cwd.is_empty() || cwd.contains(['\\', ':']) || cwd.split('/').any(|p| p.is_empty() || p == "." || p == "..")) {
+                return ToolOutput::err("cwd must be a repository-relative directory");
+            }
+            let mut check_ctx = ctx.clone();
+            check_ctx.cwd = super::real(&ctx.cwd.join(cwd));
+            if !check_ctx.cwd.starts_with(super::real(&ctx.cwd)) { return ToolOutput::err("cwd must stay inside the repository"); }
+            let out = super::bash::execute(&check_ctx, input, true).await;
             if background { return out; }
             let text = out.content.iter().filter_map(|p| match p { ResultPart::Text { text } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
             let parsed = failures(&text);
             let exit = if out.ok { Some(0) } else { out.summary.strip_prefix("exit ").and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<i32>().ok()) };
             let tail = text.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-            let result = json!({"exit_code":exit,"duration_seconds":started.elapsed().as_secs_f64(),"summary":out.summary,"failures":parsed,"output_tail":tail,"output_storage":text.lines().filter(|l| l.contains("output: /tmp/gond-agent-output/")).collect::<Vec<_>>()});
+            let result = json!({"exit_code":exit,"duration_seconds":started.elapsed().as_secs_f64(),"summary":out.summary,"failures":parsed,"output_tail":tail,"tests_ran":crate::agent::evidence::tests_ran(&text),"output_storage":text.lines().filter(|l| l.contains("output: /tmp/gond-agent-output/")).collect::<Vec<_>>()});
             ToolOutput { ok: out.ok, content: vec![ResultPart::Text { text: result.to_string() }], ..out }
         })
     }

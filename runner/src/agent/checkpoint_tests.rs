@@ -144,7 +144,7 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     let mut original = spawn(ApiClient::new(url.clone(), None), cfg);
     original.input.send(export_command("first")).unwrap();
     let mut state = exported(&mut original, "first").await;
-    state.counters = Counters { sub_counter: 9, main_context: 500, plan_calls: 17, plan_last: state.plan.clone(), plan_nudges: 1, turn_compactions: 2, skipped_history_len: None };
+    state.counters = Counters { review_reserved: false, review_mode: None, sub_counter: 9, main_context: 500, plan_calls: 17, plan_last: state.plan.clone(), plan_nudges: 1, turn_compactions: 2, skipped_history_len: None };
     let mut cfg = config(dir.path(), Mode::Allow);
     cfg.context_window = 100_000;
     let mut restored = spawn(ApiClient::new(url, None), cfg);
@@ -152,7 +152,12 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateImported { request_id } if request_id == "restore")).await;
     assert!(events.iter().all(|e| matches!(e, AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. })));
     restored.input.send(export_command("again")).unwrap();
-    assert_eq!(exported(&mut restored, "again").await, state);
+    let mut expected = state.clone();
+    // Restore advances its durable resume budget; history and counters survive.
+    let ledger = expected.evidence.as_mut().unwrap();
+    ledger.resumes += 1;
+    ledger.unverified.push("Ignored files such as node_modules may be absent after restore.".into());
+    assert_eq!(exported(&mut restored, "again").await, expected);
     restored.input.send(AgentInput::ExportState(ExportStateInput { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into(), quiescent: None, boundary_id: None, hold: false })).unwrap();
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateError { .. })).await;
     assert!(matches!(events.last(), Some(AgentEvent::StateError { request_id, code, .. }) if request_id == "wrong-owner" && code == "binding_mismatch"));

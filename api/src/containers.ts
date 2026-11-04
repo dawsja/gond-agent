@@ -20,6 +20,7 @@ export interface WorkspaceCheckpoint {
   base_sha: string;
   head_sha: string;
   checkpoint_sha: string;
+  tree_hash?: string;
   state: { runner_state_version: string; [key: string]: unknown };
 }
 
@@ -37,7 +38,7 @@ export interface Workspace {
    * Requires enableCheckpoints; await before closing. Do not concurrently send new work. */
   captureCheckpoint?(options?: { head_sha: string }): Promise<void>;
 }
-export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>) => Promise<Workspace>;
+export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>, signal?: AbortSignal) => Promise<Workspace>;
 const MANAGED = "io.gond-agent.managed=true";
 const MAX_FRAME = 256 * 1024 * 1024;
 export const CHECKPOINT_MIN_INTERVAL_MS = 30_000;
@@ -59,8 +60,22 @@ export function containerArguments(cfg: Config, name: string, instance: string, 
   ];
 }
 
+/** Disk is bounded independently of host Docker volume quotas. No author mounts,
+ * host credentials, writable image root, or shared dependency cache. */
+export function reviewContainerArguments(cfg: Config, name: string, instance: string, run: string) {
+  const args = containerArguments({ ...cfg, runCPUs: Math.min(1, cfg.runCPUs), runMemoryMB: Math.min(2048, cfg.runMemoryMB) }, name, instance, run);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--mount") {
+      const target = args[i + 1].includes("target=/workspace/repo") ? "/workspace/repo" : "/opt/gond-tools";
+      args.splice(i, 2, "--tmpfs", `${target}:rw,nosuid,nodev,size=${target === "/workspace/repo" ? "1g" : "512m"},uid=1000,gid=1000`);
+    }
+  }
+  return args;
+}
+
 export class ContainerPool {
   private active = new Set<string>();
+  private reviews = new Set<string>();
   private identity?: Promise<string>;
   constructor(private cfg: Config) {}
 
@@ -76,8 +91,8 @@ export class ContainerPool {
     })();
   }
 
-  private docker(args: string[], input?: string) {
-    return command(this.cfg.dockerBin, args, { input, timeout: 180_000 });
+  private docker(args: string[], input?: string, signal?: AbortSignal) {
+    return command(this.cfg.dockerBin, args, { input, timeout: 180_000, signal });
   }
 
   private async cleanup(run?: string) {
@@ -100,13 +115,21 @@ export class ContainerPool {
 
   async recover() { await this.cleanup(); }
 
-  async start(id: string, modelHandler: (req: Request) => Promise<Response>): Promise<Workspace> {
+  /** Separate non-queued pool: never waits for an author capacity slot. */
+  async startReview(id: string, modelHandler: (req: Request) => Promise<Response>, signal?: AbortSignal): Promise<Workspace> {
+    return this.start(id, modelHandler, true, signal);
+  }
+
+  async start(id: string, modelHandler: (req: Request) => Promise<Response>, review = false, signal?: AbortSignal): Promise<Workspace> {
+    signal?.throwIfAborted();
     if (!/^run_[a-f0-9]{24}$/.test(id)) throw new Error("Invalid workspace id");
-    if (this.active.has(id)) throw new Error("This workspace is already running");
-    if (this.active.size >= this.cfg.maxRuns) throw new Error("All workspace slots are in use");
-    this.active.add(id);
+    const active = review ? this.reviews : this.active;
+    if (this.active.has(id) || this.reviews.has(id)) throw new Error("This workspace is already running");
+    if (active.size >= (review ? 1 : this.cfg.maxRuns)) throw new Error(review ? "Review pool is full; review skipped" : "All workspace slots are in use");
+    active.add(id);
     let child: ChildProcessWithoutNullStreams | undefined;
     let destroyed = false;
+    let started = false;
     let destruction: Promise<void> | undefined;
     let sequence = 0;
     let disconnected = false;
@@ -133,9 +156,13 @@ export class ContainerPool {
           await Promise.race([new Promise<void>((r) => child!.once("exit", () => r())), delay(3000)]);
           if (child.exitCode === null) child.kill("SIGKILL");
         }
-        this.active.delete(id);
+        active.delete(id);
+        signal?.removeEventListener("abort", onAbort);
       }
     })().catch((e) => { destruction = undefined; throw e; });
+    const onAbort = () => { fail(new Error("Workspace cancelled")); if (started) void destroy().catch(() => {}); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const docker = (args: string[]) => this.docker(args, undefined, signal);
     const rpc = <T = any>(method: string, args: Record<string, unknown> = {}) => new Promise<T>((resolve, reject) => {
       const key = String(++sequence);
       const timer = setTimeout(() => { pending.delete(key); reject(new Error("Workspace request timed out")); }, 180_000);
@@ -283,12 +310,12 @@ export class ContainerPool {
       const name = `gond-agent-${instance}-${id.slice(4)}`;
       const labels = ["--label", MANAGED, "--label", `io.gond-agent.instance=${instance}`, "--label", `io.gond-agent.run=${id}`];
       // Never pull or run an arbitrary repository-provided image; operators build/pull this image.
-      await this.docker(["image", "inspect", this.cfg.workerImage]);
+      await docker(["image", "inspect", this.cfg.workerImage]);
       for (const suffix of ["work", "tools"]) {
-        await this.docker(["volume", "create", ...labels, `${name}-${suffix}`]);
+        await docker(["volume", "create", ...labels, `${name}-${suffix}`]);
       }
-      await this.docker(["network", "create", ...labels, "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", `${name}-net`]);
-      await this.docker(containerArguments(this.cfg, name, instance, id));
+      await docker(["network", "create", ...labels, "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", `${name}-net`]);
+      await docker(review ? reviewContainerArguments(this.cfg, name, instance, id) : containerArguments(this.cfg, name, instance, id));
       child = spawn(this.cfg.dockerBin, ["start", "--attach", "--interactive", name], { stdio: ["pipe", "pipe", "pipe"] });
       child.stdin.on("error", (error) => fail(error));
       child.on("error", (error) => fail(error));
@@ -314,6 +341,8 @@ export class ContainerPool {
         }
       });
       await rpc("ping");
+      signal?.throwIfAborted();
+      started = true;
       return { rpc, destroy, enableCheckpoints, flushCheckpoints, captureCheckpoint };
     } catch (error) {
       await destroy().catch((cleanupError) => console.error("Workspace startup cleanup failed", id, cleanupError));

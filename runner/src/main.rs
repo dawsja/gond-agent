@@ -27,7 +27,8 @@ async fn main() -> Result<()> {
     let model = std::env::var("GOND_AGENT_MODEL").unwrap_or_else(|_| "auto".into());
     let catalog: serde_json::Value = api.get("/v1/models").await?;
     let context_window = catalog["models"].as_array().and_then(|ms| ms.iter().find(|m| m["id"] == model)).and_then(|m| m["context_window"].as_u64()).unwrap_or(200_000);
-    let (extra_tools, status) = mcp::connect_all(&cwd, true).await;
+    let review = std::env::var("GOND_AGENT_REVIEW_WORKER").as_deref() == Ok("true");
+    let (extra_tools, status) = if review { (vec![], vec![]) } else { mcp::connect_all(&cwd, true).await };
     for s in status { eprintln!("MCP {}: {} ({} tools, ok={})", s.name, s.detail, s.tools, s.ok); }
     let mut tools = tools::builtin(); tools.extend(extra_tools);
     let search_available = catalog["web_search"].as_bool() == Some(true);
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
         eprintln!("web_search is unavailable: configure a provider in Settings > Web search. No fallback is used.");
     }
     let cfg = AgentConfig {
-        model, context_window, mode: Mode::Allow, rules: vec![], cwd: cwd.clone(),
+        model, context_window, mode: match std::env::var("GOND_AGENT_PARENT_MODE").as_deref() { Ok("plan") => Mode::Plan, Ok("ask") => Mode::Ask, _ => Mode::Allow }, rules: vec![], cwd: cwd.clone(),
         effort: std::env::var("GOND_AGENT_EFFORT").unwrap_or_else(|_| "high".into()), session_id: uuid::Uuid::new_v4().to_string(), history: vec![],
         plan: initial_plan(&std::env::var("GOND_AGENT_INITIAL_PLAN").unwrap_or_else(|_| "[]".into())),
         plan_reminder_every: plan_setting("GOND_AGENT_PLAN_REMINDER_EVERY", 6),

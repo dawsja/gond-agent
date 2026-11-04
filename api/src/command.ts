@@ -31,6 +31,7 @@ export function command(
     cwd?: string;
     input?: Buffer | string;
     timeout?: number;
+    signal?: AbortSignal;
     env?: NodeJS.ProcessEnv;
     maxBuffer?: number;
     onStderr?: (text: string) => void;
@@ -42,6 +43,7 @@ export function command(
       args,
       {
         cwd: options.cwd,
+        signal: options.signal,
         timeout: options.timeout ?? 120_000,
         maxBuffer: options.maxBuffer ?? 256 * 1024 * 1024,
         env: options.env ?? process.env,
