@@ -7,6 +7,14 @@ import type { Accent } from "../../../shared/accents"
 
 export type { RunStatus } from "../../../shared/run-state"
 
+export interface Capacity {
+  max: number
+  occupied: number
+  working: number
+  idle_releasable: number
+  queued_total_for_account: number
+}
+
 export interface Run {
   id: string
   user_id: string
@@ -26,6 +34,8 @@ export interface Run {
   status: RunStatus
   queue_position?: number
   queue_length?: number
+  capacity?: Capacity
+  queue_reason?: string
   step: string | null
   plan_done: number
   summary?: { plan_steps?: { text: string; status: "pending" | "in_progress" | "done" }[] }

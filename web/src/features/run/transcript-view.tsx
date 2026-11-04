@@ -319,6 +319,8 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
         return <PlanCard key={it.key} steps={it.steps} />
       case "agents":
         return <AgentsBlock key={it.key} agents={it.agents} />
+      case "released":
+        return <p key={it.key} role="status" className="text-xs text-muted-foreground">Idle workspace closed to make room for waiting work. Send a follow-up to reopen it with saved progress when available.</p>
       case "compacted":
         return <p key={it.key} className="text-xs text-muted-foreground">
           Context compacted

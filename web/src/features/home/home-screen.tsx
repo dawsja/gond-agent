@@ -4,7 +4,8 @@ import { useLocation, useNavigate } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import type { Run } from "@/lib/api"
 import { ago, greeting, queueLabel, repoName, runElapsed } from "@/lib/format"
-import { useDeleteRun, useMe, useModels, useRuns, useStopRun } from "@/lib/queries"
+import { useCloseRun, useDeleteRun, useMe, useModels, useRuns, useStopRun } from "@/lib/queries"
+import { QueueReason } from "../run/queue-reason"
 import { ConfirmDialog } from "../studio/confirm-dialog"
 import { devOpen } from "@/lib/dev-open"
 import { cn } from "@/lib/utils"
@@ -30,6 +31,7 @@ function InterruptedStopItem({ run }: { run: Run }) {
 
 function RunMenu({ run, first }: { run: Run; first?: boolean }) {
   const stop = useStopRun()
+  const close = useCloseRun()
   const del = useDeleteRun()
   const [confirming, setConfirming] = useState(false)
   const live = run.status === "working" || run.status === "queued"
@@ -69,6 +71,9 @@ function RunMenu({ run, first }: { run: Run; first?: boolean }) {
               <span className="min-w-0 flex-1 truncate">{run.status === "queued" ? "Cancel" : "Stop"}</span>
             </MenuItem>
           )}
+          {!live && run.status !== "merged" && run.status !== "interrupted" && <MenuItem disabled={close.isPending} onSelect={() => close.mutate({ id: run.id, arg: undefined })}>
+            Close workspace
+          </MenuItem>}
           {run.status === "interrupted" && <InterruptedStopItem run={run} />}
           {(run.pr_url || live || run.status === "interrupted") && <MenuSeparator />}
           <MenuItem onSelect={() => setConfirming(true)} className="text-destructive">
@@ -155,6 +160,7 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
             </span>
           )}
         </div>
+        {run.status === "queued" && <QueueReason run={run} />}
       </div>
       <div className="flex shrink-0 items-center gap-5 max-md:-mt-1 max-md:-mr-1">
         <div className="w-[112px] max-md:hidden">
