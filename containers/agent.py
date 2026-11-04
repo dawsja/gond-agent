@@ -122,8 +122,16 @@ def checkpoint_repository(allow_unborn=False):
                "GIT_ALLOW_PROTOCOL": "file", "GIT_ATTR_NOSYSTEM": "1"}
 
         def git(*args, input=None, output=None):
+            # Waiting for Git is not sufficient if it launches detached automatic
+            # maintenance. It can keep writing objects/pack after this scratch
+            # repository (or the publication clone) has been released. Suppress
+            # auto work and keep any future fallback foreground; -c propagates
+            # to Git's internal children, including fetch/index-pack helpers.
             result = subprocess.run(
                 ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                 "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                 "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false",
+                 "-c", "fetch.writeCommitGraph=false",
                  "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
                  "-c", "commit.gpgsign=false", "-c", "credential.helper=",
                  "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", *args],
@@ -309,7 +317,7 @@ def restore_checkpoint(req):
             if git("bundle", "list-heads", str(bundle)) != expected:
                 raise RuntimeError("Invalid checkpoint bundle references.")
             git("bundle", "verify", str(bundle))
-            git("fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+            git("fetch", "--no-auto-maintenance", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                 str(bundle), f"{CHECKPOINT_REF}:{CHECKPOINT_REF}")
             checkpoint_commit(git, commit)
             git("fsck", "--strict", "--no-reflogs", "--no-dangling", commit, head, base)

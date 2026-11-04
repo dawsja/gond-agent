@@ -63,6 +63,18 @@ impl Repository {
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                // Mirror checkpoint_repository: no Git helper may detach and
+                // keep using the scratch tree after the awaited command exits.
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.autoDetach=false",
+                "-c",
+                "maintenance.autoDetach=false",
+                "-c",
+                "fetch.writeCommitGraph=false",
                 "-c",
                 "core.attributesFile=/dev/null",
                 "-c",
@@ -270,6 +282,8 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"])
             .args(args)
             .output()
             .unwrap();
@@ -279,6 +293,27 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn isolated_git_disables_automatic_background_work() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let repo = Repository::new(temp.path()).unwrap();
+        for (name, value) in [
+            ("gc.auto", "0"),
+            ("maintenance.auto", "false"),
+            ("gc.autoDetach", "false"),
+            ("maintenance.autoDetach", "false"),
+            ("core.fsmonitor", "false"),
+            ("fetch.writeCommitGraph", "false"),
+        ] {
+            assert_eq!(
+                String::from_utf8(repo.git(&["config", "--get", name], None).unwrap())
+                    .unwrap().trim(), value,
+                "isolated Git must override automatic/background work: {name}",
+            );
+        }
     }
 
     #[test]

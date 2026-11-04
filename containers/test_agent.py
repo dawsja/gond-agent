@@ -799,7 +799,12 @@ class CheckpointTest(unittest.TestCase):
         env = {"PATH": "/usr/bin:/bin", "HOME": self.temp.name, "LC_ALL": "C",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
-        return subprocess.check_output(["/usr/bin/git", *args], cwd=cwd or self.root,
+        # Fixture commits/imports also ask Git to run auto-maintenance by default;
+        # they must not leave a detached writer racing TemporaryDirectory cleanup.
+        # Production is independently audited below, including real Trace2 child
+        # events, so these fixture flags cannot mask a production regression.
+        return subprocess.check_output(["/usr/bin/git", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                                        "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false", *args], cwd=cwd or self.root,
                                        env=env, input=input, stderr=subprocess.DEVNULL)
 
     def write(self, name, content):
@@ -815,6 +820,74 @@ class CheckpointTest(unittest.TestCase):
     def state(self):
         return (self.git("rev-parse", "HEAD"), self.git("symbolic-ref", "HEAD"),
                 (self.root / ".git/index").read_bytes(), self.git("show-ref"))
+
+    @unittest.skipUnless(pathlib.Path("/proc/self").is_dir(), "Linux process lifecycle regression")
+    def test_capture_snapshot_restore_leave_no_git_processes_or_automatic_maintenance(self):
+        trace = pathlib.Path(self.temp.name, "git-trace.jsonl")
+        run = subprocess.run
+        popen = subprocess.Popen
+        commands, children, repositories = [], [], {str(self.root)}
+
+        def traced(args, **kwargs):
+            commands.append(args)
+            env = dict(kwargs["env"])
+            if "GIT_DIR" in env:
+                repositories.add(str(pathlib.Path(env["GIT_DIR"]).parent.parent))
+            # Explicit test instrumentation only; production never inherits trace
+            # paths or other Git environment/configuration from the caller.
+            env["GIT_TRACE2_EVENT"] = str(trace)
+            return run(args, **{**kwargs, "env": env})
+
+        def spawned(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        def assert_finished():
+            self.assertTrue(children)
+            self.assertTrue(all(child.returncode is not None for child in children),
+                            "the launcher must reap every direct Git child before returning")
+            # Include reparented/detached grandchildren, not just children of the
+            # test process. Check immediately, with no waits or cleanup retries.
+            remaining = []
+            for proc in pathlib.Path("/proc").glob("[0-9]*"):
+                if proc.name == str(os.getpid()):
+                    continue
+                try:
+                    cwd = os.readlink(proc / "cwd")
+                    if any(cwd == path or cwd.startswith(path + "/") for path in repositories):
+                        remaining.append(proc.name)
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+            self.assertEqual(remaining, [], "a Git descendant outlived capture/snapshot/restore")
+
+        self.write("edit.txt", "capture and publish\n")
+        with mock.patch.object(subprocess, "run", side_effect=traced), \
+                mock.patch.object(subprocess, "Popen", side_effect=spawned):
+            agent.tree_hash()
+            assert_finished()
+            checkpoint = self.export()
+            assert_finished()
+            published = agent.dispatch({"method": "snapshot", "identity": self.identity})
+            assert_finished()
+            agent.dispatch({"method": "snapshot"})
+            assert_finished()
+            self.restore(checkpoint, published_head=published["head"])
+            assert_finished()
+        records = [json.loads(line) for line in trace.read_text().splitlines()]
+        starts = [event for event in records if event["event"] == "child_start"]
+        self.assertTrue(starts, "trace must observe real Git subprocesses")
+        forbidden = {"maintenance", "gc", "repack", "fsmonitor--daemon"}
+        for event in starts:
+            self.assertFalse(forbidden.intersection(event["argv"]), event["argv"])
+            self.assertTrue(any(end["event"] == "child_exit" and end["sid"] == event["sid"]
+                                and end["child_id"] == event["child_id"] for end in records),
+                            "Git did not await its internal child")
+        for args in commands:
+            for setting in ("gc.auto=0", "maintenance.auto=false", "gc.autoDetach=false",
+                            "maintenance.autoDetach=false", "core.fsmonitor=false",
+                            "fetch.writeCommitGraph=false"):
+                self.assertIn(setting, args)
 
     def assert_snapshot_publishes_worktree(self):
         self.write("edit.txt", "staged, not published\n")
