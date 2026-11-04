@@ -20,6 +20,8 @@ export interface Run {
   effort?: string
   title: string
   prompt: string
+  pr_body?: string | null
+  description?: string
   status: RunStatus
   step: string | null
   plan_done: number

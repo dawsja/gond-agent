@@ -34,6 +34,7 @@ import { ModelAccess } from "../access";
 import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
+import { assertBranchAvailable, descriptionFor, publicationFields } from "./publication";
 
 export interface Run {
   id: string;
@@ -41,6 +42,7 @@ export interface Run {
   repo: string;
   base_branch: string;
   branch: string;
+  explicit_branch?: boolean;
   model_id: string;
   effort?: string;
   backend: Backend;
@@ -48,6 +50,7 @@ export interface Run {
   retired_backend?: string;
   title: string;
   prompt: string;
+  pr_body?: string | null;
   status: string;
   step: string | null;
   created_at: number;
@@ -132,7 +135,7 @@ export class Runs {
   get(id: string, user?: string): Run {
     const r = this.db
       .prepare(
-        "SELECT data FROM runs WHERE id=? AND deleted_at IS NULL" +
+        "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE id=? AND deleted_at IS NULL" +
           (user ? " AND user_id=?" : ""),
       )
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
@@ -143,7 +146,7 @@ export class Runs {
     return (
       this.db
         .prepare(
-          "SELECT data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
+          "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
         )
         .all(user) as { data: string }[]
     ).map((r) => this.restorePlan(parseRun(r.data)));
@@ -162,8 +165,9 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls FROM runs WHERE id=?").get(r.id) as {calls: number | null} | undefined;
-    // Other lifecycle work may still hold a snapshot from before a search request.
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; pr_body: string | null} | undefined;
+    // Lifecycle snapshots must not reset newer description overrides or search counts.
+    if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.updated_at = Date.now();
     this.db
@@ -234,6 +238,7 @@ export class Runs {
     error: string | null = null,
   ) {
     r.status = status;
+    if (status === "failed" || status === "stopped") r.summary = { ...r.summary, text: "", final_reply: false };
     r.step = step;
     r.error = error;
     this.save(r);
@@ -266,6 +271,9 @@ export class Runs {
       model: string;
       effort?: string;
       prompt: string;
+      title?: string;
+      branch?: string;
+      pr_body?: string;
       images?: string[];
       source?: string;
       backend?: unknown;
@@ -274,6 +282,7 @@ export class Runs {
   ) {
     this.assertAccount(user);
     const backend = assertBackend(input.backend);
+    const fields = publicationFields(input);
     if (
       !validRepo(input.repo) ||
       !input.prompt?.trim() ||
@@ -296,8 +305,9 @@ export class Runs {
         "That branch name isn't valid.",
       );
     const id = attribution?.id ?? `run_${randomBytes(12).toString("hex")}`,
-      title = titleFrom(input.prompt),
+      title = fields.title ?? titleFrom(input.prompt),
       now = Date.now();
+    if (fields.branch) await assertBranchAvailable(input.repo, fields.branch, githubEnvFor(this.db, this.cfg.secret, user));
     this.assertAccount(user);
     const profile = this.profile(user);
     const r: Run = {
@@ -305,12 +315,14 @@ export class Runs {
       user_id: user,
       repo: input.repo,
       base_branch: base,
-      branch: `gond-agent/${slug(title)}-${id.slice(-6)}`,
+      branch: fields.branch ?? `gond-agent/${slug(title)}-${id.slice(-6)}`,
+      ...(fields.branch ? { explicit_branch: true } : {}),
       model_id: selectedModel.id,
       backend,
       effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
+      pr_body: fields.pr_body ?? null,
       status: "queued",
       step: null,
       created_at: now,
@@ -343,9 +355,9 @@ export class Runs {
       this.checkCapacity();
       this.db
         .prepare(
-          "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)",
+          "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data,pr_body) VALUES(?,?,?,?,?,?,?,?)",
         )
-        .run(id, user, r.repo, r.status, now, now, JSON.stringify(r));
+        .run(id, user, r.repo, r.status, now, now, JSON.stringify(r), r.pr_body);
       this.enqueue(
         id,
         user,
@@ -400,9 +412,11 @@ export class Runs {
     images: string[] = [],
     effort?:string,
     model?:string,
+    pr_body?: unknown,
   ) {
     this.assertAccount(user);
     const r = this.get(id, user);
+    const fields = publicationFields({ pr_body });
     assertActive(r);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
@@ -418,6 +432,10 @@ export class Runs {
     const answering = this.live.get(id);
     if (question && answering?.busy) {
       r.summary.question = null;
+      if (fields.pr_body !== undefined) {
+        this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
+        r.pr_body = fields.pr_body;
+      }
       this.save(r);
       this.append(id, { type: "user", text, images: [] });
       void answering.workspace.rpc("send", { input: { type: "question.reply", request_id: question.request_id, answer: text } }).catch(e => this.fail(id, e));
@@ -440,6 +458,10 @@ export class Runs {
     if (!this.live.has(id) && r.status === "stopped") r.status = "queued";
     if(effort !== undefined){
       if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
+    }
+    if (fields.pr_body !== undefined) {
+      this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
+      r.pr_body = fields.pr_body;
     }
     r.pending.push({ text, images, effort, model });
     this.save(r);
@@ -640,6 +662,8 @@ export class Runs {
   }
   private async publish(id: string, live: Live) {
     let r = this.get(id);
+    // A branch can be created remotely while this workspace is working.
+    if (r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     const snapshot = await live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
@@ -649,6 +673,7 @@ export class Runs {
       Buffer.from(snapshot.bundle, "base64"),
       r.branch,
       githubEnvFor(this.db, this.cfg.secret, r.user_id),
+      !!r.explicit_branch && !r.pushed,
     );
     r = this.get(id);
     r.pushed = true;
@@ -690,7 +715,7 @@ export class Runs {
         "not_pushed",
         "Wait until the changes have been pushed.",
       );
-    const body = r.summary.text || r.prompt;
+    const body = descriptionFor(r);
     if (r.pr_number)
       await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     else {

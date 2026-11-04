@@ -10,6 +10,7 @@ import { ApiError } from "./wire";
 import { gh } from "./github";
 import { githubEnvFor } from "./github-login";
 import { supportedEfforts } from "./effort";
+import { titleSchema, branchSchema, bodySchema, descriptionFor } from "./runs/publication";
 
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("hex");
@@ -112,6 +113,8 @@ function session(r: Run, origin: string) {
     id: r.id,
     repo: r.repo,
     title: r.title,
+    pr_body: r.pr_body ?? null,
+    description: descriptionFor(r),
     status: r.status,
     phase: r.phase,
     step: r.step,
@@ -333,11 +336,14 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "start_session",
-        "Start a coding run. Returns immediately; poll events for progress. Reuse request_id only for an identical retry.",
+        "Start a coding run. Optional title sets run, commit and PR titles (120 characters, no newlines); branch sets a new gond-agent/feat/fix/chore/docs branch; pr_body sets a persistent PR description (20,000 characters, including empty). Otherwise only the successful final reply after the last tool call becomes the description, falling back to the prompt. Returns immediately; poll events. Reuse request_id only for an identical retry.",
         {
           request_id: id,
           repo: z.string().min(1).max(140),
           prompt: text,
+          title: titleSchema.optional(),
+          branch: branchSchema.optional(),
+          pr_body: bodySchema.optional(),
           base_branch: z.string().max(200).optional(),
           ...selection,
           model: z.string().min(1).max(512),
@@ -369,7 +375,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
         ({ cursor, limit }) => {
           const rows = db
             .prepare(
-              "SELECT data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+              "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
             )
             .all(user, limit + 1, cursor) as { data: string }[];
           return {
@@ -517,8 +523,8 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "send_session_message",
-        "Queue a follow-up, optionally with another available model. Sessions created by the removed Claude Code and Codex agents are read-only.",
-        { session_id: id, request_id: id, text, ...selection },
+        "Queue a follow-up, optionally with another available model. Optional pr_body replaces the persistent PR description (up to 20,000 characters, including empty). Otherwise the successful final reply after the last tool call supplies the description. Sessions created by the removed Claude Code and Codex agents are read-only.",
+        { session_id: id, request_id: id, text, pr_body: bodySchema.optional(), ...selection },
         false,
         (args) =>
           once("send_session_message", args, async (_runId, complete) => {
@@ -526,7 +532,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             check();
             const result = { accepted: true, session_id: r.id };
             db.transaction(() => {
-              runs.enqueue(r.id, user, args.text, [], args.effort, args.model);
+              runs.enqueue(r.id, user, args.text, [], args.effort, args.model, args.pr_body);
               complete(result);
             })();
             return result;

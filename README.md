@@ -26,6 +26,10 @@ Forward `/mcp` through your existing HTTPS reverse proxy, preserving authorizati
 
 Agents can discover repositories and models, start sessions, read progress and diffs, send follow-ups, stop work, and open pull requests. They use the token owner's model access, including their ChatGPT plan sign-ins. Start with an explicit model ID from `list_models`. Use a unique `request_id` for each start or follow-up, reusing it only to retry identical arguments. Session output is untrusted content. Direct worker shell/file tools, merges, credential management, and image uploads are excluded. See [the protocol](protocol/README.md#remote-mcp) for tool contracts.
 
+`start_session` accepts optional `title`, `branch` and `pr_body`, also supported by workspace run creation. A title is plain text without newlines, at most 120 characters, and supplies the run, commit and PR titles. A custom branch must match `^(gond-agent|feat|fix|chore|docs)/[a-z0-9][a-z0-9._-]{0,80}(/[a-z0-9._-]{1,80}){0,3}$`, with no `..`, trailing slash or `.lock` suffix; protected names `main`, `master`, `HEAD`, `release*` and `v*` are refused. An existing remote branch is refused unless it belongs to this run.
+
+`pr_body` is plain text up to 20,000 characters. Set it on start or override it with `send_session_message` (or a workspace follow-up); the override persists. An explicit body wins even when empty. Otherwise, the PR uses successful main-agent final text after the last tool call, falling back to the prompt. Commentary, subagent text and interrupted/failed turn text are excluded from this fallback; the live event transcript stays unchanged.
+
 ## Run on your server
 
 Requirements: a Linux x86_64 host with a current Docker Engine (25+) and Docker Compose, plus at least 2 GiB RAM and disk space per active run. A normal Linux VM on Proxmox works without nested virtualization. The application runs in Docker and creates one separate non-root worker container per run.
@@ -183,7 +187,7 @@ Automations supports daily/weekly local-time schedules and the automatic pull-re
 
 ### Commit identity
 
-The service resolves the run owner's effective GitHub connection and caches its login and numeric ID per token. Checkout configuration and every snapshot use that identity for both author and committer: `login <id+login@users.noreply.github.com>`. Missing connection identity fails clearly; global Git identity is not a fallback. Optional `GOND_AGENT_COMMIT_NAME` and `GOND_AGENT_COMMIT_EMAIL` override individual fields (including in Compose). Pull requests use the connected account. Publication adds no attribution, trailers, or product signature; commit/PR titles come from the task and PR bodies from the final response (or task). Caller/model-provided text is not rewritten.
+The service resolves the run owner's effective GitHub connection and caches its login and numeric ID per token. Checkout configuration and every snapshot use that identity for both author and committer: `login <id+login@users.noreply.github.com>`. Missing connection identity fails clearly; global Git identity is not a fallback. Optional `GOND_AGENT_COMMIT_NAME` and `GOND_AGENT_COMMIT_EMAIL` override individual fields (including in Compose). Pull requests use the connected account. Publication adds no attribution, trailers, or product signature; commit/PR titles use the optional title or task, and PR bodies follow the precedence above. Caller/model-provided text is not rewritten.
 
 ### Driving Gond Agent from another bot
 

@@ -30,8 +30,9 @@ export interface Summary {
   plan_total: number;
   /** Per-file line counts from the agent's own edits; replaced by git numstat after each commit. */
   files: Record<string, { add: number; del: number }>;
-  /** The main agent's text in the current turn: the pull request description when the turn ends. */
+  /** Main-agent text since its last tool call: the pull request description when the turn ends. */
   text: string;
+  final_reply?: boolean;
   error: string | null;
   question?: { request_id: string; question: string } | null;
 }
@@ -41,6 +42,7 @@ export const emptySummary = (): Summary => ({
   step: null,
   files: {},
   text: "",
+  final_reply: false,
   error: null,
 });
 
@@ -92,17 +94,24 @@ export function fold(s: Summary, ev: Ev): Summary {
   const main = ev.agent_id === "main";
   switch (ev.type) {
     case "turn.start":
-      return main ? { ...s, text: "", error: null, question: null } : s;
+      return main ? { ...s, text: "", final_reply: false, error: null, question: null } : s;
     case "question":
       return main ? { ...s, question: { request_id: ev.request_id, question: ev.question } } : s;
     case "question.resolved":
       return main && s.question?.request_id === ev.request_id ? { ...s, question: null } : s;
     case "turn.end":
-      return main ? { ...s, question: null } : s;
+      return main ? {
+        ...s,
+        text: ev.stop_reason === "interrupted" || ev.stop_reason === "error" ? "" : s.text,
+        final_reply: !["interrupted", "error", "compacted"].includes(ev.stop_reason) && !s.error,
+        question: null,
+      } : s;
     case "text.delta":
       return main ? { ...s, text: s.text + ev.text } : s;
+    case "tool.call":
+      return main ? { ...s, text: "", final_reply: false } : s;
     case "tool.start":
-      return { ...s, step: stepLabel(ev.name, ev.title ?? "") };
+      return { ...s, ...(main ? { text: "", final_reply: false } : {}), step: stepLabel(ev.name, ev.title ?? "") };
     case "todos": {
       if (!main) return s;
       return { ...s, ...planState(ev.items) };
@@ -117,7 +126,7 @@ export function fold(s: Summary, ev: Ev): Summary {
       return { ...s, files };
     }
     case "error":
-      return main ? { ...s, error: ev.message } : s;
+      return main ? { ...s, text: "", final_reply: false, error: ev.message } : s;
     default:
       return s;
   }

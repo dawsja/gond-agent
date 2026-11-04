@@ -246,6 +246,102 @@ it("negotiates with the official HTTP client and reads only owned browser runs",
   expect(last.body.diff).toHaveLength(1000);
   expect(last.body.next_cursor).toBe(null);
 });
+it("advertises optional publication fields through the MCP tool schemas", async () => {
+  const client = await connect();
+  const { tools } = await client.listTools();
+  const start = tools.find(t => t.name === "start_session")!.inputSchema;
+  const send = tools.find(t => t.name === "send_session_message")!.inputSchema;
+  expect(start.properties).toMatchObject({
+    title: { type: "string", maxLength: 120 },
+    branch: { type: "string", pattern: expect.any(String) },
+    pr_body: { type: "string", maxLength: 20000 },
+  });
+  for (const field of ["title", "branch", "pr_body"])
+    expect(start.required).not.toContain(field);
+  expect(send.properties).toMatchObject({ pr_body: { type: "string", maxLength: 20000 } });
+  expect(send.required).not.toContain("pr_body");
+  expect(send.properties).not.toHaveProperty("title");
+  expect(send.properties).not.toHaveProperty("branch");
+  expect(send.additionalProperties).toBe(false);
+});
+it("rejects invalid publication fields at the MCP schema boundary", async () => {
+  seed();
+  const create = vi.spyOn(runs, "create");
+  const enqueue = vi.spyOn(runs, "enqueue");
+  const client = await connect();
+  const start = { request_id: "invalid-start", repo: "acme/app", model: "model", prompt: "Fix this" };
+  for (const fields of [
+    { title: "Two\nlines" },
+    { title: "a".repeat(121) },
+    { branch: "main" },
+    { branch: "feat/../escape" },
+    { pr_body: "b".repeat(20001) },
+    { pr_body: 42 },
+  ]) {
+    const result = await client.callTool({ name: "start_session", arguments: { ...start, ...fields } });
+    expect(result.isError).toBe(true);
+  }
+  for (const fields of [
+    { pr_body: "b".repeat(20001) },
+    { pr_body: 42 },
+    { title: "Cannot rename a session" },
+  ]) {
+    const result = await client.callTool({
+      name: "send_session_message",
+      arguments: { session_id: "run_test", request_id: "invalid-send", text: "Continue", ...fields },
+    });
+    expect(result.isError).toBe(true);
+  }
+  expect(create).not.toHaveBeenCalled();
+  expect(enqueue).not.toHaveBeenCalled();
+});
+it("forwards a valid title, branch and explicit empty PR body when starting a session", async () => {
+  const r = seed();
+  Object.assign(r, { title: "Fix login", branch: "fix/login", pr_body: "", prompt: "Fix this" });
+  const create = vi.spyOn(runs, "create").mockResolvedValue(r);
+  const client = await connect();
+  const args = {
+    request_id: "publication-start", repo: r.repo, model: r.model_id, prompt: r.prompt,
+    title: r.title, branch: r.branch, pr_body: "",
+  };
+  const { result, body } = await call(client, "start_session", args);
+  expect(result.isError).not.toBe(true);
+  expect(create).toHaveBeenCalledTimes(1);
+  expect(create.mock.calls[0].slice(0, 2)).toEqual([owner, { ...args, source: "mcp" }]);
+  expect(body).toMatchObject({ id: r.id, title: r.title, branch: r.branch, pr_body: "", description: "" });
+});
+it("forwards follow-up PR body overrides to enqueue", async () => {
+  const r = seed();
+  const enqueue = vi.spyOn(runs, "enqueue").mockImplementation(() => {});
+  const client = await connect();
+  const { result, body } = await call(client, "send_session_message", {
+    session_id: r.id, request_id: "publication-send", text: "Continue", pr_body: "Updated description",
+  });
+  expect(result.isError).not.toBe(true);
+  expect(body).toEqual({ accepted: true, session_id: r.id });
+  expect(enqueue).toHaveBeenCalledExactlyOnceWith(r.id, owner, "Continue", [], undefined, undefined, "Updated description");
+});
+it("persists follow-up PR bodies, preserves omitted overrides and exposes the description", async () => {
+  const r = seed();
+  // Exercise real enqueue and SQLite persistence without starting a worker.
+  vi.spyOn(runs as unknown as { boot(id: string): Promise<void> }, "boot").mockResolvedValue(undefined);
+  const client = await connect();
+  for (const [index, fields, expected] of [
+    [0, { pr_body: "Updated description" }, "Updated description"],
+    [1, {}, "Updated description"],
+    [2, { pr_body: "" }, ""],
+  ] as const) {
+    const { result, body } = await call(client, "send_session_message", {
+      session_id: r.id, request_id: `persist-body-${index}`, text: "Continue", ...fields,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(body.accepted).toBe(true);
+    const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+    expect(JSON.parse(stored.data).pr_body).toBe(expected);
+    expect((await call(client, "get_session", { session_id: r.id })).body).toMatchObject({ pr_body: expected, description: expected });
+    expect((await call(client, "list_sessions")).body.sessions[0]).toMatchObject({ pr_body: expected, description: expected });
+  }
+});
 it("rejects missing, expired, revoked and cross-origin tokens without cookie fallback", async () => {
   const req = (headers: Record<string, string>) =>
     app.request(cfg.origin + "/mcp", {

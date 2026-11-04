@@ -7,6 +7,7 @@ import type { Store } from "./db";
 import type { Config } from "./config";
 import type { Authentication } from "./auth";
 import type { Runs } from "./runs/service";
+import { descriptionFor } from "./runs/publication";
 import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnvFor } from "./github-login";
 import { getSetting, setSetting } from "./db";
@@ -488,12 +489,12 @@ export function createApp(
   );
   app.get("/api/v1/runs", async (c) => {
     await runs.refreshPulls(c.get("user").id);
-    return c.json({ runs: runs.list(c.get("user").id) });
+    return c.json({ runs: runs.list(c.get("user").id).map(r => ({ ...r, description: descriptionFor(r) })) });
   });
   app.get("/api/v1/runs/:id", async (c) => {
     await runs.refreshPulls(c.get("user").id, c.req.param("id"));
     const r = runs.get(c.req.param("id"), c.get("user").id);
-    return c.json({ ...r, live: { phase: r.phase, pushed: r.pushed } });
+    return c.json({ ...r, description: descriptionFor(r), live: { phase: r.phase, pushed: r.pushed } });
   });
   app.get("/api/v1/runs/:id/diff", (c) =>
     c.text(runs.get(c.req.param("id"), c.get("user").id).diff),
@@ -523,7 +524,7 @@ export function createApp(
     )
       throw new ApiError(400, "invalid_message", "Write a message.");
     await runs.validateFollowUp(c.req.param("id"), c.get("user").id, b.model, b.effort);
-    runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images, b.effort,b.model);
+    runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images, b.effort,b.model,b.pr_body);
     return c.json({ ok: true });
   });
   app.post("/api/v1/runs/:id/close", async (c) =>

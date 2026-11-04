@@ -39,6 +39,10 @@ pub enum AgentEvent {
     TextDelta { agent_id: String, text: String },
     #[serde(rename = "reasoning.delta")]
     ReasoningDelta { agent_id: String, text: String },
+    /// Every dispatched call, including internal, invalid and cancelled calls.
+    /// A boundary marker only: does not start visible activity or require tool.end.
+    #[serde(rename = "tool.call")]
+    ToolCall { agent_id: String, call_id: String, name: String },
     #[serde(rename = "tool.start")]
     ToolStart { agent_id: String, call_id: String, name: String, input: Value, title: String },
     #[serde(rename = "tool.output")]
@@ -142,6 +146,10 @@ mod tests {
 
     #[test]
     fn json_shapes_match_protocol() {
+        let call = AgentEvent::ToolCall { agent_id: "main".into(), call_id: "c".into(), name: "list_plan".into() };
+        let wire = r#"{"type":"tool.call","agent_id":"main","call_id":"c","name":"list_plan"}"#;
+        assert_eq!(serde_json::to_string(&call).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<AgentEvent>(wire).unwrap(), call);
         let e = AgentEvent::ToolEnd { agent_id: "main".into(), call_id: "c".into(), ok: true, summary: "s".into(), output: "o".into(), diff: None };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"tool.end","agent_id":"main","call_id":"c","ok":true,"summary":"s","output":"o"}"#);
         let i: AgentInput = serde_json::from_str(r#"{"type":"permission.reply","request_id":"r1","decision":"always"}"#).unwrap();

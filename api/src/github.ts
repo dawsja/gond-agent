@@ -10,7 +10,7 @@ export const validRepo = (repo: string) =>
   !repo.endsWith("/.") &&
   !repo.endsWith("/..");
 export const validBranch = (b: string) =>
-  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(b) &&
+  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,334}$/.test(b) &&
   !b.includes("..") &&
   !b.includes("@{") &&
   !b.endsWith("/") &&
@@ -154,13 +154,15 @@ export async function importBundle(
   bundle: Buffer,
   branch: string,
   env: NodeJS.ProcessEnv = process.env,
+  newBranch = false,
 ) {
   const path = join(cwd, ".git", "gond-agent.bundle");
   await writeFile(path, bundle, { mode: 0o600 });
   try {
     await git(cwd, "fetch", "--no-tags", path, "HEAD");
     await git(cwd, "reset", "--hard", "FETCH_HEAD");
-    await authenticatedGit(env, cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]);
+    // An empty lease is create-only: never overwrite a branch created since validation.
+    await authenticatedGit(env, cwd, ["push", ...(newBranch ? [`--force-with-lease=refs/heads/${branch}:`] : []), "origin", `HEAD:refs/heads/${branch}`]);
   } finally {
     await rm(path, { force: true });
   }
