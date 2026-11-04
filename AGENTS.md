@@ -101,6 +101,8 @@ Model names must use live provider metadata; do not maintain alias-to-version ta
 
 Settings use larger foreground-colored category headings for Personal settings, Models, Security, Agent access and Account management, with more space between categories than between related cards. Keep category headings at level 2 and nested card headings at level 3; retain existing hash targets and subscription/API adjacency.
 
+Boolean settings use the Radix-backed `shared/ui/switch.tsx`, with labels on the left and switches on the right. Pass `pending` for in-flight saves: it disables the control, sets `aria-busy` and announces Saving. Immediate saves show the new value optimistically and restore it on failure; form drafts such as OIDC still require Save. Do not add local switch implementations. Only choose-several list checkboxes may use a nearby `settings-multiselect: <reason>` comment to pass `web/test/settings-switch.test.mjs`. Browser coverage: `cd web && npm exec --call 'node --test test/settings-switch.browser.cjs'` (requires Playwright/Chromium); it runs the real components with mocked API responses and writes screenshots to `/tmp/gond-settings-switches`, never the checkout.
+
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
 - `cd runner && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`

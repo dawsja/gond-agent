@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useState } from "react"
 import { api } from "@/lib/api"
+import { Switch } from "@shared/ui/switch"
 import { Section } from "../studio/section"
 interface OIDC { enabled: boolean; name: string; issuer: string; clientId: string; hasSecret: boolean; callbackURL: string }
 export function OIDCSettings() {
@@ -13,8 +14,8 @@ function OIDCForm({ initial }: { initial: OIDC }) {
   const [value, setValue] = useState({ ...initial, clientSecret: "" }), qc = useQueryClient()
   const save = useMutation({ mutationFn: () => api("/v1/settings/oidc", { method: "PUT", body: value }), onSuccess: () => { setValue(v => ({ ...v, clientSecret: "" })); void qc.invalidateQueries({ queryKey: ["oidc"] }) } })
   const field = "mt-1.5 h-10 w-full rounded-[4px] border border-border-strong bg-background px-3 text-sm outline-none focus:border-link"
-  return <form onSubmit={e => { e.preventDefault(); save.mutate() }} className="space-y-4 border-t border-border p-5">
-    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={value.enabled} onChange={e => setValue({ ...value, enabled: e.target.checked })} /> Enable single sign-on</label>
+  return <form onSubmit={e => { e.preventDefault(); if (!save.isPending) save.mutate() }} className="space-y-4 border-t border-border p-5">
+    <div className="flex items-center justify-between gap-4 text-sm"><label htmlFor="oidc-enabled">Enable single sign-on</label><Switch id="oidc-enabled" checked={value.enabled} pending={save.isPending} onCheckedChange={enabled => setValue({ ...value, enabled })} /></div>
     <label className="block text-sm">Button label<input className={field} value={value.name} onChange={e => setValue({ ...value, name: e.target.value })} /></label>
     <label className="block text-sm">Issuer URL<input type="url" placeholder="https://identity.example.com/realms/team" required={value.enabled} className={field} value={value.issuer} onChange={e => setValue({ ...value, issuer: e.target.value })} /></label>
     <label className="block text-sm">Client ID<input required={value.enabled} className={field} value={value.clientId} onChange={e => setValue({ ...value, clientId: e.target.value })} /></label>
