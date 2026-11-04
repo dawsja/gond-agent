@@ -33,7 +33,7 @@ export interface Summary {
   plan_total: number;
   /** Per-file line counts from the agent's own edits; replaced by git numstat after each commit. */
   files: Record<string, { add: number; del: number }>;
-  /** Main-agent text since its last tool call: the pull request description when the turn ends. */
+  /** Main-agent publication candidate since its last tool call or compaction. */
   text: string;
   final_reply?: boolean;
   error: string | null;
@@ -112,7 +112,10 @@ export function fold(s: Summary, ev: Ev): Summary {
     case "text.delta":
       return main ? { ...s, text: s.text + ev.text } : s;
     case "tool.call":
+    case "compacted": // Overflow recovery can follow an incomplete reply without a tool call.
       return main ? { ...s, text: "", final_reply: false } : s;
+    case "stream.reset":
+      return main ? { ...s, text: s.text.slice(0, Math.max(0, s.text.length - ev.text_length)) } : s;
     case "tool.start":
       return { ...s, ...(main ? { text: "", final_reply: false } : {}), step: stepLabel(ev.name, ev.title ?? "") };
     case "todos": {

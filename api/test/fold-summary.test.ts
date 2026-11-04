@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptySummary, fold, type Ev, type Summary } from "../src/runs/fold";
+import { descriptionFor } from "../src/runs/publication";
 import { createTranscript } from "../../web/src/features/run/transcript";
 
 const text = (value: string, agent_id = "main"): Ev => ({ type: "text.delta", agent_id, text: value });
@@ -13,6 +14,50 @@ const turnEnd = (stop_reason: string, agent_id = "main"): Ev => ({ type: "turn.e
 const foldAll = (events: Ev[], initial: Summary = emptySummary()): Summary => events.reduce(fold, initial);
 
 describe("run summary final reply", () => {
+  it("rolls back a partial attempt and publishes only the post-tool retry reply once on clean end_turn", () => {
+    const partial = "Partial attempt 🛠";
+    let summary = foldAll([
+      { type: "turn.start", agent_id: "main" },
+      text(partial),
+      { type: "stream.reset", agent_id: "main", text_length: partial.length, reasoning_length: 0 },
+    ]);
+    expect(summary.text).toBe("");
+
+    summary = foldAll([text("Retry commentary"), { type: "tool.call", agent_id: "main", call_id: "plan", name: "list_plan" }], summary);
+    expect(summary.text).toBe("");
+    summary = foldAll([text("Final reply. "), text("Checks passed.")], summary);
+    const run = () => ({ summary, title: "Safe run title", status: "ready" as const });
+    expect(descriptionFor(run())).toBe("Safe run title");
+
+    summary = fold(summary, turnEnd("end_turn"));
+    expect(summary.final_reply).toBe(true);
+    expect(summary.text).toBe("Final reply. Checks passed.");
+    expect(descriptionFor(run())).toBe("Final reply. Checks passed.");
+  });
+
+  it("excludes an overflowing reply after compaction while keeping its transcript and subsequent retry rollback", () => {
+    const events: Ev[] = [
+      { type: "turn.start", agent_id: "main" },
+      text("Partial overflowing response"),
+      { type: "compacted", agent_id: "helper", reason: "overflow", before: 1000, after: 300 },
+      { type: "compacted", agent_id: "main", reason: "overflow", before: 1000, after: 300 },
+      text("Abandoned retry"),
+      { type: "stream.reset", agent_id: "main", text_length: "Abandoned retry".length, reasoning_length: 0 },
+      text("Recovered final reply"),
+      turnEnd("end_turn"),
+    ];
+    expect(foldAll(events.slice(0, 3)).text).toBe("Partial overflowing response");
+    const compacted = foldAll(events.slice(0, 4));
+    expect(compacted.text).toBe("");
+    expect(descriptionFor({ summary: compacted, title: "Safe title", status: "working" })).toBe("Safe title");
+    expect(descriptionFor({ summary: foldAll(events), title: "Safe title", status: "ready" })).toBe("Recovered final reply");
+    const transcript = createTranscript()(events.map((ev, i) => ({ ...ev, seq: i + 1, ts: i + 1 })));
+    expect(transcript.items.filter(item => item.kind === "text").map(item => item.text)).toEqual([
+      "Partial overflowing response", "Recovered final reply",
+    ]);
+    expect(transcript.items.some(item => item.kind === "compacted")).toBe(true);
+  });
+
   it("leaves streaming transcript text and visible activity unchanged by boundary markers", () => {
     const events = [text("Commentary"), { type: "tool.call", agent_id: "main", call_id: "r", name: "read" }, start("r"), end("r"), text("Final reply"), turnEnd("end_turn")]
       .map((ev, i) => ({ ...ev, seq: i + 1, ts: i + 1 }));

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { gh } from "../github";
+import { gh, type PushOptions } from "../github";
 import { ApiError } from "../wire";
 import type { Run } from "./service";
 
@@ -18,6 +18,11 @@ export function publicationFields(input: { title?: unknown; branch?: unknown; pr
   const result = z.object({ title: titleSchema.optional(), branch: branchSchema.optional(), pr_body: bodySchema.optional() }).safeParse(input);
   if (!result.success) throw new ApiError(400, "invalid_publication", "Check the title, branch and description: use a title of up to 120 characters without newlines, a valid branch, and a description of up to 20,000 characters.");
   return result.data;
+}
+
+/** Keep the first-publication lease and any policy guard together on every push path. */
+export function publicationPushOptions(run: Pick<Run, "explicit_branch" | "pushed">, beforePush?: PushOptions["beforePush"]): PushOptions {
+  return { lease: run.explicit_branch && !run.pushed ? "create-only" : undefined, beforePush };
 }
 
 /** The sole publication-body policy, shared by GitHub, MCP and workspace reads. */

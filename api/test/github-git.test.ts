@@ -57,7 +57,7 @@ describe("real service Git operations", () => {
       await git(worker, "-c", "user.email=test@example.test", "commit", "-m", "worker result");
       const bundle = join(dir, "worker.bundle");
       await git(worker, "bundle", "create", bundle, "HEAD");
-      await importBundle(cwd, await readFile(bundle), "gond-agent/fixture", env, true);
+      await importBundle(cwd, await readFile(bundle), "gond-agent/fixture", env, undefined, { lease: "create-only" });
       expect((await git(remote, "show", "gond-agent/fixture:change.txt")).toString()).toBe("implemented\n");
       expect((await git(remote, "rev-list", "--count", "main")).toString().trim()).toBe("2");
       // Recovery clones only the saved run branch, retaining the same HEAD for follow-ups.
@@ -73,7 +73,7 @@ describe("real service Git operations", () => {
       const followup = join(dir, "followup.bundle"); await git(resumedWorker, "bundle", "create", followup, "HEAD");
       const previousHead = (await git(remote, "rev-parse", "gond-agent/fixture")).toString();
       // Creation-only publication cannot update a branch that appeared during the turn.
-      await expect(importBundle(resumed.cwd, await readFile(followup), "gond-agent/fixture", env, true)).rejects.toThrow("git failed");
+      await expect(importBundle(resumed.cwd, await readFile(followup), "gond-agent/fixture", env, undefined, { lease: "create-only" })).rejects.toMatchObject({ step: "push", class: "rejected", attempts: 1 });
       expect((await git(remote, "rev-parse", "gond-agent/fixture")).toString()).toBe(previousHead);
       await importBundle(resumed.cwd, await readFile(followup), "gond-agent/fixture", env);
       expect((await git(resumed.cwd, "diff", baseSHA, "HEAD")).toString()).toContain("follow-up");

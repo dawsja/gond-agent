@@ -106,6 +106,8 @@ export function sessionState(r: Run) {
     question: question?.question ?? null,
     pr_url: r.pr_url ?? null,
     last_error: r.status === "failed" ? r.error ?? r.summary?.error ?? null : null,
+    last_error_details: r.status === "failed" ? r.last_error ?? null : null,
+    work_kept: !!r.work_kept,
   };
 }
 function session(r: Run, origin: string) {
@@ -381,7 +383,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
           return {
             sessions: rows
               .slice(0, limit)
-              .map((r) => session(parseRun(r.data), cfg.origin)),
+              .map((r) => session(runs.get(parseRun(r.data).id, user), cfg.origin)),
             next_cursor: rows.length > limit ? cursor + limit : null,
           };
         },

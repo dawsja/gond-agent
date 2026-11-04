@@ -43,6 +43,9 @@ pub enum AgentEvent {
     /// A boundary marker only: does not start visible activity or require tool.end.
     #[serde(rename = "tool.call")]
     ToolCall { agent_id: String, call_id: String, name: String },
+    /// Roll back a retried attempt's deltas; lengths are UTF-16 code units for host consumers.
+    #[serde(rename = "stream.reset")]
+    StreamReset { agent_id: String, text_length: usize, reasoning_length: usize },
     #[serde(rename = "tool.start")]
     ToolStart { agent_id: String, call_id: String, name: String, input: Value, title: String },
     #[serde(rename = "tool.output")]
@@ -78,9 +81,9 @@ pub enum AgentEvent {
     Usage { input: u64, output: u64, cache_read: u64, context_used: u64, context_window: u64 },
     #[serde(rename = "turn.end")]
     TurnEnd { agent_id: String, stop_reason: String },
-    /// The history was replaced by a summary; token counts before and (estimated) after.
+    /// Older history was summarized; estimated history token sizes before and after.
     #[serde(rename = "compacted")]
-    Compacted { before: u64, after: u64 },
+    Compacted { agent_id: String, reason: String, before: u64, after: u64 },
     #[serde(rename = "error")]
     Error { agent_id: String, message: String, retryable: bool },
 }
@@ -152,6 +155,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<AgentEvent>(wire).unwrap(), call);
         let e = AgentEvent::ToolEnd { agent_id: "main".into(), call_id: "c".into(), ok: true, summary: "s".into(), output: "o".into(), diff: None };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"tool.end","agent_id":"main","call_id":"c","ok":true,"summary":"s","output":"o"}"#);
+        let reset = AgentEvent::StreamReset { agent_id: "main".into(), text_length: 3, reasoning_length: 0 };
+        let json = r#"{"type":"stream.reset","agent_id":"main","text_length":3,"reasoning_length":0}"#;
+        assert_eq!(serde_json::to_string(&reset).unwrap(), json);
+        assert_eq!(serde_json::from_str::<AgentEvent>(json).unwrap(), reset);
         let i: AgentInput = serde_json::from_str(r#"{"type":"permission.reply","request_id":"r1","decision":"always"}"#).unwrap();
         assert_eq!(i, AgentInput::PermissionReply { request_id: "r1".into(), decision: Decision::Always, message: None });
         let m: AgentInput = serde_json::from_str(r#"{"type":"mode","mode":"plan"}"#).unwrap();
