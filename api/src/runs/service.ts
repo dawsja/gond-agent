@@ -563,7 +563,12 @@ export class Runs {
         type: "user",
         text: message.text,
         effort: message.effort ?? r.effort ?? "high",
-        images: message.images.map((id) => ({ id })),
+        images: message.images.map((id) => {
+          const image = this.db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND user_id=? AND run_id=?")
+            .get(id, r.user_id, r.id) as { media_type: string; bytes: Buffer } | undefined;
+          if (!image) throw new ApiError(404, "image_not_found", "That image isn't available.");
+          return { media_type: image.media_type, data: image.bytes.toString("base64") };
+        }),
       },
     });
   }

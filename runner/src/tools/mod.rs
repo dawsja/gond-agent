@@ -127,7 +127,11 @@ impl Tool for Bounded {
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
-            let out = self.0.run(ctx, input).await;
+            let mut out = self.0.run(ctx, input).await;
+            if !crate::images::normalise_parts(&mut out.content).await {
+                out.ok = false;
+                out.summary = "image processing failed".into();
+            }
             output::bound(ctx, out)
         })
     }

@@ -516,7 +516,7 @@ const key = 'fixture-only-provider-key';
       activity('text.delta', { text: "The mobile flow drops the return URL. I've updated the redirect and added a regression check." });
       for (const [index, file] of ['api/src/auth.ts', 'api/test/auth.test.ts'].entries()) {
         activity('tool.start', { call_id: `edit-${index}`, name: 'mcp__gond__edit', title: 'mcp__gond__edit', input: { path: file } });
-        activity('tool.end', { call_id: `edit-${index}`, ok: true, ...(index === 0 ? { diff: fixtureDiff } : {}) });
+        activity('tool.end', { call_id: `edit-${index}`, ok: true });
       }
       await expect(page.getByRole('button', { name: 'Updated 2 files', exact: true })).toHaveAttribute('aria-expanded', 'false');
       activity('tool.start', { call_id: 'check', name: 'commandExecution', title: 'npm run typecheck', input: { command: 'npm run typecheck' } });
@@ -574,6 +574,10 @@ const key = 'fixture-only-provider-key';
       await expect(checklist.getByRole('listitem')).toHaveText(plan.map(step => step.text));
       await noPinnedTasks();
 
+      // Keep the original activity-summary fixture above unchanged. Only this
+      // later call supplies a diff for the light/dark Changes screenshots.
+      activity('tool.start', { call_id: 'diff-preview', name: 'edit', title: 'api/src/auth.ts', input: { path: 'api/src/auth.ts' } });
+      activity('tool.end', { call_id: 'diff-preview', ok: true, diff: fixtureDiff });
       if (width !== 1440) await page.getByRole('tab', { name: 'Changes & PR', exact: true }).click();
       const diffCard = page.locator('[data-slot="card"]').filter({ has: page.getByRole('heading', { name: 'api/src/auth.ts', exact: true }) });
       await expect(diffCard.locator('.bg-diff-add-line')).toContainText('return "/agents/"');
