@@ -116,13 +116,16 @@ export interface Run extends CiInfo {
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
 const RUNNER_STATE_VERSION = "gond-agent-checkpoint-3";
 const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
-const EVIDENCE_TIMEOUT_MS = 1000;
-/** Evidence is advisory: a missing control reply must not hold capacity or publication. */
-async function evidenceRequest<T>(request: () => Promise<T>): Promise<T> {
+const EVIDENCE_EXPORT_TIMEOUT_MS = 10_000;
+const EVIDENCE_FLUSH_TIMEOUT_MS = 30_000;
+const EVIDENCE_SETTLE_TIMEOUT_MS = 30_000;
+class EvidenceTimeout extends Error {}
+/** Evidence is advisory; bound each operation without cancelling its underlying work. */
+async function evidenceRequest<T>(request: () => Promise<T>, timeoutMs = EVIDENCE_EXPORT_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([request(), new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Workspace evidence unavailable")), EVIDENCE_TIMEOUT_MS);
+      timer = setTimeout(() => reject(new EvidenceTimeout("Workspace evidence unavailable")), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -1434,12 +1437,21 @@ export class Runs {
     if (!this.workerAlive(live)) { this.saveEvidence(id, live); return; }
     // Boundary exports and private exports share runner control state. Settle
     // checkpoint capture first so the evidence export cannot race a held boundary.
-    try { await evidenceRequest(async () => { await live.workspace.flushCheckpoints?.(); }); }
-    catch {
+    const flush = Promise.resolve().then(() => live.workspace.flushCheckpoints?.());
+    try { await evidenceRequest(() => flush, EVIDENCE_FLUSH_TIMEOUT_MS); }
+    catch (error) {
       if (live.closed || this.live.get(id) !== live) return;
       this.checkpointUnavailable(id);
-      this.saveEvidence(id, live);
-      return; // A timed-out flush may still hold the boundary; do not race it.
+      // Timing out does not cancel tree export/persistence or release its hold.
+      // Give that same operation a separate bounded drain before publication's
+      // snapshot. Persistence failures already settle after release in the pool.
+      try {
+        if (!(error instanceof EvidenceTimeout) || !this.workerAlive(live)) throw error;
+        await evidenceRequest(() => flush, EVIDENCE_SETTLE_TIMEOUT_MS);
+      } catch {
+        this.saveEvidence(id, live);
+        return; // Still unavailable; never wait indefinitely on advisory work.
+      }
     }
     if (live.closed || this.live.get(id) !== live) return;
     if (!this.workerAlive(live)) { this.saveEvidence(id, live); return; }

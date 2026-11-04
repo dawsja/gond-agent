@@ -311,6 +311,7 @@ describe("persistent workspace queue", () => {
     const active = await create(), waiting = await create("b");
     const workspace = workspaces.get(active.id)!;
     workspace.hangEvidenceExport = true;
+    workspace.flushCheckpoints = vi.fn(() => new Promise<void>(() => {}));
     const exports = workspace.calls.filter(call => call.method === "export_state").length;
     workspace.exit({ type: "turn.end", agent_id: "main", stop_reason });
     await flush();
@@ -318,6 +319,7 @@ describe("persistent workspace queue", () => {
     expect(releases).toEqual([active.id]);
     expect(starts).toEqual([active.id, waiting.id]);
     expect(workspace.calls.filter(call => call.method === "export_state")).toHaveLength(exports);
+    expect(workspace.flushCheckpoints).not.toHaveBeenCalled();
     expect(workspace.calls.some(call => call.method === "snapshot")).toBe(false);
   });
 
@@ -404,7 +406,9 @@ describe("persistent workspace queue", () => {
     expect(runs.get(active.id).pending.map(message => message.text)).toContain("Retry disconnected work");
   });
 
-  it.each(["flush", "export"])("bounds a hung evidence %s on a healthy worker without blocking publication or waiting work", async operation => {
+  // Budget/fallback coverage for alternate workspaces with no controller hold.
+  // Real held/locked publication ordering is covered in evidence-controller.test.ts.
+  it.each(["flush", "export"])("bounds a hung evidence %s on an alternate workspace without checkpoint holds", async operation => {
     const active = await create(), waiting = await create("b");
     const workspace = workspaces.get(active.id)!;
     if (operation === "export") workspace.hangEvidenceExport = true;
@@ -414,7 +418,12 @@ describe("persistent workspace queue", () => {
     await flush();
     expect(starts).toEqual([active.id]);
     expect(importBundle).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1000); await flush();
+    if (operation === "flush") {
+      await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect(importBundle).not.toHaveBeenCalled(); // Separate bounded hold drain.
+      await vi.advanceTimersByTimeAsync(30_000);
+    } else await vi.advanceTimersByTimeAsync(10_000);
+    await flush();
     expect(importBundle).toHaveBeenCalledTimes(1);
     expect(runs.get(active.id)).toMatchObject({ status: "merged", evidence: { unverified: ["Verification policy status unavailable."] } });
     expect(releases).toEqual([active.id]);
