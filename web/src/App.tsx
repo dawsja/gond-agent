@@ -6,6 +6,7 @@ import { SetupGate } from "@/features/setup/setup-screen"
 import { HomeScreen } from "@/features/home/home-screen"
 import { ApiError } from "@/lib/api"
 import { BASE } from "@/lib/base"
+import { ThemeSync } from "@/components/theme-sync"
 import { useMe } from "@/lib/queries"
 import { applyAccent } from "@/lib/accent"
 
@@ -53,6 +54,7 @@ export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthGate>
+        <ThemeSync />
         <AccountAccent />
         <SetupGate>
         <BrowserRouter basename={BASE || undefined}>

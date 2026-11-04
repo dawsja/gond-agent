@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore } from "../src/db";
@@ -9,8 +9,9 @@ import { ApiError } from "../src/wire";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
-import { gh, checkout, importBundle } from "../src/github";
-import { createMcp, createToken } from "../src/mcp";
+import { gh, checkout, importBundle, pushBranch } from "../src/github";
+import { RetryError } from "../src/retry";
+import { createMcp, createToken, sessionState } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 vi.mock("../src/github", async (original) => {
   const actual = await original<typeof import("../src/github")>();
@@ -29,6 +30,7 @@ vi.mock("../src/github", async (original) => {
       archive: Buffer.from("repo"),
     })),
     importBundle: vi.fn(async () => {}),
+    pushBranch: vi.fn(async () => {}),
     git: vi.fn(async (_cwd: string, ...args: string[]) =>
       Buffer.from(
         args[0] === "rev-parse"
@@ -392,7 +394,8 @@ describe("persistent local run lifecycle", () => {
     vi.mocked(checkout).mockRejectedValueOnce(new ApiError(502, "checkout_failed", "Couldn't download the repository. Check GitHub access and retry."));
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Explain it" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
-    expect(runs.get(r.id).error).toContain("Couldn't download the repository");
+    expect(runs.get(r.id)).toMatchObject({step:"clone", last_error:{step:"clone", attempts:1}, work_kept:false});
+    expect(runs.get(r.id).error).toContain("Cloning the repository failed");
     expect(log).toEqual([]);
     expect(runs.history(r.id, 0).filter(event => event.type === "run.status").some(event => event.step === "Starting a workspace container")).toBe(false);
   });
@@ -415,10 +418,218 @@ describe("persistent local run lifecycle", () => {
     workerFailure = "The model connection failed.";
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
-    expect(runs.get(r.id).error).toBe("The model connection failed.");
+    expect(runs.get(r.id)).toMatchObject({step:"model", phase:"idle", work_kept:true});
+    expect(runs.get(r.id).error).toContain("The model connection failed after 1 attempt");
     expect(log.some((x) => x.method === "snapshot")).toBe(false);
     expect(importBundle).not.toHaveBeenCalled();
     expect(vi.mocked(gh).mock.calls.some((c) => c[1] === "POST")).toBe(false);
+  });
+  it("keeps a failed publication and pushes the kept commit before sending a follow-up", async () => {
+    const captured = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"server",retryable:true,reason:"GitHub returned 500"}, 5));
+      const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Keep this work"});
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+      expect(runs.get(r.id)).toMatchObject({phase:"idle",work_kept:true,last_error:{step:"push",class:"server",attempts:5}});
+      expect(runs.get(r.id).error).toBe("Pushing the branch failed after 5 attempts (GitHub returned 500). Your changes are kept; send a follow-up to try again.");
+      expect(sessionState(runs.get(r.id))).toMatchObject({state:"failed",done:true,work_kept:true,last_error_details:{step:"push",class:"server",attempts:5},last_error:expect.stringContaining("Pushing the branch")});
+      expect(runs.get(r.id).diff).toContain("src/app.ts");
+      expect(runs.history(r.id,0)).toContainEqual(expect.objectContaining({type:"run.error",step:"push",class:"server",attempts:5}));
+      expect(destroy).not.toHaveBeenCalled();
+      const snapshots = log.filter(x => x.method === "snapshot").length;
+      let release!: () => void;
+      vi.mocked(pushBranch).mockImplementationOnce(() => new Promise<void>(done => {release=done;}));
+      runs.enqueue(r.id,"u","Continue");
+      await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(1));
+      expect(log.filter(x => x.method === "snapshot")).toHaveLength(snapshots);
+      expect(log.filter(x => x.method === "send" && (x.input as any)?.type === "user")).toHaveLength(1);
+      release();
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+      expect(checkout).toHaveBeenCalledTimes(1);
+      expect(runs.get(r.id).head_sha).toBe("b".repeat(40));
+      expect(runs.get(r.id).work_kept).toBe(false);
+      expect(destroy).not.toHaveBeenCalled();
+      expect(JSON.stringify(captured.mock.calls)).not.toMatch(/test-managed-github-token|https:\/\//);
+    } finally { captured.mockRestore(); }
+  });
+  it("reclaims the oldest kept failure at capacity and still releases failures on stop", async () => {
+    workerFailure = "The model connection dropped 3 times";
+    const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
+    const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
+    await vi.waitFor(() => expect(runs.get(first.id).status).toBe("failed"));
+    await vi.waitFor(() => expect(runs.get(second.id).status).toBe("failed"));
+    const third = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"});
+    await vi.waitFor(() => expect(runs.get(third.id).status).toBe("failed"));
+    expect(runs.get(first.id).work_kept).toBe(false);
+    expect(runs.get(second.id).work_kept).toBe(true);
+    await runs.stop(first.id,"u");
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(runs.get(first.id).work_kept).toBe(false);
+    await runs.closeSession(second.id,"u");
+    expect(destroy).toHaveBeenCalledTimes(2);
+  });
+  it("does not reclaim failed work for invalid create or follow-up requests", async () => {
+    const closed = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Closed"});
+    await vi.waitFor(() => expect(runs.get(closed.id).status).toBe("ready"));
+    await runs.close(closed.id);
+    destroy.mockClear();
+    workerFailure = "The model connection dropped 3 times";
+    const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
+    await vi.waitFor(() => expect(runs.get(first.id).status).toBe("failed"));
+    const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
+    await vi.waitFor(() => expect(runs.get(second.id).status).toBe("failed"));
+    await expect(runs.create("u", {repo:"acme/app",model:"auto",prompt:"Invalid",images:["missing"]})).rejects.toMatchObject({code:"image_not_found"});
+    await expect(runs.create("u", {repo:"acme/app",model:"auto",prompt:"Invalid",base_branch:".."})).rejects.toMatchObject({code:"invalid_branch"});
+    vi.mocked(gh).mockRejectedValueOnce(new Error("Repository unavailable"));
+    await expect(runs.create("u", {repo:"acme/missing",model:"auto",prompt:"Invalid"})).rejects.toThrow("Repository unavailable");
+    expect(() => runs.enqueue(closed.id, "u", "Invalid", ["missing"])).toThrow("That image isn't available.");
+    expect(() => runs.enqueue(closed.id, "u", "Invalid", [], "x".repeat(21))).toThrow("Choose a supported effort.");
+    expect(destroy).not.toHaveBeenCalled();
+    expect(runs.get(first.id).work_kept).toBe(true);
+    expect(runs.get(second.id).work_kept).toBe(true);
+  });
+  it("reclaims a kept failure for a follow-up and republishes its imported commit before re-cloning", async () => {
+    const stopped = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Stopped"});
+    await vi.waitFor(() => expect(runs.get(stopped.id).status).toBe("ready"));
+    await runs.close(stopped.id);
+    destroy.mockClear();
+    vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"server",retryable:true,reason:"GitHub returned 500"}, 5));
+    const kept = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Kept"});
+    await vi.waitFor(() => expect(runs.get(kept.id).status).toBe("failed"));
+    const healthy = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Healthy"});
+    await vi.waitFor(() => expect(runs.get(healthy.id).status).toBe("ready"));
+    const history = runs.history(kept.id, 0);
+    const clone = join(dir, "checkouts", kept.id);
+    mkdirSync(clone, { recursive: true });
+    writeFileSync(join(clone, "saved-commit"), "b".repeat(40));
+    let destroyed!: () => void;
+    destroy.mockImplementationOnce(() => new Promise<void>(done => { destroyed = done; }));
+    runs.enqueue(stopped.id, "u", "Resume at capacity");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(checkout).toHaveBeenCalledTimes(3); // Replacement waits for resource release.
+    destroyed();
+    await vi.waitFor(() => expect(checkout).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(runs.get(stopped.id).status).toBe("ready"));
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(runs.get(kept.id)).toMatchObject({work_kept:false, kept_commit:"b".repeat(40)});
+    expect(runs.history(kept.id, 0)).toEqual(history);
+    expect(runs.get(kept.id).diff).toContain("src/app.ts");
+    expect(readFileSync(join(clone, "saved-commit"), "utf8")).toBe("b".repeat(40));
+    await runs.close(stopped.id);
+    vi.mocked(pushBranch).mockRejectedValueOnce(new RetryError("push", {class:"server",retryable:true,reason:"GitHub returned 500"}, 5));
+    runs.enqueue(kept.id, "u", "Republish while offline");
+    await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(runs.get(kept.id).status).toBe("failed"));
+    expect(runs.get(kept.id).kept_commit).toBe("b".repeat(40));
+    expect(runs.get(kept.id).error).toContain("Your saved commit is kept");
+    expect(readFileSync(join(clone, "saved-commit"), "utf8")).toBe("b".repeat(40));
+    vi.mocked(pushBranch).mockClear();
+    let release!: () => void;
+    vi.mocked(pushBranch).mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
+    const clones = vi.mocked(checkout).mock.calls.length;
+    runs.enqueue(kept.id, "u", "Republish and continue");
+    await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(pushBranch).mock.calls[0]?.[0]).toBe(join(dir, "checkouts", kept.id));
+    expect(checkout).toHaveBeenCalledTimes(clones);
+    runs.enqueue(kept.id, "u", "Queued during republish");
+    release();
+    await vi.waitFor(() => expect(log.some(call => call.method === "send" && (call.input as any)?.text === "Queued during republish")).toBe(true));
+    await vi.waitFor(() => expect(runs.get(kept.id).status).toBe("ready"));
+    expect(runs.get(kept.id).kept_commit).toBeUndefined();
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
+  });
+  it("honors Stop while a reclaimed commit is being republished", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Saved commit"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    await runs.close(r.id);
+    const saved = runs.get(r.id);
+    saved.kept_commit = "b".repeat(40);
+    saved.pushed = false;
+    saved.status = "failed";
+    runs.save(saved);
+    let release!: () => void;
+    vi.mocked(pushBranch).mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
+    runs.enqueue(r.id, "u", "Resume");
+    await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(1));
+    await runs.stop(r.id, "u");
+    release();
+    await vi.waitFor(() => expect(runs.get(r.id)).toMatchObject({status:"stopped",phase:"idle",pushed:true,pending:[]}));
+    expect(runs.get(r.id).kept_commit).toBeUndefined();
+    expect(checkout).toHaveBeenCalledTimes(1);
+    expect(log.filter(call => call.method === "send" && (call.input as any)?.type === "user")).toHaveLength(1);
+  });
+  it("honors Stop while waiting for a reclaimed workspace to be destroyed", async () => {
+    workerFailure = "The model connection dropped 3 times";
+    const kept = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Kept"});
+    await vi.waitFor(() => expect(runs.get(kept.id).status).toBe("failed"));
+    workerFailure = null;
+    const healthy = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Healthy"});
+    await vi.waitFor(() => expect(runs.get(healthy.id).status).toBe("ready"));
+    let release!: () => void;
+    destroy.mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
+    const stopped = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Stop before startup"});
+    await runs.stop(stopped.id, "u");
+    release();
+    await vi.waitFor(() => expect((runs as unknown as {booting:Set<string>}).booting.has(stopped.id)).toBe(false));
+    await vi.waitFor(() => expect(runs.get(stopped.id)).toMatchObject({status:"stopped",phase:"idle",pending:[]}));
+    expect(checkout).toHaveBeenCalledTimes(2);
+    const next = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Free slot"});
+    await vi.waitFor(() => expect(runs.get(next.id).status).toBe("ready"));
+  });
+  it("still prepares account deletion after a run was soft-deleted", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Delete me"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    await runs.remove(r.id, "u");
+    await expect(runs.withAccountDeletion("u", async prepare => { await prepare(); })).resolves.toBeUndefined();
+    expect(() => runs.get(r.id)).toThrow("That run doesn't exist.");
+  });
+  it("drops failed import bundles during retention and re-snapshots before a follow-up", async () => {
+    vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("import", {class:"unknown",retryable:false,reason:"Import failed"}, 1));
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Import fails"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    const live = (runs as unknown as {live:Map<string,{publishPending?:{snapshot?:unknown}}>}).live.get(r.id)!;
+    expect(live.publishPending?.snapshot).toBeUndefined();
+    expect(runs.get(r.id).work_kept).toBe(true);
+    expect(log.filter(call => call.method === "snapshot")).toHaveLength(1);
+    runs.enqueue(r.id, "u", "Retry");
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    // Re-snapshot/import the kept turn, then snapshot the follow-up's completed turn.
+    expect(log.filter(call => call.method === "snapshot")).toHaveLength(3);
+    expect(importBundle).toHaveBeenCalledTimes(3);
+    expect(checkout).toHaveBeenCalledTimes(1);
+  });
+  it("falls back to the pushed branch when persisted retention metadata has no live workspace", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    await runs.close(r.id);
+    const stale = runs.get(r.id);
+    stale.status = "failed";
+    stale.work_kept = true; // An abrupt restart can leave this persisted flag behind.
+    runs.save(stale);
+    expect(runs.get(r.id).work_kept).toBe(false);
+    runs.enqueue(r.id,"u","Reopen after restart");
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(checkout).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
+    expect(pushBranch).not.toHaveBeenCalled();
+  });
+  it("expires failed work with a fake timer and releases immediately when configured", async () => {
+    vi.useFakeTimers();
+    try {
+      workerFailure = "The model connection dropped 3 times";
+      const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
+      await vi.waitFor(() => expect(runs.get(first.id).status).toBe("failed"));
+      await vi.advanceTimersByTimeAsync(59 * 60_000);
+      expect(destroy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(runs.get(first.id).work_kept).toBe(false);
+      vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES","0");
+      const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
+      await vi.waitFor(() => expect(runs.get(second.id).status).toBe("failed"));
+      expect(destroy).toHaveBeenCalledTimes(2);
+      expect(runs.get(second.id).work_kept).toBe(false);
+    } finally { vi.useRealTimers(); }
   });
   it("stores tool screenshots with run ownership and broadcasts IDs, not image bytes", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Test browser" });

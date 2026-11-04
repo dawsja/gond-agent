@@ -24,19 +24,136 @@ const key = 'fixture-only-provider-key';
   // The replacement browser container uses the same alias/port after service restart.
   await new Promise(resolve => provider.listen(3030, '0.0.0.0', resolve));
   const browser = await chromium.launch({ executablePath: process.env.GOND_AGENT_BROWSER_EXECUTABLE, args: ['--no-sandbox'] });
-  const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
+  const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
   const errors = [];
   const externalRequests = [];
+  const authResponses = [];
+  page.on('response', response => {
+    const url = new URL(response.url());
+    if (url.origin !== origin || !url.pathname.startsWith('/api/auth/')) return;
+    authResponses.push({ path: url.pathname, method: response.request().method(), status: response.status(), retryAfter: response.headers()['x-retry-after'] });
+    if (authResponses.length > 30) authResponses.shift();
+  });
   page.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
-  const greyAvatar = async locator => {
+  const greyAvatar = async (locator, theme = 'dark') => {
     await expect(locator).toBeVisible();
-    await expect(locator).toHaveCSS('background-color', 'rgb(26, 26, 26)');
-    await expect(locator).toHaveCSS('color', 'rgb(138, 138, 138)');
+    await expect(locator).toHaveCSS('background-color', theme === 'light' ? 'rgb(235, 232, 225)' : 'rgb(26, 26, 26)');
+    await expect(locator).toHaveCSS('color', theme === 'light' ? 'rgb(82, 79, 74)' : 'rgb(138, 138, 138)');
     await expect(locator.locator('svg.lucide-user-round')).toBeVisible();
     await expect(locator).toHaveText('');
   };
   page.on('pageerror', error => errors.push(error.message));
-  const capture = async (name, target = page) => screenshots.push({ name: `${name}-${width}.png`, data: (await target.screenshot({ fullPage: true, mask: [target.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
+  const capture = async (name, target = page) => screenshots.push({ name: `${name}-${width}.png`, data: (await target.screenshot({ fullPage: true, animations: 'disabled', mask: [target.getByLabel('New MCP token', { exact: true })] })).toString('base64') });
+  const resolvedTheme = async (theme, target = page, preference = theme) => {
+    const html = target.locator('html');
+    await expect(html).toHaveAttribute('data-theme', preference);
+    if (theme === 'dark') await expect(html).toHaveClass(/\bdark\b/);
+    else await expect(html).not.toHaveClass(/\bdark\b/);
+    await expect(html).toHaveCSS('color-scheme', theme);
+    if (theme === 'light') await expect.poll(() => html.evaluate(element => getComputedStyle(element).getPropertyValue('--background').trim())).toBe('#f5f3ee');
+    await expect(target.locator('meta[name="theme-color"]')).toHaveAttribute('content', theme === 'light' ? '#f5f3ee' : /^(#000000|#000)$/);
+    await expect(target.locator('body')).toHaveCSS('background-color', theme === 'light' ? 'rgb(245, 243, 238)' : 'rgb(0, 0, 0)');
+  };
+  // The theme checks leave System selected with a dark device. Reuse the existing
+  // transcript/plan/composer fixtures in both palettes without replaying events.
+  const captureThemes = async name => {
+    try {
+      for (const theme of ['light', 'dark']) {
+        await page.emulateMedia({ colorScheme: theme });
+        await resolvedTheme(theme, page, 'system');
+        for (const avatar of await page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).all()) await greyAvatar(avatar, theme);
+        for (const mark of await page.locator('svg rect[fill="#1b1a18"]').filter({ visible: true }).all()) await expect(mark).toHaveCSS('fill', 'rgb(27, 26, 24)');
+        for (const heading of await page.locator('[data-settings-category] > h2').all()) await expect(heading).toHaveCSS('color', theme === 'light' ? 'rgb(27, 26, 24)' : 'rgb(237, 237, 237)');
+        await capture(name + '-' + theme);
+      }
+    } finally {
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await resolvedTheme('dark', page, 'system');
+    }
+  };
+  const chooseTheme = async theme => {
+    await page.getByRole('combobox', { name: 'Theme', exact: true }).click();
+    await expect(page.getByRole('option')).toHaveText(['System', 'Light', 'Dark']);
+    const saving = page.waitForResponse(response => response.url() === origin + '/api/v1/me/theme' && response.request().method() === 'PUT');
+    await page.getByRole('option', { name: theme, exact: true }).click();
+    const saved = await saving;
+    expect(saved.status()).toBe(200);
+    expect(saved.request().postDataJSON()).toEqual({ theme: theme.toLowerCase() });
+    expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe(theme.toLowerCase());
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('gond-agent-theme'))).toBe(theme.toLowerCase());
+  };
+  const verifyTheme = async () => {
+    await expect(page.getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
+    await chooseTheme('Light');
+    await resolvedTheme('light');
+    const avatar = page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last();
+    if (await avatar.count()) await greyAvatar(avatar, 'light');
+    await capture('settings-appearance-light');
+
+    // Hold all external scripts during reload: only the synchronous inline boot
+    // script can apply the cached preference, before React or /me can fix it.
+    let releaseScripts;
+    const scriptsReady = new Promise(resolve => { releaseScripts = resolve; });
+    const holdScripts = async route => {
+      if (route.request().resourceType() === 'script') await scriptsReady;
+      await route.continue();
+    };
+    await page.route('**/*', holdScripts);
+    try {
+      const response = await page.reload({ waitUntil: 'commit' });
+      expect(response.headers()['content-security-policy']).toBe("img-src 'self' data: blob:");
+      await resolvedTheme('light');
+      await expect(page.locator('#root')).toBeEmpty();
+    } finally {
+      releaseScripts();
+      await page.waitForLoadState('load');
+      await page.unroute('**/*', holdScripts);
+    }
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText('Light');
+    await resolvedTheme('light');
+
+    // Same authenticated user, but no localStorage/cache and an opposing device
+    // preference: this context must obtain Light from the real saved profile.
+    const state = await page.context().storageState();
+    const freshContext = await browser.newContext({ storageState: { ...state, origins: [] }, viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
+    const fresh = await freshContext.newPage();
+    fresh.on('pageerror', error => errors.push(error.message));
+    fresh.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
+    try {
+      await fresh.goto(origin + '/agents/settings');
+      await expect(fresh.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText('Light');
+      await resolvedTheme('light', fresh);
+      expect((await (await fresh.request.get(origin + '/api/v1/me')).json()).user.id).toBe((await (await page.request.get(origin + '/api/v1/me')).json()).user.id);
+      await capture('settings-appearance-light-fresh-context', fresh);
+    } finally { await freshContext.close(); }
+
+    // A delayed failed save must show the choice optimistically, then restore the
+    // previous server value and cache with a plain, dismissible error toast.
+    let releaseFailure;
+    const failedSave = new Promise(resolve => { releaseFailure = resolve; });
+    await page.route(origin + '/api/v1/me/theme', async route => {
+      await failedSave;
+      await route.fulfill({ status: 500, json: { error: { code: 'fixture_failure', message: 'Could not save.' } } });
+    }, { times: 1 });
+    await page.getByRole('combobox', { name: 'Theme', exact: true }).click();
+    await page.getByRole('option', { name: 'Dark', exact: true }).click();
+    try { await resolvedTheme('dark'); } finally { releaseFailure(); }
+    await resolvedTheme('light');
+    await expect(page.getByRole('alert')).toContainText("Couldn't change the theme. Try again.");
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('gond-agent-theme'))).toBe('light');
+    expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('light');
+    await page.getByRole('button', { name: 'Dismiss theme error', exact: true }).click();
+
+    await chooseTheme('Dark');
+    await page.emulateMedia({ colorScheme: 'light' });
+    await resolvedTheme('dark'); // Explicit Dark ignores the device preference.
+    await capture('settings-appearance-dark');
+    await chooseTheme('System');
+    await resolvedTheme('light', page, 'system');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await resolvedTheme('dark', page, 'system');
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText('System');
+  };
   const agentHeaders = async () => {
     const headers = page.locator('[data-agent-label]');
     await expect(headers.first()).toBeVisible();
@@ -83,7 +200,8 @@ const key = 'fixture-only-provider-key';
     const control = target => target.locator('#appearance').getByRole('button', { name: 'Color', exact: true });
     const primary = target => target.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--primary').trim());
     const unchangedIdentity = async target => {
-      await greyAvatar(target.getByRole('region', { name: 'Personal settings', exact: true }).getByLabel('No profile photo', { exact: true }));
+      const scheme = await target.locator('html').evaluate(element => element.classList.contains('dark') ? 'dark' : 'light');
+      await greyAvatar(target.getByRole('region', { name: 'Personal settings', exact: true }).getByLabel('No profile photo', { exact: true }), scheme);
       const marks = target.locator('[aria-label="Gond Agent"] svg');
       expect(await marks.count()).toBeGreaterThan(0);
       for (const mark of await marks.all()) {
@@ -131,7 +249,7 @@ const key = 'fixture-only-provider-key';
     await state(page, 'Blue', '#2b61b9');
     let previous = await primary(page);
     // No copied cookies or storage: the same account retrieves its color from the server.
-    const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
+    const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
     const other = await context.newPage();
     other.on('pageerror', error => errors.push(error.message));
     other.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
@@ -159,6 +277,19 @@ const key = 'fixture-only-provider-key';
         await state(other, name, color);
         await selected(other, name);
       }
+      // Color and Theme share Appearance, but remain independent account choices.
+      // System changes the shades, never the selected color or neutral identity.
+      await page.emulateMedia({ colorScheme: 'light' });
+      await resolvedTheme('light', page, 'system');
+      await state(page, 'Orange', '#c2460c');
+      await page.reload();
+      await resolvedTheme('light', page, 'system');
+      await state(page, 'Orange', '#c2460c');
+      await page.getByRole('region', { name: 'Personal settings', exact: true }).scrollIntoViewIfNeeded();
+      await selected(page, 'Orange', 'accent-orange-light');
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await resolvedTheme('dark', page, 'system');
+      await state(page, 'Orange', previous);
       // Both a valid-but-stale hint and an invalid hint lose to the account response.
       for (const target of [page, other]) {
         for (const hint of ['purple', 'not-an-accent']) {
@@ -231,7 +362,8 @@ const key = 'fixture-only-provider-key';
     const listRoute = route => route.fulfill({ json: { runs: prState ? [run()] : [] } });
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
-    const diffRoute = route => route.fulfill({ body: '' });
+    const fixtureDiff = 'diff --git a/api/src/auth.ts b/api/src/auth.ts\n--- a/api/src/auth.ts\n+++ b/api/src/auth.ts\n@@ -1,3 +1,3 @@\n export function returnURL() {\n-  return "/login"\n+  return "/agents/"\n }\n';
+    const diffRoute = route => route.fulfill({ body: fixtureDiff });
     const imageRoute = route => { imageRequests++; return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64') }); };
     await page.route(catalogURL, modelRoute);
     await page.route(fixtureRunURL, runRoute);
@@ -257,7 +389,7 @@ const key = 'fixture-only-provider-key';
       for (const model of models) {
         await expect(page.getByRole('button', { name: model.display_name, exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
       }
-      await capture('model-menu-brands');
+      await captureThemes('model-menu-brands');
       await page.keyboard.press('Escape');
       for (const model of models) {
         await page.getByRole('button', { name: 'Choose model', exact: true }).click();
@@ -282,9 +414,9 @@ const key = 'fixture-only-provider-key';
         await expect(page.getByRole('button', { name: 'Reasoning effort', exact: true })).toHaveText('High');
       }
       await page.getByRole('button', { name: 'Reasoning effort', exact: true }).click();
-      await capture('thinking-menu');
+      await captureThemes('thinking-menu');
       await page.keyboard.press('Escape');
-      await capture('subscription-no-api-warning');
+      await captureThemes('subscription-no-api-warning');
       for (const model of models) {
         current = model;
         await page.goto(origin + '/agents/runs/composer-fixture');
@@ -336,6 +468,10 @@ const key = 'fixture-only-provider-key';
       await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
       await agentHeaders();
       await capture('streamed-transcript-image');
+      // verifyTheme leaves System saved. Device changes resolve the palette, not
+      // the account preference; use the helper that checks both independently.
+      await captureThemes('streamed-transcript-image');
+      expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
       const inlineImage = await page.evaluate(() => {
         const canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
         const data = canvas.toDataURL('image/png');
@@ -420,6 +556,7 @@ const key = 'fixture-only-provider-key';
       await failedCheck.click();
       await expect(page.getByText('Expected /agents/; received /login.', { exact: true })).toBeVisible();
       await capture('message-activity-details');
+      await captureThemes('message-activity-details');
 
       const noPinnedTasks = async () => {
         await expect(page.getByRole('complementary', { name: 'Tasks', exact: true })).toHaveCount(0);
@@ -446,10 +583,22 @@ const key = 'fixture-only-provider-key';
       await noPinnedTasks();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await capture('in-chat-plan');
+      await captureThemes('in-chat-plan');
       activity('todos', { agent_id: 'main', items: plan.map((step, i) => ({ ...step, status: i < 2 ? 'done' : 'in_progress' })) });
       await expect(checklist.locator('svg.lucide-check')).toHaveCount(2);
       await expect(checklist.getByRole('listitem')).toHaveText(plan.map(step => step.text));
       await noPinnedTasks();
+
+      // Keep the original activity-summary fixture above unchanged. Only this
+      // later call supplies a diff for the light/dark Changes screenshots.
+      activity('tool.start', { call_id: 'diff-preview', name: 'edit', title: 'api/src/auth.ts', input: { path: 'api/src/auth.ts' } });
+      activity('tool.end', { call_id: 'diff-preview', ok: true, diff: fixtureDiff });
+      if (width !== 1440) await page.getByRole('tab', { name: 'Changes & PR', exact: true }).click();
+      const diffCard = page.locator('[data-slot="card"]').filter({ has: page.getByRole('heading', { name: 'api/src/auth.ts', exact: true }) });
+      await expect(diffCard.locator('.bg-diff-add-line')).toContainText('return "/agents/"');
+      await expect(diffCard.locator('.bg-diff-del-line')).toContainText('return "/login"');
+      await captureThemes('run-diff');
+      if (width !== 1440) await page.getByRole('tab', { name: 'Transcript', exact: true }).click();
 
       // A GitHub merge updates the existing PR card and every current-state icon.
       activePreview = false; prState = 'open';
@@ -536,7 +685,8 @@ const key = 'fixture-only-provider-key';
     }
   };
   try {
-    await page.goto(origin + '/');
+    const documentResponse = await page.goto(origin + '/');
+    expect(documentResponse.headers()['content-security-policy']).toBe("img-src 'self' data: blob:");
     await expect(page).toHaveURL(origin + '/agents/');
     expect(await page.evaluate(() => ({ secure: isSecureContext, uuid: typeof crypto.randomUUID }))).toEqual({ secure: false, uuid: 'undefined' });
     const returning = process.env.PHASE === 'returning';
@@ -648,6 +798,7 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('menuitem', { name: 'Settings', exact: true }).click();
     await expect(page).toHaveURL(origin + '/agents/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+    await verifyTheme();
     if (!returning) {
       const categoryNames = ['Personal settings', 'Models', 'Security', 'Connections', 'People', 'Agent access', 'Account management'];
       await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
@@ -659,12 +810,12 @@ const key = 'fixture-only-provider-key';
         await expect(firstCard.getByRole('heading', { level: 3 })).toBeVisible();
         const style = await heading.evaluate(element => ({ size: parseFloat(getComputedStyle(element).fontSize), color: getComputedStyle(element).color, left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right }));
         expect(style.size).toBeGreaterThanOrEqual(22);
-        expect(style.color).toBe('rgb(237, 237, 237)');
+        expect(style.color).toBe(await page.locator('body').evaluate(element => getComputedStyle(element).color));
         expect(style.right).toBeLessThanOrEqual(width);
         expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
         // Three overviews cover the page; repeat screenshots after restart add
         // no coverage for layout that does not depend on persisted state.
-        if (['Personal settings', 'Security', 'Account management'].includes(name)) await capture('settings-category-' + name.toLowerCase().replaceAll(' ', '-'));
+        if (['Personal settings', 'Security', 'Account management'].includes(name)) await captureThemes('settings-category-' + name.toLowerCase().replaceAll(' ', '-'));
       }
     }
     await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['ChatGPT plan', 'Model providers']);
@@ -869,7 +1020,12 @@ const key = 'fixture-only-provider-key';
       try {
         const signed = await member.request.post(origin + '/api/auth/sign-in/email', { headers: { Origin: origin }, data: { email: 'member@example.test', password: 'test-password-only-123456' } });
         expect(signed.status()).toBe(200);
+        const memberTheme = await member.request.put(origin + '/api/v1/me/theme', { headers: { Origin: origin }, data: { theme: 'light' } });
+        expect(memberTheme.status()).toBe(200);
+        expect((await (await member.request.get(origin + '/api/v1/me')).json()).theme).toBe('light');
+        expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
         await member.goto(origin + '/agents/settings#connections');
+        await resolvedTheme('light', member);
         await expect(member.getByText('Connect your own GitHub account here. Your runs and pull requests use it.', { exact: true })).toBeVisible();
         await expect(member.getByRole('button', { name: 'Connect GitHub', exact: true })).toBeVisible();
         await expect(member.getByRole('heading', { name: 'Shared connection', exact: true })).toHaveCount(0);
@@ -895,7 +1051,13 @@ const key = 'fixture-only-provider-key';
     if (returning) {
       await page.getByLabel('Email', { exact: true }).fill('admin@example.test');
       await page.getByLabel('Password', { exact: true }).fill('test-password-only-123456');
+      // Observe the app's real requests: a successful password check alone does not
+      // guarantee hydration if the following session lookup is rate-limited.
+      const signingIn = page.waitForResponse(r => r.url() === origin + '/api/auth/sign-in/email' && r.request().method() === 'POST');
+      const gettingSession = page.waitForResponse(r => new URL(r.url()).pathname === '/api/auth/get-session' && new URL(r.url()).origin === origin && r.request().method() === 'GET');
       await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      expect((await signingIn).status()).toBe(200);
+      expect((await gettingSession).status()).toBe(200);
       await expect(page.getByRole('heading', { level: 1 })).toContainText(', Test');
       if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
       await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
@@ -959,7 +1121,7 @@ const key = 'fixture-only-provider-key';
     console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, screenshots }));
   } catch (error) {
     await capture('failure').catch(() => {});
-    console.log(JSON.stringify({ error: error.message, screenshots }));
+    console.log(JSON.stringify({ error: error.stack || error.message, diagnostics: { errors, authResponses }, screenshots }));
   } finally {
     await browser.close(); await new Promise(resolve => provider.close(resolve));
   }

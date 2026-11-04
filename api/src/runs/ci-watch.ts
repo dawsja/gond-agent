@@ -41,13 +41,14 @@ export function ciConfigPath(path: string): boolean {
 }
 
 /** Net changes plus every new commit: changing and then reverting CI is not a bypass. */
-export async function ciPushTouchesConfig(cwd: string, baseline: string): Promise<boolean> {
+export async function ciPushTouchesConfig(cwd: string, baseline: string, head = "HEAD"): Promise<boolean> {
   if (!/^[a-f0-9]{40}$/i.test(baseline)) throw new Error("Invalid previous CI revision");
-  const paths = (await git(cwd, "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", baseline, "HEAD", "--")).toString().split("\0");
+  if (head !== "HEAD" && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) throw new Error("Invalid CI publication revision");
+  const paths = (await git(cwd, "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", baseline, head, "--")).toString().split("\0");
   if (paths.some(ciConfigPath)) return true;
   // Fail closed if the imported history cannot prove descent from the pushed revision.
-  await git(cwd, "merge-base", "--is-ancestor", baseline, "HEAD");
-  const history = await git(cwd, "log", "--format=", "--name-only", "--no-renames", "--diff-merges=first-parent", "-z", `${baseline}..HEAD`, "--");
+  await git(cwd, "merge-base", "--is-ancestor", baseline, head);
+  const history = await git(cwd, "log", "--format=", "--name-only", "--no-renames", "--diff-merges=first-parent", "-z", `${baseline}..${head}`, "--");
   return history.toString().split("\0").some(ciConfigPath);
 }
 

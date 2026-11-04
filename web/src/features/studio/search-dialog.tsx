@@ -104,7 +104,7 @@ export function SearchDialog({
   return (
     <Dialog.Root open={open} onOpenChange={change}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-overlay/60" />
         <Dialog.Content
           aria-describedby={undefined}
           onKeyDown={(e) => {

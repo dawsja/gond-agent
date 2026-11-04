@@ -315,6 +315,11 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
         return <PlanCard key={it.key} steps={it.steps} />
       case "agents":
         return <AgentsBlock key={it.key} agents={it.agents} />
+      case "compacted":
+        return <p key={it.key} className="text-xs text-muted-foreground">
+          Context compacted
+          {it.before !== undefined && it.after !== undefined && <> · {it.before.toLocaleString()} → ~{it.after.toLocaleString()} tokens</>}
+        </p>
       case "pr":
         return (
           <a key={it.key} href={it.url} target="_blank" rel="noreferrer" className="w-fit rounded-sm outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">

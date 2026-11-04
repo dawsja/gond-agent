@@ -77,9 +77,9 @@ beforeEach(async () => {
   db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
     .run("u", seal(cfg.secret, "test-owner-github-token"), Date.now());
   runs = new Runs(db, cfg, factory);
-  vi.mocked(importBundle).mockImplementation(async (_cwd, _bundle, _branch, _env, beforePush) => {
+  vi.mocked(importBundle).mockImplementation(async (cwd, _bundle, branch, _env, _retry, options) => {
     // Match importBundle's real ordering: validation must complete before push.
-    await beforePush?.();
+    await options?.beforeAttempt?.({ cwd, branch, head: NEXT });
     pushed();
   });
   vi.mocked(git).mockImplementation(async (_cwd, ...args) => {
@@ -332,10 +332,11 @@ describe("run service automatic CI hooks", () => {
     await service().finish("run", live);
 
     expect(importBundle).toHaveBeenCalledExactlyOnceWith(
-      "/fake", Buffer.from("bundle"), "gond-agent/fix", expect.objectContaining({ GH_TOKEN: "test-owner-github-token" }), expect.any(Function),
+      "/fake", Buffer.from("bundle"), "gond-agent/fix", expect.objectContaining({ GH_TOKEN: "test-owner-github-token" }), undefined,
+      expect.objectContaining({ beforeAttempt: expect.any(Function) }),
     );
     expect(git).toHaveBeenCalledExactlyOnceWith(
-      "/fake", "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", SHA, "HEAD", "--",
+      "/fake", "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", SHA, NEXT, "--",
     );
     expect(pushed).not.toHaveBeenCalled();
     expect(runs.get("run")).toMatchObject({
