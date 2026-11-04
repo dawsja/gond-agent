@@ -41,6 +41,7 @@ function deferred<T>() {
 class ControlledWorkspace implements Workspace {
   readonly calls: { method: string; args?: Record<string, unknown> }[] = [];
   rejectEventsOnDestroy = false;
+  state = { head: "b".repeat(40), clean: true };
   private batches: Batch[] = [];
   private poll?: ReturnType<typeof deferred<Batch>>;
   constructor(readonly id: string, private starts: string[], private releases: string[]) {}
@@ -61,6 +62,7 @@ class ControlledWorkspace implements Workspace {
       this.poll = deferred<Batch>();
       return this.poll.promise as Promise<T>;
     }
+    if (method === "workspace_state") return { ...this.state } as T;
     if (method === "snapshot") return { bundle: Buffer.from("bundle").toString("base64"), head: "b".repeat(40) } as T;
     if (method === "send" && (args?.input as { type?: string })?.type === "interrupt")
       this.emit({ type: "turn.end", agent_id: "main", stop_reason: "interrupted" });
@@ -210,7 +212,7 @@ describe("persistent workspace queue", () => {
     expect(queuedIds()).toEqual([]);
   });
 
-  it.each(["ready", "stopped", "failed"])("counts a live %s workspace until close or kept-failure reclamation", async status => {
+  it.each(["ready", "stopped", "failed"])("preserves a live %s workspace until close, including failed kept work", async status => {
     const active = await create(), waiting = await create("b");
     if (status === "ready") await finish(active.id);
     else if (status === "stopped") { await runs.stop(active.id, "a"); await flush(); }
@@ -223,15 +225,10 @@ describe("persistent workspace queue", () => {
     }
     expect(runs.get(active.id).status).toBe(status);
     runs.drain(); await flush();
-    if (status === "failed") {
-      // A kept failure still owns a slot, but queued work now reclaims it.
-      expect(runs.get(active.id).work_kept).toBe(false);
-      expect(releases).toEqual([active.id]);
-    } else {
-      expect(starts).toEqual([active.id]);
-      expect(releases).toEqual([]);
-      expect(runs.get(waiting.id).status).toBe("queued");
-    }
+    expect(starts).toEqual([active.id]);
+    expect(releases).toEqual([]);
+    expect(runs.get(waiting.id).status).toBe("queued");
+    if (status === "failed") expect(runs.get(active.id).work_kept).toBe(true);
     await runs.closeSession(active.id, "a"); await flush();
     expect(starts).toEqual([active.id, waiting.id]);
   });
@@ -252,13 +249,16 @@ describe("persistent workspace queue", () => {
     expect(checkout).toHaveBeenCalledTimes(2);
   });
 
-  it("drains after a worker exits, without retrying the failed run ahead of waiting work", async () => {
+  it("preserves work after a worker exits, then drains after explicit close without retrying ahead of waiting work", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const active = await create(), waiting = await create("b");
-    // Unlike a model error event, a dead worker releases its live workspace.
+    // The container can still contain uncommitted work even if its worker exited.
     workspaces.get(active.id)!.exit();
     await flush();
-    expect(runs.get(active.id).status).toBe("failed");
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true });
+    expect(releases).toEqual([]);
+    expect(starts).toEqual([active.id]);
+    await runs.closeSession(active.id, "a"); await flush();
     expect(releases).toEqual([active.id]);
     expect(starts).toEqual([active.id, waiting.id]);
   });
@@ -270,7 +270,7 @@ describe("persistent workspace queue", () => {
     await flush();
     expect(runs.get(active.id).status).toBe("merged");
     expect(releases).toEqual([active.id]);
-    expect(starts).toEqual([active.id, waiting.id]);
+    await vi.waitFor(() => expect(starts).toEqual([active.id, waiting.id]));
   });
 
   it("keeps replacement messages accepted while a stopped startup is still unwinding", async () => {
@@ -352,7 +352,15 @@ describe("persistent workspace queue", () => {
       });
       expect(response.status).toBe(201);
       const http = await response.json();
-      expect(http).toMatchObject({ status: "queued", queue_position: 1, queue_length: 1 });
+      const capacity = { max: 1, occupied: 1, working: 1, idle_releasable: 0, queued_total_for_account: 1 };
+      const queue_reason = "All 1 workspace is in use: 1 working, 0 idle. Idle workspaces can be closed to free a slot.";
+      expect(http).toMatchObject({ status: "queued", queue_position: 1, queue_length: 1, capacity, queue_reason });
+      for (const path of [`/api/v1/runs/${http.id}`, "/api/v1/runs"]) {
+        const read = await app.request(cfg.origin + path, { headers: { cookie } });
+        expect(read.status).toBe(200);
+        const data = await read.json();
+        expect(data.runs ? data.runs[0] : data).toMatchObject({ capacity, queue_reason });
+      }
       const token = createToken(db, user, "Queue fixture");
       await client.connect(new StreamableHTTPClientTransport(new URL(cfg.origin + "/mcp"), {
         requestInit: { headers: { Authorization: `Bearer ${token.token}` } },
@@ -365,7 +373,12 @@ describe("persistent workspace queue", () => {
       };
       const args = { ...input("MCP start"), request_id: "start-1" };
       const started = await call("start_session", args);
-      expect(started).toMatchObject({ state: "queued", queue_position: 2, queue_length: 2 });
+      capacity.queued_total_for_account = 2;
+      expect(started).toMatchObject({ state: "queued", queue_position: 2, queue_length: 2, capacity, queue_reason });
+      expect(await call("get_session", { session_id: http.id })).toMatchObject({ capacity, queue_reason });
+      expect(await call("read_session_events", { session_id: http.id })).toMatchObject({ capacity, queue_reason });
+      expect((await call("list_sessions")).sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: http.id, capacity, queue_reason })]));
+      expect(runs.history(http.id, 0).filter(e => e.type === "run.queued").at(-1)).toMatchObject({ capacity, queue_reason });
       expect((await call("start_session", args)).id).toBe(started.id);
       expect((await call("get_session", { session_id: http.id })).queue_length).toBe(2);
       expect((await call("list_sessions")).sessions.map((r: { id: string }) => r.id).sort()).toEqual([http.id, started.id].sort());
@@ -383,6 +396,173 @@ describe("persistent workspace queue", () => {
       await runs.close(started.id); await flush();
       expect(workspaces.get(http.id)!.users()).toEqual([message.text]);
     } finally { await client.close(); await mcp.close(); await githubLogin.close(); }
+  });
+
+  it("shows capacity then releases the oldest safe idle workspace for account-fair waiting work", async () => {
+    cfg.maxRuns = 2;
+    const oldest = await create(), newer = await create();
+    await finish(oldest.id);
+    vi.setSystemTime(Date.now() + 1000);
+    await finish(newer.id);
+    const a1 = await create("a", "A first"), b1 = await create("b", "B first"), a2 = await create("a", "A second");
+    expect(runs.get(a1.id).capacity).toEqual({ max: 2, occupied: 2, working: 0, idle_releasable: 0, queued_total_for_account: 2 });
+    vi.setSystemTime(Date.now() + 120_000);
+    expect(runs.get(a1.id).capacity?.idle_releasable).toBe(2);
+    const gate = deferred<void>(); gates.push(gate);
+    const workspace = workspaces.get(oldest.id)!;
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    runs.drain(); await flush();
+    runs.drain(); runs.drain(); await flush();
+    expect(starts).toEqual([oldest.id, newer.id]);
+    expect(workspaces.get(newer.id)!.calls.filter(c => c.method === "snapshot")).toHaveLength(1);
+    gate.resolve(); await flush();
+    expect(releases).toEqual([oldest.id, newer.id]);
+    expect(starts).toEqual([oldest.id, newer.id, b1.id, a1.id]); // B has fewer occupied slots; A remains FIFO.
+    expect(queuedIds()).toEqual([a2.id]);
+    expect(runs.history(oldest.id, 0).filter(e => e.type === "run.released"))
+      .toEqual([expect.objectContaining({ reason: "idle_for_waiting_work" })]);
+    expect(runs.get(oldest.id)).toMatchObject({ status: "ready", pushed: true, phase: "idle" });
+    await runs.close(b1.id); await flush();
+    expect(starts.at(-1)).toBe(a2.id);
+    runs.enqueue(oldest.id, "a", "Reopen released branch");
+    await runs.close(a1.id); await flush();
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
+    expect(workspaces.get(oldest.id)!.users()).toEqual(["Reopen released branch"]);
+  });
+
+  it.each(["dirty", "different head", "question", "CI watch", "pending message", "auto resume", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
+    const active = await create(); await finish(active.id);
+    if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;
+    else if (unsafe === "different head") workspaces.get(active.id)!.state.head = "c".repeat(40);
+    else {
+      const r = runs.get(active.id);
+      if (unsafe === "question") r.summary.question = { request_id: "q", question: "Which?" };
+      if (unsafe === "CI watch") r.ci_active = true;
+      if (unsafe === "pending message") r.pending.push({ text: "Pending", images: [] });
+      if (unsafe === "auto resume") r.phase = "auto_resume_pending";
+      if (unsafe === "merged pending") r.pr_state = "merged";
+      runs.save(r);
+    }
+    const waiting = await create("b");
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    expect(releases).toEqual([]);
+    expect(starts).toEqual([active.id]);
+    expect(runs.get(waiting.id).status).toBe("queued");
+    expect(runs.get(waiting.id).capacity?.idle_releasable).toBe(0);
+    expect(runs.history(active.id, 0).some(e => e.type === "run.released")).toBe(false);
+  });
+
+  it("retains a workspace if publication creates new edits or a background writer", async () => {
+    const active = await create(); await finish(active.id);
+    const waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    const rpc = workspace.rpc.bind(workspace);
+    vi.spyOn(workspace, "rpc").mockImplementation((method, args) => {
+      if (method === "workspace_state" && workspace.calls.filter(c => c.method === "snapshot").length >= 2)
+        return Promise.resolve({ head: "b".repeat(40), clean: false });
+      return rpc(method, args);
+    });
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    expect(workspace.calls.filter(c => c.method === "snapshot")).toHaveLength(2);
+    expect(releases).toEqual([]);
+    expect(runs.get(active.id).status).toBe("ready");
+    expect(runs.get(waiting.id)).toMatchObject({ status: "queued", capacity: { idle_releasable: 0 } });
+    expect(runs.history(active.id, 0).some(e => e.type === "run.released")).toBe(false);
+  });
+
+  it("reprobes transient dirty evidence and starts waiting work without another turn or read", async () => {
+    const active = await create();
+    const workspace = workspaces.get(active.id)!;
+    workspace.state.clean = false;
+    await finish(active.id);
+    const waiting = await create("b");
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    expect(releases).toEqual([]);
+    workspace.state.clean = true;
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("does not let a slow unsuccessful probe starve a newer safe idle workspace", async () => {
+    cfg.maxRuns = 2;
+    const oldest = await create(); await finish(oldest.id);
+    vi.setSystemTime(Date.now() + 1000);
+    const newer = await create(); await finish(newer.id);
+    const waiting = await create("b");
+    const workspace = workspaces.get(oldest.id)!;
+    const rpc = workspace.rpc.bind(workspace);
+    const probe = deferred<{ head: string; clean: boolean }>();
+    vi.spyOn(workspace, "rpc").mockImplementation((method, args) => method === "workspace_state" ? probe.promise : rpc(method, args));
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    vi.setSystemTime(Date.now() + 120_000); // Probe took longer than the retry cooldown.
+    probe.resolve({ head: "b".repeat(40), clean: false });
+    await flush();
+    expect(releases).toEqual([newer.id]);
+    expect(starts).toEqual([oldest.id, newer.id, waiting.id]);
+    expect(runs.get(oldest.id).status).toBe("ready");
+  });
+
+  it("retains capacity on failed destruction and permits explicit teardown retry, not lost follow-ups", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(); await finish(active.id);
+    const waiting = await create("b");
+    vi.spyOn(workspaces.get(active.id)!, "destroy").mockRejectedValueOnce(new Error("fixture cleanup failed"));
+    vi.setSystemTime(Date.now() + 120_000);
+    runs.drain(); await flush();
+    expect(starts).toEqual([active.id]);
+    expect(runs.get(waiting.id)).toMatchObject({ status: "queued", capacity: { occupied: 1 } });
+    expect(runs.history(active.id, 0).some(e => e.type === "run.released")).toBe(false);
+    expect(() => runs.enqueue(active.id, "a", "Must not be lost")).toThrow(expect.objectContaining({ code: "workspace_closing" }));
+    await runs.closeSession(active.id, "a"); await flush();
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("leaves old safe idle workspaces open without waiting work", async () => {
+    const active = await create(); await finish(active.id);
+    vi.setSystemTime(Date.now() + 3600_000);
+    runs.drain(); await flush();
+    expect(releases).toEqual([]);
+    expect(runs.get(active.id).status).toBe("ready");
+  });
+
+  it("does not release when idle release is disabled", async () => {
+    await runs.shutdown();
+    vi.stubEnv("GOND_AGENT_IDLE_RELEASE_SECONDS", "0");
+    runs = new Runs(db, cfg, factory);
+    const active = await create(); await finish(active.id);
+    vi.setSystemTime(Date.now() + 3600_000);
+    runs.drain(); await flush();
+    const waiting = await create("b");
+    runs.drain(); await flush();
+    expect(releases).toEqual([]);
+    expect(runs.get(waiting.id).capacity?.idle_releasable).toBe(0);
+    expect(starts).toEqual([active.id]);
+  });
+
+  it("runtime evidence: two slots, one working, one idle, one waiting", async () => {
+    cfg.maxRuns = 2;
+    const idle = await create("a", "Idle"), working = await create("a", "Working");
+    await finish(idle.id);
+    const waiting = await create("b", "Waiting");
+    const before = runs.get(waiting.id);
+    console.log(`BEFORE (legacy queue projection): queued, position ${before.queue_position} of ${before.queue_length}; reason absent`);
+    console.log(`AFTER visibility: ${before.queue_reason}`);
+    expect(before.capacity).toEqual({ max: 2, occupied: 2, working: 1, idle_releasable: 0, queued_total_for_account: 1 });
+    vi.setSystemTime(Date.now() + 120_000);
+    console.log(`AT 120s: idle_releasable=${runs.get(waiting.id).capacity?.idle_releasable}`);
+    runs.drain(); await flush();
+    const event = runs.history(idle.id, 0).find(e => e.type === "run.released");
+    expect(event?.reason).toBe("idle_for_waiting_work");
+    expect(starts).toEqual([idle.id, working.id, waiting.id]);
+    expect(releases).toEqual([idle.id]);
+    console.log(`RELEASE: ${event!.reason}; idle closed; working untouched; waiting=${runs.get(waiting.id).status}`);
   });
 
   it("bounds waiting runs globally and per account, without leaving partial runs or claiming images", async () => {
@@ -585,26 +765,28 @@ describe("persistent workspace queue", () => {
     expect(runs.get(failed.id).work_kept).toBe(false);
   });
 
-  it("reclaims a failure for already queued work and reserves the reclaimed slot only once", async () => {
+  it("preserves a failed publication under queue pressure, then reserves capacity only after explicit release", async () => {
     const active = await create(), first = await create("b"), second = await create("c");
     const gate = deferred<void>();
     gates.push(gate);
     const workspace = workspaces.get(active.id)!;
     const destroy = workspace.destroy.bind(workspace);
     vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
-    // Publication imported this commit before its push failed. Capacity eviction
-    // must retain the API clone/commit, as in the retry/keep-work contract.
+    // Publication imported this commit before its push failed. Waiting work must
+    // not evict it; an explicit capacity close still preserves the imported commit.
     vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", { class: "server", retryable: true, reason: "GitHub returned 500" }, 5));
     workspace.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
     await flush();
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true });
+    expect(releases).toEqual([]);
+    expect(queuedIds()).toEqual([first.id, second.id]);
+    const closing = runs.close(active.id, true);
     expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false, kept_commit: "b".repeat(40) });
-    expect(membership(first.id).queue_seq).toBeNull();
-    expect(queuedIds()).toEqual([second.id]);
     expect(starts).toEqual([active.id]); // Replacement waits for destruction.
     const third = await create("a");
     runs.drain();
-    expect(queuedIds()).toEqual([second.id, third.id]);
-    gate.resolve(); await flush();
+    expect(queuedIds()).toEqual([first.id, second.id, third.id]);
+    gate.resolve(); await closing; await flush();
     expect(starts).toEqual([active.id, first.id]);
     expect(queuedIds()).toEqual([second.id, third.id]);
   });

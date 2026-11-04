@@ -683,6 +683,65 @@ class CheckpointTest(unittest.TestCase):
         return (self.git("rev-parse", "HEAD"), self.git("symbolic-ref", "HEAD"),
                 (self.root / ".git/index").read_bytes(), self.git("show-ref"))
 
+    @mock.patch.object(agent, "workspace_quiescent", return_value=True)
+    def test_workspace_state_verifies_real_head_and_clean_tree_without_changing_index(self, _quiescent):
+        before = self.state()
+        self.assertEqual(agent.dispatch({"method": "workspace_state"}), {"head": self.head, "clean": True})
+        self.assertEqual(self.state(), before)
+        for kind in ("edit", "untracked", "staged", "staged-ignored", "deleted", "mode"):
+            with self.subTest(kind=kind):
+                self.git("reset", "--hard", self.head)
+                self.git("clean", "-fdx")
+                if kind == "edit":
+                    self.write("edit.txt", "changed\n")
+                elif kind == "untracked":
+                    self.write("new.txt", "new\n")
+                elif kind == "staged":
+                    self.write("edit.txt", "staged\n")
+                    self.git("add", "edit.txt")
+                    self.write("edit.txt", "head\n")
+                elif kind == "staged-ignored":
+                    self.write("ignored-secret", "kept\n")
+                    self.git("add", "-f", "ignored-secret")
+                elif kind == "deleted":
+                    (self.root / "deleted.txt").unlink()
+                else:
+                    (self.root / "mode.sh").chmod(0o755)
+                before = self.state()
+                self.assertEqual(agent.dispatch({"method": "workspace_state"}), {"head": self.head, "clean": False})
+                self.assertEqual(self.state(), before)
+        self.git("reset", "--hard", self.head)
+        self.git("clean", "-fdx")
+        self.write("ignored-cache", "ordinary ignored files are not published\n")
+        self.assertTrue(agent.dispatch({"method": "workspace_state"})["clean"])
+
+    @mock.patch.object(agent, "workspace_quiescent", return_value=True)
+    def test_workspace_state_does_not_execute_checkout_filters_or_fsmonitor(self, _quiescent):
+        marker = self.root / "executed"
+        self.git("config", "filter.hostile.clean", f"touch {marker}; cat")
+        self.git("config", "filter.hostile.required", "true")
+        self.git("config", "core.fsmonitor", f"touch {marker}")
+        self.write(".gitattributes", "*.txt filter=hostile\n")
+        self.assertFalse(agent.dispatch({"method": "workspace_state"})["clean"])
+        self.assertFalse(marker.exists())
+
+    def test_workspace_state_rejects_background_processes_and_submodules(self):
+        with mock.patch.object(agent, "workspace_quiescent", return_value=False):
+            self.assertFalse(agent.dispatch({"method": "workspace_state"})["clean"])
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.head},submodule")
+        self.git("commit", "-qm", "gitlink")
+        with mock.patch.object(agent, "workspace_quiescent", return_value=True):
+            self.assertFalse(agent.dispatch({"method": "workspace_state"})["clean"])
+
+    def test_quiescence_counts_detached_processes_and_fails_closed(self):
+        allowed = [pathlib.Path("1"), pathlib.Path(str(os.getpid())), pathlib.Path("self")]
+        with mock.patch.object(pathlib.Path, "iterdir", return_value=iter(allowed)):
+            self.assertTrue(agent.workspace_quiescent())
+        with mock.patch.object(pathlib.Path, "iterdir", return_value=iter(allowed + [pathlib.Path("999999")])):
+            self.assertFalse(agent.workspace_quiescent())
+        with mock.patch.object(pathlib.Path, "iterdir", side_effect=OSError):
+            self.assertFalse(agent.workspace_quiescent())
+
     def test_round_trip_preserves_head_index_branch_ignored_files_and_publication(self):
         self.write("edit.txt", "staged\n")
         self.git("add", "edit.txt")

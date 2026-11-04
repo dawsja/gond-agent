@@ -62,6 +62,15 @@ export type StreamEvent =
 
 export const emptyUsage = (): Usage => ({ input_uncached: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0 });
 
+/** Service workspace admission view; queue totals are scoped to the requesting account. */
+export interface Capacity {
+  max: number;
+  occupied: number;
+  working: number;
+  idle_releasable: number;
+  queued_total_for_account: number;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,

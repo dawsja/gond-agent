@@ -27,6 +27,13 @@ export function failedKeepMs(): number {
     throw new Error("Invalid GOND_AGENT_FAILED_KEEP_MINUTES");
   return minutes * 60_000;
 }
+export function idleReleaseMs(): number {
+  const raw = process.env.GOND_AGENT_IDLE_RELEASE_SECONDS ?? "120";
+  const seconds = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(seconds) || seconds > 0xffff_ffff)
+    throw new Error("Invalid GOND_AGENT_IDLE_RELEASE_SECONDS");
+  return seconds * 1000;
+}
 export function planSetting(name: "GOND_AGENT_PLAN_REMINDER_EVERY" | "GOND_AGENT_PLAN_NUDGE_LIMIT"): number {
   const fallback = name === "GOND_AGENT_PLAN_REMINDER_EVERY" ? 6 : 2;
   const raw = process.env[name];
@@ -61,6 +68,7 @@ export function questionWaitMinutes(): number {
 export function configFromEnv(): Config {
   modelStallMs();
   failedKeepMs();
+  idleReleaseMs();
   webSearchLimit();
   questionWaitMinutes();
   planSetting("GOND_AGENT_PLAN_REMINDER_EVERY");

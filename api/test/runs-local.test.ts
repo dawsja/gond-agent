@@ -488,6 +488,10 @@ describe("persistent local run lifecycle", () => {
         const healthy = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Healthy"});
         await vi.waitFor(() => expect(runs.get(healthy.id).status).toBe("ready"));
         const replacement = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Reclaim failed workspace"});
+        expect(runs.get(replacement.id).status).toBe("queued");
+        expect(runs.get(r.id).work_kept).toBe(true);
+        expect(destroy).not.toHaveBeenCalled();
+        await runs.close(r.id, true); // Explicitly prepare the legacy kept-commit recovery path; queue pressure cannot evict it.
         await vi.waitFor(() => expect(runs.get(replacement.id).status).toBe("ready"));
         expect(destroy).toHaveBeenCalledTimes(1);
         expect(runs.get(r.id)).toMatchObject({work_kept:false,kept_commit:"b".repeat(40),pushed:false});
@@ -590,17 +594,19 @@ describe("persistent local run lifecycle", () => {
       captured.mockRestore();
     }
   });
-  it("reclaims the oldest kept failure at capacity and still releases failures on stop", async () => {
+  it("preserves kept failures at capacity and releases them only on explicit stop or close", async () => {
     workerFailure = "The model connection dropped 3 times";
     const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
     const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
     await vi.waitFor(() => expect(runs.get(first.id).status).toBe("failed"));
     await vi.waitFor(() => expect(runs.get(second.id).status).toBe("failed"));
     const third = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"});
-    await vi.waitFor(() => expect(runs.get(third.id).status).toBe("failed"));
-    expect(runs.get(first.id).work_kept).toBe(false);
+    expect(runs.get(third.id).status).toBe("queued");
+    expect(runs.get(first.id).work_kept).toBe(true);
     expect(runs.get(second.id).work_kept).toBe(true);
+    expect(destroy).not.toHaveBeenCalled();
     await runs.stop(first.id,"u");
+    await vi.waitFor(() => expect(runs.get(third.id).status).toBe("failed"));
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(runs.get(first.id).work_kept).toBe(false);
     await runs.closeSession(second.id,"u");
@@ -626,7 +632,7 @@ describe("persistent local run lifecycle", () => {
     expect(runs.get(first.id).work_kept).toBe(true);
     expect(runs.get(second.id).work_kept).toBe(true);
   });
-  it("reclaims a kept failure for a follow-up and republishes its imported commit before re-cloning", async () => {
+  it("preserves a kept failure under follow-up pressure, then recovers its imported commit after explicit release", async () => {
     const stopped = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Stopped"});
     await vi.waitFor(() => expect(runs.get(stopped.id).status).toBe("ready"));
     await runs.close(stopped.id);
@@ -644,8 +650,13 @@ describe("persistent local run lifecycle", () => {
     destroy.mockImplementationOnce(() => new Promise<void>(done => { destroyed = done; }));
     runs.enqueue(stopped.id, "u", "Resume at capacity");
     await new Promise(resolve => setTimeout(resolve, 0));
-    expect(checkout).toHaveBeenCalledTimes(3); // Replacement waits for resource release.
+    expect(checkout).toHaveBeenCalledTimes(3); // Queue pressure does not evict kept work.
+    expect(runs.get(kept.id).work_kept).toBe(true);
+    expect(destroy).not.toHaveBeenCalled();
+    const closing = runs.close(kept.id, true); // Retain legacy imported-commit recovery coverage.
+    expect(checkout).toHaveBeenCalledTimes(3); // Replacement still waits for resource release.
     destroyed();
+    await closing;
     await vi.waitFor(() => expect(checkout).toHaveBeenCalledTimes(4));
     await vi.waitFor(() => expect(runs.get(stopped.id).status).toBe("ready"));
     expect(destroy).toHaveBeenCalledTimes(1);
@@ -696,7 +707,7 @@ describe("persistent local run lifecycle", () => {
     expect(checkout).toHaveBeenCalledTimes(1);
     expect(log.filter(call => call.method === "send" && (call.input as any)?.type === "user")).toHaveLength(1);
   });
-  it("honors Stop while waiting for a reclaimed workspace to be destroyed", async () => {
+  it("honors Stop while waiting for an explicitly closed kept workspace to be destroyed", async () => {
     workerFailure = "The model connection dropped 3 times";
     const kept = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Kept"});
     await vi.waitFor(() => expect(runs.get(kept.id).status).toBe("failed"));
@@ -706,8 +717,12 @@ describe("persistent local run lifecycle", () => {
     let release!: () => void;
     destroy.mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
     const stopped = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Stop before startup"});
+    expect(runs.get(stopped.id).status).toBe("queued");
+    expect(runs.get(kept.id).work_kept).toBe(true);
+    const closing = runs.closeSession(kept.id, "u");
     await runs.stop(stopped.id, "u");
     release();
+    await closing;
     await vi.waitFor(() => expect((runs as unknown as {booting:Set<string>}).booting.has(stopped.id)).toBe(false));
     await vi.waitFor(() => expect(runs.get(stopped.id)).toMatchObject({status:"stopped",phase:"idle",pending:[]}));
     expect(checkout).toHaveBeenCalledTimes(2);

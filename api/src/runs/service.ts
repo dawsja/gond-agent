@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
-import { failedKeepMs, planSetting, webSearchLimit, questionWaitMinutes, type Config } from "../config";
+import { idleReleaseMs, failedKeepMs, planSetting, webSearchLimit, questionWaitMinutes, type Config } from "../config";
 import type { Store } from "../db";
 import type { Workspace, WorkspaceFactory } from "../containers";
 import {
@@ -40,6 +40,7 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
+import { capacityReason, releasable, type Capacity, type ReleaseCandidate, type WorkspaceState } from "./capacity";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
@@ -63,6 +64,8 @@ export interface Run extends CiInfo {
   status: string;
   queue_position?: number;
   queue_length?: number;
+  capacity?: Capacity;
+  queue_reason?: string;
   step: string | null;
   created_at: number;
   updated_at: number;
@@ -106,8 +109,12 @@ interface Live {
   closed: boolean;
   busy: boolean;
   closing?: boolean;
+  destruction?: Promise<void>;
   keepTimer?: ReturnType<typeof setTimeout>;
   keptSince?: number;
+  idleSince?: number;
+  lastIdleProbe?: number;
+  state?: WorkspaceState;
   publishPending?: { snapshot?: { bundle: string; head: string }; imported?: boolean };
 }
 export class Runs {
@@ -118,13 +125,14 @@ export class Runs {
   private cancelledBoots = new Set<string>();
   private launches = new Map<string, Promise<void>>();
   private pumps = new Map<string, Promise<void>>();
-  private releasing = new Set<Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
   private ci: CiWatch;
   private queue: RunQueue;
   private draining = false;
+  private idleRelease?: Promise<void>;
+  private readonly idleDelay = idleReleaseMs();
   private queueTimer: ReturnType<typeof setInterval>;
   constructor(
     private db: Store,
@@ -190,7 +198,7 @@ export class Runs {
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
     if (!r) throw new ApiError(404, "not_found", "That run doesn't exist.");
     const run = this.restorePlan(parseRun(r.data));
-    return Object.assign(run, this.queue.info(run.id, run.user_id));
+    return this.withQueueInfo(run);
   }
   list(user: string): Run[] {
     return (
@@ -201,8 +209,34 @@ export class Runs {
         .all(user) as { data: string }[]
     ).map((r) => {
       const run = this.restorePlan(parseRun(r.data));
-      return Object.assign(run, this.queue.info(run.id, user));
+      return this.withQueueInfo(run);
     });
+  }
+  private withQueueInfo(run: Run): Run {
+    const info = this.queue.info(run.id, run.user_id);
+    if (!info.queue_position) return run;
+    const capacity = this.capacity(run.user_id);
+    return Object.assign(run, info, { capacity, queue_reason: capacityReason(capacity) });
+  }
+  private releaseCandidate(id: string, live: Live): ReleaseCandidate {
+    const row = this.db.prepare("SELECT data FROM runs WHERE id=? AND deleted_at IS NULL").get(id) as { data: string } | undefined;
+    return {
+      run: row ? parseRun(row.data) : { status: "deleted", phase: "idle", pending: [], summary: emptySummary(), pushed: false, head_sha: null, pr_state: null },
+      live: this.live.get(id) === live && !live.closed, busy: live.busy, closing: !!live.closing,
+      booting: this.booting.has(id), publicationPending: !!live.publishPending,
+      idleSince: live.idleSince, delayMs: this.idleDelay, state: live.state,
+    };
+  }
+  private capacity(user: string): Capacity {
+    let working = 0, idle_releasable = 0;
+    for (const id of this.occupied()) {
+      const live = this.live.get(id);
+      const row = this.db.prepare("SELECT status FROM runs WHERE id=?").get(id) as { status: string } | undefined;
+      if (this.booting.has(id) || live?.busy || row?.status === "working") working++;
+      if (live && releasable(this.releaseCandidate(id, live), Date.now())) idle_releasable++;
+    }
+    return { max: this.cfg.maxRuns, occupied: this.occupied().size, working, idle_releasable,
+      queued_total_for_account: this.queue.waiting().filter(entry => entry.user_id === user).length };
   }
   private restorePlan(r: Run): Run {
     // Retention describes this process's live workspace, never a restart guarantee.
@@ -228,6 +262,8 @@ export class Runs {
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
+    delete r.capacity;
+    delete r.queue_reason;
     // Lifecycle snapshots must not reset newer description overrides or search/CI counts.
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
@@ -326,20 +362,54 @@ export class Runs {
     this.drain();
   }
   private occupied() { return new Set([...this.live.keys(), ...this.booting]); }
-  private hasCapacity(reclaim = false) {
-    if (this.occupied().size < this.cfg.maxRuns) return true;
-    const oldest = [...this.live].filter(([id, live]) =>
-      live.keptSince !== undefined && !live.busy && !live.closing && !this.booting.has(id) && this.get(id).work_kept,
-    ).sort((a, b) => a[1].keptSince! - b[1].keptSince!)[0];
-    if (!oldest) return false;
-    if (!reclaim) return true;
-    // Detach synchronously so drain can reserve this slot without yielding.
-    // Boot waits for destruction before allocating a replacement container.
-    const release = this.close(oldest[0], true);
-    this.releasing.add(release);
-    void release.catch(() => console.error("Couldn't release failed workspace", oldest[0]))
-      .finally(() => this.releasing.delete(release));
-    return true;
+  private hasCapacity() { return this.occupied().size < this.cfg.maxRuns; }
+  private releaseIdleForWaitingWork() {
+    if (this.idleRelease || this.shuttingDown || this.hasCapacity() || !this.queue.first(new Map(), this.occupied())) return;
+    const now = Date.now();
+    const oldest = [...this.live].filter(([id, live]) => {
+      if (live.lastIdleProbe !== undefined && now - live.lastIdleProbe < 60_000) return false;
+      const candidate = this.releaseCandidate(id, live);
+      // Probe otherwise-safe workspaces even after a transient failure/dirty
+      // observation. This provisional evidence is never counted or used to close.
+      return releasable({ ...candidate, state: { head: candidate.run.head_sha ?? "", clean: true } }, now);
+    }).sort((a, b) => a[1].idleSince! - b[1].idleSince!)[0];
+    if (!oldest) return;
+    const [id, live] = oldest;
+    live.lastIdleProbe = now;
+    live.closing = true; // Block follow-ups while checking the actual worker again.
+    const release = (async () => {
+      try {
+        live.state = await live.workspace.rpc<WorkspaceState>("workspace_state");
+        const candidate = this.releaseCandidate(id, live);
+        candidate.closing = false; // This release owns the closing lock.
+        if (this.shuttingDown || this.hasCapacity() || !this.queue.first(new Map(), this.occupied()) || !releasable(candidate, Date.now())) return;
+        live.closing = false;
+        // Same snapshot/push and teardown path as an explicit Close workspace.
+        const result = await this.closeSession(id, this.get(id).user_id, async () => {
+          // Snapshot can run repository filters. Verify again afterwards so a
+          // writer or edit created during publication cannot be discarded.
+          live.state = await live.workspace.rpc<WorkspaceState>("workspace_state");
+          const current = this.releaseCandidate(id, live);
+          return !this.shuttingDown && !this.hasCapacity() && !!this.queue.first(new Map(), this.occupied()) &&
+            releasable({ ...current, closing: false }, Date.now());
+        });
+        if (result.closed) this.append(id, { type: "run.released", reason: "idle_for_waiting_work" });
+      } catch {
+        live.state = undefined;
+        console.error("Couldn't release idle workspace", id);
+      } finally {
+        // Cool down from completion, not request start: a slow failed probe must
+        // give newer safe workspaces a chance on the next drain pass.
+        live.lastIdleProbe = Date.now();
+        live.closing = false;
+      }
+    })();
+    this.idleRelease = release;
+    void release.finally(() => {
+      this.idleRelease = undefined;
+      // Re-enter normal account-fair admission only after destruction completes.
+      this.drain();
+    });
   }
   private checkCapacity() {
     if (this.queue.waiting().length || !this.hasCapacity())
@@ -356,8 +426,10 @@ export class Runs {
       const length = lengths.get(entry.user_id)!;
       const previous = this.db.prepare("SELECT data FROM events WHERE run_id=? AND json_extract(data,'$.type') IN ('run.queued','run.dequeued') ORDER BY seq DESC LIMIT 1").get(entry.id) as { data: string } | undefined;
       const last = previous && JSON.parse(previous.data);
-      if (last?.type !== "run.queued" || last?.position !== position || last?.length !== length)
-        this.append(entry.id, { type: "run.queued", position, length });
+      const capacity = this.capacity(entry.user_id);
+      const reason = capacityReason(capacity);
+      if (last?.type !== "run.queued" || last?.position !== position || last?.length !== length || JSON.stringify(last?.capacity) !== JSON.stringify(capacity) || last?.queue_reason !== reason)
+        this.append(entry.id, { type: "run.queued", position, length, capacity, queue_reason: reason });
     }
   }
   /** All claims and reservations happen synchronously, before boot yields to checkout. */
@@ -378,7 +450,7 @@ export class Runs {
       }
       // Check for an eligible head before reclaiming: a cancelled boot's
       // replacement can be queued while still reserved by the old startup.
-      while (this.queue.first(new Map(), this.occupied()) && this.hasCapacity(true)) {
+      while (this.queue.first(new Map(), this.occupied()) && this.hasCapacity()) {
         const accounts = new Map<string, number>();
         for (const id of this.occupied()) {
           // A deleted run can still own a container or an outstanding startup.
@@ -404,6 +476,7 @@ export class Runs {
         this.launches.set(entry.id, launch);
       }
       this.queueChanged();
+      this.releaseIdleForWaitingWork();
     } finally { this.draining = false; }
   }
   async create(
@@ -596,7 +669,7 @@ export class Runs {
         "invalid_prompt",
         "Write a message of up to 20,000 characters.",
       );
-    if (this.live.get(id)?.closing) throw new ApiError(409, "workspace_closing", "Wait for the workspace to close before sending a follow-up.");
+    if (this.live.get(id)?.closing || (this.live.get(id)?.closed && r.ci_state !== "gave_up")) throw new ApiError(409, "workspace_closing", "The workspace is closing. If closing failed, try Close workspace again before sending a follow-up.");
     const question = r.summary.question;
     const answering = this.live.get(id);
     if (question && answering?.busy) {
@@ -655,7 +728,6 @@ export class Runs {
   private async boot(id: string) {
     let workspace: Workspace | undefined;
     try {
-      if (this.releasing.size) await Promise.all(this.releasing);
       let r = this.get(id);
       assertActive(r);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
@@ -786,6 +858,9 @@ export class Runs {
     if(!r.pending.length || live.closed)return;
     if (live.busy) return;
     live.busy = true;
+    live.idleSince = undefined;
+    live.lastIdleProbe = undefined;
+    live.state = undefined;
     clearTimeout(live.keepTimer);
     live.keepTimer = undefined;
     live.keptSince = undefined;
@@ -935,6 +1010,12 @@ export class Runs {
     else if (!r.pending.length && !r.summary.question && r.status === "ready" && (!published || (ciSettings().rounds && r.head_sha && r.ci_pending_sha === r.head_sha && r.ci_sha !== r.head_sha))) {
       await this.close(id);
       if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
+    }
+    if (!live.closed && r.status === "ready" && !r.pending.length) {
+      live.idleSince = Date.now();
+      // Read from the worker, not the API clone. Unknown workers fail closed.
+      try { live.state = await live.workspace.rpc<WorkspaceState>("workspace_state"); }
+      catch { live.state = undefined; }
     }
     this.drain();
   }
@@ -1151,7 +1232,7 @@ export class Runs {
     if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
     this.drain();
   }
-  async closeSession(id: string, user: string) {
+  async closeSession(id: string, user: string, beforeClose?: () => Promise<boolean>) {
     const r = this.get(id, user);
     const live = this.live.get(id);
     if (this.queue.has(id)) { await this.stop(id, user); return { closed: true }; }
@@ -1160,11 +1241,18 @@ export class Runs {
     r.ci_cancelled_sha = r.head_sha ?? undefined;
     this.save(r);
     this.ci.stop(id);
-    if (!live || live.closed) return { closed: true };
+    if (!live) return { closed: true };
+    // A failed destroy retains its capacity reservation. Retry teardown instead
+    // of reporting success or accepting a message into a closed worker.
+    if (live.closed) {
+      if (!live.destruction) await this.close(id);
+      return { closed: true };
+    }
     if (r.work_kept) { await this.close(id); return { closed: true }; }
     live.closing = true;
     try {
       await this.publish(id, live, {});
+      if (beforeClose && !await beforeClose()) return { closed: false };
       await this.close(id);
       return { closed: true };
     } catch (error) {
@@ -1186,7 +1274,7 @@ export class Runs {
       force: true,
     });
   }
-  // Failed workspaces have a bounded grace period; successful idle work does not expire.
+  // Ready workspaces release only for waiting work through the shared safety guard.
   async close(id: string, forCapacity = false) {
     if (this.queue.has(id)) {
       const r = this.get(id);
@@ -1215,8 +1303,8 @@ export class Runs {
       live.closed = true;
       live.closing = true;
       live.publishPending = undefined;
-      if (forCapacity) this.live.delete(id);
-      await live.workspace.destroy();
+      try { await (live.destruction ??= live.workspace.destroy()); }
+      catch (error) { live.destruction = undefined; throw error; }
       this.live.delete(id);
     }
     // Only an imported commit survives capacity eviction, not the worker's
@@ -1232,7 +1320,7 @@ export class Runs {
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));
     await Promise.allSettled([...this.pumps.values()]);
-    await Promise.allSettled(this.releasing);
+    await this.idleRelease;
   }
   private async fail(id: string, error: unknown) {
     const failure = error instanceof RetryError ? error : error instanceof ApiError && error.cause instanceof RetryError ? error.cause :

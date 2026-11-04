@@ -5,6 +5,7 @@ import { useEffect, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
+import { QueueReason } from "./queue-reason"
 import { queueLabel, runElapsed } from "@/lib/format"
 import { useCloseRun, useDeleteRun, useMe, useModelCatalog, useRun, useSendMessage, useStopRun } from "@/lib/queries"
 import { PlanIndicator } from "../settings/chatgpt-plan"
@@ -197,7 +198,7 @@ export function RunScreen() {
         </div>
         <ScrollToBottomButton shown={shown} onClick={scrollToBottom} />
         <div ref={composer} data-run-composer {...attach.handlers} className="relative mx-auto w-full max-w-[720px] px-8 pt-2 pb-5 max-md:px-3 max-md:pb-3">
-          {r.status === "queued" && <p role="status" className="mb-3 px-1 text-[13px] text-muted-foreground">{queueLabel(r)}</p>}
+          {r.status === "queued" && <div role="status" className="mb-3 px-1 text-[13px] text-muted-foreground"><p>{queueLabel(r)}</p><QueueReason run={r} /></div>}
           <DropHint show={attach.dragging} />
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />

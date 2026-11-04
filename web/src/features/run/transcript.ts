@@ -52,6 +52,7 @@ export type Item =
   | { kind: "tool"; key: string; tool: ToolCall }
   | { kind: "plan"; key: string; steps: PlanStep[] }
   | { kind: "agents"; key: string; agents: SubAgent[] }
+  | { kind: "released"; key: string }
   | { kind: "compacted"; key: string; reason?: string; before?: number; after?: number }
   | { kind: "pr"; key: string; number: number; url: string; ts: number; state?: "open" | "closed" | "merged" }
   | { kind: "end"; key: string; status: RunStatus; error?: string; ts: number }
@@ -219,6 +220,10 @@ export function createTranscript() {
           if (a) Object.assign(a, { status: ev.ok ? "done" : "failed", summary: ev.summary })
           break
         }
+        case "run.released":
+          if (ev.reason === "idle_for_waiting_work") items.push({ kind: "released", key: `released${ev.seq}` })
+          queueRevision++
+          break
         case "run.queued":
         case "run.dequeued":
           queueRevision++
