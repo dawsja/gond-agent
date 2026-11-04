@@ -510,6 +510,12 @@ pub fn check_environment() -> BTreeMap<String, String> {
         "CARGO_HOME",
         "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN",
+        // Non-secret worker-image toolchain locations (Dockerfile ENV).
+        // The checks subprocess regression test guards image/allow-list parity.
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "NODE_PATH",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
         "NPM_CONFIG_CACHE",
         "npm_config_cache",
         "PIP_CACHE_DIR",
