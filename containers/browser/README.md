@@ -63,6 +63,14 @@ The lightweight suite covers DNS pinning with an injected resolver, blocked
 destinations, CONNECT, cursor bounds, fake-clock idle expiry, stdio and cleanup.
 The Chromium suite drives a real loopback fixture, including refs, navigation,
 screenshots, downloads/popups, permission denial, logs and policy termination.
+Every case owns a fresh daemon/context/profile, runs sequentially and awaits
+close completion and profile deletion. Because these fixtures live inside a
+shared Node/Playwright test host rather than a dedicated daemon process, their
+RSS budgets add the measured host baseline to the browser allowance. Production
+still uses exactly 768 MiB. The ref-cap regression retains 224 MiB of unrelated
+host state: charging that state to the browser used to close it during the
+second snapshot. A separate real-browser test measures RSS and crosses a lower
+threshold explicitly, without waiting for a timer or risking a worker OOM.
 
 After Cargo checks, from the repository root:
 
@@ -73,7 +81,27 @@ GOND_IMAGE_WORKER="$PWD/runner/target/debug/gond-agent-worker" python3 container
 This standard-library-only smoke scripts a local model through the compiled
 runner, verifies normalized screenshot dimensions/bytes and checks cancellation
 cleanup against real Chromium. It requires the worker's explicit browser path
-(`/opt/gond-agent-browser`), Node module path and installed Chromium. The
-worker-image build runs both new suites and this smoke, retaining all existing
-one-shot browser and worker smoke checks. Do not run Chromium alongside Cargo
-or other memory-heavy commands in a 2 GiB worker.
+(`/opt/gond-agent-browser`), Node module path and installed Chromium.
+
+Only the fast, Chromium-free unit tests run in Docker build layers. The required
+CI Docker job runs `containers/smoke-worker-image.py` against the **finished**
+image: both Chromium suites, the existing `smoke-worker.py` and `smoke-browser.py`,
+one at a time. None of the security assertions or existing smoke checks are
+removed; failures still block publication. These checks run on every CI job,
+not only on cache misses, with a 2 GiB/2 CPU limit and the runtime restrictions:
+
+```sh
+docker run --rm --init --network=none --read-only \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --memory=2g --cpus=2 --pids-limit=512 --shm-size=256m \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g,uid=1000,gid=1000 \
+  --tmpfs /home/gond-agent:rw,nosuid,nodev,noexec,size=256m,uid=1000,gid=1000 \
+  --volume /opt/gond-tools --volume /workspace/repo \
+  --entrypoint python3 gond-agent-worker:local /opt/gond-agent/smoke-worker-image.py
+```
+
+Anonymous writable workspace/tools volumes retain image UID-1000 ownership and
+are removed by `--rm`; no host paths or credentials are mounted. The smoke
+wrapper scrubs inherited GitHub/runner configuration; individual model fixtures
+create private test credentials. Do not run Chromium alongside Cargo or other
+memory-heavy commands in a 2 GiB worker.

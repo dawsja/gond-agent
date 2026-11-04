@@ -9,7 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { once } = require('node:events');
-const { PersistentBrowser, IDLE_MS, STALE, RESPONSE_BYTES } = require('./persistent.cjs');
+const { PersistentBrowser, processTree, IDLE_MS, STALE, RESPONSE_BYTES, RSS_LIMIT } = require('./persistent.cjs');
 
 const HTML = `<!doctype html><html><head><title>Persistent fixture</title></head><body>
 <h1>Fixture ready</h1>
@@ -55,9 +55,21 @@ async function fixture(t) {
 }
 async function daemonFor(t, options = {}) {
   const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'gond-browser-real-'));
-  const daemon = new PersistentBrowser(profile, options);
-  t.after(async () => { await daemon.close(); await fs.rm(profile, { recursive: true, force: true }); });
-  return { daemon, profile };
+  const closed = Promise.withResolvers();
+  // These in-process fixtures share Node/Playwright with the test runner. The
+  // production daemon owns its process: unrelated test-host allocations must
+  // not consume the fixture's browser budget. Keep the production limit intact.
+  const daemon = new PersistentBrowser(profile, {
+    rssLimit: process.memoryUsage().rss + RSS_LIMIT, ...options,
+    onClose: closed.resolve,
+  });
+  t.after(async () => {
+    await daemon.close();
+    await closed.promise;
+    assert.equal(daemon.context?.pages().length ?? 0, 0);
+    await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
+  });
+  return { daemon, profile, closed: closed.promise };
 }
 function ref(snapshot, name) {
   const line = snapshot.text.split('\n').find((line) => line.startsWith('[e') && line.includes(JSON.stringify(name)));
@@ -86,7 +98,7 @@ function dimensions(base64) {
   assert.fail('JPEG has no dimensions');
 }
 
-test('persistent Chromium fixture: interactions, stable refs, stale refs, screenshots, logs, blocked downloads/popups, and idle cleanup', { timeout: 120000 }, async (t) => {
+test('persistent Chromium fixture: interactions, stable refs, stale refs, screenshots, logs, blocked downloads/popups, and idle cleanup', { timeout: 120000, concurrency: false }, async (t) => {
   const { base, hits } = await fixture(t);
   let idleCallback, delay;
   const clock = { set(fn, ms) { idleCallback = fn; delay = ms; return 1; }, clear() {} };
@@ -165,32 +177,32 @@ test('persistent Chromium fixture: interactions, stable refs, stale refs, screen
   await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
 });
 
-test('Chromium forced loopback proxy, private redirects, non-HTTP navigation and frame limits fail closed', { timeout: 120000 }, async (t) => {
+test('Chromium forced loopback proxy, private redirects, non-HTTP navigation and frame limits fail closed', { timeout: 120000, concurrency: false }, async (t) => {
   const { base } = await fixture(t);
   await t.test('reserved relay and control ports and private redirects', async (t) => {
     const { daemon } = await daemonFor(t);
     for (const url of ['http://127.0.0.1:8787/v1/models', 'http://127.0.0.1:8788/', `${base}/redirect-private`]) {
       const response = await daemon.request({ method: 'browser_open', url });
       assert.equal(response.ok, false, response.text);
+      assert.match(response.text, /\(HTTP 403\)/, 'The filtering proxy must refuse the destination, not just an unreachable network');
       // A proxy rejection is deliberately generic, without service contents.
       assert.ok(!response.text.includes('GOND_AGENT_RELAY_TOKEN'));
     }
   });
   await t.test('non-HTTP navigation closes browser and removes profile', async (t) => {
-    const { daemon, profile } = await daemonFor(t);
+    const { daemon, profile, closed } = await daemonFor(t);
     await ok(daemon, 'browser_open', { url: `${base}/non-http` });
     const snapshot = await ok(daemon, 'browser_snapshot');
     await daemon.request({ method: 'browser_click', ref: ref(snapshot, 'Leave HTTP') });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await closed;
     assert.equal(daemon.closed, true);
     await daemon.close();
     await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
   });
   await t.test('17 frames trigger context shutdown', async (t) => {
-    const { daemon, profile } = await daemonFor(t);
+    const { daemon, profile, closed } = await daemonFor(t);
     await daemon.request({ method: 'browser_open', url: `${base}/frames` });
-    // Event-driven shutdown may finish immediately after goto rejects.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await closed;
     assert.equal(daemon.closed, true);
     assert.ok(daemon.logs.entries.some((e) => e.text === 'Frame limit exceeded'));
     await daemon.close();
@@ -198,14 +210,28 @@ test('Chromium forced loopback proxy, private redirects, non-HTTP navigation and
   });
   await t.test('RSS watchdog closes a real browser, not just a JS heap limit', async (t) => {
     const { daemon, profile } = await daemonFor(t);
+    // Drive this sampler explicitly: a scheduled sample must not race the
+    // measured threshold change or make the following await return early.
+    clearInterval(daemon.monitor);
     await ok(daemon, 'browser_open', { url: base });
-    daemon.rssLimit = 1;
+    await daemon.monitorMemory();
+    assert.notEqual(daemon.closed, true, 'The fresh browser must stay below its fixture budget');
+    const rows = await processTree();
+    const baseline = rows.reduce((sum, row) => sum + row.rss, 0);
+    assert.ok(baseline > 0);
+    // Cross a threshold relative to real measured RSS, without allocating near
+    // the worker's OOM ceiling or relying on the next two-second timer tick.
+    daemon.rssLimit = Math.floor(baseline / 2);
     await daemon.monitorMemory();
     assert.equal(daemon.closed, true);
     await daemon.close();
     await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
   });
   await t.test('at the retained-ref cap, existing refs remain visible and stable', async (t) => {
+    // Regression: previous tests can leave unrelated allocations in this shared
+    // host. Without baseline accounting, 224 MiB reproduces the CI shutdown at
+    // the second snapshot even though this browser's own growth is bounded.
+    const hostState = Buffer.alloc(224 * 1024 * 1024, 1);
     const { daemon } = await daemonFor(t);
     await ok(daemon, 'browser_open', { url: `${base}/many` });
     // Wait for child documents, not just the main DOMContentLoaded event.
@@ -215,5 +241,6 @@ test('Chromium forced loopback proxy, private redirects, non-HTTP navigation and
     const second = await ok(daemon, 'browser_snapshot');
     assert.equal(second.text, first.text);
     assert.equal((second.text.match(/\[e\d+\]/g) || []).length, 1024);
+    assert.equal(hostState.at(-1), 1); // Keep the host allocation live through both snapshots.
   });
 });

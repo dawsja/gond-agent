@@ -31,16 +31,16 @@ COPY containers/browser/package*.json /opt/gond-agent-browser/
 RUN cd /opt/gond-agent-browser && npm ci --ignore-scripts && npx playwright install --with-deps chromium && rm -rf /var/lib/apt/lists/*
 COPY containers/browser/browser.cjs /opt/gond-agent-browser/browser.cjs
 COPY containers/browser/browser.test.cjs /opt/gond-agent-browser/browser.test.cjs
-RUN node --test /opt/gond-agent-browser/browser.test.cjs
 COPY containers/browser/persistent*.cjs containers/browser/proxy*.cjs /opt/gond-agent-browser/
-RUN node --test /opt/gond-agent-browser/proxy.test.cjs /opt/gond-agent-browser/persistent.test.cjs \
- && node --test /opt/gond-agent-browser/persistent.chromium.test.cjs
+# Only deterministic, Chromium-free unit tests run while building layers.
+RUN node --test /opt/gond-agent-browser/proxy.test.cjs /opt/gond-agent-browser/persistent.test.cjs
 
 FROM worker-tools AS worker-image
 COPY --from=worker-build /src/target/release/gond-agent-worker /usr/local/bin/gond-agent-worker
 COPY containers/agent.py /opt/gond-agent/agent.py
 COPY containers/smoke-worker.py /opt/gond-agent/smoke-worker.py
 COPY containers/smoke-browser.py /opt/gond-agent/smoke-browser.py
+COPY containers/smoke-worker-image.py /opt/gond-agent/smoke-worker-image.py
 RUN useradd --uid 1000 --gid 1000 --non-unique --home-dir /home/gond-agent --no-create-home --shell /bin/bash gond-agent \
  && mkdir -p /workspace/repo /home/gond-agent /opt/gond-tools/bin /opt/gond-tools/tmp /opt/gond-tools/cache && chown -R 1000:1000 /workspace /home/gond-agent /opt/gond-tools
 ENV HOME=/home/gond-agent \
@@ -68,8 +68,7 @@ ENV HOME=/home/gond-agent \
     PNPM_HOME=/opt/gond-tools/pnpm
 ENV PATH="${PATH}:/opt/gond-tools/bin:/opt/gond-tools/bun/bin:/opt/gond-tools/cargo/bin:/opt/gond-tools/npm/bin:/opt/gond-tools/pnpm:/opt/gond-tools/python/bin"
 USER 1000:1000
-RUN python3 /opt/gond-agent/smoke-worker.py
-RUN python3 /opt/gond-agent/smoke-browser.py
+# CI runs smoke-worker-image.py against the finished image with runtime limits.
 WORKDIR /workspace/repo
 ENTRYPOINT ["python3", "-u", "/opt/gond-agent/agent.py"]
 

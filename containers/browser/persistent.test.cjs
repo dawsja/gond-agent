@@ -7,7 +7,7 @@ const path = require('node:path');
 const { PassThrough } = require('node:stream');
 const { once } = require('node:events');
 const { spawn } = require('node:child_process');
-const { PersistentBrowser, LogBuffer, IdleTimer, processTree, serve, framed, webURL, REQUEST_BYTES, RESPONSE_BYTES, IDLE_MS } = require('./persistent.cjs');
+const { PersistentBrowser, LogBuffer, IdleTimer, processTree, serve, framed, webURL, REQUEST_BYTES, RESPONSE_BYTES, IDLE_MS, RSS_LIMIT } = require('./persistent.cjs');
 
 async function profile(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gond-browser-test-'));
@@ -94,6 +94,8 @@ test('/proc ancestry sums descendants, excludes siblings, and protects against P
 
 test('typed requests reject executable/invalid fields without launching Chromium', async (t) => {
   const daemon = new PersistentBrowser(await profile(t));
+  assert.equal(RSS_LIMIT, 768 * 1024 * 1024);
+  assert.equal(daemon.rssLimit, RSS_LIMIT);
   t.after(() => daemon.close());
   for (const request of [{ method: 'evaluate', script: '1+1' }, { method: 'browser_open', url: 'file:///etc/passwd' }, { method: 'browser_logs', kind: 'console', limit: 101 }, { method: 'browser_logs', kind: 'console', since: -1 }, { method: 'browser_snapshot', script: 'bad' }, null]) {
     assert.equal((await daemon.request(request)).ok, false);

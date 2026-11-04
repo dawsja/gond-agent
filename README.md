@@ -182,6 +182,8 @@ For step-by-step checks, `browser_open(url)` starts a persistent page; `browser_
 
 The persistent browser uses a DNS-pinning filtering proxy: public HTTP(S) and container-loopback app servers are allowed, but metadata, LAN/Docker-gateway destinations and reserved ports 8787/8788 are blocked, including redirects. Downloads, popups, WebRTC and permission grants are disabled. Chromium runs without its own sandbox; Docker remains the containment boundary. This policy does not restrict the unchanged arbitrary-script `browser` or shell commands. See [browser implementation and checks](containers/browser/README.md).
 
+CI verifies both real-browser suites and both compiled-worker smokes against the finished worker image under its 2 GiB memory limit and non-root, read-only runtime restrictions. Only Chromium-free unit tests run during image builds; the mandatory smoke gate retains all security checks and blocks publication on failure.
+
 
 The service uses the run owner's effective GitHub connection for repository API calls and HTTPS Git operations. It shallow-clones only the requested branch (`--depth 1 --single-branch --no-tags`), rather than downloading the entire repository history. Full history and other branches are not available inside workers. The run shows download/checkout progress, repository packing, container startup and agent startup separately. Compressed checkout archives are limited to 128 MiB so their base64 controller messages fit safely; an oversized checkout fails with a plain explanation instead of attempting an invalid transfer.
 
