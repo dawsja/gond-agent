@@ -26,6 +26,7 @@ use crate::api::client::SUMMARY_REQUEST_LIMIT;
 use crate::permissions::{self, Access, Mode, Rule, Verdict};
 use crate::skills::{self, Skill};
 use crate::tools::{Baseline, ReadSet, Shells, Tool, ToolCtx, schema, str_arg};
+use crate::tools::persistent_browser::BrowserSession;
 
 pub struct AgentConfig {
     pub model: String,
@@ -53,6 +54,14 @@ pub struct AgentConfig {
 pub struct AgentHandle {
     pub input: UnboundedSender<AgentInput>,
     pub events: UnboundedReceiver<AgentEvent>,
+    pub browser: BrowserSession,
+}
+
+impl Drop for AgentHandle {
+    fn drop(&mut self) {
+        let _ = self.input.send(AgentInput::Interrupt);
+        self.browser.terminate();
+    }
 }
 
 enum Reply {
@@ -71,6 +80,7 @@ struct Shared {
     tools: Vec<Arc<dyn Tool>>,
     reads: ReadSet,
     shells: Shells,
+    browser: BrowserSession,
     baseline: Baseline,
     plan: Mutex<Vec<TodoItem>>,
     plan_reminder_every: u32,
@@ -158,6 +168,11 @@ impl Shared {
         let _ = self.events.send(e);
     }
 
+    async fn end_turn(&self, agent_id: &str, stop_reason: impl Into<String>) {
+        if agent_id == "main" { self.browser.close().await; }
+        self.emit(AgentEvent::TurnEnd { agent_id: agent_id.into(), stop_reason: stop_reason.into() });
+    }
+
     fn resolve(&self, id: &str, r: Reply) {
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
             let _ = tx.send(r);
@@ -208,6 +223,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         tools: cfg.tools,
         reads: ReadSet::default(),
         shells: Shells::default(),
+        browser: BrowserSession::default(),
         baseline: Baseline::default(),
         plan: Mutex::new(cfg.plan),
         plan_reminder_every: cfg.plan_reminder_every,
@@ -280,6 +296,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         }
     });
 
+    let browser = shared.browser.clone();
     let s = shared;
     let mut history = cfg.history;
     tokio::spawn(async move {
@@ -315,7 +332,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     s.emit(AgentEvent::TurnStart { agent_id: main.id.clone() });
                     let result = compact(&s, &main, &mut history, "manual", &cancel).await;
                     let stop = if cancel.is_cancelled() { "interrupted" } else if result.is_err() { "error" } else { "compacted" };
-                    s.emit(AgentEvent::TurnEnd { agent_id: main.id.clone(), stop_reason: stop.into() });
+                    s.end_turn(&main.id, stop).await;
                     if let Err(e) = result {
                         if !cancel.is_cancelled() {
                             s.emit(AgentEvent::Error { agent_id: main.id, message: s.api.describe(&e), retryable: false });
@@ -339,6 +356,8 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     Err(anyhow!("Something went wrong in Gond Agent during this turn. Try again."))
                 }
             };
+            // Also covers a panic caught outside run_loop, before any error event.
+            s.browser.close().await;
             export_boundary(&s, &history);
             if let Err(e) = result {
                 let retryable = e.downcast_ref::<ApiError>().is_some_and(|a| a.retryable);
@@ -347,7 +366,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         }
     });
 
-    AgentHandle { input: in_tx, events: ev_rx }
+    AgentHandle { input: in_tx, events: ev_rx, browser }
 }
 
 enum Work {
@@ -505,9 +524,9 @@ async fn compact_automatically(s: &Arc<Shared>, run: &Run, history: &mut Vec<Mes
     }
 }
 
-fn end_compaction_failure(s: &Shared, run: &Run, cancel: &CancellationToken, error: anyhow::Error) -> Result<String> {
+async fn end_compaction_failure(s: &Shared, run: &Run, cancel: &CancellationToken, error: anyhow::Error) -> Result<String> {
     let interrupted = cancel.is_cancelled();
-    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: if interrupted { "interrupted" } else { "error" }.into() });
+    s.end_turn(&run.id, if interrupted { "interrupted" } else { "error" }).await;
     if interrupted { Ok(String::new()) } else { Err(error) }
 }
 
@@ -595,7 +614,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
             let reason = if first { "auto-turn" } else { "auto-round" };
             if let Err(e) = compact_automatically(s, run, history, reason, &mut compactions, context_used, cancel).await {
                 round_boundary(s, run, history, &reminders, &compactions, context_used);
-                return end_compaction_failure(s, run, cancel, e);
+                return end_compaction_failure(s, run, cancel, e).await;
             }
             if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
             first = false;
@@ -634,7 +653,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 if let Err(e) = compact_in_turn(s, run, history, "overflow", &mut compactions.count, cancel).await {
                     if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
                     round_boundary(s, run, history, &reminders, &compactions, context_used);
-                    return end_compaction_failure(s, run, cancel, e);
+                    return end_compaction_failure(s, run, cancel, e).await;
                 }
                 compactions.skipped_history_len = None;
                 if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
@@ -654,12 +673,12 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                         history.push(m);
                     }
                     round_boundary(s, run, history, &reminders, &compactions, context_used);
-                    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "interrupted".into() });
+                    s.end_turn(&run.id, "interrupted").await;
                     return Ok(String::new());
                 }
                 Streamed::Failed(e) => {
                     round_boundary(s, run, history, &reminders, &compactions, context_used);
-                    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "error".into() });
+                    s.end_turn(&run.id, "error").await;
                     return Err(e);
                 }
             };
@@ -678,7 +697,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                     }
                 }
                 round_boundary(s, run, history, &reminders, &compactions, context_used);
-                s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: stop });
+                s.end_turn(&run.id, stop).await;
                 return Ok(text);
             }
 
@@ -699,7 +718,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
             history.push(results);
             round_boundary(s, run, history, &reminders, &compactions, context_used);
             if cancel.is_cancelled() {
-                s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "interrupted".into() });
+                s.end_turn(&run.id, "interrupted").await;
                 return Ok(text);
             }
         }
@@ -1005,7 +1024,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
 }
 
 fn tool_context(s: &Shared, run: &Run, id: &str, cancel: &CancellationToken) -> ToolCtx {
-    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
+    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
 }
 
 fn permission_detail(name: &str, input: &Value) -> String {
@@ -2021,11 +2040,65 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_shared_with_subagent_is_cleaned_before_main_turn_done() {
+        struct BrowserFixture;
+        impl Tool for BrowserFixture {
+            fn name(&self) -> &'static str { "browser_fixture" }
+            fn description(&self) -> &'static str { "Start a fake browser daemon" }
+            fn schema(&self) -> Value { schema(json!({}), &[]) }
+            fn access(&self) -> Access { Access::Exec }
+            fn title(&self, _: &Value) -> String { "browser fixture".into() }
+            fn run<'a>(&'a self, ctx: &'a ToolCtx, _: Value) -> BoxFuture<'a, crate::tools::ToolOutput> {
+                Box::pin(async move {
+                    let mut command = tokio::process::Command::new("sh");
+                    command.args(["-c", r#"
+                        printf '%s\n%s\n' "$$" "$1" > browser-probe
+                        while IFS= read -r line; do printf '{"ok":true,"text":"shared page"}\n'; done
+                    "#, "browser-fixture"]);
+                    ctx.browser.start_for_test(command, &ctx.cwd, &ctx.cwd, ctx.cancel.clone());
+                    let snapshot = crate::tools::persistent_browser::tools().into_iter().find(|tool| tool.name() == "browser_snapshot").unwrap();
+                    snapshot.run(ctx, json!({})).await
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let url = mock(Arc::new(|req| {
+            let main = req["metadata"]["agent_id"] == "main";
+            let count = req["messages"].as_array().unwrap().len();
+            let blocks = match (main, count) {
+                (true, 1) => vec![json!({"type":"tool_call","id":"delegate","name":"task","input":{
+                    "description":"Start shared page","prompt":"Start the fixture","kind":"general"
+                }})],
+                (false, 1) => vec![json!({"type":"tool_call","id":"fixture","name":"browser_fixture","input":{}})],
+                (true, 3) => vec![json!({"type":"tool_call","id":"snapshot","name":"browser_snapshot","input":{}})],
+                _ => vec![json!({"type":"text","text":"Done"})],
+            };
+            sse(&blocks, if blocks[0]["type"] == "tool_call" { "tool_use" } else { "end_turn" })
+        }), seen).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.context_window = 200_000;
+        cfg.tools.push(Arc::new(BrowserFixture));
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        h.input.send(AgentInput::User { text: "Work".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { agent_id, call_id, ok: true, output, .. }
+            if agent_id == "main" && call_id == "snapshot" && output == "shared page")));
+        let probe = std::fs::read_to_string(dir.path().join("browser-probe")).unwrap();
+        let mut lines = probe.lines();
+        let pid: libc::pid_t = lines.next().unwrap().parse().unwrap();
+        assert!(!std::path::Path::new(lines.next().unwrap()).exists());
+        // SAFETY: signal 0 only tests existence; stop() has already reaped this child.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
     fn compaction_shared(api: ApiClient, window: u64) -> Arc<Shared> {
         Arc::new(Shared {
             api, events: unbounded_channel().0, pending: Mutex::default(), mode: Mutex::new(Mode::Allow),
             rules: Mutex::default(), model: Mutex::new(("m".into(), window)), effort: Mutex::new("default".into()),
-            tools: vec![], reads: ReadSet::default(), shells: Shells::default(), baseline: Baseline::default(),
+            tools: vec![], reads: ReadSet::default(), shells: Shells::default(), browser: BrowserSession::default(), baseline: Baseline::default(),
             plan: Mutex::default(), plan_reminder_every: 0, plan_nudge_limit: 0, cwd: PathBuf::from("/tmp"),
             session_id: "s".into(), system: String::new(), sub_system: String::new(), locks: Mutex::default(),
             turn_cancel: Mutex::new(CancellationToken::new()), interactive: false, question_wait: Duration::ZERO,
