@@ -1,7 +1,7 @@
 // Runs inside the worker image against the real packaged service, never API/browser mocks.
 const { chromium, expect } = require('@playwright/test');
 const { createServer } = require('node:http');
-const { writeFileSync, unlinkSync } = require('node:fs');
+const { mkdirSync, writeFileSync, unlinkSync } = require('node:fs');
 const { join } = require('node:path');
 const width = Number(process.env.WIDTH);
 const origin = process.env.GOND_AGENT_BROWSER_ORIGIN || 'http://gond-agent:8787';
@@ -505,6 +505,14 @@ const key = 'fixture-only-provider-key';
       // Approved A layout: real streamed messages, quiet disclosures and visible failures.
       let activitySeq = 3;
       const activity = (type, fields) => sockets.at(-1).send(JSON.stringify({ seq: ++activitySeq, ts: Date.now(), type, ...fields }));
+      activity('run.ci', { state: 'failing', round: 1, sha: 'a'.repeat(40), failing: ['typecheck'] });
+      await expect(page.getByRole('status', { name: 'CI status', exact: true })).toHaveText('CI failing · round 1 · typecheck');
+      activity('ci', { source: 'ci', text: 'Fix the failed checks.', images: [] });
+      const automaticCI = page.getByRole('button', { name: 'Automatic CI', exact: true });
+      await expect(automaticCI).toHaveAttribute('aria-expanded', 'false');
+      await automaticCI.click();
+      await expect(page.getByLabel('Automatic CI', { exact: true }).getByText('Fix the failed checks.', { exact: true })).toBeVisible();
+      await automaticCI.click();
       queuePosition = 2;
       activity('run.queued', { position: 2, length: 3 });
       await expect(page.getByRole('status').filter({ hasText: 'Waiting for a free workspace' })).toHaveText('Waiting for a free workspace (position 2 of 3)');
@@ -605,6 +613,115 @@ const key = 'fixture-only-provider-key';
       await captureThemes('run-diff');
       if (width !== 1440) await page.getByRole('tab', { name: 'Transcript', exact: true }).click();
 
+      // Keep this scroll regression on the mounted run and its existing socket:
+      // no reloads, navigation, replacement DOM or synthetic transcript heights.
+      {
+        const scroller = page.locator('[data-run-scroller]');
+        const content = page.locator('[data-run-content]');
+        const composer = page.locator('[data-run-composer]');
+        // Hidden means mounted but inaccessible, not display:none or unmounted.
+        const bottomButton = page.locator('button[aria-label="Scroll to bottom"]');
+        const visibleButton = page.getByRole('button', { name: 'Scroll to bottom', exact: true });
+        const originalScroller = await scroller.elementHandle();
+        const socketCount = sockets.length;
+        const runURL = page.url();
+        const navigations = [];
+        const onNavigation = frame => { if (frame === page.mainFrame()) navigations.push(frame.url()); };
+        const gap = () => scroller.evaluate(el => Math.abs(el.scrollHeight - el.clientHeight - el.scrollTop));
+        const atBottom = () => expect.poll(gap, { timeout: 5000 }).toBeLessThanOrEqual(2);
+        const hidden = async () => {
+          await expect(bottomButton).toHaveCount(1);
+          await expect(bottomButton).toHaveAttribute('aria-hidden', 'true');
+          await expect(bottomButton).toHaveAttribute('tabindex', '-1');
+          await expect(bottomButton).toHaveCSS('opacity', '0');
+          await expect.poll(() => bottomButton.evaluate(el => el.disabled || !!el.closest('[inert]') || getComputedStyle(el).pointerEvents === 'none'), { timeout: 5000 }).toBe(true);
+          await expect(visibleButton).toHaveCount(0);
+        };
+        const visible = async () => {
+          await expect(visibleButton).toBeVisible();
+          await expect(visibleButton).toBeEnabled();
+          await expect(visibleButton).toHaveCSS('opacity', '1');
+          const buttonBox = await visibleButton.boundingBox();
+          const composerBox = await composer.boundingBox();
+          expect(buttonBox.y + buttonBox.height).toBeLessThanOrEqual(composerBox.y - 8);
+        };
+        const scrollUp = async () => {
+          const before = await scroller.evaluate(el => el.scrollTop);
+          const box = await scroller.boundingBox();
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+          await page.mouse.wheel(0, -360);
+          await expect.poll(async () => before - await scroller.evaluate(el => el.scrollTop), { timeout: 5000 }).toBeGreaterThan(120);
+          await expect.poll(gap, { timeout: 5000 }).toBeGreaterThan(120);
+          // mouse.wheel returns before compositor scrolling necessarily finishes.
+          await expect.poll(async () => Math.abs(await scroller.evaluate(el => el.scrollTop) - Math.max(0, before - 360)), { timeout: 5000 }).toBeLessThanOrEqual(2);
+          await visible();
+        };
+        const stream = async marker => {
+          const before = await content.evaluate(el => el.getBoundingClientRect().height);
+          activity('text.delta', { text: '\n\n' + Array.from({ length: 12 }, (_, i) => `${marker} paragraph ${i + 1}: Checking the run transcript, layout and follow-up controls.`).join('\n\n') });
+          await expect(content).toContainText(`${marker} paragraph 12`);
+          await expect.poll(() => content.evaluate(el => el.getBoundingClientRect().height), { timeout: 5000 }).toBeGreaterThan(before + 120);
+        };
+        const shot = async (state, theme) => {
+          await capture(`run-scroll-${state}-${theme}`);
+          mkdirSync('shots', { recursive: true });
+          const image = screenshots.at(-1);
+          writeFileSync(join('shots', image.name), Buffer.from(image.data, 'base64'));
+        };
+        page.on('framenavigated', onNavigation);
+        try {
+          await expect(scroller).toBeVisible();
+          await expect(content).toBeVisible();
+          await expect(composer).toBeVisible();
+          // Enough actual Markdown to overflow even the wide, tall viewport.
+          await stream('Scroll fixture');
+          await scroller.evaluate(el => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+          await atBottom();
+          await hidden();
+          // The rest of onboarding reduces motion. Exercise smooth scrolling here.
+          await page.emulateMedia({ reducedMotion: 'no-preference' });
+          for (const theme of ['light', 'dark']) {
+            await page.emulateMedia({ colorScheme: theme });
+            await resolvedTheme(theme, page, 'system');
+            await scrollUp();
+            await shot('visible', theme);
+            await visibleButton.click({ timeout: 5000 });
+            // New output during the smooth jump must not cancel resumed following.
+            await stream(`Jump ${theme}`);
+            await atBottom();
+            await hidden();
+            await shot('hidden', theme);
+
+            const pinnedTop = await scroller.evaluate(el => el.scrollTop);
+            await stream(`Pinned ${theme}`);
+            await atBottom();
+            expect(await scroller.evaluate(el => el.scrollTop)).toBeGreaterThan(pinnedTop + 120);
+            await hidden();
+
+            await scrollUp();
+            const unpinnedTop = await scroller.evaluate(el => el.scrollTop);
+            await stream(`Unpinned ${theme}`);
+            // Let resize observers and scheduled scroll work run before asserting
+            // preservation; an immediate assertion could pass before a bad jump.
+            await page.waitForTimeout(400);
+            expect(Math.abs(await scroller.evaluate(el => el.scrollTop) - unpinnedTop)).toBeLessThanOrEqual(2);
+            await visible();
+            await visibleButton.click({ timeout: 5000 });
+            await atBottom();
+            await hidden();
+          }
+          expect(navigations).toEqual([]);
+          expect(page.url()).toBe(runURL);
+          expect(sockets.length).toBe(socketCount);
+          expect(await scroller.evaluate((el, original) => el === original, originalScroller)).toBe(true);
+        } finally {
+          page.off('framenavigated', onNavigation);
+          await originalScroller?.dispose();
+          await page.emulateMedia({ reducedMotion: 'reduce', colorScheme: 'dark' });
+          await resolvedTheme('dark', page, 'system');
+        }
+      }
+
       // A GitHub merge updates the existing PR card and every current-state icon.
       activePreview = false; prState = 'open';
       activity('run.pr', { number: 42, url: 'https://github.com/acme/app/pull/42', state: 'open' });
@@ -635,9 +752,23 @@ const key = 'fixture-only-provider-key';
       queuePosition = 2;
       await page.reload();
       await expect(page.getByText('Waiting for a free workspace (position 2 of 3)', { exact: true })).toBeVisible();
+      const queuedRow = page.getByRole('listitem').filter({ hasText: 'Composer preview' });
+      await expect(queuedRow.getByText('Queued', { exact: true })).toBeVisible();
+      await expect(queuedRow.getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
+      await capture('queued-list-menu-closed');
+      await queuedRow.getByRole('button', { name: 'Run actions', exact: true }).focus();
+      await page.keyboard.press('Enter');
+      const cancelItem = page.getByRole('menuitem', { name: 'Cancel', exact: true });
+      await expect(cancelItem).toBeVisible();
+      await expect(cancelItem).toBeFocused();
+      await expect(page.getByRole('menuitem', { name: 'Stop', exact: true })).toHaveCount(0);
+      await capture('queued-list-menu-open');
       const cancelled = page.waitForResponse(r => r.url() === fixtureRunURL + '/stop' && r.request().method() === 'POST');
-      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.keyboard.press('Enter');
       expect((await cancelled).status()).toBe(200);
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+      await expect(page.getByRole('alertdialog')).toHaveCount(0);
+      await expect(page.getByRole('menu')).toHaveCount(0);
       await expect(page.getByText('Waiting for a free workspace', { exact: false })).toHaveCount(0);
 
       for (const backend of ['claude-code', 'codex']) {

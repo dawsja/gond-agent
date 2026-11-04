@@ -128,6 +128,7 @@ class BrowserProcesses:
         for pid in owned - {self.worker_pid}:
             self.known[pid] = rows[pid][1]
             try:
+                assert b"GOND_AGENT_RELAY_TOKEN=" not in pathlib.Path(f"/proc/{pid}/environ").read_bytes(), "Relay token inherited by a browser descendant"
                 args = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
                 daemon = b"/opt/gond-agent-browser/persistent.cjs"
                 if daemon not in args:
@@ -136,7 +137,6 @@ class BrowserProcesses:
                 assert profile.parent == pathlib.Path("/opt/gond-tools") and profile.name.startswith("browser-"), "Unexpected profile location"
                 assert profile.is_dir(), "Disposable profile was not created"
                 assert profile.stat().st_mode & 0o777 == 0o700, "Browser profile is not private"
-                assert b"GOND_AGENT_RELAY_TOKEN=" not in pathlib.Path(f"/proc/{pid}/environ").read_bytes(), "Relay token inherited by browser daemon"
                 self.profiles.add(profile)
             except FileNotFoundError:
                 pass

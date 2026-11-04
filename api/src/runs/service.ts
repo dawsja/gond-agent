@@ -17,6 +17,7 @@ import {
   validRepo,
   validBranch,
   type GitHubOptions,
+  type PushOptions,
 } from "../github";
 import { githubEnvFor } from "../github-login";
 import { modelResponse } from "../responses";
@@ -36,11 +37,15 @@ import { ModelAccess } from "../access";
 import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
+import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
-export interface Run {
+export interface Run extends CiInfo {
+  ci_turn?: boolean;
+  /** Unpublished work still belongs to an automatic round, even after a human queues work. */
+  ci_publication_pending?: boolean;
   id: string;
   user_id: string;
   repo: string;
@@ -84,7 +89,7 @@ export interface Run {
   pushed: boolean;
   diff: string;
   summary: Summary;
-  pending: { text: string; images: string[]; effort?:string; model?:string; request_id?: string }[];
+  pending: { text: string; images: string[]; effort?:string; model?:string; request_id?: string; source?: "ci" }[];
   base_sha: string | null;
   auto_pr: boolean;
 }
@@ -117,6 +122,7 @@ export class Runs {
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
+  private ci: CiWatch;
   private queue: RunQueue;
   private draining = false;
   private queueTimer: ReturnType<typeof setInterval>;
@@ -128,6 +134,24 @@ export class Runs {
   ) {
     this.access = new ModelAccess(db, cfg.secret, subscriptions);
     this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user));
+    this.ci = new CiWatch({
+      get: id => this.get(id),
+      env: user => githubEnvFor(db, cfg.secret, user),
+      update: (id, patch, event) => { const r = this.get(id); Object.assign(r, patch); this.save(r); this.append(id, { type: "run.ci", ...event }); },
+      followUp: async (id, text, sha) => {
+        await this.validateFollowUp(id, this.get(id).user_id);
+        const r = this.get(id);
+        if (this.shuttingDown || r.head_sha !== sha || r.ci_cancelled_sha === sha || r.status !== "ready" || !["agent", "idle"].includes(r.phase) || r.pending.length || r.summary.question || ["closed", "merged"].includes(r.pr_state ?? "") || this.live.has(id) || this.booting.has(id) || (r.ci_round ?? 0) >= ciSettings().rounds) return false;
+        githubEnvFor(db, cfg.secret, r.user_id);
+        db.transaction(() => {
+          r.ci_round = (r.ci_round ?? 0) + 1;
+          r.ci_previous_sha = sha;
+          this.save(r);
+          this.enqueue(id, r.user_id, text, [], undefined, undefined, undefined, undefined, "ci");
+        })();
+        return true;
+      },
+    });
     this.queue = new RunQueue(db);
     this.queueTimer = setInterval(() => this.drain(), 60_000);
     this.queueTimer.unref();
@@ -200,13 +224,14 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
-    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; pr_body: string | null} | undefined;
-    // Lifecycle snapshots must not reset newer description overrides or search counts.
+    // Lifecycle snapshots must not reset newer description overrides or search/CI counts.
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
+    r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -283,6 +308,8 @@ export class Runs {
     this.append(r.id, { type: "run.status", status, step, error });
   }
   async recover() {
+    // Watches are process-local and never resume after a restart, including on ready runs.
+    this.db.prepare("UPDATE runs SET data=json_set(data, '$.ci_active', json('false'))").run();
     for (const row of this.db
       .prepare("SELECT data FROM runs WHERE status='working'")
       .all() as { data: string }[]) {
@@ -540,16 +567,25 @@ export class Runs {
     model?:string,
     requestId?: string,
     pr_body?: unknown,
+    source?: "ci",
   ) {
-    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body))();
+    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body, source))();
     if (accepted === false) return;
     this.drain();
   }
-  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown) {
+  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown, source?: "ci") {
     this.assertAccount(user);
-    const r = this.get(id, user);
+    let r = this.get(id, user);
     const fields = publicationFields({ pr_body });
     assertActive(r);
+    if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
+      throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
+    if (!source) {
+      this.ci.stop(id);
+      r = this.get(id, user);
+      r.ci_publication_pending ||= r.ci_turn;
+      r.ci_turn = false;
+    }
     if (requestId && this.db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(id, requestId)) return false;
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
@@ -599,10 +635,11 @@ export class Runs {
       this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
       r.pr_body = fields.pr_body;
     }
-    r.pending.push({ text, images, effort, model, ...(requestId ? { request_id: requestId } : {}) });
+    r.pending.push({ text, images, effort, model, ...(source ? { source } : {}), ...(requestId ? { request_id: requestId } : {}) });
     this.save(r);
     this.append(id, {
-      type: "user",
+      type: source === "ci" ? "ci" : "user",
+      ...(source ? { source } : {}),
       text,
       images: images.map((id) => ({ id })),
     });
@@ -624,15 +661,35 @@ export class Runs {
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
       r.phase = "booting";
       r.started_at ??= Date.now();
+      // A human message is not permission to publish an older automatic round.
+      // Drop its unpushed commit and resume from the confirmed remote branch.
+      if (r.kept_commit && r.pending.some(message => message.source !== "ci") && r.pending[0]?.source !== "ci" && (r.ci_publication_pending || r.ci_turn)) {
+        this.ciPublicationRefused(id, new ApiError(409, "ci_needs_person", "needs a person: unpushed changes from an automatic round require review."));
+        r = this.get(id);
+      }
       if (r.kept_commit) {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
-        await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r));
+        try {
+          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
+        } catch (error) {
+          if (!this.ciPublicationRefused(id, error)) throw error;
+          r = this.get(id);
+          r.phase = "idle";
+          if (!r.pending.length) {
+            this.status(r, r.status === "stopped" ? "stopped" : "ready");
+            return;
+          }
+        }
         r = this.get(id); // Stop and additional follow-ups may have arrived during publication.
-        r.pushed = true;
-        r.head_sha = head;
-        delete r.kept_commit;
-        this.save(r);
+        if (r.kept_commit) {
+          r.pushed = true;
+          r.head_sha = head;
+          r.ci_pending_sha = head;
+          r.ci_publication_pending = false;
+          delete r.kept_commit;
+          this.save(r);
+        }
         if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
           r.phase = "idle";
           if (r.status === "working") { r.pending = []; this.status(r, "stopped"); }
@@ -683,7 +740,7 @@ export class Runs {
       this.status(r, "working", "Starting the agent");
       await workspace.rpc("start", {
         model: r.model_id, effort: r.effort ?? "high",
-        interactive: r.source === "web" || r.source === "mcp",
+        interactive: r.pending[0]?.source !== "ci" && (r.source === "web" || r.source === "mcp"),
         question_wait_minutes: questionWaitMinutes(),
         ...(r.summary.plan_steps?.length ? { plan: r.summary.plan_steps } : {}),
         ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
@@ -725,6 +782,7 @@ export class Runs {
   }
   private async next(id: string, live: Live) {
     let r = this.get(id);
+    if (r.pending.length && live.closed && r.ci_state === "gave_up") return this.resumeAfterCiRefusal(id);
     if(!r.pending.length || live.closed)return;
     if (live.busy) return;
     live.busy = true;
@@ -736,8 +794,13 @@ export class Runs {
     if (r.work_kept || live.publishPending) {
       r.work_kept = false;
       this.status(r, "working", "Saving kept changes");
-      await this.publish(id, live);
+      const published = await this.publish(id, live);
       r = this.get(id);
+      if (!published) {
+        live.busy = false;
+        await this.resumeAfterCiRefusal(id);
+        return;
+      }
       if (r.status === "stopped") { live.busy = false; return; }
     }
     if (live.closed || !r.pending.length) { live.busy = false; return; }
@@ -748,6 +811,8 @@ export class Runs {
       r.model_id=selected.id;r.effort=validateEffort(selected,message.effort ?? "default");this.save(r);
     }
     r.pending.shift();
+    r.ci_turn = message.source === "ci";
+    r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
     r.work_kept = false;
@@ -849,19 +914,96 @@ export class Runs {
   }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
+    if (r.status === "stopped") { live.busy = false; return; }
     r.phase = "finishing";
     this.status(r, "working", "Pushing changes");
-    await this.publish(id, live);
+    const published = await this.publish(id, live);
     r = this.get(id);
-    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
+    if (!published) {
+      live.busy = false;
+      await this.resumeAfterCiRefusal(id);
+      return;
+    }
+    if (published && r.status !== "stopped" && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
     r = this.get(id);
     live.busy = false;
     r.phase = "agent";
     r.finished_at = Date.now();
     const merged = r.pr_state === "merged" && !r.pending.length;
-    this.status(r, merged ? "merged" : "ready");
+    this.status(r, r.status === "stopped" ? "stopped" : merged ? "merged" : "ready");
     if (merged) await this.close(id);
+    else if (!r.pending.length && !r.summary.question && r.status === "ready" && (!published || (ciSettings().rounds && r.head_sha && r.ci_pending_sha === r.head_sha && r.ci_sha !== r.head_sha))) {
+      await this.close(id);
+      if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
+    }
     this.drain();
+  }
+  /** Recheck automatic-round policy against the pinned commit on every push attempt. */
+  private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
+    if (!automatic) return undefined;
+    return async ({ cwd, branch, head }) => {
+      const current = this.get(run.id);
+      if (branch !== current.branch || current.status === "stopped" || ["closed", "merged"].includes(current.pr_state ?? ""))
+        throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
+      const baseline = current.ci_previous_sha;
+      if (!baseline) throw new ApiError(409, "ci_needs_person", "needs a person: the previous pushed commit is missing.");
+      let touchesConfig: boolean;
+      try { touchesConfig = await ciPushTouchesConfig(cwd, baseline, head); }
+      catch { throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix's commit history could not be verified."); }
+      if (touchesConfig) throw new ApiError(409, "ci_needs_person", "needs a person: automatic fixes cannot push changes to CI configuration.");
+      if (current.pr_number) {
+        const pr = await gh<{ state: string; merged?: boolean }>(`repos/${current.repo}/pulls/${current.pr_number}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, current.user_id));
+        if (pr.state !== "open" || pr.merged) throw new ApiError(409, "ci_needs_person", "needs a person: the pull request is closed or merged.");
+      }
+      const latest = this.get(run.id);
+      if (latest.status === "stopped" || ["closed", "merged"].includes(latest.pr_state ?? ""))
+        throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
+    };
+  }
+  private ciPublicationRefused(id: string, error: unknown): boolean {
+    if (!(error instanceof ApiError) || error.code !== "ci_needs_person") return false;
+    const current = this.get(id);
+    // Refusing an automatic publication must never consume a person's follow-up.
+    current.pending = current.pending.filter(message => message.source !== "ci");
+    if (current.pending.length) {
+      delete current.kept_commit;
+      current.ci_publication_pending = false;
+    }
+    const reason = current.pending.length
+      ? `${error.message} The unpushed automatic changes were dropped; your message will continue from the last pushed branch.`
+      : error.message;
+    Object.assign(current, { ci_state: "gave_up", ci_reason: reason, ci_active: false });
+    this.save(current);
+    this.append(id, { type: "run.ci", state: "gave_up", round: current.ci_round ?? 0, sha: current.head_sha, failing: current.ci_failing ?? [], reason });
+    return true;
+  }
+  private async resumeAfterCiRefusal(id: string) {
+    // The worker and API clone may both contain the refused configuration. Never
+    // deliver human work there: release them, then reopen from the pushed branch.
+    const reserved = this.booting.has(id);
+    this.booting.add(id); // Reserve the checkout until teardown and requeue finish.
+    try {
+      try { await this.close(id); }
+      catch {
+        console.error("Couldn't release refused automatic workspace", id);
+        const live = this.live.get(id);
+        if (live) live.closing = false; // A follow-up retries cleanup, never the refused publication.
+        this.status(this.get(id), "failed", null, "Couldn't release the automatic workspace. Your queued messages are kept. Send a follow-up to retry.");
+        return;
+      }
+      const r = this.get(id);
+      r.phase = "idle";
+      if (r.pending.length) {
+        this.status(r, "queued");
+        this.queue.join(id);
+      } else this.status(r, r.status === "stopped" ? "stopped" : "ready");
+    } finally {
+      if (!reserved) {
+        this.booting.delete(id);
+        this.cancelledBoots.delete(id);
+      }
+      this.drain();
+    }
   }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
@@ -869,23 +1011,26 @@ export class Runs {
     // Only preflight a fresh snapshot. An imported retry may already exist remotely
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
-    const pushOptions = publicationPushOptions(r);
+    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       options.backgroundPublication
         ? { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options) }
         : { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     ), { maxAttempts: 1 });
-    if (pending.imported) await pushBranch(live.cwd, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, pushOptions);
-    else try { await importBundle(
-      live.cwd,
-      Buffer.from(snapshot.bundle, "base64"),
-      r.branch,
-      githubEnvFor(this.db, this.cfg.secret, r.user_id),
-      undefined,
-      pushOptions,
-    ); pending.imported = true; }
-    catch (error) {
+    try {
+      if (pending.imported) await pushBranch(live.cwd, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, pushOptions);
+      else await importBundle(
+        live.cwd, Buffer.from(snapshot.bundle, "base64"), r.branch,
+        githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, pushOptions,
+      );
+      pending.imported = true;
+    } catch (error) {
+      if (this.ciPublicationRefused(id, error)) {
+        snapshot.bundle = "";
+        live.publishPending = undefined;
+        return false;
+      }
       if (error instanceof RetryError && error.step === "push") {
         pending.imported = true;
         snapshot.bundle = ""; // The imported commit, not another in-memory bundle, is the retry source.
@@ -899,12 +1044,18 @@ export class Runs {
     }
     snapshot.bundle = "";
     await this.recordDiff(id, live, snapshot.head, true);
+    const current = this.get(id);
+    current.ci_publication_pending = false;
+    this.save(current);
     live.publishPending = undefined;
+    return true;
   }
   private async recordDiff(id: string, live: Live, head: string, pushed: boolean) {
     let r = this.get(id);
     r.pushed ||= pushed;
-    r.head_sha = head;
+    // A retained candidate is not the confirmed remote head. Its SHA already
+    // lives in publishPending/kept_commit for publication recovery.
+    if (pushed) r.head_sha = head;
     r.diff = (
       await git(live.cwd, "diff", "--no-ext-diff", r.base_sha!, "HEAD", "--")
     )
@@ -925,7 +1076,7 @@ export class Runs {
       r.additions += Number(a) || 0;
       r.deletions += Number(d) || 0;
     }
-    r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, ci_pending_sha: pushed ? head : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
     this.save(r);
     this.append(id, {
       type: "run.diff",
@@ -933,6 +1084,7 @@ export class Runs {
       additions: r.additions,
       deletions: r.deletions,
     });
+    return true;
   }
   async openPull(id: string, user: string, options: Pick<GitHubOptions, "backgroundPublication"> = {}) {
     const r = this.get(id, user);
@@ -982,6 +1134,8 @@ export class Runs {
     await this.close(id);
   }
   async stop(id: string, user: string) {
+    this.get(id, user);
+    this.ci.stop(id);
     const r = this.get(id, user);
     const kept = r.work_kept;
     const queued = this.queue.has(id);
@@ -1001,9 +1155,12 @@ export class Runs {
     const r = this.get(id, user);
     const live = this.live.get(id);
     if (this.queue.has(id)) { await this.stop(id, user); return { closed: true }; }
-    if (this.booting.has(id) || live?.busy || live?.closing || r.pending.length || ["queued", "working"].includes(r.status))
+    if (this.booting.has(id) || live?.busy || (live?.closing && !live.closed) || r.pending.length || ["queued", "working"].includes(r.status))
       throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
-    if (!live) return { closed: true };
+    r.ci_cancelled_sha = r.head_sha ?? undefined;
+    this.save(r);
+    this.ci.stop(id);
+    if (!live || live.closed) return { closed: true };
     if (r.work_kept) { await this.close(id); return { closed: true }; }
     live.closing = true;
     try {
@@ -1017,6 +1174,7 @@ export class Runs {
   }
   async remove(id: string, user: string) {
     this.get(id, user);
+    this.ci.stop(id);
     await this.stop(id, user);
     await this.launches.get(id);
     await this.close(id);
@@ -1068,6 +1226,7 @@ export class Runs {
   }
   async shutdown() {
     this.shuttingDown = true;
+    this.ci.stopAll();
     clearInterval(this.queueTimer);
     this.subscriptions.close();
     await Promise.allSettled([...this.launches.values()]);
