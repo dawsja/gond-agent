@@ -1,0 +1,760 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
+import { RetryError } from "../src/retry";
+import { createAuthentication, seal } from "../src/auth";
+import { queueSettings, type Config } from "../src/config";
+import type { Workspace, WorkspaceFactory } from "../src/containers";
+import { migrateRunQueue, openStore, setSetting } from "../src/db";
+import { checkout, gh, importBundle, pushBranch } from "../src/github";
+import { saveProviderSettings } from "../src/providers";
+import { Runs } from "../src/runs/service";
+import { RunQueue } from "../src/runs/queue";
+import { createApp } from "../src/app";
+import { createToken } from "../src/mcp";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+
+vi.mock("../src/github", async (original) => ({
+  ...await original<typeof import("../src/github")>(),
+  gh: vi.fn(async () => ({ default_branch: "main" })),
+  checkout: vi.fn(async () => ({ cwd: "/fake", archive: Buffer.from("repo") })),
+  commitIdentity: vi.fn(async () => ({ name: "fixture", email: "123+fixture@users.noreply.github.com" })),
+  importBundle: vi.fn(async () => {}),
+  pushBranch: vi.fn(async () => {}),
+  git: vi.fn(async (_cwd: string, ...args: string[]) => Buffer.from(args[0] === "rev-parse" ? "a".repeat(40) : "")),
+}));
+
+type Event = Record<string, unknown>;
+type Batch = { events: Event[]; alive: boolean };
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+// Long-poll events stay pending until the test explicitly releases them. No worker,
+// Git checkout, network request, real-time polling or automatic turn completion.
+class ControlledWorkspace implements Workspace {
+  readonly calls: { method: string; args?: Record<string, unknown> }[] = [];
+  rejectEventsOnDestroy = false;
+  private batches: Batch[] = [];
+  private poll?: ReturnType<typeof deferred<Batch>>;
+  constructor(readonly id: string, private starts: string[], private releases: string[]) {}
+  emit(...events: Event[]) { this.respond({ events, alive: true }); }
+  exit() { this.respond({ events: [], alive: false }); }
+  private respond(batch: Batch) {
+    if (this.poll) {
+      const poll = this.poll;
+      this.poll = undefined;
+      poll.resolve(batch);
+    } else this.batches.push(batch);
+  }
+  async rpc<T>(method: string, args?: Record<string, unknown>): Promise<T> {
+    this.calls.push({ method, args });
+    if (method === "start") this.starts.push(this.id);
+    if (method === "events") {
+      if (this.batches.length) return this.batches.shift() as T;
+      this.poll = deferred<Batch>();
+      return this.poll.promise as Promise<T>;
+    }
+    if (method === "snapshot") return { bundle: Buffer.from("bundle").toString("base64"), head: "b".repeat(40) } as T;
+    if (method === "send" && (args?.input as { type?: string })?.type === "interrupt")
+      this.emit({ type: "turn.end", agent_id: "main", stop_reason: "interrupted" });
+    return true as T;
+  }
+  async destroy() {
+    this.releases.push(this.id);
+    // A real workspace resolves an outstanding RPC on teardown. A nonempty batch
+    // lets the pump see live.closed before attempting another database read.
+    if (this.rejectEventsOnDestroy && this.poll) {
+      this.poll.reject(new Error("Workspace was destroyed"));
+      this.poll = undefined;
+    } else this.emit({ type: "turn.start", agent_id: "main" });
+  }
+  users() {
+    return this.calls.filter(call => call.method === "send")
+      .map(call => call.args?.input as { type: string; text?: string })
+      .filter(input => input.type === "user").map(input => input.text);
+  }
+}
+
+let dir: string, db: ReturnType<typeof openStore>, cfg: Config, runs: Runs;
+let starts: string[], releases: string[], workspaces: Map<string, ControlledWorkspace>;
+let gates: ReturnType<typeof deferred<void>>[];
+const input = (prompt = "Implement it") => ({ repo: "acme/app", model: "local:coder", prompt });
+const factory: WorkspaceFactory = async id => {
+  const workspace = new ControlledWorkspace(id, starts, releases);
+  workspaces.set(id, workspace);
+  return workspace;
+};
+// Flush promise chains and asynchronous checkout cleanup without advancing the
+// fake clock. Worker event RPCs remain under test control.
+async function flush() { for (let i = 0; i < 100; i++) await setImmediate(); }
+async function create(user = "a", prompt = "Implement it") {
+  const run = await runs.create(user, input(prompt));
+  await flush();
+  return runs.get(run.id, user);
+}
+async function finish(id: string) {
+  workspaces.get(id)!.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+  await flush();
+  expect(runs.get(id).status).toBe("ready");
+}
+function holdCheckout(fail = false) {
+  const gate = deferred<void>();
+  gates.push(gate);
+  vi.mocked(checkout).mockImplementationOnce(async () => {
+    await gate.promise;
+    if (fail) throw new Error("fixture checkout failure");
+    return { cwd: "/fake", archive: Buffer.from("repo") };
+  });
+  return () => gate.resolve();
+}
+function membership(id: string) {
+  return db.prepare("SELECT queue_seq,queued_at FROM runs WHERE id=?").get(id) as { queue_seq: number | null; queued_at: number | null };
+}
+function queuedIds() {
+  return (db.prepare("SELECT id FROM runs WHERE queue_seq IS NOT NULL ORDER BY queue_seq").all() as { id: string }[]).map(row => row.id);
+}
+function countRuns() { return (db.prepare("SELECT count(*) AS n FROM runs").get() as { n: number }).n; }
+
+beforeEach(async () => {
+  vi.clearAllMocks();
+  vi.mocked(checkout).mockReset().mockResolvedValue({ cwd: "/fake", archive: Buffer.from("repo") });
+  dir = mkdtempSync(join(tmpdir(), "gond-run-queue-"));
+  cfg = { data: dir, origin: "http://localhost:8787", secret: "q".repeat(40), signup: true, port: 8787,
+    dockerBin: "docker", workerImage: "unused", maxRuns: 1, runCPUs: 2, runMemoryMB: 2048 };
+  db = openStore(dir);
+  await createAuthentication(db, cfg);
+  setSetting(db, "github-shared-fallback", false);
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-06-01T12:00:00Z"));
+  for (const user of ["a", "b", "c"]) {
+    db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)')
+      .run(user, user.toUpperCase(), `${user}@example.test`, 0, Date.now(), Date.now());
+    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
+      .run(user, seal(cfg.secret, `fixture-github-${user}`), Date.now());
+    db.prepare("INSERT INTO profiles(user_id,auto_pr) VALUES(?,0)").run(user);
+  }
+  saveProviderSettings(db, cfg.secret, { connections: [{ id: "local", name: "Local", format: "openai",
+    baseURL: "http://127.0.0.1:9/v1", apiKey: "fixture-provider-key", discover: false,
+    models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }], defaultModel: "local:coder" });
+  starts = []; releases = []; gates = []; workspaces = new Map();
+  runs = new Runs(db, cfg, factory);
+});
+afterEach(async () => {
+  for (const gate of gates) gate.resolve();
+  await flush();
+  await runs.shutdown();
+  await flush();
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
+describe("persistent workspace queue", () => {
+  it("accepts work at capacity, exposes only the owner's queue and starts it automatically on close", async () => {
+    const active = await create();
+    const a1 = await create("a", "A first"), b1 = await create("b"), a2 = await create("a", "A second");
+    expect(starts).toEqual([active.id]);
+    expect(runs.get(a1.id, "a")).toMatchObject({ status: "queued", queue_position: 1, queue_length: 2 });
+    expect(runs.get(a2.id, "a")).toMatchObject({ queue_position: 2, queue_length: 2 });
+    expect(runs.list("b")).toEqual([expect.objectContaining({ id: b1.id, queue_position: 1, queue_length: 1 })]);
+    expect(() => runs.get(a1.id, "b")).toThrow(expect.objectContaining({ code: "not_found" }));
+    expect(runs.list("a").map(r => r.id)).not.toContain(b1.id);
+    expect(runs.history(b1.id, 0).filter(e => e.type === "run.queued").at(-1)).toMatchObject({ position: 1, length: 1 });
+    expect(membership(a1.id)).toEqual({ queue_seq: expect.any(Number), queued_at: Date.now() });
+    runs.save(runs.get(a1.id));
+    const stored = JSON.parse((db.prepare("SELECT data FROM runs WHERE id=?").get(a1.id) as { data: string }).data);
+    expect(stored).not.toHaveProperty("queue_position");
+    expect(stored).not.toHaveProperty("queue_length");
+    await finish(active.id);
+    expect(starts).toEqual([active.id]); // Successful turns retain their workspace.
+    await runs.closeSession(active.id, "a");
+    await flush();
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, a1.id]); // No occupied accounts: oldest head wins.
+    expect(membership(a1.id)).toEqual({ queue_seq: null, queued_at: null });
+    expect(runs.get(a1.id)).not.toHaveProperty("queue_position");
+    expect(runs.get(a2.id)).toMatchObject({ queue_position: 1, queue_length: 1 });
+    expect(vi.mocked(checkout).mock.calls.map(call => call[6]?.GH_TOKEN)).toEqual(["fixture-github-a", "fixture-github-a"]);
+    expect(vi.mocked(importBundle).mock.calls[0]?.[3]?.GH_TOKEN).toBe("fixture-github-a");
+    expect(vi.mocked(gh).mock.calls.map(call => call[3]?.GH_TOKEN))
+      .toEqual(["fixture-github-a", "fixture-github-a", "fixture-github-b", "fixture-github-a"]);
+    expect(JSON.stringify([...workspaces.values()].flatMap(w => w.calls))).not.toMatch(/fixture-github|fixture-provider-key/);
+  });
+
+  it("prefers the account with fewer occupied workspaces, then FIFO within each account", async () => {
+    cfg.maxRuns = 2;
+    const first = await create(), second = await create();
+    const a1 = await create("a", "A first"), b1 = await create("b", "B first");
+    const b2 = await create("b", "B second"), a2 = await create("a", "A second");
+    // All admissions have the same timestamp: persistent sequence, not clock or ID,
+    // must break ties. B gets capacity even though A joined earlier.
+    await runs.close(first.id); await flush();
+    expect(starts).toEqual([first.id, second.id, b1.id]);
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.[6]?.GH_TOKEN).toBe("fixture-github-b");
+    await runs.close(second.id); await flush();
+    expect(starts.at(-1)).toBe(a1.id);
+    await runs.close(a1.id); await flush();
+    expect(starts.at(-1)).toBe(a2.id); // B still occupies a workspace.
+    await runs.close(b1.id); await flush();
+    expect(starts.at(-1)).toBe(b2.id);
+    expect(queuedIds()).toEqual([]);
+  });
+
+  it.each(["ready", "stopped", "failed"])("counts a live %s workspace until close or kept-failure reclamation", async status => {
+    const active = await create(), waiting = await create("b");
+    if (status === "ready") await finish(active.id);
+    else if (status === "stopped") { await runs.stop(active.id, "a"); await flush(); }
+    else {
+      workspaces.get(active.id)!.emit(
+        { type: "turn.end", agent_id: "main", stop_reason: "error" },
+        { type: "error", agent_id: "main", message: "Fixture model failure", retryable: false },
+      );
+      await flush();
+    }
+    expect(runs.get(active.id).status).toBe(status);
+    runs.drain(); await flush();
+    if (status === "failed") {
+      // A kept failure still owns a slot, but queued work now reclaims it.
+      expect(runs.get(active.id).work_kept).toBe(false);
+      expect(releases).toEqual([active.id]);
+    } else {
+      expect(starts).toEqual([active.id]);
+      expect(releases).toEqual([]);
+      expect(runs.get(waiting.id).status).toBe("queued");
+    }
+    await runs.closeSession(active.id, "a"); await flush();
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it.each(["failure", "stop"])("reserves boot capacity and automatically releases it after boot %s", async outcome => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const release = holdCheckout(outcome === "failure");
+    const booting = await create(), waiting = await create("b");
+    expect(starts).toEqual([]);
+    expect(checkout).toHaveBeenCalledTimes(1);
+    if (outcome === "stop") await runs.stop(booting.id, "a");
+    runs.drain(); await flush();
+    expect(checkout).toHaveBeenCalledTimes(1); // Stopping doesn't release an in-flight boot early.
+    release(); await flush();
+    expect(runs.get(booting.id).status).toBe(outcome === "failure" ? "failed" : "stopped");
+    expect(runs.get(booting.id).pending).toEqual([]);
+    expect(starts).toEqual([waiting.id]);
+    expect(checkout).toHaveBeenCalledTimes(2);
+  });
+
+  it("drains after a worker exits, without retrying the failed run ahead of waiting work", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    // Unlike a model error event, a dead worker releases its live workspace.
+    workspaces.get(active.id)!.exit();
+    await flush();
+    expect(runs.get(active.id).status).toBe("failed");
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("starts waiting work when a merged turn finishes and releases its workspace", async () => {
+    const active = await create(), waiting = await create("b");
+    const current = runs.get(active.id); current.pr_state = "merged"; runs.save(current);
+    workspaces.get(active.id)!.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await flush();
+    expect(runs.get(active.id).status).toBe("merged");
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("keeps replacement messages accepted while a stopped startup is still unwinding", async () => {
+    cfg.maxRuns = 2;
+    const release = holdCheckout(true);
+    const cancelled = await create();
+    await runs.stop(cancelled.id, "a");
+    runs.enqueue(cancelled.id, "a", "Replacement", [], undefined, undefined, "replacement-1");
+    const later = await create("a", "Later for the same account");
+    expect(runs.get(cancelled.id)).toMatchObject({ status: "queued", queue_position: 1 });
+    expect(starts).toEqual([]); // Can't double-claim the old boot or jump its account head.
+    release(); await flush();
+    expect(workspaces.get(cancelled.id)!.users()).toEqual(["Replacement"]);
+    expect(workspaces.get(later.id)!.users()).toEqual(["Later for the same account"]);
+    expect(checkout).toHaveBeenCalledTimes(3);
+  });
+
+  it("waits for boot teardown before deleting its row and drains other accounts safely", async () => {
+    cfg.maxRuns = 2;
+    const release = holdCheckout();
+    const booting = await create(), live = await create("b"), waiting = await create("c");
+    const removing = runs.remove(booting.id, "a");
+    await runs.close(live.id); await flush();
+    expect(starts).toEqual([live.id, waiting.id]);
+    release(); await removing; await flush();
+    expect(() => runs.get(booting.id)).toThrow(expect.objectContaining({ code: "not_found" }));
+    expect(() => runs.drain()).not.toThrow();
+    expect(starts).not.toContain(booting.id);
+  });
+
+  it("tracks a replacement startup until shutdown completes instead of losing its launch receipt", async () => {
+    const releaseOriginal = holdCheckout();
+    const run = await create();
+    await runs.stop(run.id, "a");
+    runs.enqueue(run.id, "a", "Replacement");
+    const releaseReplacement = holdCheckout();
+    releaseOriginal(); await flush();
+    expect(checkout).toHaveBeenCalledTimes(2);
+    let closed = false;
+    const shutdown = runs.shutdown().then(() => { closed = true; });
+    await flush();
+    expect(closed).toBe(false);
+    releaseReplacement(); await shutdown;
+    expect(closed).toBe(true);
+    expect(starts).toEqual([]);
+  });
+
+  it("validates saved model and GitHub access before admitting a closed-run follow-up", async () => {
+    const closed = await create(); await finish(closed.id); await runs.closeSession(closed.id, "a");
+    await create("b");
+    db.prepare("DELETE FROM github_connections WHERE user_id='a'").run();
+    await expect(runs.validateFollowUp(closed.id, "a")).rejects.toMatchObject({ code: "github_required" });
+    expect(() => runs.enqueue(closed.id, "a", "Continue")).toThrow(expect.objectContaining({ code: "github_required" }));
+    db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)").run("a", seal(cfg.secret, "fixture-github-a"), Date.now());
+    vi.spyOn(runs, "resolveSelection").mockRejectedValueOnce(new Error("Saved model unavailable"));
+    await expect(runs.validateFollowUp(closed.id, "a")).rejects.toThrow("Saved model unavailable");
+    expect(runs.get(closed.id).pending).toEqual([]);
+    expect(queuedIds()).toEqual([]);
+  });
+
+  it("accepts HTTP and MCP starts at capacity, shares cancellation and durably deduplicates queued messages", async () => {
+    const active = await create();
+    const auth = await createAuthentication(db, cfg);
+    const { app, mcp, githubLogin } = createApp(db, cfg, auth, runs);
+    const client = new Client({ name: "queue-fixture", version: "1" });
+    try {
+      const registration = await app.request(cfg.origin + "/api/auth/sign-up/email", {
+        method: "POST", headers: { origin: cfg.origin, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Queue", email: "queue@example.test", password: "fixture-password-long-enough" }),
+      });
+      expect(registration.status).toBe(200);
+      const user = (await registration.json()).user.id;
+      const cookie = registration.headers.getSetCookie().map(c => c.split(";")[0]).join("; ");
+      db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
+        .run(user, seal(cfg.secret, "fixture-github-queue"), Date.now());
+      const response = await app.request(cfg.origin + "/api/v1/runs", {
+        method: "POST", headers: { cookie, origin: cfg.origin, "content-type": "application/json" },
+        body: JSON.stringify(input("HTTP start")),
+      });
+      expect(response.status).toBe(201);
+      const http = await response.json();
+      expect(http).toMatchObject({ status: "queued", queue_position: 1, queue_length: 1 });
+      const token = createToken(db, user, "Queue fixture");
+      await client.connect(new StreamableHTTPClientTransport(new URL(cfg.origin + "/mcp"), {
+        requestInit: { headers: { Authorization: `Bearer ${token.token}` } },
+        fetch: async (url, init) => mcp.fetch(new Request(url, init)),
+      }));
+      const call = async (name: string, args: Record<string, unknown> = {}) => {
+        const result = await client.callTool({ name, arguments: args });
+        expect(result.isError).not.toBe(true);
+        return JSON.parse((result.content as { text: string }[])[0].text);
+      };
+      const args = { ...input("MCP start"), request_id: "start-1" };
+      const started = await call("start_session", args);
+      expect(started).toMatchObject({ state: "queued", queue_position: 2, queue_length: 2 });
+      expect((await call("start_session", args)).id).toBe(started.id);
+      expect((await call("get_session", { session_id: http.id })).queue_length).toBe(2);
+      expect((await call("list_sessions")).sessions.map((r: { id: string }) => r.id).sort()).toEqual([http.id, started.id].sort());
+      await call("stop_session", { session_id: http.id });
+      expect(runs.get(http.id, user)).toMatchObject({ status: "stopped", pending: [] });
+      const message = { session_id: http.id, request_id: "message-1", text: "Reopen when free" };
+      await call("send_session_message", message);
+      await call("send_session_message", message);
+      expect(runs.get(http.id, user)).toMatchObject({ status: "queued", queue_position: 2, queue_length: 2 });
+      expect(runs.get(http.id, user).pending.map(p => p.text)).toEqual([message.text]);
+      expect(countRuns()).toBe(3);
+      await runs.close(active.id); await flush();
+      expect(starts).toEqual([active.id, started.id]);
+      expect(await call("start_session", args)).toMatchObject({ id: started.id, state: "working" });
+      await runs.close(started.id); await flush();
+      expect(workspaces.get(http.id)!.users()).toEqual([message.text]);
+    } finally { await client.close(); await mcp.close(); await githubLogin.close(); }
+  });
+
+  it("bounds waiting runs globally and per account, without leaving partial runs or claiming images", async () => {
+    cfg.queueMax = 3; cfg.queueMaxPerAccount = 2;
+    await create();
+    const own = await create(); await create();
+    runs.enqueue(own.id, "a", "Another message for the same waiting run");
+    expect(runs.get(own.id).pending).toHaveLength(2); // Bounds count runs, not messages.
+    expect(queuedIds()).toHaveLength(2);
+    db.prepare("INSERT INTO images(id,user_id,media_type,bytes,created_at) VALUES(?,?,?,?,?)")
+      .run("img_bound", "a", "image/png", Buffer.from("png"), Date.now());
+    const full = { status: 429, code: "queue_full", message: "Too many runs are waiting. Try again later." };
+    await expect(runs.create("a", { ...input(), images: ["img_bound"] })).rejects.toMatchObject(full);
+    expect(countRuns()).toBe(3);
+    expect(db.prepare("SELECT run_id FROM images WHERE id='img_bound'").get()).toEqual({ run_id: null });
+    await create("b");
+    await expect(runs.create("c", input())).rejects.toMatchObject(full);
+    expect(countRuns()).toBe(4);
+    expect(queuedIds()).toHaveLength(3);
+    expect(starts).toHaveLength(1);
+  });
+
+  it("uses the default ten-waiting-runs account bound when queue settings are omitted", async () => {
+    await create();
+    for (let i = 0; i < 10; i++) await create("a", `Waiting ${i}`);
+    await expect(runs.create("a", input())).rejects.toMatchObject({ code: "queue_full" });
+    const other = await create("b");
+    expect(runs.get(other.id)).toMatchObject({ queue_position: 1, queue_length: 1 });
+    expect(queuedIds()).toHaveLength(11);
+  });
+
+  it("still validates requests at capacity instead of persisting invalid queued work", async () => {
+    await create();
+    const invalid: [Partial<Parameters<Runs["create"]>[1]>, string][] = [
+      [{ prompt: " " }, "invalid_request"], [{ repo: "not-a-repo" }, "invalid_request"],
+      [{ backend: "codex" }, "invalid_backend"], [{ base_branch: "../bad" }, "invalid_branch"],
+      [{ model: "" }, "invalid_model"], [{ images: ["missing-image"] }, "image_not_found"],
+    ];
+    for (const [bad, code] of invalid)
+      await expect(runs.create("a", { ...input(), ...bad })).rejects.toMatchObject({ code });
+    db.prepare("DELETE FROM github_connections WHERE user_id='c'").run();
+    await expect(runs.create("c", input())).rejects.toMatchObject({ code: "github_required" });
+    expect(countRuns()).toBe(1);
+    expect(queuedIds()).toEqual([]);
+    expect(checkout).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["stop", "closeSession", "close", "remove"] as const)("cancels queued work through %s without ever starting it", async action => {
+    const active = await create(), cancelled = await create("b"), survivor = await create("b");
+    await expect(runs.stop(cancelled.id, "a")).rejects.toMatchObject({ code: "not_found" });
+    if (action === "close") await runs.close(cancelled.id);
+    else await runs[action](cancelled.id, "b");
+    expect(membership(cancelled.id)).toEqual({ queue_seq: null, queued_at: null });
+    if (action === "remove") expect(() => runs.get(cancelled.id, "b")).toThrow(expect.objectContaining({ code: "not_found" }));
+    else expect(runs.get(cancelled.id)).toMatchObject({ status: "stopped", pending: [] });
+    expect(runs.get(survivor.id)).toMatchObject({ queue_position: 1, queue_length: 1 });
+    await runs.close(active.id); await flush();
+    expect(starts).toEqual([active.id, survivor.id]);
+    expect(releases).toEqual([active.id]);
+  });
+
+  it("queues follow-ups to closed runs, preserving their history and branch", async () => {
+    const original = await create(); await finish(original.id);
+    const history = runs.history(original.id, 0);
+    await runs.closeSession(original.id, "a");
+    const active = await create("b");
+    runs.enqueue(original.id, "a", "Continue on the saved branch");
+    const position = membership(original.id);
+    runs.enqueue(original.id, "a", "Then add a test");
+    expect(membership(original.id)).toEqual(position); // One waiting run, not one slot per message.
+    expect(runs.get(original.id)).toMatchObject({ status: "queued", queue_position: 1, queue_length: 1 });
+    expect(runs.get(original.id).pending.map(p => p.text)).toEqual(["Continue on the saved branch", "Then add a test"]);
+    await runs.close(active.id); await flush();
+    expect(starts).toEqual([original.id, active.id, original.id]);
+    expect(vi.mocked(checkout).mock.calls.at(-1)?.slice(4, 6)).toEqual([original.branch, true]);
+    expect(runs.history(original.id, 0).slice(0, history.length)).toEqual(history);
+    expect(workspaces.get(original.id)!.users()).toEqual(["Continue on the saved branch"]);
+  });
+
+  it("deduplicates attributed creates and request-ID follow-ups, including after restart", async () => {
+    await create();
+    const attribution = { id: "run_attributed", tokenId: "token_fixture", authorize: vi.fn() };
+    const request = { ...input("Original"), source: "mcp" };
+    const [a, b] = await Promise.all([runs.create("b", request, attribution), runs.create("b", request, attribution)]);
+    expect(a.id).toBe(attribution.id); expect(b.id).toBe(a.id);
+    expect(runs.get(a.id)).toMatchObject({ source: "mcp", mcp_token_id: attribution.tokenId });
+    runs.enqueue(a.id, "b", "Follow-up", [], undefined, undefined, "message-1");
+    const order = membership(a.id);
+    runs.enqueue(a.id, "b", "Follow-up", [], undefined, undefined, "message-1");
+    expect(countRuns()).toBe(2);
+    expect(runs.get(a.id).pending.map(p => p.text)).toEqual(["Original", "Follow-up"]);
+    expect(runs.history(a.id, 0).filter(e => e.type === "user")).toHaveLength(2);
+    expect(attribution.authorize).toHaveBeenCalled();
+    await runs.shutdown();
+    runs = new Runs(db, cfg, factory);
+    // Retry before recovery drains the persisted queue.
+    await runs.create("b", request, attribution);
+    runs.enqueue(a.id, "b", "Follow-up", [], undefined, undefined, "message-1");
+    expect(membership(a.id)).toEqual(order);
+    expect(runs.get(a.id).pending).toHaveLength(2);
+    expect(runs.history(a.id, 0).filter(e => e.type === "user")).toHaveLength(2);
+    await runs.recover(); await flush();
+    expect(starts.filter(id => id === a.id)).toHaveLength(1);
+    expect(workspaces.get(a.id)!.users()).toEqual(["Original"]);
+    workspaces.get(a.id)!.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await flush();
+    expect(workspaces.get(a.id)!.users()).toEqual(["Original", "Follow-up"]);
+    expect(runs.get(a.id).pending).toEqual([]);
+    // Consuming the message must not discard its durable retry receipt.
+    runs.enqueue(a.id, "b", "Follow-up", [], undefined, undefined, "message-1");
+    expect(runs.get(a.id).pending).toEqual([]);
+    expect(runs.history(a.id, 0).filter(e => e.type === "user")).toHaveLength(2);
+  });
+
+  it("persists queued publication overrides atomically with request receipts without replaying stale bodies", async () => {
+    await create(); // Occupy the only slot so publication metadata waits with the queued run.
+    const queued = await runs.create("b", {...input(),title:"Queued publication",pr_body:"Initial description"});
+    const order = membership(queued.id);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "");
+    expect(runs.get(queued.id)).toMatchObject({status:"queued",queue_position:1,title:"Queued publication",pr_body:""});
+    expect(membership(queued.id)).toEqual(order);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "Stale retry body");
+    expect(runs.get(queued.id).pr_body).toBe("");
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    expect(() => runs.enqueue(queued.id, "b", "Invalid description", [], undefined, undefined, "invalid-body", "bad\0body"))
+      .toThrow(expect.objectContaining({code:"invalid_publication"}));
+    expect(db.prepare("SELECT request_id FROM run_message_requests WHERE run_id=?").all(queued.id))
+      .toEqual([{request_id:"body-update"}]);
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    await runs.shutdown();
+    runs = new Runs(db, cfg, factory);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "Stale restart body");
+    expect(runs.get(queued.id)).toMatchObject({status:"queued",queue_position:1,title:"Queued publication",pr_body:""});
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    expect(membership(queued.id)).toEqual(order);
+    expect(runs.history(queued.id, 0).filter(e => e.type === "user")).toHaveLength(2);
+  });
+
+  it("recovers waiting membership, messages and order while failing interrupted active work", async () => {
+    const interrupted = await create(), first = await create("b", "First"), second = await create("b", "Second");
+    runs.enqueue(first.id, "b", "Pending follow-up");
+    const before = [membership(first.id), membership(second.id)];
+    const pending = runs.get(first.id).pending;
+    await runs.shutdown(); await flush();
+    db.close(); db = openStore(dir);
+    expect([membership(first.id), membership(second.id)]).toEqual(before);
+    expect(queuedIds()).toEqual([first.id, second.id]);
+    runs = new Runs(db, cfg, factory);
+    const release = holdCheckout();
+    await runs.recover(); await flush();
+    expect(runs.get(interrupted.id)).toMatchObject({ status: "failed", pending: [] });
+    expect(runs.get(interrupted.id).error).toMatch(/host restarted/i);
+    expect(runs.get(first.id).pending).toEqual(pending);
+    expect(membership(second.id)).toEqual(before[1]);
+    release(); await flush();
+    expect(starts).toEqual([interrupted.id, first.id]);
+    expect(workspaces.get(first.id)!.users()).toEqual(["First"]);
+    await runs.close(first.id); await flush();
+    expect(starts).toEqual([interrupted.id, first.id, second.id]);
+  });
+
+  it.each(["runner", "schedule"])("rejects %s at capacity, ignores queue bounds and never jumps waiting work", async source => {
+    cfg.queueMax = 1; cfg.queueMaxPerAccount = 1;
+    const active = await create(), waiting = await create("b");
+    await expect(runs.create("c", { ...input(), source })).rejects.toMatchObject({ status: 429, code: "run_limit" });
+    expect(countRuns()).toBe(2);
+    cfg.maxRuns = 2;
+    // Admission must drain older interactive work before checking schedule capacity.
+    await expect(runs.create("c", { ...input(), source })).rejects.toMatchObject({ code: "run_limit" });
+    await flush();
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(queuedIds()).toEqual([]);
+    await runs.close(active.id); await runs.close(waiting.id); await flush();
+    const scheduled = await runs.create("c", { ...input(), source }); await flush();
+    expect(starts.at(-1)).toBe(scheduled.id);
+    expect(workspaces.get(scheduled.id)!.calls.find(call => call.method === "start")?.args).toMatchObject({ interactive: false });
+  });
+
+  it.each(["close", "stop", "expiry"])("drains waiting work when a kept failed workspace finishes releasing after %s", async action => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "1");
+    const failed = await create();
+    workspaces.get(failed.id)!.emit({ type: "error", agent_id: "main", message: "The model connection failed." });
+    await flush();
+    expect(runs.get(failed.id).work_kept).toBe(true);
+    const gate = deferred<void>();
+    gates.push(gate);
+    const workspace = workspaces.get(failed.id)!;
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    let closing: Promise<unknown> | undefined;
+    if (action === "close") closing = runs.closeSession(failed.id, "a");
+    else if (action === "stop") closing = runs.stop(failed.id, "a");
+    else await vi.advanceTimersByTimeAsync(60_000);
+    const waiting = await create("b");
+    expect(runs.get(waiting.id).status).toBe("queued");
+    expect(starts).toEqual([failed.id]);
+    gate.resolve();
+    await closing; await flush();
+    expect(starts).toEqual([failed.id, waiting.id]);
+    expect(runs.get(failed.id).work_kept).toBe(false);
+  });
+
+  it("reclaims a failure for already queued work and reserves the reclaimed slot only once", async () => {
+    const active = await create(), first = await create("b"), second = await create("c");
+    const gate = deferred<void>();
+    gates.push(gate);
+    const workspace = workspaces.get(active.id)!;
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    // Publication imported this commit before its push failed. Capacity eviction
+    // must retain the API clone/commit, as in the retry/keep-work contract.
+    vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", { class: "server", retryable: true, reason: "GitHub returned 500" }, 5));
+    workspace.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await flush();
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false, kept_commit: "b".repeat(40) });
+    expect(membership(first.id).queue_seq).toBeNull();
+    expect(queuedIds()).toEqual([second.id]);
+    expect(starts).toEqual([active.id]); // Replacement waits for destruction.
+    const third = await create("a");
+    runs.drain();
+    expect(queuedIds()).toEqual([second.id, third.id]);
+    gate.resolve(); await flush();
+    expect(starts).toEqual([active.id, first.id]);
+    expect(queuedIds()).toEqual([second.id, third.id]);
+  });
+
+  it.each(["membership", "status"])("does not boot a stale queue selection after another claimant changes its %s", async changed => {
+    const active = await create(), waiting = await create("b");
+    const queue = new RunQueue(db);
+    const claim = RunQueue.prototype.claim;
+    vi.spyOn(RunQueue.prototype, "claim").mockImplementationOnce(function (this: RunQueue, id) {
+      expect(id).toBe(waiting.id);
+      // Simulate the durable result of a different process winning after selection.
+      if (changed === "membership") db.prepare("UPDATE runs SET queue_seq=NULL WHERE id=?").run(id);
+      else db.prepare("UPDATE runs SET status='working' WHERE id=?").run(id);
+      return claim.call(this, id);
+    });
+    await runs.close(active.id); await flush();
+    expect(queue.claim(waiting.id)).toBe(false);
+    expect(starts).toEqual([active.id]);
+    expect(vi.mocked(checkout).mock.calls.map(call => call[1])).toEqual([active.id]);
+    expect(runs.history(waiting.id, 0).filter(event => event.type === "run.dequeued")).toEqual([]);
+  });
+
+  it("preserves replacement messages accepted after Stop during kept-commit publication", async () => {
+    const original = await create();
+    await runs.close(original.id);
+    const saved = runs.get(original.id);
+    saved.kept_commit = "b".repeat(40);
+    saved.status = "failed";
+    runs.save(saved);
+    const gate = deferred<void>();
+    gates.push(gate);
+    vi.mocked(pushBranch).mockImplementationOnce(() => gate.promise);
+    runs.enqueue(original.id, "a", "Cancelled retry");
+    await flush();
+    expect(pushBranch).toHaveBeenCalledTimes(1);
+    await runs.stop(original.id, "a");
+    runs.enqueue(original.id, "a", "Replacement", [], undefined, undefined, "replacement-id");
+    gate.resolve(); await flush();
+    expect(starts).toEqual([original.id, original.id]);
+    expect(workspaces.get(original.id)!.users()).toEqual(["Replacement"]);
+    expect(membership(original.id).queue_seq).toBeNull();
+    expect(runs.get(original.id).kept_commit).toBeUndefined();
+    expect(runs.get(original.id).pending).toEqual([]);
+  });
+
+  it("does not turn intentional teardown RPC errors into a kept failure", async () => {
+    const active = await create();
+    await finish(active.id);
+    await vi.advanceTimersByTimeAsync(50); await flush();
+    workspaces.get(active.id)!.rejectEventsOnDestroy = true;
+    await runs.closeSession(active.id, "a"); await flush();
+    expect(runs.get(active.id)).toMatchObject({ status: "ready", work_kept: false });
+    expect(runs.history(active.id, 0).filter(event => event.type === "run.error")).toEqual([]);
+  });
+
+  it("claims each run only once when releases, drains and new admissions race", async () => {
+    cfg.maxRuns = 2;
+    const first = await create(), second = await create("b");
+    const waiting1 = await create("a", "Waiting first"), waiting2 = await create("b", "Waiting second");
+    const release = holdCheckout();
+    await Promise.all([
+      runs.close(first.id), runs.close(second.id),
+      runs.create("c", input("New admission")),
+      Promise.resolve().then(() => { runs.drain(); runs.drain(); }),
+    ]);
+    await flush();
+    expect(vi.mocked(checkout).mock.calls.map(call => call[1])).toEqual([first.id, second.id, waiting1.id, waiting2.id]);
+    expect(queuedIds()).toHaveLength(1);
+    release(); await flush();
+    expect(starts.filter(id => id === waiting1.id)).toHaveLength(1);
+    expect(starts.filter(id => id === waiting2.id)).toHaveLength(1);
+    runs.drain(); await flush();
+    expect(starts).toHaveLength(4);
+  });
+
+  it("expires only overdue waiting work at the fake-clock boundary and permits a fresh follow-up", async () => {
+    const active = await create(), expired = await create("b");
+    const joined = Date.now();
+    vi.setSystemTime(joined + 3600_000);
+    const fresh = await create("c");
+    vi.setSystemTime(joined + 24 * 3600_000 - 1);
+    runs.drain();
+    expect(runs.get(expired.id).status).toBe("queued");
+    vi.setSystemTime(joined + 24 * 3600_000);
+    runs.drain();
+    expect(runs.get(expired.id)).toMatchObject({ status: "failed", pending: [], error: expect.stringMatching(/wait.*expired/i) });
+    expect(membership(expired.id)).toEqual({ queue_seq: null, queued_at: null });
+    expect(runs.get(fresh.id)).toMatchObject({ status: "queued", queue_position: 1, queue_length: 1 });
+    expect(runs.get(active.id).status).toBe("working"); // Queue expiry is not a run lifetime budget.
+    runs.enqueue(expired.id, "b", "Retry after expiry");
+    expect(queuedIds()).toEqual([fresh.id, expired.id]);
+    expect(membership(expired.id).queued_at).toBe(Date.now());
+    await runs.close(active.id); await flush();
+    expect(starts).toEqual([active.id, fresh.id]);
+  });
+
+  it("honors configured wait hours and periodically drains as a safety net", async () => {
+    cfg.queueWaitHours = 1;
+    await create();
+    const expired = await create("b");
+    vi.setSystemTime(Date.now() + 3600_000);
+    // No release or explicit drain: the minute tick must clean up the expired row.
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    expect(runs.get(expired.id).status).toBe("failed");
+    const waiting = await create("b");
+    cfg.maxRuns = 2;
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    expect(starts.at(-1)).toBe(waiting.id);
+  });
+});
+
+it("validates bounded queue settings and supplies defaults without echoing invalid values", () => {
+  const names = ["GOND_AGENT_QUEUE_MAX", "GOND_AGENT_QUEUE_MAX_PER_ACCOUNT", "GOND_AGENT_QUEUE_WAIT_HOURS"] as const;
+  for (const name of names) vi.stubEnv(name, undefined);
+  expect(queueSettings()).toEqual({ queueMax: 50, queueMaxPerAccount: 10, queueWaitHours: 24 });
+  for (const name of names) {
+    for (const value of ["0", "-1", "1.5", "NaN", "Infinity", " 2", "1e2", "4294967296", "private-invalid-value"]) {
+      vi.stubEnv(name, value);
+      expect(() => queueSettings()).toThrow(expect.objectContaining({ message: `Invalid ${name}` }));
+    }
+    vi.stubEnv(name, "2");
+  }
+  expect(queueSettings()).toEqual({ queueMax: 2, queueMaxPerAccount: 2, queueWaitHours: 2 });
+});
+
+it("migrates legacy queued rows additively and repeatedly without changing messages or established order", () => {
+  const legacy = new Database(":memory:");
+  try {
+    legacy.exec("CREATE TABLE runs(id TEXT PRIMARY KEY,user_id TEXT,status TEXT,created_at INTEGER,deleted_at INTEGER,data TEXT NOT NULL)");
+    const insert = legacy.prepare("INSERT INTO runs(id,user_id,status,created_at,deleted_at,data) VALUES(?,?,?,?,?,?)");
+    const pending = [{ text: "Original", images: [] }, { text: "Follow-up", images: [], request_id: "request-1" }];
+    const data = JSON.stringify({ backend: "builtin", pending, diff: "saved diff" });
+    insert.run("q_b", "a", "queued", 100, null, data);
+    insert.run("q_a", "b", "queued", 100, null, data);
+    insert.run("working", "a", "working", 50, null, data);
+    insert.run("deleted", "a", "queued", 10, 20, data);
+    insert.run("retired", "a", "queued", 5, null, JSON.stringify({ retired_backend: "codex", pending }));
+    migrateRunQueue(legacy);
+    const snapshot = () => legacy.prepare("SELECT id,queue_seq,queued_at,data FROM runs ORDER BY id").all();
+    const before = snapshot();
+    expect(legacy.prepare("SELECT id,queue_seq,queued_at FROM runs WHERE queue_seq IS NOT NULL ORDER BY queue_seq").all()).toEqual([
+      { id: "q_a", queue_seq: 1, queued_at: 100 }, { id: "q_b", queue_seq: 2, queued_at: 100 },
+    ]);
+    migrateRunQueue(legacy); migrateRunQueue(legacy);
+    expect(snapshot()).toEqual(before);
+    insert.run("q_new", "a", "queued", 200, null, data);
+    migrateRunQueue(legacy);
+    expect(legacy.prepare("SELECT queue_seq,queued_at,data FROM runs WHERE id='q_new'").get())
+      .toEqual({ queue_seq: 3, queued_at: 200, data });
+    expect(legacy.prepare("SELECT seq FROM run_queue_counter").get()).toEqual({ seq: 3 });
+    expect(legacy.prepare("SELECT data FROM runs WHERE id='q_a'").get()).toEqual({ data });
+  } finally { legacy.close(); }
+});

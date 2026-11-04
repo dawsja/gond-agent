@@ -15,11 +15,11 @@ export const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage"
 const CALLBACK = "http://127.0.0.1:1455/auth/callback"
 
 function OpenAIMark({ className, inverted = false }: { className?: string; inverted?: boolean }) {
-  return <span aria-hidden="true" className={cn("inline-block size-4 shrink-0 bg-contain bg-center bg-no-repeat", inverted && "invert", className)} style={{ backgroundImage: `url("${MODEL_PROVIDER_ICONS.openai}")` }} />
+  return <span aria-hidden="true" className={cn("inline-block size-4 shrink-0 bg-contain bg-center bg-no-repeat", inverted && "dark:invert", className)} style={{ backgroundImage: `url("${MODEL_PROVIDER_ICONS.openai}")` }} />
 }
 
 export function ContinueWithChatGPT({ onClick, disabled, children = "Continue with ChatGPT" }: { onClick: () => void; disabled?: boolean; children?: string }) {
-  return <Button onClick={onClick} disabled={disabled} className="border border-black/10 bg-white text-black hover:bg-white/90"><OpenAIMark />{children}</Button>
+  return <Button onClick={onClick} disabled={disabled} className="border border-provider-ink/10 bg-provider-paper text-provider-ink hover:bg-provider-paper/90"><OpenAIMark />{children}</Button>
 }
 
 const subscriptionsQuery = { queryKey: ["subscriptions"], queryFn: () => api<Subscriptions>("/v1/subscriptions") }
@@ -69,7 +69,7 @@ export function ChatGPTPlanSettings({ setup = false }: { setup?: boolean }) {
     {query.isError && <p role="alert" className="border-t border-border p-5 text-sm text-failed">{query.error.message}</p>}
     {query.data && <>
       {query.data.accounts.map(account => <div key={account.id} className="flex flex-col gap-3 border-t border-border p-5 sm:px-7"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 items-center gap-3"><span className="grid size-8 shrink-0 place-items-center rounded-full bg-white"><OpenAIMark /></span><div className="min-w-0"><p className="truncate text-sm font-medium">{account.email ?? "ChatGPT account"}</p><p className={cn("text-xs", account.status === "active" && account.plan === "enabled" && !account.limited ? "text-muted-foreground" : "text-amber-300")}>{status(account)}</p></div></div>
+        <div className="flex min-w-0 items-center gap-3"><span className="grid size-8 shrink-0 place-items-center rounded-full bg-provider-paper"><OpenAIMark /></span><div className="min-w-0"><p className="truncate text-sm font-medium">{account.email ?? "ChatGPT account"}</p><p className={cn("text-xs", account.status === "active" && account.plan === "enabled" && !account.limited ? "text-muted-foreground" : "text-warning")}>{status(account)}</p></div></div>
         <div className="flex flex-wrap items-center gap-2">
           {(account.status !== "active" || account.plan === "disabled") && <ContinueWithChatGPT disabled={busy || !!pending} onClick={() => start.mutate(account.id)} />}
           <Button asChild variant="ghost" size="sm"><a href={account.usage_url ?? CHATGPT_USAGE_URL} target="_blank" rel="noreferrer">Manage usage<ExternalLink /></a></Button>
@@ -106,7 +106,7 @@ export function ChatGPTWelcome() {
   const done = useMutation({ mutationFn: () => api("/v1/subscriptions/welcome", { body: {} }), onSettled: () => qc.invalidateQueries({ queryKey: ["subscriptions"] }) })
   return <Dialog open={open && !done.isSuccess} onOpenChange={next => { if (!next) done.mutate() }}>
     <DialogContent>
-      <span className="grid size-10 place-items-center rounded-full bg-white"><OpenAIMark className="size-5" /></span>
+      <span className="grid size-10 place-items-center rounded-full bg-provider-paper"><OpenAIMark className="size-5" /></span>
       <DialogTitle className="text-lg font-semibold">You're using your ChatGPT plan</DialogTitle>
       <DialogDescription className="text-sm text-muted-foreground">Eligible requests from Gond Agent's built-in agent now use your ChatGPT plan instead of API billing. Usage counts toward your plan limits, which you can review in ChatGPT settings.</DialogDescription>
       <div className="flex flex-wrap justify-end gap-2"><Button asChild variant="ghost"><a href={CHATGPT_USAGE_URL} target="_blank" rel="noreferrer">Manage usage<ExternalLink /></a></Button><Button onClick={() => done.mutate()}>Got it</Button></div>
@@ -116,7 +116,7 @@ export function ChatGPTWelcome() {
 
 export function UsageLimitCard({ className }: { className?: string }) {
   return <div role="status" className={cn("flex flex-col gap-3 rounded-md border border-border-strong bg-card p-4", className)}>
-    <div className="flex items-center gap-2 text-sm font-medium"><span className="grid size-6 place-items-center rounded-full bg-white"><OpenAIMark className="size-3.5" /></span>Usage limit reached</div>
+    <div className="flex items-center gap-2 text-sm font-medium"><span className="grid size-6 place-items-center rounded-full bg-provider-paper"><OpenAIMark className="size-3.5" /></span>Usage limit reached</div>
     <p className="text-sm text-muted-foreground">You've reached a ChatGPT plan usage limit for Gond Agent. Gond Agent won't switch to API billing. Review your limits in ChatGPT settings, or choose a model from an API connection.</p>
     <Button asChild size="sm" className="self-start"><a href={CHATGPT_USAGE_URL} target="_blank" rel="noreferrer">Manage usage<ExternalLink /></a></Button>
   </div>

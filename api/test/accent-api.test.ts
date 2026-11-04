@@ -56,13 +56,14 @@ it("defaults to blue and round-trips all seven accents without changing other pr
   expect((await me(user)).accent).toBe("blue");
   expect(db.prepare("SELECT * FROM user_accents").all()).toEqual([]);
   db.prepare("UPDATE profiles SET auto_pr=0 WHERE user_id=?").run(user.id);
+  expect((await request("/api/v1/me/theme", user.cookie, "PUT", JSON.stringify({ theme: "light" }))).status).toBe(200);
   expect(ACCENTS).toHaveLength(7);
   for (const accent of ACCENTS) {
     const response = await save(user, { accent });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ accent });
-    expect(await me(user)).toMatchObject({ accent, automations: { auto_pr: false } });
-    expect(db.prepare("SELECT * FROM profiles WHERE user_id=?").get(user.id)).toEqual({ user_id: user.id, auto_pr: 0 });
+    expect(await me(user)).toMatchObject({ accent, theme: "light", automations: { auto_pr: false } });
+    expect(db.prepare("SELECT * FROM profiles WHERE user_id=?").get(user.id)).toEqual({ user_id: user.id, auto_pr: 0, theme: "light" });
     expect(db.prepare("SELECT * FROM user_accents WHERE user_id=?").get(user.id)).toEqual({ user_id: user.id, accent });
   }
   db.prepare("DELETE FROM user_accents WHERE user_id=?").run(user.id);
@@ -87,8 +88,8 @@ it("rejects malformed, invalid and extra fields without changing either account"
   const profiles = db.prepare("SELECT * FROM profiles").all();
   expect(profiles).toHaveLength(2);
   expect(profiles).toEqual(expect.arrayContaining([
-    { user_id: owner.id, auto_pr: 1 },
-    { user_id: other.id, auto_pr: 1 },
+    { user_id: owner.id, auto_pr: 1, theme: "system" },
+    { user_id: other.id, auto_pr: 1, theme: "system" },
   ]));
   expect(db.prepare("SELECT * FROM user_accents").all()).toEqual([{ user_id: owner.id, accent: ACCENTS[1] }]);
   expect((await me(owner)).accent).toBe(ACCENTS[1]);
@@ -135,9 +136,9 @@ it("migrates old profiles and preserves accents, auto_pr, photos and account dat
   await stop();
   await start();
   expect(await me(user)).toMatchObject({ accent: ACCENTS[1], automations: { auto_pr: false }, user: { id: user.id, email: "owner@example.test", has_photo: true } });
-  expect(db.prepare("SELECT * FROM profiles").all()).toEqual([{ user_id: user.id, auto_pr: 0 }]);
+  expect(db.prepare("SELECT * FROM profiles").all()).toEqual([{ user_id: user.id, auto_pr: 0, theme: "system" }]);
   expect(db.prepare("SELECT * FROM user_accents").all()).toEqual([{ user_id: user.id, accent: ACCENTS[1] }]);
-  expect((db.pragma("table_info(profiles)") as { name: string }[]).map(column => column.name)).toEqual(["user_id", "auto_pr"]);
+  expect((db.pragma("table_info(profiles)") as { name: string }[]).map(column => column.name)).toEqual(["user_id", "auto_pr", "theme"]);
   expect(db.prepare("SELECT revision,bytes FROM profile_photos WHERE user_id=?").get(user.id)).toEqual({ revision: "kept", bytes: Buffer.from("photo") });
 });
 

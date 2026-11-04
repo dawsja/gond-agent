@@ -37,6 +37,7 @@ import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
+import { RunQueue } from "./queue";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run {
@@ -55,6 +56,8 @@ export interface Run {
   prompt: string;
   pr_body?: string | null;
   status: string;
+  queue_position?: number;
+  queue_length?: number;
   step: string | null;
   created_at: number;
   updated_at: number;
@@ -81,7 +84,7 @@ export interface Run {
   pushed: boolean;
   diff: string;
   summary: Summary;
-  pending: { text: string; images: string[]; effort?:string; model?:string }[];
+  pending: { text: string; images: string[]; effort?:string; model?:string; request_id?: string }[];
   base_sha: string | null;
   auto_pr: boolean;
 }
@@ -107,17 +110,28 @@ export class Runs {
   readonly access: ModelAccess;
   private live = new Map<string, Live>();
   private booting = new Set<string>();
+  private cancelledBoots = new Set<string>();
   private launches = new Map<string, Promise<void>>();
+  private pumps = new Map<string, Promise<void>>();
   private releasing = new Set<Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
+  private queue: RunQueue;
+  private draining = false;
+  private queueTimer: ReturnType<typeof setInterval>;
   constructor(
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
     subscriptions = new SubscriptionAccounts(db, cfg.secret, [new ChatGPTProvider()]),
-  ) { this.access = new ModelAccess(db, cfg.secret, subscriptions); this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user)); }
+  ) {
+    this.access = new ModelAccess(db, cfg.secret, subscriptions);
+    this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user));
+    this.queue = new RunQueue(db);
+    this.queueTimer = setInterval(() => this.drain(), 60_000);
+    this.queueTimer.unref();
+  }
   get subscriptions() { return this.access.subscriptions; }
   catalog(user: string, refresh = false) { return this.access.catalog(user, refresh); }
   resolveSelection(user: string, id: string) { return this.access.resolve(user, id); }
@@ -151,7 +165,8 @@ export class Runs {
       )
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
     if (!r) throw new ApiError(404, "not_found", "That run doesn't exist.");
-    return this.restorePlan(parseRun(r.data));
+    const run = this.restorePlan(parseRun(r.data));
+    return Object.assign(run, this.queue.info(run.id, run.user_id));
   }
   list(user: string): Run[] {
     return (
@@ -160,7 +175,10 @@ export class Runs {
           "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
         )
         .all(user) as { data: string }[]
-    ).map((r) => this.restorePlan(parseRun(r.data)));
+    ).map((r) => {
+      const run = this.restorePlan(parseRun(r.data));
+      return Object.assign(run, this.queue.info(run.id, user));
+    });
   }
   private restorePlan(r: Run): Run {
     // Retention describes this process's live workspace, never a restart guarantee.
@@ -182,6 +200,9 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
+    // Queue positions are a live owner-scoped view, never part of the durable snapshot.
+    delete r.queue_position;
+    delete r.queue_length;
     const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; pr_body: string | null} | undefined;
     // Lifecycle snapshots must not reset newer description overrides or search counts.
     if (stored) r.pr_body = stored.pr_body;
@@ -263,7 +284,7 @@ export class Runs {
   }
   async recover() {
     for (const row of this.db
-      .prepare("SELECT data FROM runs WHERE status IN ('queued','working')")
+      .prepare("SELECT data FROM runs WHERE status='working'")
       .all() as { data: string }[]) {
       const r: Run = JSON.parse(row.data);
       r.phase = "idle";
@@ -275,21 +296,88 @@ export class Runs {
         "The host restarted. Send a follow-up to continue from the last pushed branch.",
       );
     }
+    this.drain();
   }
-  private checkCapacity(reclaim = true) {
-    if (new Set([...this.live.keys(), ...this.booting]).size < this.cfg.maxRuns) return;
+  private occupied() { return new Set([...this.live.keys(), ...this.booting]); }
+  private hasCapacity(reclaim = false) {
+    if (this.occupied().size < this.cfg.maxRuns) return true;
     const oldest = [...this.live].filter(([id, live]) =>
       live.keptSince !== undefined && !live.busy && !live.closing && !this.booting.has(id) && this.get(id).work_kept,
     ).sort((a, b) => a[1].keptSince! - b[1].keptSince!)[0];
-    if (!oldest)
-      throw new ApiError(429, "run_limit", "All workspaces are busy. Close finished sessions with close_session or in the workspace to free capacity.");
-    if (!reclaim) return;
-    // Detach synchronously so enqueue can reserve the slot without yielding. Boot
-    // waits for destruction before allocating a replacement container.
+    if (!oldest) return false;
+    if (!reclaim) return true;
+    // Detach synchronously so drain can reserve this slot without yielding.
+    // Boot waits for destruction before allocating a replacement container.
     const release = this.close(oldest[0], true);
     this.releasing.add(release);
     void release.catch(() => console.error("Couldn't release failed workspace", oldest[0]))
       .finally(() => this.releasing.delete(release));
+    return true;
+  }
+  private checkCapacity() {
+    if (this.queue.waiting().length || !this.hasCapacity())
+      throw new ApiError(429, "run_limit", "All workspaces are busy. Close finished sessions with close_session or in the workspace to free capacity.");
+  }
+  private queueChanged() {
+    const waiting = this.queue.waiting();
+    const lengths = new Map<string, number>();
+    const positions = new Map<string, number>();
+    for (const entry of waiting) lengths.set(entry.user_id, (lengths.get(entry.user_id) ?? 0) + 1);
+    for (const entry of waiting) {
+      const position = (positions.get(entry.user_id) ?? 0) + 1;
+      positions.set(entry.user_id, position);
+      const length = lengths.get(entry.user_id)!;
+      const previous = this.db.prepare("SELECT data FROM events WHERE run_id=? AND json_extract(data,'$.type') IN ('run.queued','run.dequeued') ORDER BY seq DESC LIMIT 1").get(entry.id) as { data: string } | undefined;
+      const last = previous && JSON.parse(previous.data);
+      if (last?.type !== "run.queued" || last?.position !== position || last?.length !== length)
+        this.append(entry.id, { type: "run.queued", position, length });
+    }
+  }
+  /** All claims and reservations happen synchronously, before boot yields to checkout. */
+  drain() {
+    if (this.draining || this.shuttingDown) return;
+    this.draining = true;
+    try {
+      for (const entry of this.queue.waiting()) {
+        if (Date.now() - entry.queued_at < (this.cfg.queueWaitHours ?? 24) * 3600_000) continue;
+        this.db.transaction(() => {
+          const r = this.get(entry.id);
+          this.queue.leave(r.id);
+          r.pending = [];
+          r.phase = "idle";
+          this.status(r, "failed", null, "The wait for a free workspace expired. Send a follow-up to try again.");
+          this.append(r.id, { type: "run.dequeued" });
+        })();
+      }
+      // Check for an eligible head before reclaiming: a cancelled boot's
+      // replacement can be queued while still reserved by the old startup.
+      while (this.queue.first(new Map(), this.occupied()) && this.hasCapacity(true)) {
+        const accounts = new Map<string, number>();
+        for (const id of this.occupied()) {
+          // A deleted run can still own a container or an outstanding startup.
+          const row = this.db.prepare("SELECT user_id FROM runs WHERE id=?").get(id) as { user_id: string } | undefined;
+          if (row) accounts.set(row.user_id, (accounts.get(row.user_id) ?? 0) + 1);
+        }
+        const entry = this.queue.first(accounts, this.occupied());
+        if (!entry) break;
+        const claimed = this.db.transaction(() => {
+          const r = this.get(entry.id);
+          if (!this.queue.claim(r.id)) return false;
+          r.status = "working";
+          this.save(r);
+          this.booting.add(r.id);
+          return true;
+        })();
+        if (!claimed) continue;
+        this.append(entry.id, { type: "run.dequeued" });
+        const launch: Promise<void> = this.boot(entry.id).catch(e => this.fail(entry.id, e)).finally(() => {
+          if (this.launches.get(entry.id) === launch) this.launches.delete(entry.id);
+          this.drain();
+        });
+        this.launches.set(entry.id, launch);
+      }
+      this.queueChanged();
+    } finally { this.draining = false; }
   }
   async create(
     user: string,
@@ -309,6 +397,10 @@ export class Runs {
     attribution?: { id: string; tokenId: string; authorize?: () => void },
   ) {
     this.assertAccount(user);
+    if (attribution && this.db.prepare("SELECT 1 FROM runs WHERE id=? AND user_id=? AND json_extract(data,'$.mcp_token_id')=?").get(attribution.id, user, attribution.tokenId)) {
+      attribution.authorize?.();
+      return this.get(attribution.id, user);
+    }
     const backend = assertBackend(input.backend);
     const fields = publicationFields(input);
     if (
@@ -323,7 +415,6 @@ export class Runs {
       );
     githubEnvFor(this.db, this.cfg.secret, user);
     const selectedModel = await this.resolveSelection(user,input.model);
-    this.checkCapacity(false);
     const info = await gh<{ default_branch: string }>(`repos/${input.repo}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, user)),
       base = input.base_branch || info.default_branch;
     if (!validBranch(base))
@@ -377,11 +468,13 @@ export class Runs {
     };
     this.validateImages(user, input.images ?? []);
     attribution?.authorize?.();
+    this.drain();
     this.db.transaction(() => {
       // Repository/model lookups yield: simultaneous requests may have filled
       // the remaining slots before this run reserves one through enqueue.
       if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
-      this.checkCapacity();
+      if (input.source === "runner" || input.source === "schedule") this.checkCapacity();
+      if (attribution && this.db.prepare("SELECT 1 FROM runs WHERE id=? AND user_id=? AND json_extract(data,'$.mcp_token_id')=?").get(id, user, attribution.tokenId)) return;
       this.db
         .prepare(
           "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data,pr_body) VALUES(?,?,?,?,?,?,?,?)",
@@ -394,6 +487,7 @@ export class Runs {
         input.images ?? [],
       );
     })();
+    this.drain();
     return this.get(id, user);
   }
   profile(user: string) {
@@ -404,6 +498,7 @@ export class Runs {
       .prepare("SELECT * FROM profiles WHERE user_id=?")
       .get(user) as {
       auto_pr: number;
+      theme: unknown;
     };
   }
   validateImages(user: string, images: string[]) {
@@ -428,7 +523,9 @@ export class Runs {
     assertActive(run);
     if (model !== undefined && typeof model !== "string")
       throw new ApiError(400, "invalid_model", "Choose an available model.");
-    if (model !== undefined || effort !== undefined) {
+    const needsWorkspace = !this.live.has(id);
+    if (needsWorkspace) githubEnvFor(this.db, this.cfg.secret, user);
+    if (needsWorkspace || model !== undefined || effort !== undefined) {
       const selected = await this.resolveSelection(user, model ?? run.model_id);
       validateEffort(selected, effort ?? "default");
     }
@@ -441,12 +538,19 @@ export class Runs {
     images: string[] = [],
     effort?:string,
     model?:string,
+    requestId?: string,
     pr_body?: unknown,
   ) {
+    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body))();
+    if (accepted === false) return;
+    this.drain();
+  }
+  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown) {
     this.assertAccount(user);
     const r = this.get(id, user);
     const fields = publicationFields({ pr_body });
     assertActive(r);
+    if (requestId && this.db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(id, requestId)) return false;
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
       throw new ApiError(409, "merged", "Start a new run after merging.");
@@ -467,6 +571,7 @@ export class Runs {
       }
       this.save(r);
       this.append(id, { type: "user", text, images: [] });
+      if (requestId) this.db.prepare("INSERT INTO run_message_requests(run_id,request_id) VALUES(?,?)").run(id, requestId);
       void answering.workspace.rpc("send", { input: { type: "question.reply", request_id: question.request_id, answer: text } }).catch(e => this.fail(id, e));
       return;
     }
@@ -476,50 +581,47 @@ export class Runs {
         "queue_full",
         "Wait for queued messages to finish.",
       );
-    if (images.length) this.validateImages(user, images);
-    if(effort !== undefined){
-      if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
-    }
-    if (!this.live.has(id) && !this.booting.has(id)) this.checkCapacity();
+    if (effort !== undefined && effort !== "default" && (typeof effort !== "string" || effort.length > 20))
+      throw new ApiError(400, "invalid_effort", "Choose a supported effort.");
+    this.validateImages(user, images);
+    const waiting = !this.live.has(id) && (!this.booting.has(id) || this.cancelledBoots.has(id));
+    if (waiting) githubEnvFor(this.db, this.cfg.secret, user);
+    if (waiting && !this.queue.has(id) && (!this.hasCapacity() || this.queue.waiting().length))
+      this.queue.check(user, this.cfg.queueMax ?? 50, this.cfg.queueMaxPerAccount ?? 10);
     if (images.length) {
       for (const image of images)
         this.db
           .prepare("UPDATE images SET run_id=? WHERE id=? AND user_id=?")
           .run(id, image, user);
     }
-    if (!this.live.has(id) && r.status === "stopped") r.status = "queued";
+    if (waiting) { r.status = "queued"; r.error = null; r.step = null; r.summary.question = null; }
     if (fields.pr_body !== undefined) {
       this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
       r.pr_body = fields.pr_body;
     }
-    r.pending.push({ text, images, effort, model });
+    r.pending.push({ text, images, effort, model, ...(requestId ? { request_id: requestId } : {}) });
     this.save(r);
     this.append(id, {
       type: "user",
       text,
       images: images.map((id) => ({ id })),
     });
+    if (requestId) this.db.prepare("INSERT INTO run_message_requests(run_id,request_id) VALUES(?,?)").run(id, requestId);
     const live = this.live.get(id);
     if (live) {
       if (!live.busy) void this.next(id, live).catch((e) => this.fail(id, e));
-    } else if (!this.booting.has(id)) {
-      const launch = this.boot(id).catch((e) => this.fail(id, e)).finally(() => this.launches.delete(id));
-      this.launches.set(id, launch);
+    } else if (waiting) {
+      this.queue.join(id);
+      this.queueChanged();
     }
   }
   private async boot(id: string) {
-    this.booting.add(id);
     let workspace: Workspace | undefined;
     try {
       if (this.releasing.size) await Promise.all(this.releasing);
       let r = this.get(id);
       assertActive(r);
-      if (this.shuttingDown || r.status === "stopped") {
-        r.phase = "idle";
-        r.pending = [];
-        this.status(r, "stopped");
-        return;
-      }
+      if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
       r.phase = "booting";
       r.started_at ??= Date.now();
       if (r.kept_commit) {
@@ -531,10 +633,10 @@ export class Runs {
         r.head_sha = head;
         delete r.kept_commit;
         this.save(r);
-        if (this.shuttingDown || r.status === "stopped") {
+        if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
           r.phase = "idle";
-          r.pending = [];
-          this.status(r, "stopped");
+          if (r.status === "working") { r.pending = []; this.status(r, "stopped"); }
+          else this.save(r); // Preserve replacement work accepted after Stop.
           return;
         }
       }
@@ -549,13 +651,16 @@ export class Runs {
         githubEnvFor(this.db, this.cfg.secret, r.user_id),
         step => {
           const current = this.get(id);
-          if (!this.shuttingDown && current.status !== "stopped" && current.step !== step) this.status(current, "working", step);
+          if (!this.shuttingDown && !this.cancelledBoots.has(id) && current.status !== "stopped" && current.step !== step) this.status(current, "working", step);
         },
         r.base_sha ?? undefined,
       );
       r = this.get(id);
-      if (this.shuttingDown || r.status === "stopped") {
-        r = this.get(id); r.phase = "idle"; r.pending = []; this.status(r, "stopped"); return;
+      if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
+        r.phase = "idle";
+        if (r.status === "working") { r.pending = []; this.status(r, "stopped"); }
+        else this.save(r);
+        return;
       }
       this.status(r, "working", "Starting a workspace container");
       const owner = r.user_id;
@@ -566,7 +671,7 @@ export class Runs {
           : modelResponse(this.db, this.cfg.secret, owner, id, req, this.access),
       );
       r = this.get(id);
-      if (this.shuttingDown || r.status === "stopped") {
+      if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         r.phase = "idle";
         this.save(r);
         return await workspace.destroy();
@@ -574,7 +679,7 @@ export class Runs {
       this.status(r, "working", "Loading repository into the workspace");
       await workspace.rpc("setup", { archive: checked.archive.toString("base64") });
       r = this.get(id);
-      if (this.shuttingDown || r.status === "stopped") return await workspace.destroy();
+      if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
       this.status(r, "working", "Starting the agent");
       await workspace.rpc("start", {
         model: r.model_id, effort: r.effort ?? "high",
@@ -584,7 +689,7 @@ export class Runs {
         ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
         ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
       });
-      if (this.shuttingDown) return await workspace.destroy();
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
         workspace,
         cwd: checked.cwd,
@@ -598,15 +703,24 @@ export class Runs {
       )
         .toString()
         .trim();
+      r = { ...this.get(id), base_sha: r.base_sha };
       r.phase = "agent";
       this.save(r);
       try { await this.next(id, live); }
-      finally { void this.pump(id, live).catch((e) => this.fail(id, e)); }
+      finally {
+        const pump: Promise<void> = this.pump(id, live).catch(e => {
+          if (!live.closed) return this.fail(id, e);
+        }).finally(() => { if (this.pumps.get(id) === pump) this.pumps.delete(id); });
+        this.pumps.set(id, pump);
+      }
     } catch (e) {
       if (!this.live.has(id)) await workspace?.destroy();
+      if (this.cancelledBoots.has(id)) return;
       throw e;
     } finally {
       this.booting.delete(id);
+      this.cancelledBoots.delete(id);
+      this.drain();
     }
   }
   private async next(id: string, live: Live) {
@@ -677,7 +791,7 @@ export class Runs {
   private async pump(id: string, live: Live) {
     while (!live.closed) {
       try { await this.poll(id, live); }
-      catch (error) { await this.fail(id, error); }
+      catch (error) { if (!live.closed && this.live.get(id) === live) await this.fail(id, error); }
       if (!live.closed) await delay(300);
     }
   }
@@ -688,6 +802,7 @@ export class Runs {
         events: Record<string, any>[];
         alive: boolean;
       }>("events", { after: live.cursor });
+      if (live.closed) return;
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
@@ -721,9 +836,11 @@ export class Runs {
           } else if (event.stop_reason !== "compacted") {
             await this.finish(id, live);
           }
+          if (live.closed) return;
           if (this.get(id).pending.length) await this.next(id, live);
         }
       }
+      if (live.closed) return;
       const r = this.get(id);
       if(!live.busy && r.pending.length)await this.next(id,live);
       if (!batch.alive && live.busy) throw new Error("The workspace worker exited");
@@ -744,6 +861,7 @@ export class Runs {
     const merged = r.pr_state === "merged" && !r.pending.length;
     this.status(r, merged ? "merged" : "ready");
     if (merged) await this.close(id);
+    this.drain();
   }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
@@ -866,15 +984,23 @@ export class Runs {
   async stop(id: string, user: string) {
     const r = this.get(id, user);
     const kept = r.work_kept;
-    r.pending = [];
-    this.status(r, "stopped");
+    const queued = this.queue.has(id);
     const live = this.live.get(id);
+    if (this.booting.has(id) && !live) this.cancelledBoots.add(id);
+    this.db.transaction(() => {
+      this.queue.leave(id);
+      r.pending = [];
+      this.status(r, "stopped");
+      if (queued) this.append(id, { type: "run.dequeued" });
+    })();
     if (kept) { await this.close(id); return; }
     if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    this.drain();
   }
   async closeSession(id: string, user: string) {
     const r = this.get(id, user);
     const live = this.live.get(id);
+    if (this.queue.has(id)) { await this.stop(id, user); return { closed: true }; }
     if (this.booting.has(id) || live?.busy || live?.closing || r.pending.length || ["queued", "working"].includes(r.status))
       throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
     if (!live) return { closed: true };
@@ -891,6 +1017,8 @@ export class Runs {
   }
   async remove(id: string, user: string) {
     this.get(id, user);
+    await this.stop(id, user);
+    await this.launches.get(id);
     await this.close(id);
     this.db
       .prepare("UPDATE runs SET deleted_at=? WHERE id=?")
@@ -902,6 +1030,10 @@ export class Runs {
   }
   // Failed workspaces have a bounded grace period; successful idle work does not expire.
   async close(id: string, forCapacity = false) {
+    if (this.queue.has(id)) {
+      const r = this.get(id);
+      await this.stop(id, r.user_id);
+    }
     const live = this.live.get(id);
     let r: Run | undefined;
     try { r = this.get(id); }
@@ -923,19 +1055,24 @@ export class Runs {
     if (live) {
       clearTimeout(live.keepTimer);
       live.closed = true;
+      live.closing = true;
       live.publishPending = undefined;
-      this.live.delete(id);
+      if (forCapacity) this.live.delete(id);
       await live.workspace.destroy();
+      this.live.delete(id);
     }
     // Only an imported commit survives capacity eviction, not the worker's
     // uncommitted edits or a bundle that could not be imported.
     if (!r?.kept_commit) await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    this.drain();
   }
   async shutdown() {
     this.shuttingDown = true;
+    clearInterval(this.queueTimer);
     this.subscriptions.close();
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));
+    await Promise.allSettled([...this.pumps.values()]);
     await Promise.allSettled(this.releasing);
   }
   private async fail(id: string, error: unknown) {
@@ -967,6 +1104,7 @@ export class Runs {
             void this.close(id).catch(() => console.error("Couldn't release failed workspace", id));
         }, keep);
         live.keepTimer.unref();
+        this.drain();
         return;
       }
     } catch {}

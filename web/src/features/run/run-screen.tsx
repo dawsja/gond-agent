@@ -5,7 +5,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
-import { runElapsed } from "@/lib/format"
+import { queueLabel, runElapsed } from "@/lib/format"
 import { useCloseRun, useDeleteRun, useMe, useModelCatalog, useRun, useSendMessage, useStopRun } from "@/lib/queries"
 import { PlanIndicator } from "../settings/chatgpt-plan"
 import { useRunStream } from "@/lib/run-stream"
@@ -49,7 +49,7 @@ export function RunScreen() {
   const refetch = run.refetch
 
   // Status changes on the stream refresh the run row (diffstat, PR).
-  const statusKey = `${t.status}:${t.committed}:${t.items.filter((i) => i.kind === "pr").map(i => `${i.number}:${i.state}`).join(",")}`
+  const statusKey = `${t.status}:${t.queueRevision}:${t.committed}:${t.items.filter((i) => i.kind === "pr").map(i => `${i.number}:${i.state}`).join(",")}`
   useEffect(() => {
     void refetch()
   }, [statusKey, refetch])
@@ -79,7 +79,7 @@ export function RunScreen() {
   const modelName = models?.find((m) => m.id === r.model_id)?.display_name
   const pill = live ? (
     <StatusPill status={r.status}>
-      {r.status === "queued" ? "Queued" : "Working"} · {runElapsed(r) ?? "0s"}
+      {r.status === "queued" ? "Queued" : `Working · ${runElapsed(r) ?? "0s"}`}
     </StatusPill>
   ) : merged ? <StatusPill status="merged" /> : r.status === "ready" && r.pr_number && r.pr_state !== "closed" ? (
     <StatusPill status="ready">PR ready · #{r.pr_number}</StatusPill>
@@ -123,11 +123,11 @@ export function RunScreen() {
               type="button"
               disabled={stop.isPending}
               onClick={() => stop.mutate({ id: r.id, arg: undefined })}
-              aria-label="Stop"
+              aria-label={r.status === "queued" ? "Cancel" : "Stop"}
               className="inline-flex h-8 items-center gap-1.5 rounded-[4px] border border-border px-3 text-[13px] text-foreground transition-colors hover:bg-raised max-md:px-2.5"
             >
               <Square className="size-3 fill-current" />
-              <span className="max-md:hidden">Stop</span>
+              <span className={r.status === "queued" ? "" : "max-md:hidden"}>{r.status === "queued" ? "Cancel" : "Stop"}</span>
             </button>
           )}
           <ConfirmDialog
@@ -200,6 +200,7 @@ export function RunScreen() {
           <TranscriptView run={r} t={t} author={author} />
         </div>
         <div {...attach.handlers} className="relative mx-auto w-full max-w-[720px] px-8 pt-2 pb-5 max-md:px-3 max-md:pb-3">
+          {r.status === "queued" && <p role="status" className="mb-3 px-1 text-[13px] text-muted-foreground">{queueLabel(r)}</p>}
           <DropHint show={attach.dragging} />
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />

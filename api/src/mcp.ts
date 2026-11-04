@@ -5,7 +5,7 @@ import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Store } from "./db";
 import type { Config } from "./config";
-import { parseRun, type Run, type Runs } from "./runs/service";
+import type { Run, Runs } from "./runs/service";
 import { ApiError } from "./wire";
 import { gh } from "./github";
 import { githubEnvFor } from "./github-login";
@@ -100,6 +100,8 @@ export function sessionState(r: Run) {
   return {
     state: done ? (r.status === "ready" ? "done" : r.status) : question ? "waiting_for_input" : r.status === "queued" || r.pending?.length ? "queued" : "working",
     done,
+    queue_position: r.queue_position,
+    queue_length: r.queue_length,
     ...planState(r.summary?.plan_steps),
     waiting_for_input: !!question,
     asking_question: !!question,
@@ -264,7 +266,9 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             "request_conflict",
             "Use a new request_id for different arguments.",
           );
-        if (row.result) return JSON.parse(row.result);
+        if (row.result) return name === "start_session"
+          ? session(runs.get(row.run_id, user), cfg.origin)
+          : JSON.parse(row.result);
         const existing = flights.get(key);
         if (existing) return existing;
         const complete = (result: unknown) =>
@@ -377,13 +381,13 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
         ({ cursor, limit }) => {
           const rows = db
             .prepare(
-              "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+              "SELECT id FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
             )
-            .all(user, limit + 1, cursor) as { data: string }[];
+            .all(user, limit + 1, cursor) as { id: string }[];
           return {
             sessions: rows
               .slice(0, limit)
-              .map((r) => session(runs.get(parseRun(r.data).id, user), cfg.origin)),
+              .map((r) => session(runs.get(r.id, user), cfg.origin)),
             next_cursor: rows.length > limit ? cursor + limit : null,
           };
         },
@@ -534,7 +538,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
             check();
             const result = { accepted: true, session_id: r.id };
             db.transaction(() => {
-              runs.enqueue(r.id, user, args.text, [], args.effort, args.model, args.pr_body);
+              runs.enqueue(r.id, user, args.text, [], args.effort, args.model, `${token.id}:${args.request_id}`, args.pr_body);
               complete(result);
             })();
             return result;

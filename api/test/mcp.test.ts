@@ -14,6 +14,7 @@ import { Runs, type Run } from "../src/runs/service";
 import { emptySummary, fold, planState } from "../src/runs/fold";
 import { createToken } from "../src/mcp";
 import type { Config } from "../src/config";
+import { saveProviderSettings } from "../src/providers";
 
 let dir: string,
   db: ReturnType<typeof openStore>,
@@ -112,6 +113,18 @@ function seed(user = owner, runId = "run_test") {
   db.prepare(
     "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)",
   ).run(r.id, user, r.repo, r.status, now, now, JSON.stringify(r));
+  return r;
+}
+function seedFollowUpRun() {
+  const r = seed();
+  r.model_id = "local:model";
+  db.prepare("UPDATE runs SET data=? WHERE id=?").run(JSON.stringify(r), r.id);
+  db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
+    .run(owner, seal(cfg.secret, "publication-fixture-token"), Date.now());
+  saveProviderSettings(db, cfg.secret, {
+    connections: [{id:"local",name:"Local",format:"openai",baseURL:"http://127.0.0.1:8000/v1",apiKey:"fixture-key",discover:false,models:[{id:"model",name:"Model",contextWindow:128000,maxOutput:8192,reasoning:"none",images:true}]}],
+    defaultModel:"local:model",
+  });
   return r;
 }
 async function connect(legacy = false) {
@@ -311,7 +324,7 @@ it("forwards a valid title, branch and explicit empty PR body when starting a se
   expect(body).toMatchObject({ id: r.id, title: r.title, branch: r.branch, pr_body: "", description: "" });
 });
 it("forwards follow-up PR body overrides to enqueue", async () => {
-  const r = seed();
+  const r = seedFollowUpRun();
   const enqueue = vi.spyOn(runs, "enqueue").mockImplementation(() => {});
   const client = await connect();
   const { result, body } = await call(client, "send_session_message", {
@@ -319,10 +332,10 @@ it("forwards follow-up PR body overrides to enqueue", async () => {
   });
   expect(result.isError).not.toBe(true);
   expect(body).toEqual({ accepted: true, session_id: r.id });
-  expect(enqueue).toHaveBeenCalledExactlyOnceWith(r.id, owner, "Continue", [], undefined, undefined, "Updated description");
+  expect(enqueue).toHaveBeenCalledExactlyOnceWith(r.id, owner, "Continue", [], undefined, undefined, `${token.id}:publication-send`, "Updated description");
 });
 it("persists follow-up PR bodies, preserves omitted overrides and exposes the description", async () => {
-  const r = seed();
+  const r = seedFollowUpRun();
   // Exercise real enqueue and SQLite persistence without starting a worker.
   vi.spyOn(runs as unknown as { boot(id: string): Promise<void> }, "boot").mockResolvedValue(undefined);
   const client = await connect();
@@ -535,6 +548,37 @@ it("wakes a waiting read on completion without a transcript event", async () => 
   }, 300);
   try { expect((await waiting).body).toMatchObject({events:[], state:"done", done:true, return_reason:"done", pr_url:null}); }
   finally { clearTimeout(timer); }
+});
+
+it("exposes live queue positions only on the token owner's sessions", async () => {
+  const r = seed(); r.status = "queued";
+  seed(other, "foreign");
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  // Queue metadata is computed on reads, not persisted with the run.
+  const get = runs.get.bind(runs);
+  let queued = true;
+  vi.spyOn(runs, "get").mockImplementation((id, user) => {
+    const run = get(id, user);
+    return queued && id === r.id ? { ...run, queue_position: 2, queue_length: 3 } : run;
+  });
+  const client = await connect();
+  const detail = (await call(client, "get_session", {session_id:r.id})).body;
+  const list = (await call(client, "list_sessions")).body.sessions;
+  const events = (await call(client, "read_session_events", {session_id:r.id})).body;
+  expect(list.map((session: {id:string}) => session.id)).toEqual([r.id]);
+  for (const result of [detail, list[0], events]) {
+    expect(result).toMatchObject({state:"queued", done:false, queue_position:2, queue_length:3});
+  }
+  for (const name of ["get_session", "read_session_events"]) {
+    expect((await call(client, name, {session_id:"foreign"})).body).toMatchObject({error:"not_found"});
+  }
+  queued = false;
+  r.status = "working";
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  const resumed = (await call(client, "get_session", {session_id:r.id})).body;
+  expect(resumed.state).toBe("working");
+  expect(resumed).not.toHaveProperty("queue_position");
+  expect(resumed).not.toHaveProperty("queue_length");
 });
 
 it("reports a pending question without calling it done", async () => {
