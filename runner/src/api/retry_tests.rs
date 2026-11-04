@@ -7,6 +7,35 @@ fn request() -> ResponsesRequest {
     ResponsesRequest { model:"m".into(), system:None, messages:vec![Message::user_text("work")], tools:vec![], max_output_tokens:None, reasoning:None, metadata:Metadata::default() }
 }
 
+#[tokio::test]
+async fn internal_401_is_not_a_provider_key_failure() {
+    for (body, expected) in [
+        ("{}", "relay_auth"),
+        (r#"{"error":{"code":"unauthorized"}}"#, "relay_auth"),
+        (r#"{"error":{"code":"worker_auth"}}"#, "relay_auth"),
+        (r#"{"error":{"code":"relay_auth"}}"#, "relay_auth"),
+        (r#"{"error":{"code":"provider_auth"}}"#, "provider_auth"),
+        (r#"{"error":{"code":"chatgpt_unauthorized"}}"#, "chatgpt_unauthorized"),
+    ] {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let count = attempts.clone();
+        let url = serve(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Res::new(401, "application/json", body)
+        }).await;
+        let api = ApiClient::new(url, None).with_retry_delay(Duration::ZERO);
+        let mut stream = api.responses(&request()).await.unwrap();
+        let error = stream.next().await.unwrap().unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(error.code, expected);
+        assert!(!error.retryable);
+        assert_eq!(error.attempts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(error.message.contains("provider rejected the API key"), expected == "provider_auth");
+        if expected == "relay_auth" { assert!(error.message.contains("Gond Agent")); }
+    }
+}
+
 #[test]
 fn full_jitter_and_server_minimum_are_bounded() {
     let base = Duration::from_secs(2);

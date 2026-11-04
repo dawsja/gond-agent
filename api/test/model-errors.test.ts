@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { providerFailure, providerStreamFailure } from "../src/adapters/errors";
 import { chatgptFailure } from "../src/subscriptions/chatgpt";
@@ -17,6 +17,23 @@ describe("shared model error policy", () => {
       expect(policy.message).not.toMatch(/https?:|sk-|\n/);
     }
     expect(modelPolicy("unknown_provider_secret")).toMatchObject({ code:"unknown", retryable:false });
+  });
+
+  it("rejects malformed policy shapes when loading the module", async () => {
+    const unknown = { retryable:false, message:"Unknown failure." };
+    for (const table of [null, [], {}, {unknown, broken:{}}, {unknown, broken:{retryable:"false",message:"Bad"}}, {unknown, broken:{retryable:false}}, {unknown, broken:{retryable:false,message:42}}, {unknown, broken:null}]) {
+      vi.resetModules();
+      vi.doMock("node:fs", async (original) => ({
+        ...await original<typeof import("node:fs")>(),
+        readFileSync: vi.fn(() => JSON.stringify(table)),
+      }));
+      try {
+        await expect(import("../src/model-errors")).rejects.toThrow(/model error policy/i);
+      } finally {
+        vi.doUnmock("node:fs");
+        vi.resetModules();
+      }
+    }
   });
 
   it.each([

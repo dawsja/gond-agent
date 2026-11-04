@@ -1350,6 +1350,12 @@ export class Runs {
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
+        if (event.type === "model.retry") {
+          event.attempt = Number.isInteger(event.attempt) && event.attempt >= 2 && event.attempt <= 5 ? event.attempt : 2;
+          event.max_attempts = Number.isInteger(event.max_attempts) && event.max_attempts >= event.attempt && event.max_attempts <= 5 ? event.max_attempts : 5;
+          event.wait_seconds = typeof event.wait_seconds === "number" && Number.isFinite(event.wait_seconds) ? Math.max(0, Math.min(120, event.wait_seconds)) : 0;
+          event.class = modelPolicy(event.class).code;
+        }
         if (event.type === "error" && event.agent_id === "main") {
           const policy = modelPolicy(event.code);
           event.code = policy.code;

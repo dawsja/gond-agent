@@ -7,6 +7,10 @@
     "retryable": false,
     "message": "The provider account has no remaining credit or quota. Check billing with the provider."
   },
+  "relay_auth": {
+    "retryable": false,
+    "message": "Gond Agent couldn't authenticate the model connection. Sign in again or restart the run."
+  },
   "provider_auth": {
     "retryable": false,
     "message": "The provider rejected the API key. An administrator can update it in Settings → Models."

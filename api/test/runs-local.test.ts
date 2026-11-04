@@ -739,6 +739,34 @@ describe("persistent local run lifecycle", () => {
     expect(runs.get(r.id).pending).toEqual([]);
     expect(log.some((x) => x.method === "start")).toBe(false);
   });
+  it("sanitizes retry events before persistence", async () => {
+    const invalid = [NaN, -1, 1e100, "3", Infinity, 2.5, null];
+    workerTurns.push([
+      { type:"turn.start", agent_id:"main" },
+      ...invalid.map(value => ({ type:"model.retry", agent_id:"main", attempt:value, max_attempts:value, wait_seconds:value, class:value })),
+      { type:"model.retry", agent_id:"helper", attempt:5, max_attempts:2, wait_seconds:121, class:"constructor" },
+      { type:"model.retry", agent_id:"main", attempt:3, max_attempts:5, wait_seconds:4.25, class:"provider_unavailable" },
+      { type:"turn.end", agent_id:"main", stop_reason:"interrupted" },
+    ]);
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Retry safely"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("stopped"));
+    const retries = runs.history(r.id, 0).filter(e => e.type === "model.retry");
+    expect(retries.length).toBeGreaterThan(0);
+    for (const event of retries) {
+      expect(Number.isInteger(event.attempt)).toBe(true);
+      expect(event.attempt).toBeGreaterThanOrEqual(2);
+      expect(event.attempt).toBeLessThanOrEqual(5);
+      expect(Number.isInteger(event.max_attempts)).toBe(true);
+      expect(event.max_attempts).toBeGreaterThanOrEqual(event.attempt as number);
+      expect(event.max_attempts).toBeLessThanOrEqual(5);
+      expect(typeof event.wait_seconds).toBe("number");
+      expect(Number.isFinite(event.wait_seconds)).toBe(true);
+      expect(event.wait_seconds).toBeGreaterThanOrEqual(0);
+      expect(event.wait_seconds).toBeLessThanOrEqual(120);
+      expect(["unknown", "provider_unavailable"]).toContain(event.class);
+    }
+    expect(retries).toContainEqual(expect.objectContaining({attempt:3,max_attempts:5,wait_seconds:4.25,class:"provider_unavailable"}));
+  });
   it("does not snapshot, push or open a PR when the model fails", async () => {
     workerFailure = "The model connection failed.";
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });

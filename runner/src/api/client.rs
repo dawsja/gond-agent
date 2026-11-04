@@ -76,9 +76,14 @@ fn model_error(error: anyhow::Error, attempts: u32) -> ApiError {
         Ok(error) => error,
         Err(error) => ApiError { code: if error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_body() || (e.is_request() && !e.is_builder())) { "network" } else { "unknown" }.into(), ..Default::default() },
     };
-    // Bare proxy HTTP errors have no relay body. Permanent HTTP status wins.
-    if error.code == "http_error" || error.code == "unauthorized" || (model_policy(&error.code).0 == "unknown" && error.status.is_some()) {
-        error.code = match error.status { Some(401 | 403) => "provider_auth", Some(402) => "provider_quota", Some(429) => "provider_rate_limit", Some(500..=599) => "provider_unavailable", Some(400..=499) => "provider_request", _ => "unknown" }.into();
+    // We talk to Gond Agent, not directly to a provider. A bare 401 (including
+    // worker/loopback authentication failures) is not evidence of a bad API key.
+    let provider_code = model_policy(&error.code).0 != "unknown"
+        && ["provider_", "chatgpt_", "subscription_"].iter().any(|prefix| error.code.starts_with(prefix));
+    if error.status == Some(401) && !provider_code {
+        error.code = "relay_auth".into();
+    } else if error.code == "http_error" || (model_policy(&error.code).0 == "unknown" && error.status.is_some()) {
+        error.code = match error.status { Some(403) => "provider_auth", Some(402) => "provider_quota", Some(429) => "provider_rate_limit", Some(500..=599) => "provider_unavailable", Some(400..=499) => "provider_request", _ => "unknown" }.into();
     }
     if model_policy(&error.code).1.retryable {
         match error.status {

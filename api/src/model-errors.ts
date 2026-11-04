@@ -1,9 +1,24 @@
 import { readFileSync } from "node:fs";
 import { ApiError } from "./wire";
 
+type ModelPolicy = { retryable: boolean; message: string };
+
+function loadModelErrors(): Readonly<Record<string, ModelPolicy>> {
+  const table: unknown = JSON.parse(readFileSync(new URL("../../runner/model-errors.json", import.meta.url), "utf8"));
+  if (!table || typeof table !== "object" || Array.isArray(table) || !Object.hasOwn(table, "unknown")) {
+    throw new Error("Invalid model error policy: expected a class table with an unknown fallback");
+  }
+  for (const [code, policy] of Object.entries(table)) {
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)
+      || typeof policy.retryable !== "boolean" || typeof policy.message !== "string" || !policy.message.trim()) {
+      throw new Error(`Invalid model error policy for class ${code}: expected retryable and message`);
+    }
+  }
+  return table as Record<string, ModelPolicy>;
+}
+
 /** Shared with the compiled worker; no provider prose is a public failure reason. */
-export const modelErrors: Readonly<Record<string, { retryable: boolean; message: string }>> =
-  JSON.parse(readFileSync(new URL("../../runner/model-errors.json", import.meta.url), "utf8"));
+export const modelErrors = loadModelErrors();
 export function modelPolicy(code: unknown) {
   const key = typeof code === "string" && Object.hasOwn(modelErrors, code) ? code : "unknown";
   return { code: key, ...modelErrors[key] };

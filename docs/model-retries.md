@@ -5,6 +5,7 @@ never replays a completed response or executes partial calls. Five total attempt
 use exponential full jitter (2s base, 60s ceiling), with a valid Retry-After minimum
 capped at 120s. Stop drops the stream and its pending sleep. The shared
 `runner/model-errors.json` policy supplies both retry decisions and public reasons.
+Worst-case backoff is bounded at about 4 × 120 seconds per request when a server sends a long Retry-After (excluding request/stream time).
 
 ## What the incident record can establish
 
