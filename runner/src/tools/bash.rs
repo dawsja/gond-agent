@@ -101,13 +101,46 @@ impl Tool for Bash {
     }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            execute(ctx, input, ShellEnvironment::Bash).await
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ShellEnvironment<'a> {
+    Bash,
+    InheritedCheck,
+    CleanCheck(&'a std::collections::BTreeMap<String, String>),
+}
+
+impl ShellEnvironment<'_> {
+    fn apply(self, command: &mut Command) {
+        match self {
+            Self::Bash => {} // Preserve ordinary bash's existing environment contract.
+            Self::CleanCheck(environment) => { command.env_clear().envs(environment); }
+            Self::InheritedCheck => {
+                for (name, _) in std::env::vars_os() {
+                    if name == "GH_TOKEN" || name == "GITHUB_TOKEN" || name.to_string_lossy().starts_with("GOND_AGENT_") {
+                        command.env_remove(name);
+                    }
+                }
+                command.env_remove(crate::config::RELAY_TOKEN_ENV);
+            }
+        }
+    }
+}
+
+/// Bash never emits evidence, even if its command resembles an eligible check.
+pub(super) async fn execute(ctx: &ToolCtx, input: Value, environment: ShellEnvironment<'_>) -> ToolOutput {
             let Some(cmd) = str_arg(&input, "command") else { return ToolOutput::err("command is required") };
             if input.get("run_in_background").and_then(Value::as_bool).unwrap_or(false) {
-                return start_background(ctx, cmd);
+                return start_background(ctx, cmd, environment);
             }
             let timeout = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
             let started = Instant::now();
-            let mut child = match shell_command(cmd)
+            let mut command = shell_command(cmd);
+            environment.apply(&mut command);
+            let mut child = match command
                 .current_dir(&ctx.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -181,8 +214,6 @@ impl Tool for Bash {
                 _ => {}
             }
             ToolOutput { ok, content: vec![crate::api::wire::ResultPart::Text { text: model_text }], summary, display: out, diff: None }
-        })
-    }
 }
 
 /// A command's output, keeping the start and the end (MAX_OUTPUT each) and counting what's between.
@@ -255,8 +286,10 @@ impl Drop for BgShell {
     }
 }
 
-fn start_background(ctx: &ToolCtx, cmd: &str) -> ToolOutput {
-    let mut child = match shell_command(cmd)
+fn start_background(ctx: &ToolCtx, cmd: &str, environment: ShellEnvironment<'_>) -> ToolOutput {
+    let mut command = shell_command(cmd);
+    environment.apply(&mut command);
+    let mut child = match command
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

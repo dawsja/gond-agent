@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { settle, waitForCondition } from "./wait";
@@ -10,13 +11,19 @@ import { createAuthentication, seal } from "../src/auth";
 import { queueSettings, type Config } from "../src/config";
 import type { Workspace, WorkspaceFactory } from "../src/containers";
 import { migrateRunQueue, openStore, setSetting } from "../src/db";
-import { checkout, gh, importBundle, pushBranch } from "../src/github";
+import { checkout, commitIdentity, gh, importBundle, pushBranch } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import { RunQueue } from "../src/runs/queue";
 import { createApp } from "../src/app";
 import { createToken } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { evidenceState, signedRecord } from "./fixtures/evidence";
+
+vi.mock("node:fs/promises", async original => {
+  const fs = await original<typeof import("node:fs/promises")>();
+  return { ...fs, rm: vi.fn(fs.rm) };
+});
 
 // A condition can legitimately take up to 15s under CI load.
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
@@ -45,12 +52,14 @@ function deferred<T>() {
 class ControlledWorkspace implements Workspace {
   readonly calls: { method: string; args?: Record<string, unknown> }[] = [];
   rejectEventsOnDestroy = false;
+  hangEvidenceExport = false;
+  flushCheckpoints?: () => Promise<void>;
   state = { head: "b".repeat(40), clean: true };
   private batches: Batch[] = [];
   private poll?: ReturnType<typeof deferred<Batch>>;
   constructor(readonly id: string, private starts: string[], private releases: string[]) {}
   emit(...events: Event[]) { this.respond({ events, alive: true }); }
-  exit() { this.respond({ events: [], alive: false }); }
+  exit(...events: Event[]) { this.respond({ events, alive: false }); }
   private respond(batch: Batch) {
     if (this.poll) {
       const poll = this.poll;
@@ -60,6 +69,7 @@ class ControlledWorkspace implements Workspace {
   }
   async rpc<T>(method: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push({ method, args });
+    if (method === "export_state" && this.hangEvidenceExport) return new Promise<T>(() => {});
     if (method === "start") this.starts.push(this.id);
     if (method === "events") {
       if (this.batches.length) return this.batches.shift() as T;
@@ -105,7 +115,10 @@ async function create(user = "a", prompt = "Implement it") {
   if (run.status !== "queued") {
     await waitForCondition(() => {
       expect(vi.mocked(checkout).mock.calls.some(call => call[1] === run.id)).toBe(true);
-      if (!heldCheckouts.has(run.id)) expect(workspaces.get(run.id)?.users()).toEqual([prompt]);
+      if (!heldCheckouts.has(run.id)) {
+        expect(workspaces.get(run.id)?.users()).toEqual([prompt]);
+        expect((runs as unknown as { booting: Set<string> }).booting.has(run.id)).toBe(false);
+      }
     });
   }
   return runs.get(run.id, user);
@@ -152,7 +165,8 @@ function countRuns() { return (db.prepare("SELECT count(*) AS n FROM runs").get(
 function saveCheckpoint(id: string) {
   const run = runs.get(id);
   const key = { runId: id, ownerId: run.user_id, runnerVersion: "gond-agent-checkpoint-2" };
-  const checkpoint = runs.checkpoints.save({ ...key, bundle: Buffer.from("opaque checkpoint"), state: "{}",
+  const checkpoint = runs.checkpoints.save({ ...key, bundle: Buffer.from("opaque checkpoint"),
+    state: JSON.stringify({ runner: { runner_state_version: key.runnerVersion }, service: {} }),
     tree: { baseSha: run.base_sha!, headSha: run.head_sha!, checkpointSha: "c".repeat(40) } });
   return { key, checkpoint, bundlePath: join(dir, "checkpoints", checkpoint.bundle_path), statePath: join(dir, "checkpoints", checkpoint.state_path) };
 }
@@ -273,6 +287,10 @@ describe("persistent workspace queue", () => {
       );
     }
     await waitForCondition(() => expect(runs.get(active.id).status).toBe(status));
+    if (status === "stopped") {
+      // Stop acceptance precedes interrupted-turn evidence export and idle state.
+      await waitForCondition(() => expect((runs as unknown as { live: Map<string, { busy: boolean }> }).live.get(active.id)?.busy).toBe(false));
+    }
     await drain();
     expect(starts).toEqual([active.id]);
     expect(releases).toEqual([]);
@@ -300,7 +318,7 @@ describe("persistent workspace queue", () => {
     });
   });
 
-  it("drains after worker loss without retrying ahead of waiting work", async () => {
+  it("drains after a worker exits, without retrying the failed run ahead of waiting work", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const active = await create(), waiting = await create("b");
     workspaces.get(active.id)!.exit();
@@ -329,6 +347,258 @@ describe("persistent workspace queue", () => {
       expect(releases).toEqual([active.id]);
       expect(starts).toEqual([active.id, waiting.id]);
     });
+  });
+
+  it.each(["error", "end_turn", "interrupted"])("releases an exited worker with a %s event without requesting its hung evidence export", async stop_reason => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    workspace.hangEvidenceExport = true;
+    workspace.flushCheckpoints = vi.fn(() => new Promise<void>(() => {}));
+    const exports = workspace.calls.filter(call => call.method === "export_state").length;
+    workspace.exit({ type: "turn.end", agent_id: "main", stop_reason });
+    await waitForCondition(() => expect(starts).toEqual([active.id, waiting.id]));
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", evidence: { unverified: ["Verification policy status unavailable."] } });
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(workspace.calls.filter(call => call.method === "export_state")).toHaveLength(exports);
+    expect(workspace.flushCheckpoints).not.toHaveBeenCalled();
+    expect(workspace.calls.some(call => call.method === "snapshot")).toBe(false);
+  });
+
+  it("drains a destroyed worker's slot before checkout cleanup, but does not reopen that checkout until cleanup finishes", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    const cleanup = deferred<void>(); gates.push(cleanup);
+    vi.mocked(rm).mockImplementationOnce(() => cleanup.promise);
+    workspaces.get(active.id)!.exit();
+    await waitForCondition(() => {
+      expect(rm).toHaveBeenCalledWith(join(dir, "checkouts", active.id), { recursive: true, force: true });
+      expect(starts).toEqual([active.id, waiting.id]);
+    });
+    runs.enqueue(active.id, "a", "Retry after cleanup");
+    await runs.close(waiting.id);
+    // Cleanup is explicitly gated; a completed close must not bypass it.
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(runs.get(active.id).status).toBe("queued");
+    cleanup.resolve();
+    await waitForCondition(() => {
+      expect(starts).toEqual([active.id, waiting.id, active.id]);
+      expect(runs.get(active.id).pending.map(message => message.text)).toEqual(["Retry after cleanup"]);
+    });
+  });
+
+  it("reclaims a model-error workspace without waiting for its never-resolving evidence export", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    workspace.hangEvidenceExport = true;
+    const exports = workspace.calls.filter(call => call.method === "export_state").length;
+    workspace.emit(
+      { type: "turn.end", agent_id: "main", stop_reason: "error" },
+      { type: "error", agent_id: "main", message: "Fixture model failure", retryable: false },
+    );
+    await waitForCondition(() => expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true }));
+    await vi.advanceTimersByTimeAsync(60_000); // #34's failed-retry grace starts at failure, not emission.
+    await waitForCondition(() => expect(starts).toEqual([active.id, waiting.id]));
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false });
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(workspace.calls.filter(call => call.method === "export_state")).toHaveLength(exports);
+  });
+
+  it("reserves a reclaimed run through destruction and cleanup when other slots become free", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    cfg.maxRuns = 2;
+    const active = await create(), other = await create("b"), waiting = await create("c");
+    const workspace = workspaces.get(active.id)!;
+    const destruction = deferred<void>(), cleanup = deferred<void>(); gates.push(destruction, cleanup);
+    const destroy = workspace.destroy.bind(workspace);
+    const destroying = vi.spyOn(workspace, "destroy").mockImplementation(async () => { await destruction.promise; await destroy(); });
+    const remove = vi.mocked(rm).getMockImplementation()!;
+    vi.mocked(rm).mockImplementationOnce(remove).mockImplementationOnce(() => cleanup.promise);
+    workspace.emit({ type: "error", agent_id: "main", message: "Fixture failure", retryable: false });
+    await waitForCondition(() => expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    await waitForCondition(() => expect(destroying).toHaveBeenCalledTimes(1));
+    await runs.close(other.id);
+    await waitForCondition(() => expect(starts).toEqual([active.id, other.id, waiting.id])); // The other slot can be reused independently.
+    destruction.resolve();
+    // Wait for the held cleanup to be entered before testing the reservation.
+    await waitForCondition(() => expect(rm).toHaveBeenCalledWith(join(dir, "checkouts", active.id), { recursive: true, force: true }));
+    expect(starts).toEqual([active.id, other.id, waiting.id]);
+    runs.enqueue(active.id, "a", "Retry after destruction");
+    expect(runs.get(active.id).status).toBe("queued");
+    cleanup.resolve();
+    await waitForCondition(() => expect(starts).toEqual([active.id, other.id, waiting.id, active.id]));
+  });
+
+  it("does not acknowledge or strand a follow-up on a disconnected failed-kept worker", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create();
+    const workspace = workspaces.get(active.id)!;
+    workspace.emit({ type: "error", agent_id: "main", message: "Fixture failure", retryable: false });
+    await waitForCondition(() => expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true }));
+    Object.assign(workspace, { isAlive: () => false });
+    const callsAtExit = workspace.calls.length;
+    expect(() => runs.enqueue(active.id, "a", "Retry disconnected work", [], undefined, undefined, "disconnected-request"))
+      .toThrow(expect.objectContaining({ code: "workspace_unavailable" }));
+    expect(runs.get(active.id).pending).toEqual([]);
+    expect(db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(active.id, "disconnected-request")).toBeUndefined();
+    await runs.closeSession(active.id, "a");
+    expect(workspace.calls.slice(callsAtExit)).toEqual([]);
+    runs.enqueue(active.id, "a", "Retry disconnected work", [], undefined, undefined, "disconnected-request");
+    await waitForCondition(() => {
+      expect(starts).toEqual([active.id, active.id]);
+      expect(db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(active.id, "disconnected-request")).toBeDefined();
+      expect(runs.get(active.id).pending.map(message => message.text)).toContain("Retry disconnected work");
+    });
+  });
+
+  // Budget/fallback coverage for alternate workspaces with no controller hold.
+  // Real held/locked publication ordering is covered in evidence-controller.test.ts.
+  it.each(["flush", "export"])("bounds a hung evidence %s on an alternate workspace without checkpoint holds", async operation => {
+    const active = await create(), waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    if (operation === "export") workspace.hangEvidenceExport = true;
+    else workspace.flushCheckpoints = vi.fn(() => new Promise<void>(() => {}));
+    const current = runs.get(active.id); current.pr_state = "merged"; runs.save(current);
+    workspace.emit({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    // Start the fake timeout only once the corresponding operation is pending.
+    await waitForCondition(() => {
+      if (operation === "flush") expect(workspace.flushCheckpoints).toHaveBeenCalledTimes(1);
+      else expect(workspace.calls.some(call => call.method === "export_state")).toBe(true);
+    });
+    expect(starts).toEqual([active.id]);
+    expect(importBundle).not.toHaveBeenCalled();
+    if (operation === "flush") {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await waitForCondition(() => expect(runs.history(active.id, 0).some(event => event.type === "run.checkpoint_unavailable")).toBe(true));
+      expect(importBundle).not.toHaveBeenCalled(); // Separate bounded hold drain.
+      await vi.advanceTimersByTimeAsync(30_000);
+    } else await vi.advanceTimersByTimeAsync(10_000);
+    await waitForCondition(() => {
+      expect(importBundle).toHaveBeenCalledTimes(1);
+      expect(runs.get(active.id)).toMatchObject({ status: "merged", evidence: { unverified: ["Verification policy status unavailable."] } });
+      expect(releases).toEqual([active.id]);
+      expect(starts).toEqual([active.id, waiting.id]);
+    });
+    if (operation === "flush") expect(runs.history(active.id, 0).some(event => event.type === "run.checkpoint_unavailable")).toBe(true);
+  });
+
+  it.each(["ready", "stopped"])("persists the %s idle-release ledger and budgets before teardown without losing its checkpoint policy", async status => {
+    const active = await create();
+    if (status === "ready") await finish(active.id);
+    else {
+      await runs.stop(active.id, "a");
+      await waitForCondition(() => expect((runs as unknown as { live: Map<string, { busy: boolean }> }).live.get(active.id)?.busy).toBe(false));
+    }
+    const workspace = workspaces.get(active.id)!;
+    const run = runs.get(active.id);
+    workspace.state.head = run.head_sha ?? run.base_sha!;
+    run.evidence = { ...run.evidence!, gate_budget: 6, gate_rounds: 4 };
+    runs.save(run);
+    const saved = status === "ready" ? saveCheckpoint(active.id) : undefined;
+    const key = workspace.calls.find(call => call.method === "init_evidence")!.args!.key as string;
+    const record = signedRecord({ run_id: active.id, seq: 9 }, Buffer.from(key, "hex"));
+    const reply = evidenceState(key);
+    Object.assign(reply.state.evidence, { gate_rounds: 5, resumes: 3 });
+    const rpc = workspace.rpc.bind(workspace);
+    vi.spyOn(workspace, "rpc").mockImplementation(async (method, args) => {
+      if (method === "export_state") {
+        runs.append(active.id, { type: "evidence.recorded", record });
+        return reply;
+      }
+      return rpc(method, args);
+    });
+    const destroy = workspace.destroy.bind(workspace);
+    vi.spyOn(workspace, "destroy").mockImplementation(async () => {
+      expect(runs.get(active.id).evidence).toMatchObject({ records: [record], last_seq: 9, gate_budget: 6, gate_rounds: 5, resumes: 3 });
+      if (saved) expect(runs.checkpoints.load(saved.key)).not.toBeNull();
+      await destroy();
+    });
+    const snapshots = workspace.calls.filter(call => call.method === "snapshot").length;
+    const waiting = await create("b");
+    vi.setSystemTime(Date.now() + 600_000);
+    runs.drain();
+    await waitForCondition(() => {
+      expect(releases).toEqual([active.id]);
+      expect(starts).toEqual([active.id, waiting.id]);
+      expect(runs.get(active.id)).toMatchObject({ status, resume_from_checkpoint: !!saved,
+        evidence: { records: [record], last_seq: 9, gate_budget: 6, gate_rounds: 5, resumes: 3 } });
+    });
+    expect(workspace.calls.filter(call => call.method === "snapshot")).toHaveLength(snapshots + (status === "ready" ? 1 : 0));
+    expect(JSON.stringify(runs.get(active.id))).not.toContain(key);
+  });
+
+  it("preserves a follow-up accepted while interrupted-turn evidence is being exported", async () => {
+    const active = await create();
+    const workspace = workspaces.get(active.id)!;
+    const exportGate = deferred<void>(); gates.push(exportGate);
+    const exports = workspace.calls.filter(call => call.method === "export_state").length;
+    const rpc = workspace.rpc.bind(workspace);
+    vi.spyOn(workspace, "rpc").mockImplementation(async (method, args) => {
+      const reply = await rpc(method, args);
+      if (method === "export_state") await exportGate.promise;
+      return reply;
+    });
+    await runs.stop(active.id, "a");
+    await waitForCondition(() => expect(workspace.calls.filter(call => call.method === "export_state")).toHaveLength(exports + 1));
+    runs.enqueue(active.id, "a", "Follow-up during evidence");
+    exportGate.resolve();
+    await waitForCondition(() => {
+      expect(workspace.users()).toEqual(["Implement it", "Follow-up during evidence"]);
+      expect(runs.get(active.id)).toMatchObject({ status: "working", active_message: { text: "Follow-up during evidence" }, pending: [] });
+    });
+  });
+
+  it("does not probe, publish or deliver work after a worker disconnects during interrupted evidence capture", async () => {
+    const active = await create(), waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    let alive = true;
+    Object.assign(workspace, { isAlive: () => alive });
+    const exportGate = deferred<void>(); gates.push(exportGate);
+    const exports = workspace.calls.filter(call => call.method === "export_state").length;
+    const rpc = workspace.rpc.bind(workspace);
+    vi.spyOn(workspace, "rpc").mockImplementation(async (method, args) => {
+      const reply = await rpc(method, args);
+      if (method === "export_state") await exportGate.promise;
+      return reply;
+    });
+    await runs.stop(active.id, "a");
+    await waitForCondition(() => expect(workspace.calls.filter(call => call.method === "export_state")).toHaveLength(exports + 1));
+    const callsAtExit = workspace.calls.length;
+    alive = false;
+    exportGate.resolve();
+    await waitForCondition(() => expect(starts).toEqual([active.id, waiting.id]));
+    expect(workspace.calls.slice(callsAtExit)).toEqual([]);
+    expect(runs.get(active.id)).toMatchObject({ status: "stopped", phase: "idle" });
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+    expect(importBundle).not.toHaveBeenCalled();
+  });
+
+  it("does not snapshot a released worker when publication identity resolution finishes after teardown", async () => {
+    const active = await create(); await finish(active.id);
+    const waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    const identityGate = deferred<void>(); gates.push(identityGate);
+    let resolving = false;
+    vi.mocked(commitIdentity).mockImplementationOnce(async () => {
+      resolving = true;
+      await identityGate.promise;
+      return { name: "fixture", email: "123+fixture@users.noreply.github.com" };
+    });
+    const closing = expect(runs.closeSession(active.id, "a")).rejects.toMatchObject({ step: "snapshot", attempts: 1 });
+    await waitForCondition(() => expect(resolving).toBe(true));
+    await runs.close(active.id);
+    const callsAtRelease = workspace.calls.length;
+    identityGate.resolve();
+    await closing;
+    await waitForCondition(() => expect(starts).toEqual([active.id, waiting.id]));
+    expect(workspace.calls.slice(callsAtRelease)).toEqual([]);
+    expect(runs.get(active.id)).toMatchObject({ status: "ready", phase: "idle" });
+    expect(starts).toEqual([active.id, waiting.id]);
   });
 
   it("starts waiting work when a merged turn finishes and releases its workspace", async () => {
@@ -1075,10 +1345,17 @@ describe("persistent workspace queue", () => {
     const workspace = workspaces.get(failed.id)!;
     const destroy = workspace.destroy.bind(workspace);
     vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    const close = vi.spyOn(runs, "close");
     let closing: Promise<unknown> | undefined;
     if (action === "close") closing = runs.closeSession(failed.id, "a");
     else if (action === "stop") closing = runs.stop(failed.id, "a");
-    else await vi.advanceTimersByTimeAsync(60_000);
+    else {
+      await vi.advanceTimersByTimeAsync(60_000);
+      // The expiry callback does not return its asynchronous cleanup to the
+      // clock. Await the real close barrier, not a fixed number of event ticks.
+      closing = close.mock.results[0]?.value;
+      expect(closing).toBeInstanceOf(Promise);
+    }
     const waiting = await create("b");
     expect(runs.get(waiting.id).status).toBe("queued");
     expect(starts).toEqual([failed.id]);

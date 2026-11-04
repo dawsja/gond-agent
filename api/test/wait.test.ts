@@ -18,6 +18,24 @@ function timingWaits(source: string) {
   return violations;
 }
 
+// The queue suite removed this helper entirely. Catch every reintroduced call,
+// even before statuses/events, an intervening await, or the end of a test.
+function legacyQueueFlushes(source: string) {
+  return [...source.matchAll(/\bflush\s*\(/g)].map(match => source.slice(0, match.index).split("\n").length);
+}
+
+it("rejects legacy queue flush calls regardless of the following assertion", () => {
+  expect(legacyQueueFlushes("await flush();\nexpect(run.status).toBe('failed');")).toEqual([1]);
+  expect(legacyQueueFlushes("await flush();\nawait vi.advanceTimersByTimeAsync(60000);")).toEqual([1]);
+  expect(legacyQueueFlushes("await flush();\nexpect(events).toEqual([]);\nawait flush();")).toEqual([1, 3]);
+  expect(legacyQueueFlushes("await waitForCondition(() => expect(starts).toHaveLength(2));\nawait workspace.flushCheckpoints();")).toEqual([]);
+});
+
+it("keeps the removed flush helper out of the entire queue suite", () => {
+  const source = readFileSync(new URL("./run-queue.test.ts", import.meta.url), "utf8");
+  expect(legacyQueueFlushes(source)).toEqual([]);
+});
+
 it("rejects bare timing waits before exact run-start assertions", () => {
   expect(timingWaits("await flush();\nexpect(releases).toEqual([id]);\nexpect(starts).toEqual([id, next]);")).toEqual([1]);
   expect(timingWaits("await flush(); expect(starts.at(-1)).toBe(next);")).toEqual([1]);

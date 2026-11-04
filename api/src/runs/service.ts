@@ -43,10 +43,13 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
+import { acceptEvidence, emptyEvidence, finishEvidence, MAX_EVIDENCE_IDS, weakenedEvidence, type Evidence } from "./evidence";
 import { capacityReason, releasable, type Capacity, type ReleaseCandidate, type WorkspaceState } from "./capacity";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
+  /** Validated public evidence only. Signing keys belong exclusively to Live. */
+  evidence?: Evidence;
   ci_turn?: boolean;
   /** Unpublished work still belongs to an automatic round, even after a human queues work. */
   ci_publication_pending?: boolean;
@@ -111,7 +114,21 @@ export interface Run extends CiInfo {
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
-const RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
+const RUNNER_STATE_VERSION = "gond-agent-checkpoint-3";
+const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
+const EVIDENCE_EXPORT_TIMEOUT_MS = 10_000;
+const EVIDENCE_FLUSH_TIMEOUT_MS = 30_000;
+const EVIDENCE_SETTLE_TIMEOUT_MS = 30_000;
+class EvidenceTimeout extends Error {}
+/** Evidence is advisory; bound each operation without cancelling its underlying work. */
+async function evidenceRequest<T>(request: () => Promise<T>, timeoutMs = EVIDENCE_EXPORT_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([request(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new EvidenceTimeout("Workspace evidence unavailable")), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
 interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
@@ -121,9 +138,12 @@ export function parseRun(data: string): Run {
   return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
 }
 interface Live {
+  /** Service-generated once per worker, never serialized or refreshed at turn end. */
+  evidenceKey?: Buffer;
   workspace: Workspace;
   cwd: string;
   cursor: number;
+  exited?: boolean;
   closed: boolean;
   busy: boolean;
   closing?: boolean;
@@ -149,6 +169,8 @@ export class Runs {
   private cancelledBoots = new Set<string>();
   private launches = new Map<string, Promise<void>>();
   private pumps = new Map<string, Promise<void>>();
+  private closingWorkspaces = new Map<string, Promise<void>>();
+  private checkoutCleanup = new Map<string, Promise<void>>();
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
@@ -261,11 +283,14 @@ export class Runs {
     const row = this.db.prepare("SELECT data FROM runs WHERE id=? AND deleted_at IS NULL").get(id) as { data: string } | undefined;
     return {
       run: row ? parseRun(row.data) : { status: "failed", phase: "idle", pending: [], summary: emptySummary(), pushed: false, head_sha: null, base_sha: null, pr_state: null },
-      live: !!row && this.live.get(id) === live && !live.closed, busy: live.busy, closing: !!live.closing,
+      live: !!row && this.live.get(id) === live && this.workerAlive(live), busy: live.busy, closing: !!live.closing,
       booting: this.booting.has(id), publicationPending: !!live.publishPending,
       checkpointClaimed: !!this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND claimed_by IS NOT NULL AND consumed_at IS NULL LIMIT 1").get(id),
       idleSince: live.idleSince, delayMs: this.idleDelay, state: live.state,
     };
+  }
+  private workerAlive(live: Live) {
+    return !live.closed && !live.exited && live.workspace.isAlive?.() !== false;
   }
   private capacity(user?: string): Capacity {
     let working = 0, idle_releasable = 0;
@@ -298,7 +323,7 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
+    const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body,json_extract(data, '$.evidence') AS evidence FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null; evidence: string | null} | undefined;
     if (stored) assertRunTransition(stored.status, r.status);
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
@@ -309,6 +334,18 @@ export class Runs {
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
+    if (stored?.evidence) {
+      const evidence = JSON.parse(stored.evidence) as Evidence;
+      // Async lifecycle snapshots cannot roll replay protection or budgets back,
+      // including turns that consumed gate rounds without producing a record.
+      const rounds = Math.max(evidence.gate_rounds ?? 0, r.evidence?.gate_rounds ?? 0);
+      const resumes = Math.max(evidence.resumes ?? 0, r.evidence?.resumes ?? 0);
+      const gateBudget = Math.max(evidence.gate_budget ?? 0, r.evidence?.gate_budget ?? 0);
+      if (!r.evidence || evidence.last_seq > r.evidence.last_seq) r.evidence = evidence;
+      const historical = new Set([...(evidence.recorded_before_restart ?? []), ...(r.evidence.recorded_before_restart ?? [])]);
+      r.evidence = { ...r.evidence, gate_rounds: rounds, gate_budget: gateBudget, resumes,
+        recorded_before_restart: r.evidence.records.filter(record => historical.has(record.id)).map(record => record.id) };
+    }
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -339,6 +376,32 @@ export class Runs {
     }
   }
   append(id: string, event: Record<string, unknown>) {
+    // State replies are private control data, never transcript events.
+    if (typeof event.type === "string" && event.type.startsWith("state.")) return;
+    let recordsCapped = false;
+    if (event.type === "evidence.records_capped") {
+      // Fixed service-owned notice, durable across workers/restarts. Worker
+      // lookalikes cannot invent a cap or choose its text/fields.
+      if ((this.get(id).evidence?.ids.length ?? 0) < MAX_EVIDENCE_IDS || this.db.prepare(
+        "SELECT 1 FROM events WHERE run_id=? AND json_extract(data,'$.type')='evidence.records_capped' LIMIT 1",
+      ).get(id)) return;
+      event = { type: "evidence.records_capped", limit: MAX_EVIDENCE_IDS,
+        message: "Execution evidence reached the 4,096-record limit. Further records will not be accepted for this run." };
+    }
+    if (event.type === "evidence.recorded") {
+      if (Object.keys(event).some(key => key !== "type" && key !== "record")) return;
+      const run = this.get(id);
+      if ((run.evidence?.ids.length ?? 0) >= MAX_EVIDENCE_IDS) {
+        this.append(id, { type: "evidence.records_capped" });
+        return;
+      }
+      const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey, id);
+      if (!evidence) return;
+      run.evidence = evidence;
+      this.save(run);
+      event = { type: "evidence.recorded", record: evidence.records.at(-1) };
+      recordsCapped = evidence.ids.length === MAX_EVIDENCE_IDS;
+    }
     if (event.type === "tool.images") {
       const run = this.get(id);
       const images: { id: string; media_type: string }[] = [];
@@ -360,6 +423,7 @@ export class Runs {
       .run(id, JSON.stringify(ev));
     const result = { ...ev, seq: Number(row.lastInsertRowid) };
     this.events.emit(id, result);
+    if (recordsCapped) this.append(id, { type: "evidence.records_capped" });
     return result;
   }
   history(id: string, after: number) {
@@ -390,10 +454,28 @@ export class Runs {
     if (/^run_[a-f0-9]{24}$/.test(id)) this.checkpoints.deleteRun(id, user);
   }
   private checkpointKey(r: Run) { return { runId: r.id, ownerId: r.user_id, runnerVersion: RUNNER_STATE_VERSION }; }
+  private latestCheckpoint(r: Run) {
+    const latest = this.db.prepare("SELECT seq,runner_version FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(r.id) as { seq: number; runner_version: string } | undefined;
+    // Authenticate legacy ciphertext under its original version; never relabel it
+    // or search older pairs when the latest one is incompatible/unavailable.
+    const key = this.checkpointKey(r);
+    if (latest?.runner_version === LEGACY_RUNNER_STATE_VERSION) key.runnerVersion = LEGACY_RUNNER_STATE_VERSION;
+    return { latest, key };
+  }
+  private savedState(state: string, runnerVersion: string): SavedState {
+    const saved = JSON.parse(state) as SavedState;
+    if (!saved?.runner || !saved.service || saved.runner.runner_state_version !== runnerVersion ||
+        (runnerVersion !== RUNNER_STATE_VERSION && runnerVersion !== LEGACY_RUNNER_STATE_VERSION) ||
+        (runnerVersion === LEGACY_RUNNER_STATE_VERSION && saved.runner.evidence != null))
+      throw new Error("Invalid service checkpoint");
+    return saved;
+  }
   private usableCheckpoint(r: Run) {
     try {
-      const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(r.id) as { seq: number } | undefined;
-      return latest ? this.checkpoints.load(this.checkpointKey(r), latest.seq) : null;
+      const { latest, key } = this.latestCheckpoint(r);
+      const loaded = latest ? this.checkpoints.load(key, latest.seq) : null;
+      if (loaded) this.savedState(loaded.state, loaded.checkpoint.runner_version);
+      return loaded;
     } catch { return null; }
   }
   async recover() {
@@ -489,6 +571,7 @@ export class Runs {
     live.closing = true; // Block follow-ups while checking the actual worker again.
     const release = (async () => {
       try {
+        if (!this.workerAlive(live) || this.live.get(id) !== live) return;
         live.state = await live.workspace.rpc<WorkspaceState>("workspace_state");
         const candidate = this.releaseCandidate(id, live);
         candidate.closing = false; // This release owns the closing lock.
@@ -498,6 +581,7 @@ export class Runs {
         await this.closeSession(id, this.get(id).user_id, async () => {
           // Snapshot can run repository filters. Verify again afterwards so a
           // writer or edit created during publication cannot be discarded.
+          if (!this.workerAlive(live) || this.live.get(id) !== live) return false;
           live.state = await live.workspace.rpc<WorkspaceState>("workspace_state");
           const current = this.releaseCandidate(id, live);
           return !this.shuttingDown && !this.hasCapacity() && !!this.queue.first(new Map(), this.occupied()) &&
@@ -561,7 +645,7 @@ export class Runs {
       }
       // Check for an eligible head before reclaiming: a cancelled boot's
       // replacement can be queued while still reserved by the old startup.
-      const reserved = () => new Set([...this.occupied(), ...this.queue.waiting().filter(e => this.autoResuming.size && this.get(e.id).auto_resume_pending).map(e => e.id)]);
+      const reserved = () => new Set([...this.occupied(), ...this.closingWorkspaces.keys(), ...this.checkoutCleanup.keys(), ...this.queue.waiting().filter(e => this.autoResuming.size && this.get(e.id).auto_resume_pending).map(e => e.id)]);
       while (this.queue.first(new Map(), reserved()) && this.hasCapacity(true)) {
         const accounts = new Map<string, number>();
         for (const id of this.occupied()) {
@@ -785,6 +869,9 @@ export class Runs {
         "Write a message of up to 20,000 characters.",
       );
     if (this.live.get(id)?.closing || (this.live.get(id)?.closed && r.ci_state !== "gave_up")) throw new ApiError(409, "workspace_closing", "The workspace is closing. If closing failed, try Close workspace again before sending a follow-up.");
+    const existing = this.live.get(id);
+    if (existing && !existing.closed && !this.workerAlive(existing))
+      throw new ApiError(409, "workspace_unavailable", "Close the unavailable workspace before sending a follow-up.");
     const question = r.summary.question;
     const answering = this.live.get(id);
     if (question && answering?.busy) {
@@ -856,10 +943,10 @@ export class Runs {
         if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
         if ((r.auto_resumes ?? 0) >= 2 || !["web", "mcp"].includes(r.source)) throw new Error("Automatic resume is unavailable");
       }
-      claimKey = this.checkpointKey(r);
+      claimKey = this.latestCheckpoint(r).key;
       try { if (/^run_[a-f0-9]{24}$/.test(id)) claimed = this.checkpoints.claim(claimKey); }
       catch {
-        const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? AND claimed_by IS NULL ORDER BY seq DESC LIMIT 1").get(id) as { seq: number } | undefined;
+        const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1").get(id) as { seq: number } | undefined;
         if (latest) this.checkpoints.quarantine(claimKey, latest.seq);
         this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint is invalid. Continuing from a fresh checkout of the last pushed branch." });
       }
@@ -886,7 +973,7 @@ export class Runs {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
         try {
-          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
+          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r, r.pending[0]?.source === "ci"))));
         } catch (error) {
           if (!this.ciPublicationRefused(id, error)) throw error;
           r = this.get(id);
@@ -962,8 +1049,26 @@ export class Runs {
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
       let restored: SavedState | undefined;
+      let signingKey: Buffer;
       const start = async () => {
+        // Pin policy discovery before runner startup, including fallback workers.
+        const base = r.base_sha ?? (await git(checked.cwd, "rev-parse", `origin/${r.base_branch}`)).toString().trim();
+        r = this.get(id);
+        if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
+        r.base_sha ??= base;
+        const previous = r.evidence;
+        r.evidence = { ...(previous ?? emptyEvidence()), resumes: previous ? (previous.resumes ?? 0) + 1 : 0,
+          // Public events can be ahead of the checkpoint; every old record is stale.
+          recorded_before_restart: (previous?.records ?? []).map(record => record.id) };
+        this.save(r); // A failed start cannot replenish counters or freshness.
+        this.status(r, "working", "Starting the agent");
         await workspace!.rpc("start", {
+          evidence_base_sha: r.base_sha,
+          evidence_mode: process.env.GOND_AGENT_EVIDENCE === "off" ? "off" : "on",
+          evidence_repo_policy: process.env.GOND_AGENT_EVIDENCE_REPO_POLICY === "allow-weaken" ? "allow-weaken" : "",
+          evidence_seq: r.evidence.last_seq,
+          evidence_gate_rounds: Math.max(r.evidence.gate_rounds ?? 0, r.evidence.gate_budget ?? 0),
+          evidence_resumes: r.evidence.resumes,
           model: r.model_id, effort: r.effort ?? "high",
           interactive: r.pending[0]?.source !== "ci" && (r.source === "web" || r.source === "mcp"),
           question_wait_minutes: questionWaitMinutes(),
@@ -971,23 +1076,32 @@ export class Runs {
           ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
           ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
         });
+        // Only the service chooses authority. Wait for the private acknowledgement
+        // before import_state or delivery, on restored AND replacement workers.
+        signingKey = randomBytes(32);
+        await evidenceRequest(() => workspace!.rpc("init_evidence", { run_id: id, owner_id: r.user_id, key: signingKey!.toString("hex") }));
       };
       this.status(r, "working", "Loading repository into the workspace");
       await workspace.rpc("setup", { archive: checked.archive.toString("base64") });
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
       if (claimed) {
+        let startingWorker = false;
         try {
-          const state = JSON.parse(claimed.state) as SavedState;
-          if (!state.runner || !state.service) throw new Error("Invalid service checkpoint");
+          const state = this.savedState(claimed.state, claimed.checkpoint.runner_version);
           await workspace.rpc("restore_checkpoint", { bundle: claimed.bundle.toString("base64"), base_sha: claimed.tree.baseSha, head_sha: claimed.tree.headSha, checkpoint_sha: claimed.tree.checkpointSha, ...(r.pushed && r.head_sha ? { published_head: r.head_sha } : {}) });
           r = this.get(id);
           if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
+          startingWorker = true;
           await start();
+          startingWorker = false;
           if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
           await workspace.rpc("import_state", { run_id: id, owner_id: r.user_id, state: state.runner });
           restored = state;
-        } catch {
+        } catch (error) {
+          // Failed worker/key initialization says nothing about the saved pair.
+          // Leave its claim for the outer cleanup to release, never quarantine it.
+          if (startingWorker) throw error;
           r = this.get(id);
           if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
           this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint could not be restored. Continuing from a fresh checkout of the last pushed branch." });
@@ -1007,11 +1121,22 @@ export class Runs {
           await start();
         }
       } else await start();
+
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
+      // Keep the initial private export for policy inspection, never key acquisition.
+      // Older exports may be unavailable; no control reply is logged or published.
+      let initialEvidence: unknown;
+      try {
+        if (workspace.isAlive?.() !== false)
+          initialEvidence = await evidenceRequest(() => workspace!.rpc("export_state", { run_id: id, owner_id: r.user_id }));
+      } catch { /* unavailable */ }
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
+        evidenceKey: signingKey!,
         workspace,
         cwd: checked.cwd,
         cursor: 0,
+        exited: false,
         closed: false,
         busy: true, // Delivery stays reserved through checkpoint/replay initialization.
         releaseClaim: () => {
@@ -1024,21 +1149,18 @@ export class Runs {
         },
       };
       this.live.set(id, live);
-      r.base_sha ??= (
-        await git(checked.cwd, "rev-parse", `origin/${r.base_branch}`)
-      )
-        .toString()
-        .trim();
-      r = { ...this.get(id), base_sha: r.base_sha };
+      r = this.get(id);
+      r.evidence = finishEvidence(r.evidence, initialEvidence, signingKey!);
       r.phase = "agent";
       this.save(r);
-      await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
+      try { await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
         if (live.closed || this.live.get(id) !== live) return;
         const current = this.get(id);
         if (current.status === "stopped" || current.status === "merged") return;
         // Stop may have removed the predecessor while retaining this worker for a follow-up.
         if (claimed && !this.db.prepare("SELECT 1 FROM run_checkpoints WHERE seq=? AND run_id=? AND claimed_by=?").get(claimed.checkpoint.seq, id, claimed.claimToken)) claimed = null;
         const predecessor = claimed;
+        if (capture.state.runner_state_version !== RUNNER_STATE_VERSION) throw new Error("Incompatible runner checkpoint");
         this.checkpoints.save({ ...this.checkpointKey(current), bundle: Buffer.from(capture.bundle, "base64"),
           state: JSON.stringify({ runner: capture.state, service: { active_message_id: current.active_message?.id, automatic: !!(current.ci_turn || current.ci_publication_pending) } } satisfies SavedState),
           tree: { baseSha: capture.base_sha, headSha: capture.head_sha, checkpointSha: capture.checkpoint_sha } }, () => {
@@ -1047,7 +1169,8 @@ export class Runs {
           this.save(current);
         });
         if (predecessor) claimed = null;
-      }, () => this.checkpointUnavailable(id));
+      }, () => this.checkpointUnavailable(id)); }
+      catch { this.checkpointUnavailable(id); }
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         live.closed = true;
@@ -1134,7 +1257,7 @@ export class Runs {
   private async next(id: string, live: Live) {
     let r = this.get(id);
     if (r.pending.length && live.closed && r.ci_state === "gave_up") return this.resumeAfterCiRefusal(id);
-    if(!r.pending.length || live.closed)return;
+    if(!r.pending.length || !this.workerAlive(live) || this.live.get(id) !== live)return;
     if (live.busy) return;
     live.busy = true;
     live.idleSince = undefined;
@@ -1175,6 +1298,9 @@ export class Runs {
     r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
+    // Reserve before delivering the task: a crash before the private finish
+    // export may spend unused allowance, but can never reset the global budget.
+    r.evidence = { ...(r.evidence ?? emptyEvidence()), gate_budget: Math.min(6, Math.max(r.evidence?.gate_budget ?? 0, r.evidence?.gate_rounds ?? 0) + 2) };
     r.work_kept = false;
     delete r.last_error;
     r.phase = "agent";
@@ -1185,8 +1311,11 @@ export class Runs {
     }
     live.busy = true;
     const selected=await this.resolveSelection(r.user_id,r.model_id);
+    if (!this.workerAlive(live) || this.live.get(id) !== live) return;
     await live.workspace.rpc("send",{input:{type:"model",model:r.model_id,context_window:selected.context_window}});
+    if (!this.workerAlive(live) || this.live.get(id) !== live) return;
     await live.workspace.rpc("send", {input:{type:"effort",effort:r.effort ?? "high"}});
+    if (!this.workerAlive(live) || this.live.get(id) !== live) return;
     await live.workspace.rpc("send", {
       input: {
         type: "user",
@@ -1215,6 +1344,8 @@ export class Runs {
     return searchResponse(this.db, this.cfg.secret, req);
   }
   private async workerLost(id: string, live: Live) {
+    live.exited = true;
+    this.saveEvidence(id, live);
     if (this.get(id).status !== "working") {
       live.releaseClaim?.();
       await this.close(id, false, true);
@@ -1237,6 +1368,9 @@ export class Runs {
         alive: boolean;
       }>("events", { after: live.cursor });
       if (live.closed) return;
+      // Liveness applies to the entire batch, including terminal events buffered
+      // before exit. Do not ask an exited worker to export, publish or take work.
+      live.exited = !batch.alive || live.workspace.isAlive?.() === false;
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
@@ -1253,7 +1387,15 @@ export class Runs {
         });
         this.save(r);
         if (r.status === "failed") continue;
+        if (live.exited) {
+          if (event.type === "turn.end" && event.agent_id === "main" && event.stop_reason === "end_turn") {
+            r.recovery_phase = "finishing"; // Recovery must not replay completed work.
+            this.save(r);
+          }
+          continue;
+        }
         if (event.type === "error" && event.agent_id === "main") {
+          this.saveEvidence(id, live);
           const dropped = modelDropped;
           await this.fail(id, new RetryError("model", {
             class: dropped ? "network" : "unknown", retryable: !!event.retryable,
@@ -1262,11 +1404,15 @@ export class Runs {
           continue;
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
-          if (event.stop_reason === "error") continue;
+          if (event.stop_reason === "error") { this.saveEvidence(id, live); continue; }
           if (event.stop_reason === "interrupted") {
+            await this.captureEvidence(id, live);
+            if (live.closed || this.live.get(id) !== live) return;
+            if (!this.workerAlive(live)) { await this.workerLost(id, live); return; }
             live.busy = false;
-            r.phase = "agent";
-            this.status(r, "stopped");
+            const stopped = this.get(id);
+            stopped.phase = "agent";
+            this.status(stopped, "stopped");
             await this.observeIdle(id, live);
             this.drain();
           } else if (event.stop_reason !== "compacted") {
@@ -1277,28 +1423,69 @@ export class Runs {
         }
       }
       if (live.closed) return;
-      const r = this.get(id);
-      if(!live.busy && r.pending.length)await this.next(id,live);
-      if (!batch.alive) {
+      if (!batch.alive || live.workspace.isAlive?.() === false) {
         await this.workerLost(id, live);
         return;
       }
+      const r = this.get(id);
+      if(!live.busy && r.pending.length)await this.next(id,live);
       await delay(batch.events.length ? 50 : 300);
     }
   }
+  private async captureEvidence(id: string, live: Live) {
+    if (live.closed || this.live.get(id) !== live) return;
+    if (!this.workerAlive(live)) { this.saveEvidence(id, live); return; }
+    // Boundary exports and private exports share runner control state. Settle
+    // checkpoint capture first so the evidence export cannot race a held boundary.
+    const flush = Promise.resolve().then(() => live.workspace.flushCheckpoints?.());
+    try { await evidenceRequest(() => flush, EVIDENCE_FLUSH_TIMEOUT_MS); }
+    catch (error) {
+      if (live.closed || this.live.get(id) !== live) return;
+      this.checkpointUnavailable(id);
+      // Timing out does not cancel tree export/persistence or release its hold.
+      // Give that same operation a separate bounded drain before publication's
+      // snapshot. Persistence failures already settle after release in the pool.
+      try {
+        if (!(error instanceof EvidenceTimeout) || !this.workerAlive(live)) throw error;
+        await evidenceRequest(() => flush, EVIDENCE_SETTLE_TIMEOUT_MS);
+      } catch {
+        this.saveEvidence(id, live);
+        return; // Still unavailable; never wait indefinitely on advisory work.
+      }
+    }
+    if (live.closed || this.live.get(id) !== live) return;
+    if (!this.workerAlive(live)) { this.saveEvidence(id, live); return; }
+    const r = this.get(id);
+    let reply: unknown;
+    try { reply = await evidenceRequest(() => live.workspace.rpc("export_state", { run_id: id, owner_id: r.user_id })); } catch { /* unavailable; no private reply is logged */ }
+    this.saveEvidence(id, live, reply);
+  }
+  private saveEvidence(id: string, live: Live, reply?: unknown) {
+    if (live.closed || this.live.get(id) !== live) return;
+    const r = this.get(id);
+    r.evidence = finishEvidence(r.evidence, reply, live.evidenceKey);
+    this.save(r);
+  }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
-    if (r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
+    if (r.status === "stopped") {
+      await this.captureEvidence(id, live);
+      live.busy = false;
+      await this.observeIdle(id, live);
+      return;
+    }
     // The model turn has ended, even if settling its final checkpoint now yields.
     r.recovery_phase = "finishing";
     this.save(r);
-    try { await live.workspace.flushCheckpoints?.(); }
-    catch { this.checkpointUnavailable(id); }
-    r = this.get(id); // Flush yields: preserve messages and Stop accepted meanwhile.
-    if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
+    await this.captureEvidence(id, live);
+    r = this.get(id); // Capture yields: preserve messages and Stop accepted meanwhile.
+    if (live.closed || this.live.get(id) !== live) { live.busy = false; return; }
+    if (!this.workerAlive(live)) { await this.workerLost(id, live); return; }
+    if (r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     delete r.active_message;
     this.autoResuming.delete(id);
     r.auto_resume_pending = false;
+
     r.phase = "finishing";
     r.recovery_phase = "finishing";
     this.status(r, "working", "Pushing changes");
@@ -1311,6 +1498,7 @@ export class Runs {
     }
     r = this.get(id);
     if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
+    if (!this.workerAlive(live)) { await this.workerLost(id, live); return; }
     try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
     catch { this.checkpointUnavailable(id); }
     r = this.get(id);
@@ -1333,8 +1521,35 @@ export class Runs {
     if (!live.closed && r.status === "ready" && !r.pending.length) await this.observeIdle(id, live);
     this.drain();
   }
+  /** Derive freshness on the service clone from the exact pinned commit being pushed. */
+  private evidenceBeforePush(run: Run, guard?: PushOptions["beforePush"]): PushOptions["beforePush"] {
+    // Inspect every publication, including gate-off/docs-only/no-record turns.
+    return async context => {
+      const current = this.get(run.id);
+      let tree: string | undefined;
+      let uiRequired: boolean | undefined;
+      let docsOnly = false;
+      let warnings = ["Publication tree or verification diff unavailable."];
+      try {
+        const candidate = (await git(context.cwd, "rev-parse", `${context.head}^{tree}`)).toString().trim();
+        if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(candidate)) tree = candidate;
+        const diff = (await git(context.cwd, "diff", "--no-ext-diff", "--no-textconv", current.base_sha!, context.head, "--")).toString();
+        const paths = (await git(context.cwd, "diff", "--name-only", "--no-renames", "-z", current.base_sha!, context.head, "--")).toString().split("\0").filter(Boolean);
+        uiRequired = paths.some(path => path.startsWith("web/") || /\.(?:tsx|css)$/.test(path));
+        // Symlink mode changes must never inherit the regular-Markdown waiver.
+        docsOnly = paths.length > 0 && paths.every(path => path.endsWith(".md") && (!path.includes("/") || path.startsWith("docs/"))) && !/^(?:(?:old|new) mode 120000|(?:new|deleted) file mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/m.test(diff);
+        warnings = weakenedEvidence(diff.slice(0, 2_000_000));
+        if (diff.length > 2_000_000) warnings.push("Verification diff truncated; additional test/policy changes may be omitted.");
+      } catch { tree = undefined; /* no freshness claim on incomplete service-side Git inspection */ }
+      // Keep the CI guard's final stop/PR recheck closest to the actual push.
+      if (guard) await guard(context);
+      const latest = this.get(run.id);
+      latest.evidence = { ...(latest.evidence ?? emptyEvidence()), publication_tree: tree, weakened: warnings, ui_required: uiRequired, docs_only: docsOnly };
+      this.save(latest);
+    };
+  }
   private async observeIdle(id: string, live: Live) {
-    if (live.closed || live.busy || this.live.get(id) !== live) return;
+    if (!this.workerAlive(live) || live.busy || this.live.get(id) !== live) return;
     const r = this.get(id);
     if (!["ready", "stopped"].includes(r.status) || r.pending.length) return;
     if (r.status === "stopped") { r.phase = "agent"; this.save(r); }
@@ -1344,7 +1559,7 @@ export class Runs {
     // Start the delay only once work has actually stopped, not on Stop acceptance.
     try {
       const state = await live.workspace.rpc<WorkspaceState>("workspace_state");
-      if (!live.closed && !live.busy && live.idleSince === since) live.state = state;
+      if (this.workerAlive(live) && this.live.get(id) === live && !live.busy && live.idleSince === since) live.state = state;
     } catch { /* Unknown worker evidence fails closed and is reprobed on drain. */ }
   }
   private checkpointUnavailable(id: string) {
@@ -1425,13 +1640,16 @@ export class Runs {
     // Only preflight a fresh snapshot. An imported retry may already exist remotely
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
-    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
-    const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
-      "snapshot",
-      options.backgroundPublication
-        ? { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options) }
-        : { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
-    ), { maxAttempts: 1 });
+    const pushOptions = publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r)));
+    const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => {
+      const identity = options.backgroundPublication
+        ? await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options)
+        : await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id));
+      // Identity/preflight can yield while a concurrent close destroys the worker.
+      if (!this.workerAlive(live) || this.live.get(id) !== live)
+        throw new ApiError(409, "workspace_closed", "The workspace is no longer available.");
+      return live.workspace.rpc<{ bundle: string; head: string }>("snapshot", { title: r.title, identity });
+    }, { maxAttempts: 1 });
     const journal = this.get(id);
     journal.publication_head = snapshot.head;
     this.save(journal); // Must precede any upstream push, including importBundle's push.
@@ -1500,6 +1718,8 @@ export class Runs {
       r.deletions += Number(d) || 0;
     }
     r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, ci_pending_sha: pushed ? head : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    // Also surface weakening for legacy workers, which have no signed records.
+    if (r.evidence) r.evidence.weakened = [...new Set([...(r.evidence.weakened ?? []), ...weakenedEvidence(r.diff)])].sort().slice(0, 32);
     this.save(r);
     this.append(id, {
       type: "run.diff",
@@ -1580,7 +1800,7 @@ export class Runs {
       if (queued) this.append(id, { type: "run.dequeued" });
     })();
     if (kept) { await this.close(id); return; }
-    if (live?.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    if (live?.busy && this.workerAlive(live)) await live.workspace.rpc("send", { input: { type: "interrupt" } });
     else if (live) await this.observeIdle(id, live);
     this.drain();
   }
@@ -1613,9 +1833,15 @@ export class Runs {
     if (r.work_kept) { await this.close(id); return { closed: true }; }
     live.closing = true;
     try {
+      // Both explicit Close and demand-driven idle release settle the public
+      // ledger before publication/teardown. Never export from a closed/dead worker.
+      await this.captureEvidence(id, live);
+      if (live.closed || this.live.get(id) !== live) return { closed: true };
+      if (!this.workerAlive(live)) { await this.workerLost(id, live); return { closed: true }; }
+      const current = this.get(id); // Stop may have arrived during evidence capture.
       // A verified stopped checkout has nothing to publish. Automatic release
       // must not create a branch or push changes after the person pressed Stop.
-      if (!beforeClose || r.status !== "stopped") await this.publish(id, live, {});
+      if (!beforeClose || current.status !== "stopped") await this.publish(id, live, {});
       if (beforeClose && !await beforeClose()) return { closed: false };
       // Automatic idle release preserves the paired tree/conversation checkpoint,
       // just like CI auto-close; explicit Close still discards it.
@@ -1649,6 +1875,20 @@ export class Runs {
       const r = this.get(id);
       await this.stop(id, r.user_id);
     }
+    let closing = this.closingWorkspaces.get(id);
+    if (!closing && !this.checkoutCleanup.has(id)) {
+      closing = this.closeWorkspace(id, forCapacity, preserveCheckpoint);
+      this.closingWorkspaces.set(id, closing);
+    }
+    try {
+      await closing;
+      if (!forCapacity) await this.checkoutCleanup.get(id);
+    } finally {
+      if (closing && this.closingWorkspaces.get(id) === closing) this.closingWorkspaces.delete(id);
+      this.drain();
+    }
+  }
+  private async closeWorkspace(id: string, forCapacity: boolean, preserveCheckpoint: boolean) {
     const live = this.live.get(id);
     let r: Run | undefined;
     try { r = this.get(id); }
@@ -1706,13 +1946,22 @@ export class Runs {
     }
     // Only an imported commit survives capacity eviction, not the worker's
     // uncommitted edits or a bundle that could not be imported.
-    if (!r?.kept_commit) await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    const cleanup = r?.kept_commit ? Promise.resolve() : rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
+    const cleaned = cleanup.finally(() => {
+      if (this.checkoutCleanup.get(id) === cleaned) this.checkoutCleanup.delete(id);
+      this.drain();
+    });
+    this.checkoutCleanup.set(id, cleaned);
     this.autoResuming.delete(id);
+    // Destruction has freed the worker slot. Unrelated waiting work must not sit
+    // behind filesystem cleanup; reserve only this run until its clone is gone.
     if (live?.releaseForWaiting) {
       live.releaseForWaiting = false;
       this.append(id, { type: "run.released", reason: "idle_for_waiting_work" });
     }
     this.drain();
+    if (forCapacity) void cleaned.catch(() => console.error("Couldn't clean released workspace checkout", id));
+    else await cleaned;
   }
   async shutdown() {
     this.shuttingDown = true;
@@ -1725,6 +1974,7 @@ export class Runs {
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id, false, true)));
     await Promise.allSettled([...this.pumps.values()]);
     await this.idleRelease;
+    await Promise.allSettled(this.checkoutCleanup.values());
   }
   private async fail(id: string, error: unknown, workerLost = false) {
     const failure = error instanceof RetryError ? error : error instanceof ApiError && error.cause instanceof RetryError ? error.cause :

@@ -15,6 +15,7 @@ import { emptySummary, fold, planState } from "../src/runs/fold";
 import { createToken } from "../src/mcp";
 import type { Config } from "../src/config";
 import { saveProviderSettings } from "../src/providers";
+import { unverifiedDescription } from "./fixtures/evidence";
 
 let dir: string,
   db: ReturnType<typeof openStore>,
@@ -327,7 +328,7 @@ it("forwards a valid title, branch and explicit empty PR body when starting a se
   expect(result.isError).not.toBe(true);
   expect(create).toHaveBeenCalledTimes(1);
   expect(create.mock.calls[0].slice(0, 2)).toEqual([owner, { ...args, source: "mcp" }]);
-  expect(body).toMatchObject({ id: r.id, title: r.title, branch: r.branch, pr_body: "", description: "" });
+  expect(body).toMatchObject({ id: r.id, title: r.title, branch: r.branch, pr_body: "", description: unverifiedDescription("") });
 });
 it("forwards follow-up PR body overrides to enqueue", async () => {
   const r = seedFollowUpRun();
@@ -357,8 +358,8 @@ it("persists follow-up PR bodies, preserves omitted overrides and exposes the de
     expect(body.accepted).toBe(true);
     const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
     expect(JSON.parse(stored.data).pr_body).toBe(expected);
-    expect((await call(client, "get_session", { session_id: r.id })).body).toMatchObject({ pr_body: expected, description: expected });
-    expect((await call(client, "list_sessions")).body.sessions[0]).toMatchObject({ pr_body: expected, description: expected });
+    expect((await call(client, "get_session", { session_id: r.id })).body).toMatchObject({ pr_body: expected, description: unverifiedDescription(expected) });
+    expect((await call(client, "list_sessions")).body.sessions[0]).toMatchObject({ pr_body: expected, description: unverifiedDescription(expected) });
   }
 });
 it("rejects missing, expired, revoked and cross-origin tokens without cookie fallback", async () => {
@@ -493,7 +494,7 @@ it("deduplicates concurrent starts and rejects changed retry arguments and backe
 });
 it("paginates events, reports large events and releases waiting reads on revoke", async () => {
   seed();
-  const first = runs.append("run_test", { type: "text", text: "hello" });
+  const first = runs.append("run_test", { type: "text", text: "hello" })!;
   runs.append("run_test", { type: "text", text: "world" });
   const client = await connect();
   const page = await call(client, "read_session_events", {
@@ -505,7 +506,7 @@ it("paginates events, reports large events and releases waiting reads on revoke"
   const huge = runs.append("run_test", {
     type: "text",
     text: "a".repeat(150000),
-  });
+  })!;
   const large = await call(client, "read_session_events", {
     session_id: "run_test",
     after_seq: huge.seq - 1,

@@ -26,6 +26,8 @@ export interface WorkspaceCheckpoint {
 export interface Workspace {
   rpc<T = any>(method: string, args?: Record<string, unknown>): Promise<T>;
   destroy(): Promise<void>;
+  /** Local transport liveness; do not send advisory RPCs after disconnect/teardown. */
+  isAlive?(): boolean;
   /** Call after start/import and before sending work. Save runs while the runner is held.
    * Optional for alternate WorkspaceFactory implementations without checkpoint support. */
   enableCheckpoints?(options: WorkspaceCheckpointOptions,
@@ -314,7 +316,8 @@ export class ContainerPool {
         }
       });
       await rpc("ping");
-      return { rpc, destroy, enableCheckpoints, flushCheckpoints, captureCheckpoint };
+      return { rpc, destroy, isAlive: () => !destroyed && !disconnected && child?.exitCode === null,
+        enableCheckpoints, flushCheckpoints, captureCheckpoint };
     } catch (error) {
       await destroy().catch((cleanupError) => console.error("Workspace startup cleanup failed", id, cleanupError));
       throw error;
