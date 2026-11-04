@@ -47,6 +47,27 @@ test('a service cap rejection tells the person the image was not saved', () => {
   ])
 })
 
+test('real Markdown renders absolute same-origin images without allowing lookalike remote origins', () => {
+  const { Prose } = load(new URL('../../shared/prose.tsx', import.meta.url))
+  const previousWindow = globalThis.window
+  globalThis.window = { location: new URL('https://workspace.example.test/agents/') }
+  try {
+    for (const path of ['/agents/favicon-32.png', '/api/v1/runs/run_fixture/images/img_fixture']) {
+      const src = `https://workspace.example.test${path}`
+      const html = renderToStaticMarkup(createElement(Prose, { text: `![Local diagram](${src})` }))
+      assert.ok(html.includes(`<img src="${src}" alt="Local diagram"`), html)
+    }
+    for (const src of ['https://workspace.example.test.evil.test/screen.png', 'https://workspace.example.test@evil.test/screen.png', 'http://workspace.example.test/screen.png', 'https://workspace.example.test:444/screen.png']) {
+      const html = renderToStaticMarkup(createElement(Prose, { text: `![Remote](${src})` }))
+      assert.match(html, /<a href=/)
+      assert.doesNotMatch(html, /<img/)
+    }
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
+})
+
 test('real Markdown rendering explains local paths and never requests remote images', () => {
   const { Prose } = load(new URL('../../shared/prose.tsx', import.meta.url))
   for (const path of ['/tmp/screen.png', './screenshot.png', 'file:///tmp/screen.png', '../private.png']) {

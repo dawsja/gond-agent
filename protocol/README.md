@@ -270,8 +270,9 @@ image GETs across tool details, attachments, card enlargement and remounts durin
 that lifetime; HTTP `no-store` does not disable this in-memory cache. Captioned cards use caption alt text (fallback
 “Shared image”), focus-visible keyboard enlargement and Escape/focus restoration.
 Old events keep their existing fold. Local Markdown image paths show a muted
-unavailable note; remote HTTP(S) images stay links, and existing inline data/blob
-rendering remains compatible.
+unavailable note; absolute same-origin HTTP(S) images still render (including
+authenticated run-image URLs). Remote HTTP(S) images stay links, and existing
+inline data/blob rendering remains compatible.
 
 Sharing returns text only to the model, including an untrusted-image/injected-
 instructions warning. Neither image bytes nor the transcript event enter model

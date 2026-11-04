@@ -370,7 +370,8 @@ const key = 'fixture-only-provider-key';
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
     const fixtureDiff = 'diff --git a/api/src/auth.ts b/api/src/auth.ts\n--- a/api/src/auth.ts\n+++ b/api/src/auth.ts\n@@ -1,3 +1,3 @@\n export function returnURL() {\n-  return "/login"\n+  return "/agents/"\n }\n';
     const diffRoute = route => route.fulfill({ body: fixtureDiff });
-    const imageRoute = route => { imageRequests++; return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64') }); };
+    const savedImageRoute = route => route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64') });
+    const imageRoute = route => { imageRequests++; return savedImageRoute(route); };
     await page.route(catalogURL, modelRoute);
     await page.route(fixtureRunURL, runRoute);
     await page.route(origin + '/api/v1/runs?*', listRoute);
@@ -379,6 +380,7 @@ const key = 'fixture-only-provider-key';
     await page.route(fixtureRunURL + '/ticket', ticketRoute);
     await page.route(fixtureRunURL + '/diff', diffRoute);
     await page.route(fixtureRunURL + '/images/stream-image', imageRoute);
+    await page.route(fixtureRunURL + '/images/shared-image', savedImageRoute);
     await page.routeWebSocket('**/ws/runs/composer-fixture?*', socket => { sockets.push(socket); socket.onMessage(() => {}); });
     const layout = async label => {
       const image = await page.getByRole('button', { name: 'Attach images', exact: true }).boundingBox();
@@ -507,16 +509,33 @@ const key = 'fixture-only-provider-key';
       });
       const remoteImage = 'https://remote.example.test/tracking.png';
       const bareImage = 'https://remote.example.test/no-alt.png';
-      sockets.at(-1).send(JSON.stringify({ seq: 6, ts: Date.now(), type: 'text.delta', text: `\n\n![Remote diagram](${remoteImage})\n\n![](${bareImage})\n\n![Local diagram](${origin}/agents/favicon-32.png)\n\n![Data diagram](${inlineImage.data})\n\n![Blob diagram](${inlineImage.blob})` }));
+      sockets.at(-1).send(JSON.stringify({ seq: 6, ts: Date.now(), type: 'text.delta', text: `\n\n![Remote diagram](${remoteImage})\n\n![](${bareImage})\n\n![Local diagram](${origin}/agents/favicon-32.png)\n\n![Saved run diagram](${fixtureRunURL}/images/shared-image)\n\n![Worker diagram](/tmp/worker-diagram.png)\n\n![Data diagram](${inlineImage.data})\n\n![Blob diagram](${inlineImage.blob})` }));
       await expect(page.getByRole('link', { name: 'Remote diagram', exact: true })).toHaveAttribute('href', remoteImage);
       await expect(page.getByRole('link', { name: bareImage, exact: true })).toHaveAttribute('href', bareImage);
       await expect(page.locator('img[src*="remote.example.test"]')).toHaveCount(0);
-      for (const name of ['Local diagram', 'Data diagram', 'Blob diagram']) {
+      // Local diagram is an absolute same-origin web URL, not a worker path.
+      const unavailable = page.getByText('image not available (local path)', { exact: true });
+      await expect(unavailable).toBeVisible();
+      await expect(unavailable).toHaveClass(/text-muted-foreground/);
+      await expect(page.getByRole('img', { name: 'Worker diagram', exact: true })).toHaveCount(0);
+      for (const name of ['Local diagram', 'Saved run diagram', 'Data diagram', 'Blob diagram']) {
         const image = page.getByRole('img', { name, exact: true });
         await expect(image).toBeVisible();
         await expect.poll(() => image.evaluate(img => img.naturalWidth)).toBeGreaterThan(0);
       }
-      await capture('markdown-image-links');
+      // Replay the service event produced by share_image through the live fold.
+      const caption = 'Shared diagram — onboarding preview';
+      sockets.at(-1).send(JSON.stringify({ seq: 7, ts: Date.now(), type: 'image.shared', agent_id: 'main', image_id: 'shared-image', media_type: 'image/png', caption }));
+      const sharedCard = page.getByRole('button', { name: `Enlarge image: ${caption}`, exact: true });
+      await expect(sharedCard).toBeVisible();
+      await expect.poll(() => sharedCard.getByRole('img', { name: caption, exact: true }).evaluate(img => img.naturalWidth)).toBe(1);
+      await expect(page.locator('figcaption')).toHaveText(caption);
+      await sharedCard.focus();
+      await page.keyboard.press('Enter');
+      await expect(page.getByRole('dialog').getByRole('img', { name: caption, exact: true })).toBeVisible();
+      await page.keyboard.press('Escape');
+      await expect(sharedCard).toBeFocused();
+      await captureThemes('markdown-image-links');
       await page.evaluate(url => URL.revokeObjectURL(url), inlineImage.blob);
       if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
       await page.getByRole('link', { name: 'Home', exact: true }).filter({ visible: true }).click();
@@ -837,6 +856,7 @@ const key = 'fixture-only-provider-key';
       }
     } finally {
       await page.unroute(fixtureRunURL + '/images/stream-image', imageRoute);
+      await page.unroute(fixtureRunURL + '/images/shared-image', savedImageRoute);
       await page.unroute(catalogURL, modelRoute);
       await page.unroute(fixtureRunURL, runRoute);
       await page.unroute(origin + '/api/v1/runs?*', listRoute);

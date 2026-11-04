@@ -11,8 +11,9 @@ and other tool outputs. Any readable regular raster image in those locations can
 be shared; non-images and SVG are rejected. Symlinked workspace or `/tmp` roots
 are resolved canonically; `TMPDIR` does not grant access to another location.
 Local Markdown paths cannot be served
-and now show “image not available (local path)”. Remote Markdown images remain
-links, never automatic requests. Shared images survive workspace release and
+and now show “image not available (local path)”. Absolute same-origin HTTP(S) URLs
+and data/blob previews still render; remote Markdown images remain links, never
+automatic requests. Shared images survive workspace release and
 follow the run's owner-only access and retention rules. Limits: four sharing
 attempts per execution turn, 32 saved images / 16 MiB per run; 20 MiB input,
 1568px longest side and 1 MiB normalized JPEG/PNG output per image. No new

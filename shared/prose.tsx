@@ -13,6 +13,15 @@ export function Code({ children }: { children: ReactNode }) {
   )
 }
 
+function isSameOriginImage(src: string): boolean {
+  if (typeof window === "undefined") return false
+  try {
+    return new URL(src).origin === window.location.origin
+  } catch {
+    return false
+  }
+}
+
 /** `small`: secondary text (13px, muted). `className` sets the width and base size where the apps differ. */
 export function Prose({ text, small, className }: { text: string; small?: boolean; className?: string }) {
   return (
@@ -22,9 +31,11 @@ export function Prose({ text, small, className }: { text: string; small?: boolea
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" ? url : defaultUrlTransform(url)}
         components={{
           img: ({ src, alt, title }) => {
-            // File paths and remote URLs never trigger image requests. Existing
-            // inline data/blob images stay compatible; saved attachments use IDs.
-            if (typeof src === "string" && /^https?:\/\//i.test(src)) return (
+            // Only absolute same-origin HTTP(S) URLs render, not worker paths.
+            // Remote URLs stay links; inline data/blob previews remain compatible.
+            if (typeof src === "string" && /^https?:\/\//i.test(src)) return isSameOriginImage(src) ? (
+              <img src={src} alt={alt} title={title} />
+            ) : (
               <a href={defaultUrlTransform(src)} target="_blank" rel="noreferrer" className="break-all text-link underline-offset-2 hover:underline">{alt || src}</a>
             )
             if (typeof src === "string" && /^(data|blob):/i.test(src)) return <img src={src} alt={alt} title={title} />
