@@ -303,6 +303,39 @@ Built-in text results pass through one shared output wrapper (30,000-byte previe
 
 `grep` supports `context_before`/`context_after`/`context`, files/content/count modes and zero-based result-line `offset`/`head_limit` paging; context lines are page rows too. Ordinary reads are streamed, at most 1 MiB per line; optional multiline searches require files no larger than 8 MiB. `bash_output` adds `wait_seconds` (0–120) and `until` (regex over unread buffered output); `bash_list` lists shells. Read-only `git` offers status/diff/log/show/blame. Optional `run_checks` reports exit_code (null for timeout/interruption), duration_seconds, summary, detected failures and an output tail; background calls return bash shell IDs. None changes completion behavior. All images use the shared worker image limits described above; `web_fetch` remains text-only and rejects raster responses.
 
+## Bounded delegation
+
+The existing worker `task` accepts `{description,prompt,kind?}`. `description` is at most 300 bytes; `prompt` at most 32000 bytes and must include the complete task plus current diff or relevant paths. There is no parent conversation copied into the child. Kinds are `reviewer`, `test_writer`, and existing read-only `explore`; legacy `general`/omitted kind now maps to `test_writer`'s narrower policy. Unknown kinds fail closed. No separate delegation transport is introduced: existing `agent.spawn`, child tool/activity/turn events and `agent.end` remain unchanged.
+
+`runner/src/agent/subagents.rs` is the single typed capability/limits table:
+
+| Kind | Capabilities | Report JSON |
+| --- | --- | --- |
+| `reviewer` | `read`, `list_directory`, `glob`, `grep`, `symbols` (ctags), read-only `git` | `{findings:[{file,line,severity:"high|medium|low",message}],verdict:"pass|changes_required|inconclusive"}` |
+| `test_writer` | Same reads; `write`, `edit`, `multi_edit`, `apply_patch` only for test paths; `run_checks` only for exact foreground test commands | `{added:["path and behavior"],results:["command, exit status and result"]}` |
+| `explore` | Same reads as reviewer | Concise text |
+
+The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. Optional tools are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
+
+The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Both lexical and resolved paths must qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
+
+Exact test command allow-list (no added shell syntax/arguments or background execution):
+
+```text
+npm test
+cd api && npm test
+cd web && npm test
+cargo test --locked -- --test-threads=1
+cd runner && cargo test --locked -- --test-threads=1
+python3 -m unittest discover -s containers -p 'test_*.py'
+```
+
+These commands use the existing `run_checks` exec/permission path and relay-token scrubbing. Test code and package scripts execute with normal workspace trust; this is not a hostile-code filesystem/network sandbox. The container remains the boundary.
+
+Named global bounds: `MAX_CALLS=4` accepted calls per parent worker lifetime including follow-ups and failed children, `MAX_CONCURRENT=2`, `MAX_DEPTH=1`, `MAX_ROUNDS=48`, `MAX_TOOL_CALLS=128`, `MAX_SECONDS=180` including queued time, `CANCEL_GRACE_MILLIS=1000`, `MAX_OUTPUT_TOKENS=2048` requested per response, `MAX_RESPONSE_BYTES=131072` independent streamed-event guard, `MAX_REPORT_BYTES=8192`, `MAX_INPUT_BYTES=32000`. Saturated calls fail before spawn; queued calls consume allowance/time but not active slots. Parent cancellation cancels queued/active children; active work receives at most the cancellation grace to terminate/reap command groups before its future is dropped. No background child commands survive normally. Checkpoint `sub_counter` preserves consumed allowance on import; existing checkpoint foundation is not yet wired into service recovery, so a fresh worker without import does not retain it.
+
+Child histories are discarded after completion and never appended to the parent's model history. Only the bounded report returns as a tool result (child events still appear in the transcript). Structured reports are validated; invalid/oversized reports return bounded tool errors. Every child response is framed with a fresh UUID-based delimiter, an explicit untrusted-data warning, stripped Unicode Cf/tag/variation-selector characters and a UTF-8-safe length cap. The parent prompt says reviewer output is advice, not instructions. This framing is defense in depth, not a guarantee of review accuracy or injection immunity. None of these bounds gates main-turn completion.
+
 ## Task plan state
 
 `update_plan {plan:[{step,status}],explanation?}` replaces the main worker's plan; `list_plan {}` reads it. Statuses are `pending`, `in_progress`, `done`. Multi-step tasks should begin with a plan, keep one step in progress while working, and update statuses as work changes. Plans are bounded to 50 steps and 300 characters per text. `todos {agent_id:"main",items:[{text,status}]}` events replace the displayed plan and persisted summary; subagent plans do not change it.
