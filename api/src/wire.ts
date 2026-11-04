@@ -16,7 +16,7 @@ export type Block =
   | { type: "reasoning"; text: string; opaque?: Opaque }
   | { type: "tool_call"; id: string; name: string; input: Record<string, unknown>; opaque?: Opaque }
   | { type: "tool_result"; call_id: string; name: string; content: ResultPart[]; is_error?: boolean }
-  /** `data` (base64), or `id`: an image uploaded to /v1/images, filled in before the model call. */
+  /** Model input uses worker-processed base64 `data`; upload IDs are resolved before worker input. */
   | { type: "image"; media_type: string; data: string; id?: string };
 
 export interface Message {
