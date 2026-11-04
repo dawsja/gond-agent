@@ -1,4 +1,5 @@
 import { Checkpoints } from "../checkpoints";
+import { listRunPage, type RunListOptions } from "./list";
 import { runDiff, preferPullDiff, type PullDiff } from "./diff";
 import { assertRunTransition, type RunStatus } from "../../../shared/run-state";
 import { searchConfigured, searchResponse } from "../search";
@@ -252,17 +253,12 @@ export class Runs {
     const run = this.restorePlan(parseRun(r.data));
     return this.withQueueInfo(run);
   }
-  list(user: string): Run[] {
-    return (
-      this.db
-        .prepare(
-          "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
-        )
-        .all(user) as { data: string }[]
-    ).map((r) => {
-      const run = this.restorePlan(parseRun(r.data));
-      return this.withQueueInfo(run);
-    });
+  listPage(user: string, options: RunListOptions = {}) {
+    const { rows, ...page } = listRunPage(this.db, user, options);
+    return { ...page, runs: rows.map(r => this.withQueueInfo(this.restorePlan(parseRun(r.data)))) };
+  }
+  list(user: string, options: RunListOptions = {}): Run[] {
+    return this.listPage(user, options).runs;
   }
   private withQueueInfo(run: Run): Run {
     const info = this.queue.info(run.id, run.user_id);
@@ -341,9 +337,9 @@ export class Runs {
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
       .run(r.status, r.updated_at, JSON.stringify(r), r.id);
   }
-  async refreshPulls(user: string, id?: string) {
+  async refreshPulls(user: string, id?: string, options: RunListOptions = {}) {
     this.assertAccount(user);
-    const rows = id ? [this.get(id, user)] : this.list(user);
+    const rows = id ? [this.get(id, user)] : this.list(user, options);
     const metadata = await this.pullRequests.metadata(rows, user);
     this.assertAccount(user);
     for (const original of rows) {

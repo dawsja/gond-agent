@@ -8,6 +8,27 @@
 
 Theme and accent are independent account preferences in the same Appearance card. Every accent has separate light and dark shades; changing theme does not change the saved color. The local theme and accent caches only paint the first frame, and `/me` replaces both with server values.
 
+## Workspace run pagination
+
+`GET /api/v1/runs` requires a browser account session. Optional query parameters:
+
+- `limit`: unsigned decimal safe integer, clamped to 1–100; omitted/invalid uses **100**, preserving the bounded legacy response size. Zero clamps to 1.
+- `offset`: unsigned decimal safe integer, default 0; invalid/negative/fractional values use 0. Past-the-end offsets clamp to the start of the last page for the chosen limit; an empty list has offset 0.
+- `tab`: `all` (default), `working` (working + queued), `ready`, or `merged`; unknown values use `all`.
+- `repo`: exact full repository name; omitted/empty means all owned repositories. Repository and tab predicates apply before counting/paging.
+
+The response retains `{runs:[…]}`, including existing account-scoped queue position/length, shared capacity fields and descriptions, and adds:
+
+```json
+{"runs":[],"total":0,"limit":25,"offset":0,"start":0,"end":0,"counts":{"all":0,"working":0,"active":0,"queued":0,"ready":0,"merged":0},"repositories":[]}
+```
+
+`total` counts the selected tab/repository. `counts` covers every tab within the selected repository, ignoring the current tab; `active` counts working-only and `queued` counts queued-only. `repositories` lists distinct names across the caller's entire non-deleted history, independent of the active filters. No run, count or repository from another account or a deleted run is included. `start`/`end` are inclusive display positions (0/0 for no results). SQL selects only the bounded page, ordered by `created_at DESC,id DESC`; timestamp ties are deterministic. Read-triggered PR synchronization examines the selected page and then recomputes the response after any transitions. There is no new background polling.
+
+Home uses `page`/`size` in its own URL (one-based page, sizes 10/25/50/100, default 25), translated to API `offset=(page-1)*size`. The browser's saved size is read synchronously only when the URL omits size. Invalid URL values use 1/25. Tab/repository/size changes reset page 1. Refetches keep the page number, allow new top rows to shift its window, update totals, and clamp only when history shrinks below that page; stale cached clamping is not applied before its fresh response. `/agents` redirects preserve the query on refresh.
+
+MCP `list_sessions` already supports stable offset pagination and is unchanged: `cursor=0`, `limit=30` (1–100) by default, newest-first `created_at DESC,id DESC`, nullable `next_cursor`. It remains independent of Home's URL and browser preference; no new MCP arguments or wire events are needed.
+
 ## Remote MCP
 
 `/mcp` serves Streamable HTTP using the official MCP SDK, including its stateless 2025 compatibility transport. Authenticate every request with `Authorization: Bearer gond_mcp_…`. No cookies, query tokens, OAuth flow, or worker tool forwarding are supported. Production clients connect over the instance's configured HTTPS origin. If an Origin header is supplied, it must match that origin.

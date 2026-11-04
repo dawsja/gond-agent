@@ -46,6 +46,11 @@ export interface Run {
   pr_number: number | null
   pr_url: string | null
   pr_state: "open" | "closed" | "merged" | null
+  base_sha?: string | null
+  head_sha?: string | null
+  diff_base_head?: string
+  diff_head?: string
+  pr_diff?: { head_sha: string; files: number; additions: number; deletions: number }
   error: string | null
   source?: "web" | "runner" | "mcp" | null
   created_at: number
@@ -54,6 +59,15 @@ export interface Run {
   updated_at: number
   /** On a single run: what its worker container is doing (`agent`: up, with the agent ready for a message). */
   live?: { phase: "idle" | "booting" | "agent" | "finishing"; pushed?: boolean }
+}
+
+export interface RunPage {
+  runs: Run[]
+  total: number
+  limit: number
+  offset: number
+  counts: Record<"all" | "working" | "ready" | "merged" | "active" | "queued", number>
+  repositories: string[]
 }
 
 export interface Me {

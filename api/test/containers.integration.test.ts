@@ -123,6 +123,9 @@ describe.skipIf(!image)("real container workspaces", () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const project = dir.split("/").at(-1)!.toLowerCase();
     const fixture = join(dir, "fixture"); await mkdir(fixture);
+    await mkdir(join(fixture, "fixtures"));
+    for (const path of ["home-pagination.browser.cjs", "fixtures/pagination.cjs"])
+      await writeFile(join(fixture, path), await readFile(new URL(path, import.meta.url)));
     // Only disposable approval signals, never credentials. The browser stays UID 1000,
     // while the CI host may own this bind source as another UID. chmod bypasses umask.
     await chmod(fixture, 0o777);
