@@ -77,6 +77,7 @@ Settings use larger foreground-colored category headings for Personal settings, 
 - Worker-image builds run real Chromium interaction/screenshot/error tests and `containers/smoke-worker.py` (real worker tools against a scripted model). Keep `containers/browser/package-lock.json` and the installed browser version in sync.
 - Render account creation, provider setup and the workspace at wide and phone viewports after UI changes. Shared imports resolve from the workspace's dependencies; preserve Vite and TS aliases.
 - Verify first-account registration → provider setup → workspace with the real packaged API and SQLite at wide/phone sizes on a non-loopback HTTP origin. UI IDs must use `crypto.getRandomValues`, not secure-context-only `crypto.randomUUID`.
+- Onboarding's bootstrap and returning phases share saved application data, but the test-only member-seeding boundary clears Better Auth's persisted request budgets. Never clear those budgets in production startup or relax production rate limits for browser tests. Keep the re-sign-in session-response assertion and the separate rate-limit persistence regression guard.
 
 Update this guide, README and protocol when behavior changes.
 

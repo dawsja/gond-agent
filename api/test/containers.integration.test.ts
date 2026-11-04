@@ -147,7 +147,7 @@ describe.skipIf(!image)("real container workspaces", () => {
       const evidence = process.env.GOND_AGENT_BROWSER_ARTIFACTS ?? join(dir, "evidence");
       await mkdir(evidence, { recursive: true });
       for (const shot of result.screenshots ?? []) await writeFile(join(evidence, shot.name), Buffer.from(shot.data, "base64"));
-      expect(result.error).toBeUndefined();
+      expect(result.error, JSON.stringify(result.diagnostics)).toBeUndefined();
       expect(result.passed).toBe(true);
     };
     try {
@@ -161,6 +161,9 @@ describe.skipIf(!image)("real container workspaces", () => {
           db.prepare('INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run('browser-member','Team member','member@example.test',0,now,now);
           db.prepare("INSERT INTO account(id,accountId,providerId,userId,password,createdAt,updatedAt) SELECT 'browser-member-password','browser-member','credential','browser-member',password,?,? FROM account WHERE providerId='credential' LIMIT 1").run(now,now);
           db.prepare("INSERT INTO profiles(user_id) VALUES('browser-member')").run();
+          // Independent browser phases share saved application data, not request budgets.
+          // Better Auth's database-backed per-IP limits survive service/container restarts.
+          db.prepare('DELETE FROM "rateLimit"').run();
         })(); db.close();`);
       await compose("up", "-d", "--no-build", "--pull", "never", "--force-recreate", "--wait", "--wait-timeout", "60");
       await browser("returning");

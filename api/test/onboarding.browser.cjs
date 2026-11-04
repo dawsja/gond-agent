@@ -27,6 +27,13 @@ const key = 'fixture-only-provider-key';
   const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
   const errors = [];
   const externalRequests = [];
+  const authResponses = [];
+  page.on('response', response => {
+    const url = new URL(response.url());
+    if (url.origin !== origin || !url.pathname.startsWith('/api/auth/')) return;
+    authResponses.push({ path: url.pathname, method: response.request().method(), status: response.status(), retryAfter: response.headers()['x-retry-after'] });
+    if (authResponses.length > 30) authResponses.shift();
+  });
   page.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
   const greyAvatar = async (locator, theme = 'dark') => {
     await expect(locator).toBeVisible();
@@ -1036,7 +1043,13 @@ const key = 'fixture-only-provider-key';
     if (returning) {
       await page.getByLabel('Email', { exact: true }).fill('admin@example.test');
       await page.getByLabel('Password', { exact: true }).fill('test-password-only-123456');
+      // Observe the app's real requests: a successful password check alone does not
+      // guarantee hydration if the following session lookup is rate-limited.
+      const signingIn = page.waitForResponse(r => r.url() === origin + '/api/auth/sign-in/email' && r.request().method() === 'POST');
+      const gettingSession = page.waitForResponse(r => new URL(r.url()).pathname === '/api/auth/get-session' && new URL(r.url()).origin === origin && r.request().method() === 'GET');
       await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      expect((await signingIn).status()).toBe(200);
+      expect((await gettingSession).status()).toBe(200);
       await expect(page.getByRole('heading', { level: 1 })).toContainText(', Test');
       if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
       await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
@@ -1100,7 +1113,7 @@ const key = 'fixture-only-provider-key';
     console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, screenshots }));
   } catch (error) {
     await capture('failure').catch(() => {});
-    console.log(JSON.stringify({ error: error.stack || error.message, screenshots }));
+    console.log(JSON.stringify({ error: error.stack || error.message, diagnostics: { errors, authResponses }, screenshots }));
   } finally {
     await browser.close(); await new Promise(resolve => provider.close(resolve));
   }
