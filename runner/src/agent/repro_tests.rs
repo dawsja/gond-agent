@@ -85,25 +85,26 @@ fn repro_reporters_reject_compile_import_syntax_and_pretest_errors() {
 }
 
 fn repro_repository() -> tempfile::TempDir {
-    let dir = repository();
+    // The worker CI job installs Rust, not API npm dependencies. Exercise the
+    // real assertion harness without packages, a network, or synthetic reports.
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet", "--template="]);
     std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"private":true,"scripts":{"test":"vitest run"}}"#,
-    )
-    .unwrap();
-    std::fs::remove_file(dir.path().join("source.test.js")).unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules\n").unwrap();
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"repro_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    ).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"repro_fixture\"\nversion = \"0.1.0\"\n",
+    ).unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
     git(dir.path(), &["add", "--all"]);
-    git(dir.path(), &["commit", "-qm", "vitest fixture base"]);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../api/node_modules"),
-        dir.path().join("node_modules"),
-    )
-    .unwrap();
+    git(dir.path(), &["commit", "-qm", "dependency-free cargo fixture base"]);
     dir
 }
-const REPRO_TEST: &str = "import {test, expect} from 'vitest';\nimport value from './source.js';\ntest('regression returns two', () => expect(value).toBe(2));\n";
+const REPRO_TEST: &str = "#[test]\nfn regression_returns_two() { assert_eq!(repro_fixture::value(), 2); }\n";
 
 #[tokio::test]
 async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
@@ -117,24 +118,24 @@ async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
         call(
             "test",
             "write",
-            json!({"path":"regression.test.js","content":REPRO_TEST}),
+            json!({"path":"tests/regression.rs","content":REPRO_TEST}),
         ),
         call(
             "red",
             "run_checks",
-            json!({"repro":"red","test_files":["regression.test.js"]}),
+            json!({"repro":"red","test_files":["tests/regression.rs"]}),
         ),
         call(
             "fix",
             "bash",
-            json!({"command":"printf 'module.exports = 2;\\n' > source.js"}),
+            json!({"command":"printf 'pub fn value() -> u32 { 2 }\\n' > lib.rs"}),
         ),
         call(
             "green",
             "run_checks",
-            json!({"repro":"green","test_files":["regression.test.js"]}),
+            json!({"repro":"green","test_files":["tests/regression.rs"]}),
         ),
-        call("normal", "run_checks", json!({"command":"npm test"})),
+        call("normal", "run_checks", json!({"command":"cargo test --locked"})),
         finish(),
     ];
     let seen = Arc::new(Mutex::new(vec![]));
@@ -152,14 +153,14 @@ async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
     let evidence::EvidenceKind::ReproRed { test_id, cases, .. } = &records[0].kind else {
         panic!("not red")
     };
-    assert!(records[0].output_tail.contains("AssertionError"));
+    assert!(records[0].output_tail.contains("assertion `left == right` failed"));
     assert!(
         matches!(&records[1].kind, evidence::EvidenceKind::ReproGreen {test_id:id, cases:c, ..} if id == test_id && cases == c)
     );
     assert!(records[0].seq < records[1].seq && records[1].seq < records[2].seq);
     assert_ne!(records[0].tree_hash_before, records[1].tree_hash_before);
     let policy = evidence::Ledger::new(dir.path()).policy;
-    assert!(super::super::evidence_tree::repro_snapshot(dir.path(), &policy.base, &["regression.test.js".into()]).unwrap().non_test_changed);
+    assert!(super::super::evidence_tree::repro_snapshot(dir.path(), &policy.base, &["tests/regression.rs".into()]).unwrap().non_test_changed);
     let state = exported(&mut h).await;
     let tree = evidence_tree::tree_hash(dir.path()).unwrap();
     assert!(!state.evidence.as_ref().unwrap().repro_missing(Some(&tree)));
@@ -181,22 +182,22 @@ async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
 async fn repro_green_without_non_test_fix_is_not_recorded_even_if_flaky_test_passes() {
     for other_test_change in ["none", "regular", "hardlink", "symlink"] {
         let dir = repro_repository();
-        std::fs::write(dir.path().join(".gitignore"), "node_modules\n.flaky-state\n.flaky-cache/\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n.flaky-state\n.flaky-cache/\n").unwrap();
         git(dir.path(), &["add", ".gitignore"]);
         git(dir.path(), &["commit", "-qm", "ignore external flaky state"]);
-        let flaky = "import {test,expect} from 'vitest'; import {existsSync} from 'node:fs'; test('flaky regression',()=>expect(existsSync('.flaky-state')).toBe(true));\n";
+        let flaky = "#[test]\nfn flaky_regression() { assert_eq!(std::path::Path::new(\".flaky-state\").exists(), true); }\n";
         let seen = Arc::new(Mutex::new(vec![]));
         let url = mock(vec![
             call("declare", "declare_task", json!({"kind":"bug","repro_plan":"flaky test is not a fix"})),
-            call("test", "write", json!({"path":"regression.test.js","content":flaky})),
-            call("red", "run_checks", json!({"repro":"red","test_files":["regression.test.js"]})),
+            call("test", "write", json!({"path":"tests/regression.rs","content":flaky})),
+            call("red", "run_checks", json!({"repro":"red","test_files":["tests/regression.rs"]})),
             call("external", "bash", json!({"command": match other_test_change {
                 "regular" => "touch .flaky-state; printf '// unrelated test helper\\n' > other.test.js",
                 "hardlink" => "touch .flaky-state; mkdir .flaky-cache; printf '// helper\\n' > other.test.js; ln other.test.js .flaky-cache/link",
                 "symlink" => "touch .flaky-state; mkdir .flaky-cache; printf '// helper\\n' > .flaky-cache/helper; ln -s .flaky-cache/helper other.test.js",
                 _ => "touch .flaky-state",
             }})),
-            call("green", "run_checks", json!({"repro":"green","test_files":["regression.test.js"]})),
+            call("green", "run_checks", json!({"repro":"green","test_files":["tests/regression.rs"]})),
             call("unverified", "declare_unverified", json!({"reason":"no non-test fix"})),
             finish(),
         ], seen.clone()).await;
@@ -222,17 +223,17 @@ async fn repro_bash_production_edit_before_red_is_refused_by_tree_not_tool_path(
         call(
             "test",
             "write",
-            json!({"path":"regression.test.js","content":REPRO_TEST}),
+            json!({"path":"tests/regression.rs","content":REPRO_TEST}),
         ),
         call(
             "bypass",
             "bash",
-            json!({"command":"printf 'module.exports = 3;\\n' > source.js"}),
+            json!({"command":"printf 'pub fn value() -> u32 { 3 }\\n' > lib.rs"}),
         ),
         call(
             "red",
             "run_checks",
-            json!({"repro":"red","test_files":["regression.test.js"]}),
+            json!({"repro":"red","test_files":["tests/regression.rs"]}),
         ),
         call(
             "skip",
@@ -265,15 +266,15 @@ async fn repro_bash_production_edit_before_red_is_refused_by_tree_not_tool_path(
 #[test]
 fn repro_separate_grammar_rejects_free_commands_unchanged_files_and_unsupported_runners() {
     let dir = repro_repository();
-    std::fs::write(dir.path().join("regression.test.js"), REPRO_TEST).unwrap();
+    std::fs::write(dir.path().join("tests/regression.rs"), REPRO_TEST).unwrap();
     let policy = evidence::Ledger::new(dir.path()).policy;
     for input in [
-        json!({"repro":"red","test_files":["regression.test.js"],"command":"npm test"}),
-        json!({"repro":"red","test_files":["regression.test.js;echo secret"]}),
-        json!({"repro":"red","test_files":["../regression.test.js"]}),
-        json!({"repro":"red","test_files":["source.js"]}),
-        json!({"repro":"red","test_files":["regression.test.js"],"run_in_background":true}),
-        json!({"repro":"red","test_files":["regression.test.js"],"timeout_ms":999999}),
+        json!({"repro":"red","test_files":["tests/regression.rs"],"command":"cargo test --locked"}),
+        json!({"repro":"red","test_files":["tests/regression.rs;echo secret"]}),
+        json!({"repro":"red","test_files":["../tests/regression.rs"]}),
+        json!({"repro":"red","test_files":["lib.rs"]}),
+        json!({"repro":"red","test_files":["tests/regression.rs"],"run_in_background":true}),
+        json!({"repro":"red","test_files":["tests/regression.rs"],"timeout_ms":999999}),
     ] {
         assert!(
             super::super::repro::prepare(dir.path(), &policy, &input).is_err(),
@@ -284,17 +285,18 @@ fn repro_separate_grammar_rejects_free_commands_unchanged_files_and_unsupported_
         super::super::repro::prepare(
             dir.path(),
             &policy,
-            &json!({"repro":"red","test_files":["regression.test.js"]})
+            &json!({"repro":"red","test_files":["tests/regression.rs"]})
         )
         .is_ok()
     );
     let unsupported = repository();
-    std::fs::write(unsupported.path().join("regression.test.js"), REPRO_TEST).unwrap();
+    std::fs::create_dir(unsupported.path().join("tests")).unwrap();
+    std::fs::write(unsupported.path().join("tests/regression.rs"), REPRO_TEST).unwrap();
     let policy = evidence::Ledger::new(unsupported.path()).policy;
     let err = super::super::repro::prepare(
         unsupported.path(),
         &policy,
-        &json!({"repro":"red","test_files":["regression.test.js"]}),
+        &json!({"repro":"red","test_files":["tests/regression.rs"]}),
     )
     .unwrap_err();
     assert!(err.to_string().contains("skip_repro(no_cheap_test_path)"));
@@ -383,12 +385,12 @@ async fn repro_checkpoint_after_red_then_rekey_fix_green_retains_pinned_order() 
             call(
                 "test",
                 "write",
-                json!({"path":"regression.test.js","content":REPRO_TEST}),
+                json!({"path":"tests/regression.rs","content":REPRO_TEST}),
             ),
             call(
                 "red",
                 "run_checks",
-                json!({"repro":"red","test_files":["regression.test.js"]}),
+                json!({"repro":"red","test_files":["tests/regression.rs"]}),
             ),
             call(
                 "pause",
@@ -419,14 +421,14 @@ async fn repro_checkpoint_after_red_then_rekey_fix_green_retains_pinned_order() 
             call(
                 "fix",
                 "bash",
-                json!({"command":"printf 'module.exports = 2;\\n' > source.js"}),
+                json!({"command":"printf 'pub fn value() -> u32 { 2 }\\n' > lib.rs"}),
             ),
             call(
                 "green",
                 "run_checks",
-                json!({"repro":"green","test_files":["regression.test.js"]}),
+                json!({"repro":"green","test_files":["tests/regression.rs"]}),
             ),
-            call("normal", "run_checks", json!({"command":"npm test"})),
+            call("normal", "run_checks", json!({"command":"cargo test --locked"})),
             finish(),
         ],
         Arc::new(Mutex::new(vec![])),

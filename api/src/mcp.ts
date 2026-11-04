@@ -117,6 +117,8 @@ export function sessionState(r: Run) {
     done,
     queue_position: r.queue_position,
     queue_length: r.queue_length,
+    capacity: r.capacity,
+    queue_reason: r.queue_reason,
     ...planState(r.summary?.plan_steps),
     waiting_for_input: !!question,
     asking_question: !!question,

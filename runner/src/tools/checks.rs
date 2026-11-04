@@ -99,9 +99,16 @@ mod tests {
             ("NODE_PATH", "/fixture/browser/node_modules"),
             ("PLAYWRIGHT_BROWSERS_PATH", "/fixture/chromium"),
             ("BUN_INSTALL", "/fixture/bun"),
+            ("BUN_INSTALL_CACHE_DIR", "/fixture/cache/bun"),
             ("UV_TOOL_DIR", "/fixture/uv"),
             ("PYTHONUSERBASE", "/fixture/python"),
         ];
+        // Keep the explicit safe allow-list aligned with the image, without
+        // granting access to arbitrary ENV additions (including future secrets).
+        let image = include_str!("../../../Dockerfile");
+        for (name, _) in IMAGE {
+            assert!(image.split_whitespace().any(|word| word.split_once('=').is_some_and(|(key, _)| key == *name)), "image no longer defines {name}");
+        }
         if std::env::var(MARKER).as_deref() != Ok(TEST) {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact", TEST, "--nocapture"]).env(MARKER, TEST).envs(IMAGE.iter().copied());
@@ -123,11 +130,10 @@ mod tests {
         let no_secrets = r#"for name in $(compgen -e); do
 case "$name" in GH_TOKEN|GITHUB_TOKEN|GOND_AGENT_*) exit 41;; esac
 done"#;
+        let toolchains = IMAGE.iter().map(|(name, value)| format!("test \"${name}\" = {value}"))
+            .collect::<Vec<_>>().join(" &&\n");
         let inherited = format!(r#"{no_secrets}
-test "$NODE_PATH" = /fixture/browser/node_modules &&
-test "$PLAYWRIGHT_BROWSERS_PATH" = /fixture/chromium &&
-test "$BUN_INSTALL" = /fixture/bun && test "$UV_TOOL_DIR" = /fixture/uv &&
-test "$PYTHONUSERBASE" = /fixture/python && test "$NODE_OPTIONS" = --trace-warnings &&
+{toolchains} && test "$NODE_OPTIONS" = --trace-warnings &&
 test "$PYTHONPATH" = /fixture/injection && printf inherited-ok"#);
         // Model-provided flags cannot select the allow-list.
         let out = RunChecks.run(&ctx, json!({"command":inherited,"env_clean":true,"eligible":true})).await;
@@ -136,12 +142,12 @@ test "$PYTHONPATH" = /fixture/injection && printf inherited-ok"#);
 
         ctx.check_environment = Some(crate::agent::evidence::check_environment());
         let clean = format!(r#"{no_secrets}
-for name in NODE_PATH PLAYWRIGHT_BROWSERS_PATH BUN_INSTALL NODE_OPTIONS PYTHONPATH BASH_ENV; do
+for name in NODE_OPTIONS PYTHONPATH BASH_ENV; do
 test -z "${{!name+x}}" || exit 42
 done
-test "$UV_TOOL_DIR" = /fixture/uv && test "$PYTHONUSERBASE" = /fixture/python && printf clean-ok"#);
+{toolchains} && printf clean-ok"#);
         let out = RunChecks.run(&ctx, json!({"command":clean,"env_clean":false})).await;
-        assert!(out.ok, "eligible check inherited injection variables");
+        assert!(out.ok, "eligible check lost toolchain variables or inherited secrets/injection variables");
         assert!(super::super::testutil::text(&out).contains("clean-ok"));
 
         // Even a context carrying eligibility must not clean a background check.
