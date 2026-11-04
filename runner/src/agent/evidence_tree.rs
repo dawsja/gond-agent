@@ -63,6 +63,18 @@ impl Repository {
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                // Mirror checkpoint_repository: no Git helper may detach and
+                // keep using the scratch tree after the awaited command exits.
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.autoDetach=false",
+                "-c",
+                "maintenance.autoDetach=false",
+                "-c",
+                "fetch.writeCommitGraph=false",
                 "-c",
                 "core.attributesFile=/dev/null",
                 "-c",
@@ -261,6 +273,7 @@ fn capture(repo: &Repository) -> Result<String> {
 pub struct ReproSnapshot {
     pub tree: String,
     pub non_test_equal: bool,
+    pub non_test_changed: bool,
     pub test_identity: String,
 }
 
@@ -289,11 +302,14 @@ pub fn repro_snapshot(cwd: &Path, base: &str, paths: &[String]) -> Result<ReproS
         .into_iter()
         .filter(|p| original.get(*p) != current.get(*p))
         .collect::<Vec<_>>();
+    // Positive non-test evidence is based on the naming policy, not a failed
+    // filesystem safety check on an otherwise test-named hardlink/symlink.
+    let non_test_changed = changed.iter().any(|p| !super::repro::test_name(p));
     let non_test_equal = changed.iter().all(|p| {
         let regular = |entry: Option<&String>| {
             entry.is_none_or(|s| s.starts_with("100644 blob ") || s.starts_with("100755 blob "))
         };
-        regular(original.get(*p)) && regular(current.get(*p)) && super::subagents::test_path(cwd, p)
+        regular(original.get(*p)) && regular(current.get(*p)) && super::repro::test_path(cwd, p)
     });
     // A repro may execute only newly added or changed regular test files.
     let mut identity = String::new();
@@ -314,6 +330,7 @@ pub fn repro_snapshot(cwd: &Path, base: &str, paths: &[String]) -> Result<ReproS
     Ok(ReproSnapshot {
         tree,
         non_test_equal,
+        non_test_changed,
         test_identity: identity,
     })
 }
@@ -334,6 +351,8 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"])
             .args(args)
             .output()
             .unwrap();
@@ -343,6 +362,27 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn isolated_git_disables_automatic_background_work() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let repo = Repository::new(temp.path()).unwrap();
+        for (name, value) in [
+            ("gc.auto", "0"),
+            ("maintenance.auto", "false"),
+            ("gc.autoDetach", "false"),
+            ("maintenance.autoDetach", "false"),
+            ("core.fsmonitor", "false"),
+            ("fetch.writeCommitGraph", "false"),
+        ] {
+            assert_eq!(
+                String::from_utf8(repo.git(&["config", "--get", name], None).unwrap())
+                    .unwrap().trim(), value,
+                "isolated Git must override automatic/background work: {name}",
+            );
+        }
     }
 
     #[test]

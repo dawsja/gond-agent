@@ -18,8 +18,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::{self, Checkpoint, Counters};
-use super::subagents::{self, SubagentKind};
 use super::{evidence, evidence_tree};
+use super::subagents::{self, SubagentKind};
 use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
 use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, InitEvidenceInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
@@ -388,17 +388,17 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                         Ok(()) => {
                             let mut ledger = state.evidence.unwrap_or_else(|| {
                                 let mut ledger = evidence::Ledger::new(&s.cwd);
+                                // Legacy state has no prior resume count. Reconcile
+                                // against the initialized service floor below,
+                                // rather than incrementing that floor twice.
+                                ledger.resumes = 0;
                                 ledger.unverified.push("State predates the evidence ledger; re-run a check.".into());
                                 ledger
                             });
-                            ledger.restore(evidence_tree::tree_hash(&s.cwd).ok().as_deref());
-                            // A new worker keeps the service-provisioned key,
-                            // not the earlier worker's sealed signing authority.
-                            if let Some(key) = s.evidence.lock().unwrap().key.clone() {
-                                if let Err(code) = ledger.initialize(&req.run_id, key) {
-                                    req.error(&s, "import_state", code);
-                                    continue;
-                                }
+                            let initialized = s.evidence.lock().unwrap().clone();
+                            if let Err(code) = ledger.restore_with_service(evidence_tree::tree_hash(&s.cwd).ok().as_deref(), &initialized) {
+                                req.error(&s, "import_state", code);
+                                continue;
                             }
                             *s.evidence.lock().unwrap() = ledger;
                             history = state.history;
@@ -831,6 +831,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                             s.emit(AgentEvent::StreamReset { agent_id: run.id.clone(), text_length: reply_text_length, reasoning_length: 0 });
                         }
                         history.push(Message::user_text(message));
+                        round_boundary(s, run, history, &reminders, &compactions, context_used).await;
                         continue;
                     }
                 }
@@ -1086,7 +1087,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
         return result(id, name, "interrupted by the user before this call ran", true);
     }
     if run.is_sub() && matches!(name.as_str(), "task" | "update_plan" | "list_plan" | "ask_user" | "skill" | "declare_task" | "declare_unverified" | "skip_repro") {
-        return result(id, name, "subagent depth/capability limit: parent state tools unavailable to subagents", true);
+        return result(id, name, "subagent depth/capability limit: no delegation or parent state tools", true);
     }
     match name.as_str() {
         "declare_task" => {
@@ -1247,7 +1248,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
         Access::Write => Some(s.lock_for(s.cwd.join(str_arg(&input, "path").unwrap_or(""))).lock_owned().await),
         _ => None,
     };
-    let ctx = tool_context(s, run, &id, cancel);
+    let mut ctx = tool_context(s, run, &id, cancel);
     // Recheck the resolved paths after any permission wait and while holding the write lock.
     if let Some(kind) = run.kind {
         if tool.access() != Access::Read && inherited_mode(*s.mode.lock().unwrap(), Some(mode)) != mode {
@@ -1261,6 +1262,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
         }
     }
     let eligible = if repro.is_none() { s.evidence.lock().unwrap().check(&name, &input).cloned() } else { None };
+    ctx.check_environment = (eligible.is_some() || repro.is_some()).then(evidence::check_environment);
     let ui_attempt = matches!(name.as_str(), "browser" | "browser_open")
         && input["url"].as_str().is_some_and(|url| (url.starts_with("http://") || url.starts_with("https://")) && url.len() <= 2048);
     let before = if eligible.is_some() || ui_attempt { evidence_tree::tree_hash(&s.cwd).ok() } else { None };
@@ -1270,7 +1272,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
     let record_start = evidence::now_ms();
     let record_clock = Instant::now();
     let record_input = input.clone();
-    let env_digest = evidence::environment_digest();
+    let env_digest = ctx.check_environment.as_ref().map(evidence::environment_digest_for).unwrap_or_else(evidence::environment_digest);
     let mut out = tool.run(&ctx, input).await;
     if let Some(prepared) = repro {
         let accepted = (|| -> anyhow::Result<evidence::Record> {
@@ -1291,6 +1293,9 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
                 cases
             } else {
                 anyhow::ensure!(exit == Some(0), "Green requires exit 0");
+                // Admitted red has the BASE non-test tree. A different test or
+                // external timing/state alone is not a non-test fix since red.
+                anyhow::ensure!(after.non_test_changed, "Green requires a non-test change since red; no matching fresh passing repro recorded");
                 let cases = ledger.records.iter().rev().find_map(|r| match &r.kind { evidence::EvidenceKind::ReproRed { test_id, cases, .. } if test_id == &prepared.fingerprint => Some(cases.clone()), _ => None }).ok_or_else(|| anyhow::anyhow!("No red record for these exact test contents"))?;
                 let passed: Vec<String> = serde_json::from_value(parsed["repro_results"]["passed"].clone()).unwrap_or_default();
                 anyhow::ensure!(cases.iter().all(|c| passed.contains(c)), "Same failing test ids were not observed passing");
@@ -1336,7 +1341,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
                 exit_code: if eligible.is_some() { parsed["exit_code"].as_i64().and_then(|v| i32::try_from(v).ok()) } else if out.ok { Some(0) } else { None },
                 duration_ms: record_clock.elapsed().as_millis() as u64, started_at: record_start,
                 tree_hash_before: before, tree_hash_after: after,
-                tests_ran: parsed["tests_ran"].as_u64(), env_clean: eligible.is_some(), env_digest,
+                tests_ran: parsed["tests_ran"].as_u64(), env_clean: ctx.check_environment.is_some(), env_digest,
                 output_tail: if eligible.is_some() { parsed["output_tail"].as_str().unwrap_or("").into() } else { String::new() }, kind, sig: String::new(),
             };
             let recorded = s.evidence.lock().unwrap().record(record);
@@ -1355,7 +1360,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut
 }
 
 fn tool_context(s: &Shared, run: &Run, id: &str, cancel: &CancellationToken) -> ToolCtx {
-    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
+    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone(), check_environment: None }
 }
 
 fn permission_detail(name: &str, input: &Value) -> String {

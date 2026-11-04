@@ -205,9 +205,11 @@ async fn exported(h: &mut AgentHandle) -> Checkpoint {
     h.input
         .send(AgentInput::ExportState(ExportStateInput {
             request_id: "export".into(),
-            quiescent: None, boundary_id: None, hold: false,
             run_id: "run".into(),
             owner_id: "owner".into(),
+            quiescent: None,
+            boundary_id: None,
+            hold: false,
         }))
         .unwrap();
     let events = until(h, |e| {
@@ -606,11 +608,15 @@ async fn subagent_reserved_state_tools_are_hidden_and_direct_dispatch_is_forbidd
     let shared = shared(dir.path());
     let original = shared.evidence.lock().unwrap().clone();
     let cancel = CancellationToken::new();
-    for kind in ["general", "explore"] {
+    for kind in [
+        SubagentKind::Explore,
+        SubagentKind::Reviewer,
+        SubagentKind::TestWriter,
+    ] {
         let run = Run {
-            id: format!("{kind}-1"),
-            kind: Some(SubagentKind::parse(Some(kind)).unwrap()),
-            inherited_mode: None,
+            id: format!("{}-1", kind.name()),
+            kind: Some(kind),
+            inherited_mode: Some(Mode::Allow),
         };
         for name in ["declare_unverified", "declare_task", "skip_repro"] {
             assert!(!agent_tool_defs(true).iter().any(|tool| tool.name == name));
@@ -634,7 +640,7 @@ async fn subagent_reserved_state_tools_are_hidden_and_direct_dispatch_is_forbidd
                 panic!("expected tool result")
             };
             assert!(is_error);
-            assert!(content.iter().any(|part| matches!(part, ResultPart::Text { text } if text.contains("unavailable to subagents"))));
+            assert!(content.iter().any(|part| matches!(part, ResultPart::Text { text } if text.contains("depth/capability limit"))));
         }
     }
     assert!(
@@ -661,6 +667,144 @@ fn checkpoint_fixture(dir: &Path) -> Checkpoint {
         counters: Counters::default(),
         evidence: Some(ledger),
     }
+}
+
+#[tokio::test]
+async fn subagent_clean_finish_never_spends_or_fires_the_parent_evidence_gate() {
+    let dir = repository();
+    let mut shared = shared(dir.path());
+    Arc::get_mut(&mut shared).unwrap().tools = crate::tools::builtin();
+    let base = evidence_tree::tree_hash(dir.path()).unwrap();
+    {
+        let mut ledger = shared.evidence.lock().unwrap();
+        ledger.initialize("run", "07".repeat(32)).unwrap();
+        ledger.begin_turn(Some(base), false);
+    }
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let original = shared.evidence.lock().unwrap().clone();
+    assert!(
+        original.clone().gate(dir.path(), Some(&tree)).is_some(),
+        "The same change must require a main-agent gate"
+    );
+    for kind in [
+        SubagentKind::Explore,
+        SubagentKind::Reviewer,
+        SubagentKind::TestWriter,
+    ] {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let url = mock(vec![finish()], seen.clone()).await;
+        Arc::get_mut(&mut shared).unwrap().api = ApiClient::new(url, None);
+        let run = Run {
+            id: format!("{}-1", kind.name()),
+            kind: Some(kind),
+            inherited_mode: Some(Mode::Allow),
+        };
+        let mut history = vec![Message::user_text("Finish the delegated work")];
+        run_loop(&shared, &run, &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(gate_count(&history), 0);
+        assert!(
+            *shared.evidence.lock().unwrap() == original,
+            "A child finish must not mutate the parent ledger"
+        );
+        let request = &seen.lock().unwrap()[0];
+        assert!(
+            !request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "declare_unverified")
+        );
+    }
+}
+
+#[tokio::test]
+async fn evidence_gate_continuation_is_checkpointed_before_the_next_model_request() {
+    use super::super::events::CheckpointReleaseInput;
+    let dir = repository();
+    let mut script = editing_script();
+    script.push(call("checks", "run_checks", json!({"command":"npm test"})));
+    script.push(finish());
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    initialize(&mut h, "07".repeat(32)).await;
+    h.input
+        .send(AgentInput::ExportState(ExportStateInput {
+            request_id: "enable".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            quiescent: Some(true),
+            boundary_id: None,
+            hold: false,
+        }))
+        .unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::StateExported { .. })).await;
+    h.input
+        .send(AgentInput::User {
+            text: "Implement the change".into(),
+            images: vec![],
+        })
+        .unwrap();
+    let mut gate_saved = false;
+    loop {
+        let events = until(&mut h, |e| {
+            matches!(
+                e,
+                AgentEvent::CheckpointReady { .. } | AgentEvent::TurnEnd { .. }
+            )
+        })
+        .await;
+        match events.last().unwrap() {
+            AgentEvent::CheckpointReady { boundary_id } => {
+                h.input
+                    .send(AgentInput::ExportState(ExportStateInput {
+                        request_id: "held".into(),
+                        run_id: "run".into(),
+                        owner_id: "owner".into(),
+                        quiescent: None,
+                        boundary_id: Some(boundary_id.clone()),
+                        hold: false,
+                    }))
+                    .unwrap();
+                let events = until(&mut h, |e| {
+                    matches!(
+                        e,
+                        AgentEvent::StateExported { .. } | AgentEvent::StateError { .. }
+                    )
+                })
+                .await;
+                let AgentEvent::StateExported { state, .. } = events.last().unwrap() else {
+                    panic!("held export failed")
+                };
+                if gate_count(&state.history) == 1 && !gate_saved {
+                    assert_eq!(
+                        seen.lock().unwrap().len(),
+                        3,
+                        "No request may pass the gate's held checkpoint boundary"
+                    );
+                    assert_eq!(state.evidence.as_ref().unwrap().gate_rounds, 1);
+                    gate_saved = true;
+                }
+                h.input
+                    .send(AgentInput::CheckpointRelease(CheckpointReleaseInput {
+                        request_id: "release".into(),
+                        boundary_id: boundary_id.clone(),
+                    }))
+                    .unwrap();
+            }
+            AgentEvent::TurnEnd { stop_reason, .. } => {
+                assert_eq!(stop_reason, "end_turn");
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert!(gate_saved);
+    assert_eq!(seen.lock().unwrap().len(), 5);
 }
 
 fn signed_record(ledger: &mut evidence::Ledger, tree: &str) -> evidence::Record {
@@ -856,19 +1000,46 @@ async fn service_rekey_on_resume_preserves_counters_and_does_not_refresh_histori
 async fn incompatible_checkpoint_rejected_and_missing_ledger_or_key_never_trusts_history() {
     let dir = repository();
     let mut old = serde_json::to_value(checkpoint_fixture(dir.path())).unwrap();
+    old["runner_state_version"] = json!("gond-agent-checkpoint-2");
+    assert_eq!(
+        Checkpoint::import(old.clone(), "run", "owner")
+            .await
+            .unwrap_err(),
+        "incompatible_version",
+        "Only ledgerless epoch-2 state is compatible"
+    );
     old.as_object_mut().unwrap().remove("evidence");
+    old["counters"]["sub_counter"] = json!(3);
+    old["counters"]["main_context"] = json!(12345);
+    old["counters"]["plan_calls"] = json!(7);
+    old["counters"]["plan_nudges"] = json!(2);
+    old["counters"]["turn_compactions"] = json!(1);
     old["runner_state_version"] = json!("gond-agent-checkpoint-1");
-    assert_eq!(Checkpoint::import(old.clone(), "run", "owner").await.unwrap_err(), "incompatible_version");
-    old["runner_state_version"] = json!(checkpoint::RUNNER_STATE_VERSION);
-    let decoded = Checkpoint::import(old.clone(), "run", "owner").await.unwrap();
+    assert!(
+        Checkpoint::import(old.clone(), "run", "owner")
+            .await
+            .is_err(),
+        "Epoch 1 must not replenish bounded delegation slots"
+    );
+    old["runner_state_version"] = json!("gond-agent-checkpoint-2");
+    let decoded = Checkpoint::import(old.clone(), "run", "owner")
+        .await
+        .unwrap();
     assert!(decoded.evidence.is_none());
     assert_eq!(
         decoded.runner_state_version,
         checkpoint::RUNNER_STATE_VERSION
     );
     let restored = restore(dir.path(), old).await;
+    assert_eq!(restored.counters, decoded.counters);
+    assert_eq!(
+        restored.counters.sub_counter, 3,
+        "Migration must preserve consumed delegation allowance"
+    );
+    assert_eq!(restored.history, decoded.history);
     let ledger = restored.evidence.as_ref().unwrap();
     assert!(ledger.records.is_empty());
+    assert_eq!(ledger.resumes, 1);
     assert!(
         ledger
             .unverified
@@ -896,6 +1067,55 @@ async fn incompatible_checkpoint_rejected_and_missing_ledger_or_key_never_trusts
             .any(|note| note.contains("before restart cannot satisfy"))
     );
     ledger.validate().unwrap();
+}
+
+#[tokio::test]
+async fn older_checkpoint_cannot_roll_back_service_replay_and_gate_reservations() {
+    let dir = repository();
+    let base = evidence_tree::tree_hash(dir.path()).unwrap();
+    let mut state = checkpoint_fixture(dir.path());
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let ledger = state.evidence.as_mut().unwrap();
+    ledger.begin_turn(Some(base.clone()), false);
+    ledger.gate_rounds = 1;
+    ledger.turn_gate_rounds = 1;
+    let old = signed_record(ledger, &tree);
+    let mut service = evidence::Ledger::new(dir.path());
+    service.initialize("run", "08".repeat(32)).unwrap();
+    service.seq = 100;
+    service.gate_rounds = 6;
+    service.resumes = 7;
+    let decoded = Checkpoint::import(serde_json::to_value(state).unwrap(), "run", "owner")
+        .await
+        .unwrap();
+    let mut restored = decoded.evidence.unwrap();
+    restored
+        .restore_with_service(Some(&tree), &service)
+        .unwrap();
+    assert_eq!(
+        (
+            restored.seq,
+            restored.gate_rounds,
+            restored.resumes,
+            restored.turn_gate_rounds
+        ),
+        (100, 6, 7, 1)
+    );
+    assert_eq!(restored.turn_tree, Some(base));
+    assert!(restored.records[0] == old);
+    assert_eq!(restored.historical_ids, vec![old.id]);
+    assert!(restored.gate(dir.path(), Some(&tree)).is_none());
+    assert!(
+        restored
+            .unverified
+            .iter()
+            .any(|note| note.contains("budget was exhausted"))
+    );
+    let next = signed_record(&mut restored, &tree);
+    assert_eq!(next.seq, 101);
+    assert!(next.authentic(&[8; 32]));
+    restored.validate().unwrap();
 }
 
 #[test]

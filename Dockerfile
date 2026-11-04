@@ -45,6 +45,7 @@ RUN cd /opt/gond-agent-lsp && npm test
 FROM worker-tools AS worker-image
 COPY --from=worker-build /src/target/release/gond-agent-worker /usr/local/bin/gond-agent-worker
 COPY containers/agent.py /opt/gond-agent/agent.py
+COPY runner/repro-test-paths.json /opt/gond-agent/repro-test-paths.json
 COPY containers/smoke-worker.py /opt/gond-agent/smoke-worker.py
 COPY containers/smoke-browser.py /opt/gond-agent/smoke-browser.py
 COPY containers/smoke-worker-image.py /opt/gond-agent/smoke-worker-image.py

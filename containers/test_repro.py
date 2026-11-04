@@ -87,6 +87,17 @@ class ReproPublicationTest(unittest.TestCase):
         self.assertEqual(staged, {"staged": False})
         self.assertEqual(self.git("rev-parse", "HEAD").strip().decode(), self.base)
 
+    def test_repro_policy_is_packaged_from_the_rust_source(self):
+        source = pathlib.Path(__file__).resolve().parents[1]
+        policy = source / "runner/repro-test-paths.json"
+        self.assertTrue(policy.is_file(), "one shared repro policy is required")
+        dockerfile = (source / "Dockerfile").read_text()
+        self.assertIn("COPY runner/repro-test-paths.json /opt/gond-agent/repro-test-paths.json", dockerfile)
+        for path in ["a.test.ts", "nested/test_a.py", "pkg/a_test.go", "pkg/tests/helper.rs"]:
+            self.assertTrue(agent.repro_test_path(path), path)
+        for path in ["source.js", "tests/config.toml", ".git/a.test.ts", "../a.test.ts"]:
+            self.assertFalse(agent.repro_test_path(path), path)
+
     def test_non_test_delta_cannot_be_inserted_in_the_test_commit(self):
         (self.root / "source.js").write_text("module.exports = 2;\n")
         self.publish({**self.stage, "test_files": ["regression.test.js", "source.js"]})

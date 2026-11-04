@@ -70,7 +70,8 @@ pub fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, &'static str> {
 
 impl Checkpoint {
     pub fn validate(&self, run: &str, owner: &str) -> Result<(), &'static str> {
-        if self.schema_version != SCHEMA_VERSION || self.runner_state_version != RUNNER_STATE_VERSION {
+        if self.schema_version != SCHEMA_VERSION || (self.runner_state_version != RUNNER_STATE_VERSION
+            && !(self.runner_state_version == "gond-agent-checkpoint-2" && self.evidence.is_none())) {
             return Err("incompatible_version");
         }
         if let Some(evidence) = &self.evidence {

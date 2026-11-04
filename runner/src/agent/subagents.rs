@@ -94,8 +94,6 @@ pub const TEST_PATTERNS: &[&str] = &[
     "api/test/**/*.test.ts", "web/src/**/*.test.ts", "web/src/**/*.test.tsx",
     "web/src/**/*.spec.ts", "web/src/**/*.spec.tsx", "runner/tests/**/*.rs",
     "runner/src/**/*_tests.rs", "containers/test_*.py",
-    "**/*.test.ts", "**/*.test.tsx", "**/*.test.js", "**/*.test.mjs", "**/*.spec.ts",
-    "**/test_*.py", "**/*_test.go", "tests/**/*.rs", "**/tests/**/*.rs",
 ];
 
 const READ: &[(&str, Grant)] = &[
@@ -188,12 +186,17 @@ pub fn test_path(cwd: &Path, path: &str) -> bool {
         for pattern in TEST_PATTERNS { builder.add(GlobBuilder::new(pattern).literal_separator(true).build().unwrap()); }
         builder.build().unwrap()
     });
+    checked_test_path(cwd, path, |p| PATTERNS.is_match(p))
+}
+
+/// Share path/link safety, not the delegated write scope, with repro execution.
+pub fn checked_test_path(cwd: &Path, path: &str, matches: impl Fn(&Path) -> bool) -> bool {
     // Check both lexical and resolved names, excluding links/escapes and protected paths.
     let Some(real) = rule_path(cwd, path) else { return false };
     let lexical = Path::new(path).strip_prefix(cwd).unwrap_or(Path::new(path));
     if lexical.components().any(|c| !matches!(c, std::path::Component::Normal(_))) { return false; }
     if lexical != Path::new(&real) { return false; }
-    if !PATTERNS.is_match(lexical) || !PATTERNS.is_match(&real) { return false; }
+    if !matches(lexical) || !matches(Path::new(&real)) { return false; }
     // An existing hard link could otherwise overwrite a production file.
     #[cfg(unix)]
     if let Ok(meta) = std::fs::metadata(cwd.join(path)) {
@@ -260,7 +263,7 @@ mod tests {
     fn scope_and_untrusted_framing() {
         let d = tempfile::tempdir().unwrap();
         for p in ["api/test/a.test.ts", "runner/src/agent/subagent_tests.rs", "containers/test_a.py"] { assert!(test_path(d.path(), p), "{p}"); }
-        for p in ["api/src/a.ts", "api/test/config.ts", "../api/test/a.test.ts", ".git/a.test.ts", "runner/src/core.rs", "containers/test_a.py/../../agent.py"] { assert!(!test_path(d.path(), p), "{p}"); }
+        for p in ["root.test.ts", "other/a.test.js", "other/test_a.py", "other/a_test.go", "tests/helper.rs", "other/tests/helper.rs", "api/src/a.ts", "api/test/config.ts", "../api/test/a.test.ts", ".git/a.test.ts", "runner/src/core.rs", "containers/test_a.py/../../agent.py"] { assert!(!test_path(d.path(), p), "{p}"); }
         #[cfg(unix)] {
             std::fs::create_dir_all(d.path().join("api/test")).unwrap();
             std::fs::write(d.path().join("production"), "keep").unwrap();

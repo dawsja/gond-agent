@@ -20,6 +20,7 @@ export const evidenceRecordSchema = z.strictObject({
   sig: z.string().regex(/^[a-f0-9]{64}$/),
 });
 export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
+export const MAX_EVIDENCE_IDS = 4096;
 export interface Evidence {
   task?: z.infer<typeof taskSchema>;
   staging?: "tests_first" | "single_commit";
@@ -55,14 +56,14 @@ export function acceptEvidence(current: Evidence | undefined, value: unknown, ke
   if (!parsed.success) return;
   const record = parsed.data, state = current ?? emptyEvidence();
   if (record.run_id !== expectedRunId) return;
-  if (record.seq <= state.last_seq || state.ids.length >= 4096 || state.ids.includes(record.id.toLowerCase())) return;
+  if (record.seq <= state.last_seq || state.ids.length >= MAX_EVIDENCE_IDS || state.ids.includes(record.id.toLowerCase())) return;
   const { sig, ...unsigned } = record;
   const expected = createHmac("sha256", key).update(canonicalEvidence({ domain: "gond-agent:evidence:v1", run_id: record.run_id, record: unsigned })).digest();
   if (!timingSafeEqual(expected, Buffer.from(sig, "hex"))) return;
   if (record.kind.type === "repro_red" || record.kind.type === "repro_green") {
     if (!record.env_clean || record.command_definition_changed || record.duration_ms >= 120000 || !record.tests_ran || record.tree_hash_before !== record.tree_hash_after || !record.tree_hash_before) return;
     if (record.kind.type === "repro_red" && (record.exit_code === null || [0, 124, 126, 127, 137].includes(record.exit_code))) return;
-    if (record.kind.type === "repro_green" && (record.exit_code !== 0 || !state.records.some(r => r.kind.type === "repro_red" && (record.kind.type === "repro_green" && r.kind.test_id === record.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(record.kind.cases))))) return;
+    if (record.kind.type === "repro_green" && (record.exit_code !== 0 || !state.records.some(r => r.kind.type === "repro_red" && r.tree_hash_before !== record.tree_hash_before && (record.kind.type === "repro_green" && r.kind.test_id === record.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(record.kind.cases))))) return;
   }
   const retained = state.records.filter(r => record.kind.type === "repro_red" ? r.kind.type !== "repro_red" && r.kind.type !== "repro_green" : record.kind.type === "repro_green" ? r.kind.type !== "repro_green" : true);
   if (retained.length === 40) retained.splice(retained.findIndex(r => r.kind.type !== "repro_red" && r.kind.type !== "repro_green"), 1);
@@ -120,23 +121,57 @@ function fenced(value: string) {
 export const VERIFICATION_START = "<!-- gond-agent:verification:start -->";
 export const VERIFICATION_END = "<!-- gond-agent:verification:end -->";
 
-/** Treat all selected prose as untrusted, including explicit descriptions. */
+type ModelFence = { char: string; count: number } | undefined;
+function modelFence(line: string, open: ModelFence): ModelFence {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return open;
+  if (open) return match[1][0] === open.char && match[1].length >= open.count && !match[2].trim() ? undefined : open;
+  // Backtick info strings cannot themselves contain backticks.
+  return match[1][0] === "`" && match[2].includes("`") ? undefined : { char: match[1][0], count: match[1].length };
+}
+
+/** Treat selected prose as untrusted without rewriting ordinary prose or fenced code. */
 export function neutralizeVerification(body: string): string {
-  let result = bounded(body, 20000)
-    .replace(/<!--\s*gond-agent:verification:start\s*-->[\s\S]*?(?:<!--\s*gond-agent:verification:end\s*-->|$)/gi, "")
-    .replace(/<!--\s*gond-agent:verification:[^>]*-->/gi, "")
-    .replace(/\bverification\b/gi, "Model-reported checks (unverified)")
-    .replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 20000);
-  // Close any unclosed model fence, so it cannot swallow the service-owned block.
-  let open: { char: string; count: number } | undefined;
-  for (const line of result.split("\n")) {
-    const match = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (!match) continue;
-    if (!open) open = { char: match[1][0], count: match[1].length };
-    else if (match[1][0] === open.char && match[1].length >= open.count && !match[2].trim()) open = undefined;
+  // Unlike tool output, model prose retains joiners (emoji and languages using ZWNJ).
+  const clean = body.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "");
+  const chunks: string[] = [], prose: string[] = [];
+  const flush = () => {
+    if (!prose.length) return;
+    chunks.push(prose.join("\n")
+      // Remove only the reserved comments, never the content between them.
+      .replace(/<!--\s*gond-agent:verification:[\s\S]*?-->/gi, "")
+      .replace(/<!--(?=\s*gond-agent:verification:)/gi, "&lt;!--")
+      .replace(/^( {0,3}#{1,6}[ \t]+)verification([ \t]+#+)?[ \t]*$/gim, "$1Model-reported checks (unverified)$2")
+      .replace(/^( {0,3})verification[ \t]*(\n {0,3}(?:=+|-+)[ \t]*(?=\n|$))/gim, "$1Model-reported checks (unverified)$2")
+      .replace(/<\/?(?:details|summary)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^'">])*(?:>|$)/gi, tag => tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")));
+    prose.length = 0;
+  };
+  let open: ModelFence;
+  for (const line of clean.split(/\r?\n/)) {
+    const next = modelFence(line, open);
+    if (open || next) {
+      flush();
+      chunks.push(line);
+    } else prose.push(line);
+    open = next;
   }
-  if (open) result += `\n${open.char.repeat(open.count)}`;
-  return result;
+  flush();
+  const result = chunks.join("\n");
+  let end = Math.min(result.length, 20000);
+  for (;;) {
+    let prefix = result.slice(0, end);
+    const truncated = end < result.length;
+    if (truncated) {
+      // Never split an entity (including one introduced above) or a UTF-16 pair.
+      prefix = prefix.replace(/&(?:#[xX]?[0-9a-fA-F]*|[A-Za-z][A-Za-z0-9]*)?$/, "").replace(/[\uD800-\uDBFF]$/, "");
+    }
+    open = undefined;
+    for (const line of prefix.split("\n")) open = modelFence(line, open);
+    const suffix = `${truncated ? "\n[truncated]" : ""}${open ? `\n${open.char.repeat(open.count)}` : ""}`;
+    if (prefix.length + suffix.length <= 20000) return prefix + suffix;
+    // Shrink gradually: truncating a long opening fence also shortens its repair.
+    end = Math.max(0, prefix.length - Math.max(1, Math.ceil((prefix.length + suffix.length - 20000) / 2)));
+  }
 }
 
 export function verificationBlock(evidence?: Evidence): string {
@@ -161,8 +196,9 @@ export function verificationBlock(evidence?: Evidence): string {
       lines.push(`Repro skipped: ${evidence.task.skip}`);
       missing.push(`Repro skipped: ${evidence.task.skip}`);
     } else if (evidence.task.kind === "bug") {
+      lines.push("Red records only that some assertion in a new or changed test failed on base code. An unrelated or trivially failing assertion can qualify if the same test later passes after a non-test change. Worker-reported transparency does not establish relevance or causality.");
       const red = [...records].reverse().find(r => r.kind.type === "repro_red");
-      const green = red && [...records].reverse().find(r => r.kind.type === "repro_green" && red.kind.type === "repro_red" && r.kind.test_id === red.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(red.kind.cases) && r.seq > red.seq && r.exit_code === 0 && fresh(r));
+      const green = red && [...records].reverse().find(r => r.kind.type === "repro_green" && red.kind.type === "repro_red" && r.tree_hash_before !== red.tree_hash_before && r.kind.test_id === red.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(red.kind.cases) && r.seq > red.seq && r.exit_code === 0 && fresh(r));
       if (!red) missing.push("no failing repro recorded");
       else if (!green) missing.push("no matching fresh passing repro recorded");
       if (red && red.kind.type === "repro_red") lines.push("repro_red command and test id:", fenced(bounded(`${red.cwd}: ${red.command}\nTest id: ${red.kind.test_id}\n${red.kind.cases.join("\n")}`, 2000)), "Failing tail (assertion):", fenced(bounded(red.output_tail, 1200)));

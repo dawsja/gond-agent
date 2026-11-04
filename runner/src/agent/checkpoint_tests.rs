@@ -153,8 +153,7 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     assert!(events.iter().all(|e| matches!(e, AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. })));
     restored.input.send(export_command("again")).unwrap();
     let mut expected = state.clone();
-    // Restore deliberately advances its durable resume budget and records the
-    // missing ignored-dependency caveat; all history, plans and counters survive.
+    // Restore advances its durable resume budget; history and counters survive.
     let ledger = expected.evidence.as_mut().unwrap();
     ledger.resumes += 1;
     ledger.unverified.push("Ignored files such as node_modules may be absent after restore.".into());

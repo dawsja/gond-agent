@@ -122,8 +122,16 @@ def checkpoint_repository(allow_unborn=False):
                "GIT_ALLOW_PROTOCOL": "file", "GIT_ATTR_NOSYSTEM": "1"}
 
         def git(*args, input=None, output=None):
+            # Waiting for Git is not sufficient if it launches detached automatic
+            # maintenance. It can keep writing objects/pack after this scratch
+            # repository (or the publication clone) has been released. Suppress
+            # auto work and keep any future fallback foreground; -c propagates
+            # to Git's internal children, including fetch/index-pack helpers.
             result = subprocess.run(
                 ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                 "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                 "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false",
+                 "-c", "fetch.writeCommitGraph=false",
                  "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
                  "-c", "commit.gpgsign=false", "-c", "credential.helper=",
                  "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true", *args],
@@ -192,6 +200,17 @@ def publication_title(req):
     return "".join(c for c in value.splitlines()[0] if not unicodedata.category(c).startswith("C"))[:120]
 
 
+def repro_test_path(path):
+    # Trusted installed policy (or its source-tree location in local tests).
+    policy = pathlib.Path(__file__).resolve().with_name("repro-test-paths.json")
+    if not policy.is_file():
+        policy = pathlib.Path(__file__).resolve().parents[1] / "runner/repro-test-paths.json"
+    return (isinstance(path, str) and 0 < len(path) <= 512 and not path.startswith(("/", "-")) and
+            all(part not in ("", ".", "..") and part.lower().rstrip(".") not in (".git", ".gond-agent") for part in path.split("/")) and
+            all(c.isascii() and (c.isalnum() or c in "_./-") for c in path) and
+            any(re.search(pattern, path) for pattern in json.loads(policy.read_text())))
+
+
 def repro_parent(git, head, tree, req):
     """Reconstruct the authenticated red tree, never stage production changes.
 
@@ -208,19 +227,7 @@ def repro_parent(git, head, tree, req):
         files = stage.get("test_files")
         if head != base or not isinstance(files, list) or not 1 <= len(files) <= 32:
             return head
-        if any(not isinstance(p, str) or not p or p.startswith(("/", "-")) or
-               any(part in ("", ".", "..", ".git", ".gond-agent") for part in p.split("/")) or
-               any(not (c.isascii() and (c.isalnum() or c in "_./-")) for c in p) for p in files):
-            return head
-        # Same fixed defaults as the worker's shared test-write allowlist.
-        import re
-        def test_file(path):
-            return bool(re.search(r"(?:\.test\.(?:ts|tsx|js|mjs)|\.spec\.ts|_test\.go)$", path) or
-                        re.search(r"(?:^|/)test_[^/]*\.py$", path) or
-                        re.search(r"(?:^|/)tests/.+\.rs$", path) or
-                        (path.startswith("runner/src/") and path.endswith("_tests.rs")) or
-                        (path.startswith("web/src/") and path.endswith(".spec.tsx")))
-        if not all(test_file(path) for path in files):
+        if not all(repro_test_path(path) for path in files):
             return head
         entries = {}
         for entry in git("ls-tree", "-rz", tree).split(b"\0"):
@@ -378,7 +385,7 @@ def restore_checkpoint(req):
             if git("bundle", "list-heads", str(bundle)) != expected:
                 raise RuntimeError("Invalid checkpoint bundle references.")
             git("bundle", "verify", str(bundle))
-            git("fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+            git("fetch", "--no-auto-maintenance", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                 str(bundle), f"{CHECKPOINT_REF}:{CHECKPOINT_REF}")
             checkpoint_commit(git, commit)
             git("fsck", "--strict", "--no-reflogs", "--no-dangling", commit, head, base)

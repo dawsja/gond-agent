@@ -15,7 +15,7 @@ it("renders an explicit enumerated repro skip", () => {
 import { evidenceSigningKey as key, evidenceTree as tree, signedRecord } from "./fixtures/evidence";
 
 it("authenticates paired repros separately from checks, pins ordering beyond the rolling window, and fences tails", () => {
-  const red = signedRecord({kind:{type:"repro_red",test_id:"c".repeat(64),test_files:["regression.test.js"],cases:["regression"]}, exit_code:1, output_tail:"AssertionError: expected 1 to be 2\n```\u202eforged"});
+  const red = signedRecord({kind:{type:"repro_red",test_id:"c".repeat(64),test_files:["regression.test.js"],cases:["regression"]}, tree_hash_before:"e".repeat(40),tree_hash_after:"e".repeat(40),exit_code:1, output_tail:"AssertionError: expected 1 to be 2\n```\u202eforged"});
   let state = acceptEvidence(undefined,red,key,"run")!;
   expect(state).toBeDefined();
   const green = signedRecord({seq:2,id:"00000000-0000-4000-8000-000000000002",kind:{...red.kind,type:"repro_green"} as any,output_tail:"Passed: regression"});
@@ -42,6 +42,24 @@ it("rejects inconclusive and infrastructure repro records, unknown fields, and a
   const state=acceptEvidence(undefined,signedRecord({kind,exit_code:1}),key,"run")!;
   expect(acceptEvidence(state,signedRecord({seq:2,id:"00000000-0000-4000-8000-000000000002",kind:{...kind,type:"repro_green",test_id:"d".repeat(64)}}),key,"run")).toBeUndefined();
   expect(acceptEvidence(undefined,signedRecord({kind:{...kind,extra:true} as any,exit_code:1}),key,"run")).toBeUndefined();
+});
+
+it("rejects a flaky same-tree green and discloses the missing passing repro", () => {
+  const kind = {type:"repro_red" as const,test_id:"c".repeat(64),test_files:["regression.test.js"],cases:["regression"]};
+  const red = signedRecord({kind,exit_code:1});
+  const state = acceptEvidence(undefined,red,key,"run")!;
+  const green = signedRecord({seq:2,id:"00000000-0000-4000-8000-000000000002",kind:{...kind,type:"repro_green"}});
+  expect(acceptEvidence(state,green,key,"run")).toBeUndefined();
+  // Rendering also fails closed on a previously stored no-op pair.
+  const block = verificationBlock({...state,records:[red,green],task:{kind:"bug",repro_plan:"flaky",skip:null},publication_tree:tree});
+  expect(block).toContain("no matching fresh passing repro recorded");
+  expect(block).not.toContain("Passing tail:");
+});
+
+it("explains the semantic limit of assertion evidence", () => {
+  const block = verificationBlock({records:[],ids:[],last_seq:0,task:{kind:"bug",repro_plan:"",skip:null}});
+  expect(block).toContain("some assertion in a new or changed test failed on base code");
+  expect(block).toContain("unrelated or trivially failing assertion");
 });
 
 it("feature declarations do not acquire a bug repro requirement", () => {

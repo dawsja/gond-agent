@@ -157,6 +157,9 @@ async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
         matches!(&records[1].kind, evidence::EvidenceKind::ReproGreen {test_id:id, cases:c, ..} if id == test_id && cases == c)
     );
     assert!(records[0].seq < records[1].seq && records[1].seq < records[2].seq);
+    assert_ne!(records[0].tree_hash_before, records[1].tree_hash_before);
+    let policy = evidence::Ledger::new(dir.path()).policy;
+    assert!(super::super::evidence_tree::repro_snapshot(dir.path(), &policy.base, &["regression.test.js".into()]).unwrap().non_test_changed);
     let state = exported(&mut h).await;
     let tree = evidence_tree::tree_hash(dir.path()).unwrap();
     assert!(!state.evidence.as_ref().unwrap().repro_missing(Some(&tree)));
@@ -172,6 +175,39 @@ async fn repro_fake_model_red_fix_green_and_sealed_resume_keep_order() {
         restored.evidence.as_ref().unwrap().task,
         state.evidence.as_ref().unwrap().task
     );
+}
+
+#[tokio::test]
+async fn repro_green_without_non_test_fix_is_not_recorded_even_if_flaky_test_passes() {
+    for other_test_change in ["none", "regular", "hardlink", "symlink"] {
+        let dir = repro_repository();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules\n.flaky-state\n.flaky-cache/\n").unwrap();
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-qm", "ignore external flaky state"]);
+        let flaky = "import {test,expect} from 'vitest'; import {existsSync} from 'node:fs'; test('flaky regression',()=>expect(existsSync('.flaky-state')).toBe(true));\n";
+        let seen = Arc::new(Mutex::new(vec![]));
+        let url = mock(vec![
+            call("declare", "declare_task", json!({"kind":"bug","repro_plan":"flaky test is not a fix"})),
+            call("test", "write", json!({"path":"regression.test.js","content":flaky})),
+            call("red", "run_checks", json!({"repro":"red","test_files":["regression.test.js"]})),
+            call("external", "bash", json!({"command": match other_test_change {
+                "regular" => "touch .flaky-state; printf '// unrelated test helper\\n' > other.test.js",
+                "hardlink" => "touch .flaky-state; mkdir .flaky-cache; printf '// helper\\n' > other.test.js; ln other.test.js .flaky-cache/link",
+                "symlink" => "touch .flaky-state; mkdir .flaky-cache; printf '// helper\\n' > .flaky-cache/helper; ln -s .flaky-cache/helper other.test.js",
+                _ => "touch .flaky-state",
+            }})),
+            call("green", "run_checks", json!({"repro":"green","test_files":["regression.test.js"]})),
+            call("unverified", "declare_unverified", json!({"reason":"no non-test fix"})),
+            finish(),
+        ], seen.clone()).await;
+        let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+        let events = turn(&mut h).await;
+        assert!(serde_json::to_string(&*seen.lock().unwrap()).unwrap().contains("Green requires a non-test change since red"));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::EvidenceRecorded {record} if matches!(record.kind, evidence::EvidenceKind::ReproRed {..}))));
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::EvidenceRecorded {record} if matches!(record.kind, evidence::EvidenceKind::ReproGreen {..}))), "flaky green admitted: {events:?}");
+        let ledger = exported(&mut h).await.evidence.unwrap();
+        assert!(ledger.repro_missing(Some(&evidence_tree::tree_hash(dir.path()).unwrap())));
+    }
 }
 
 #[tokio::test]
@@ -473,6 +509,29 @@ async fn repro_bug_gate_uses_two_fixed_rounds_and_records_missing_repro() {
             .any(|s| s == "no failing repro recorded")
     );
     assert_eq!(requests.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn repro_rust_and_python_share_path_policy_without_widening_test_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for dir in ["", "api/test/", "web/src/", "runner/tests/", "runner/src/", "containers/", "pkg/tests/", "pkg/tests/nested/", "pkg/src/", ".git/", ".gond-agent/", "pkg/.GIT/", "pkg/.git./"] {
+        for file in ["a.test.ts", "a.test.tsx", "a.test.js", "a.test.mjs", "a.spec.ts", "a.spec.tsx", "test_a.py", "a_test.go", "helper.rs", "a_tests.rs", "source.js", "config.toml"] {
+            paths.push(format!("{dir}{file}"));
+        }
+    }
+    paths.extend(["../a.test.ts", "/a.test.ts", "pkg/../a.test.ts", "pkg//a.test.ts", "pkg/a\n.test.ts"].map(String::from));
+    let expected = paths.iter().map(|p| super::super::repro::test_path(root.path(), p)).collect::<Vec<_>>();
+    let output = std::process::Command::new("python3")
+        .env_clear().env("PATH", "/usr/bin:/bin").env("PYTHONDONTWRITEBYTECODE", "1")
+        .args(["-c", "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('agent',sys.argv[1]); a=importlib.util.module_from_spec(s); s.loader.exec_module(a); print(json.dumps([a.repro_test_path(p) for p in json.loads(sys.argv[2])]))"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../containers/agent.py"))
+        .arg(serde_json::to_string(&paths).unwrap()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let python: Vec<bool> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(expected, python, "Rust/Python repro path policies diverged");
+    assert!(super::super::repro::test_path(root.path(), "pkg/tests/helper.rs"));
+    assert!(!super::super::subagents::test_path(root.path(), "pkg/tests/helper.rs"));
 }
 
 #[test]

@@ -176,10 +176,10 @@ impl std::fmt::Debug for InitEvidenceInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentInput {
-    #[serde(rename = "checkpoint.release")]
-    CheckpointRelease(CheckpointReleaseInput),
     #[serde(rename = "init_evidence")]
     InitEvidence(InitEvidenceInput),
+    #[serde(rename = "checkpoint.release")]
+    CheckpointRelease(CheckpointReleaseInput),
     #[serde(rename = "export_state")]
     ExportState(ExportStateInput),
     #[serde(rename = "import_state")]

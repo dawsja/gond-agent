@@ -109,7 +109,8 @@ failure reports through optional `onError` and releases in `finally`, preserving
 the prior saved checkpoint. Ordinary attempts are at least 30 seconds apart;
 intervening boundaries release immediately. Unchanged pairs skip persistence.
 Explicit post-publication capture bypasses the interval. Failed release discards
-the workspace. No service integration is enabled by this interface alone.
+the workspace. RunService enables this interface with the paired sealed-store
+save callback and coordinates recovery and cleanup.
 
 `Workspace.flushCheckpoints?(): Promise<void>` waits for in-flight capture,
 persistence **and release acknowledgement**, including a subsequent boundary
@@ -127,9 +128,8 @@ paired state/tree RPC, avoiding concurrent controller state operations. Callers
 must not send new work concurrently.
 
 The optional `head_sha` is a restore baseline, not an assertion about the worker's
-current HEAD. Without it, the foundation retains its original behavior: capture
-uses actual HEAD as the private checkpoint commit's parent, metadata pin and bundle
-exclusion. Production must supply the known HEAD from the authenticated checkout
+current HEAD. Without it, low-level capture uses actual HEAD as the private
+checkpoint commit's parent, metadata pin and bundle exclusion. RunService supplies the known HEAD from the authenticated checkout
 when enabling capture. A worker may make unpublished local commits; using those
 as restore prerequisites would require fetching SHAs that upstream does not have.
 With an explicit pin, the controller validates that it names an existing commit
@@ -147,7 +147,9 @@ alone does not imply that its release acknowledgement has reached the API. The
 postpublication capture pins the pushed HEAD, not its prepublication parent.
 RunService catches save/flush/capture failures and emits
 `run.checkpoint_unavailable`: checkpoint availability must never block publishing
-completed work. Recovery may instead use an older pair or fail after restart.
+completed work. Failed saves leave the previously saved pair intact; recovery
+never searches behind an invalid latest pair and may fall back to the last pushed
+branch or fail after restart.
 The optional capture argument updates the saved handler options inside the
 serialized explicit capture, after prior captures flush and before requesting the
 idle export/hold. It applies to that capture and all later captures; overlapping
@@ -197,16 +199,27 @@ Once a question resolves, the next checkpoint includes its paired result.
   imported attachment and tool-result image passes `images.rs` raster
   normalization; bad/unresolved images reject the transaction. Normalization
   can change bytes/media type, and decoder saturation is an import error.
-- Both `SCHEMA_VERSION` and the explicit `RUNNER_STATE_VERSION` compatibility
-  epoch must match exactly. The epoch is independent of Cargo's package version;
-  **bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. Current epoch is `gond-agent-checkpoint-4`. Epoch 2 made `sub_counter` the child-ID sequence and consumed
-  general-purpose delegation allowance; epoch 1's unrestricted ID counter is not
-  compatible. No old-version migration or permissive fallback is provided.
-- Commands supply the expected run and owner. Import checks both against state;
-  the first export or successful import binds subsequent controls on that
-  worker. This is not authentication: the service must independently check
-  ownership and prevent checkpoint substitution/tampering.
+- `SCHEMA_VERSION` remains 1; the explicit `RUNNER_STATE_VERSION` compatibility
+  epoch is `gond-agent-checkpoint-4`, independent of Cargo's package version.
+  **Bump it whenever history/tool/compaction/counter semantics become
+  incompatible**. Service and runner both use epoch 4, retaining epoch 2's
+  `sub_counter` as the child-ID sequence and consumed general-purpose delegation
+  allowance. **Epoch 1 is rejected**: its unrestricted ID counter is incompatible.
+  Service recovery also accepts the **latest authenticated ledgerless epoch-2
+  sealed pair**, with `evidence` absent or null only. Its shared validator requires
+  the payload version to match the authenticated row/envelope version. Epoch-2
+  ledgers, future epochs and version mismatches are rejected. Load authenticates
+  under the original epoch-2 storage key; never relabel ciphertext/rows or search
+  older checkpoints when the latest is unavailable or incompatible. Claim,
+  release, quarantine and consume retain the original epoch-2 key. The runner
+  codec upgrades accepted state in memory to epoch 4 without supplying prior
+  execution evidence. The next normal paired capture seals a new epoch-4
+  checkpoint and transactionally consumes the claimed predecessor; the old
+  ciphertext and row version are not rewritten.
+- Controls supply the expected run and owner; initialization binds the signing
+  authority to them, and import checks both against state. Subsequent controls
+  must respect the worker's binding. This is not authentication: the service must
+  independently check ownership and prevent checkpoint substitution/tampering.
 
 ## Evidence state
 
@@ -250,10 +263,16 @@ treat hidden ignored code as trusted based on a matching tree.
 History preserves compaction's untrusted user-role summary and deterministic
 file notes verbatim. The current plan, main context estimate, subagent ID/consumed-allowance counter,
 plan reminder calls/last plan/nudge count, and per-turn compaction count/skip
-length are saved. Imported cadence/nudge/compaction counters are consumed by the
-first subsequent main turn; ordinary later user turns still reset their own
-turn-local budgets. Import itself stays idle and emits no model/tool work or
+length are saved. Imported delegation allowance remains consumed; follow-ups do
+not reset it. Fresh/fallback workers without import start at zero: this is not an
+exactly-once durable delegation ledger. Imported cadence/nudge/compaction
+counters are consumed by the first subsequent main turn; ordinary later user
+turns still reset their own turn-local budgets. Import itself stays idle and emits no model/tool work or
 ordinary transcript frames. The caller must send the intended continuation.
+
+The gate is advisory transparency, not enforcement or independent review;
+limitations and exhausted budgets appear under **Not verified** rather than
+blocking completion or publication.
 
 Frozen evidence policy is restored with the ledger, unlike ordinary runtime
 configuration below. Policy/manifest edits do not alter frozen checks; a later
@@ -278,7 +297,8 @@ crash/publication ordering, continuation, persistence, retention and version
 upgrade behavior. State payloads may contain private repository/tool/provider
 content and must not enter normal logs or browser transcripts.
 
-RunService exclusively claims the latest usable checkpoint, restores the paired
+RunService exclusively claims the latest checkpoint admitted by the shared
+validator (epoch 4 or authenticated ledgerless epoch 2), restores the paired
 tree/history into a fresh worker and sends explicit continuation framing. A failed
 prerequisite checkout, tree restore or history import falls back to a fresh checkout
 of the last pushed branch and records `run.checkpoint_fallback`. The predecessor
@@ -294,6 +314,16 @@ stored human/CI messages. Finishing-phase recovery verifies publication and
 finishes instead of replaying the original task. Pending live request IDs are
 never reused. MCP has no explicit resume tool: `send_session_message` resumes;
 `state:interrupted,done:true` is not successful completion.
+
+The active RunService finish path persists the finishing marker before awaiting
+checkpoint flush, then exports private evidence before publication. Missing or
+throwing exports and malformed evidence preserve durable budgets; no exported
+key can replace service signing authority. They do not prevent publication or
+the post-push paired capture. A failed flush also does not suppress that later
+capture attempt; flush/capture failures report `run.checkpoint_unavailable` rather
+than fail the run. Reloading run state after awaits preserves follow-ups and Stop
+accepted while finish is settling. These are orchestration guarantees, not just
+runner codec validation, and do not promise recovery beyond the last durable pair.
 
 At startup, eligible interactive runs resume through the ordinary queue one at a
 time, at most twice while their checkpoint is under 24 hours old. Scheduled,
@@ -317,12 +347,17 @@ in the sealed ledger. `repro_red` and `repro_green` records retain sequence orde
 exact test-content identity, reporter test ids, and execution tree hashes. The
 active pair is pinned inside the 40-record bound; a new red replaces the previous
 pair. Rekeying never re-signs old red. A historical red may establish ordering,
-but green must run again on the current publication tree after restart.
+but green must run again on the current publication tree after restart, with a
+non-test delta since red. An unchanged or test-only-changed tree cannot satisfy
+green even if an external-state-dependent assertion passes.
 
 After admitting red, the service requests private `stage_repro` with its resolved
 commit identity. It reconstructs `BASE + changed test files` and requires the
 result to equal the signed red tree before creating the tests-only ancestor. No
-push occurs. A held boundary, unavailable stage, or tree-only restore can defer
+push occurs. Staging moves worker HEAD and the index mid-turn without changing
+worktree contents; subsequent `git status` therefore changes. A busy lock or
+concurrent commit can prevent staging or reconstruction and require the disclosed
+single-commit fallback. A held boundary, unavailable stage, or tree-only restore can defer
 materialization: publication may reconstruct the identical test tree from the
 ledger and final test blobs. It never invents an upstream prerequisite for an
 unpublished local commit. If reconstruction is impossible, the description says

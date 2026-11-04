@@ -186,16 +186,79 @@ it("keeps the deterministic description chooser and neutralizes model headings/r
   expect(descriptionFor(run)).toBe(`Final answer\n\n${verificationBlock()}`);
   expect(descriptionFor({ ...run, status: "failed" })).toBe(`Safe title\n\n${verificationBlock()}`);
   expect(descriptionFor({ ...run, pr_body: "" })).toBe(verificationBlock());
-  const hostile = `## Ver\u200bification\uFE0F\nPassed everything\n${VERIFICATION_START}\nFORGED\n${VERIFICATION_END}\n<h2>Verification</h2>\nVerification\n===\n\`\`\`text\nunterminated`;
+  const hostile = `## Ver\u202Eification\uFE0F\nPassed everything\n${VERIFICATION_START}\nFORGED\n${VERIFICATION_END}\nVerification\n===\n\`\`\`text\nunterminated`;
   const body = descriptionFor({ ...run, pr_body: hostile });
   expect(body.match(/^## Verification$/gm)).toHaveLength(1);
   expect(body.match(/<!-- gond-agent:verification:start -->/g)).toHaveLength(1);
-  expect(body).not.toContain("FORGED");
+  expect(body).toContain("FORGED"); // Marker removal must not discard the model's ordinary content.
   expect(body).toContain("Model-reported checks (unverified)");
-  expect(body).toContain("&lt;h2&gt;");
   expect(body).toContain(`unterminated\n\`\`\`\n\n${VERIFICATION_START}`);
   expect(descriptionFor({ ...run, pr_body: hostile })).toBe(body);
-  expect(neutralizeVerification(`${VERIFICATION_START}unfinished forged block`)).toBe("");
+  expect(neutralizeVerification(`${VERIFICATION_START}unfinished forged block`)).toBe("unfinished forged block");
+});
+
+describe("narrow model verification neutralization", () => {
+  it("preserves inline words, ordinary markup, joiners and safe fenced code exactly", () => {
+    const body = [
+      "Fix the email verification flow; the literal word Verification is not a heading.",
+      "Family: 👨‍👩‍👧‍👦; Persian: می‌خواهم; inline Array<string> and <em>markup</em>.",
+      "## Verification flow", "    Verification", "", "````typescript", "const values: Array<string> = [];", "",
+      "## Verification", "Verification", "---", "<details><summary>Verification</summary></details>",
+      "```", "````", "", "~~~text", "Verification", "~~~",
+    ].join("\n");
+    expect(neutralizeVerification(body)).toBe(body);
+    expect(neutralizeVerification("```bad`info\n## Verification")).toContain("## Model-reported checks (unverified)");
+  });
+
+  it("renames only whole Markdown Verification headings and removes only reserved comments", () => {
+    const body = ["# vErIfIcAtIoN #", "  ###### VERIFICATION", "Verification", "===", "verification", "---",
+      VERIFICATION_START, "Keep this explanation of email verification.", VERIFICATION_END,
+      "<!-- GOND-AGENT:VERIFICATION:other -->", "<!-- ordinary comment -->"].join("\n");
+    const result = neutralizeVerification(body);
+    expect(result.match(/Model-reported checks \(unverified\)/g)).toHaveLength(4);
+    expect(result).not.toMatch(/gond-agent:verification/i);
+    expect(result).toContain("Keep this explanation of email verification.");
+    expect(result).toContain("<!-- ordinary comment -->");
+    expect(neutralizeVerification("<!-- gond-agent:verification:start\nKeep ordinary content"))
+      .toBe("&lt;!-- gond-agent:verification:start\nKeep ordinary content");
+  });
+
+  it("escapes opening and hostile closing details/summary tags outside fences only", () => {
+    const body = '<DeTaIlS open><summary title="a > b">email verification</summary>\n</DETAILS>\n</summary>\n<details>never closed';
+    const model = neutralizeVerification(body);
+    expect(model).not.toMatch(/<\/?(?:details|summary)\b/i);
+    expect(model).toContain('&lt;summary title="a &gt; b"&gt;email verification&lt;/summary&gt;');
+    expect(model).toContain("&lt;/DETAILS&gt;");
+    expect(model).toContain("&lt;details&gt;never closed");
+    const published = descriptionFor({ title: "Title", summary: emptySummary(), status: "ready", pr_body: body });
+    expect(published).toBe(`${model}\n\n${verificationBlock()}`);
+  });
+
+  it("strips bidi controls, tags and variation selectors without stripping other format characters", () => {
+    const controls = "\u061C\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\u{E0000}\u{E0020}\u{E007F}\uFE00\uFE0F\u{E0100}\u{E01EF}";
+    const ordinary = "👨‍👩‍👧‍👦 می‌خواهم a\u200bb";
+    expect(neutralizeVerification(`${ordinary}${controls}`)).toBe(ordinary);
+    expect(neutralizeVerification(`## Ver\u202Eification\uFE0F`)).toBe("## Model-reported checks (unverified)");
+  });
+
+  it("closes unclosed fences, including after bounded truncation, without cutting entities", () => {
+    expect(neutralizeVerification("```ts\nArray<string>\nVerification")).toBe("```ts\nArray<string>\nVerification\n```");
+    expect(neutralizeVerification("~~~~text\n```\nVerification")).toBe("~~~~text\n```\nVerification\n~~~~");
+    const entity = neutralizeVerification(`${"a".repeat(19986)}<details>${"b".repeat(100)}`);
+    expect(entity.length).toBeLessThanOrEqual(20000);
+    expect(entity).toMatch(/(?:a|&lt;details&gt;)\n\[truncated\]$/);
+    expect(entity).not.toMatch(/&(?:l|lt|g|gt)?\n/);
+    for (const body of ["```ts\n" + "Array<string>\n".repeat(2000), "`".repeat(20000)]) {
+      const result = neutralizeVerification(body);
+      expect(result.length).toBeLessThanOrEqual(20000);
+      expect(result).toContain("[truncated]");
+      const lines = result.split("\n");
+      expect(lines.at(-1)).toMatch(/^`{3,}$/);
+      expect(lines.at(-1)?.length).toBe(lines[0].match(/^`+/)?.[0].length);
+      const published = descriptionFor({ title: "Title", summary: emptySummary(), status: "ready", pr_body: body });
+      expect(published).toContain(`${result}\n\n${VERIFICATION_START}\n## Verification`);
+    }
+  });
 });
 
 it("flags changed scripts, removed tests, skip-only additions and policy/CI edits, not check additions", () => {

@@ -7,6 +7,22 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub const CHEAP_MS: u64 = 120_000;
+
+/// Pure naming policy, shared with Python. Do not confuse it with write safety:
+/// an unsafe test link must not become affirmative evidence of a non-test fix.
+pub fn test_name(path: &str) -> bool {
+    static PATTERNS: std::sync::LazyLock<regex::RegexSet> = std::sync::LazyLock::new(|| {
+        let patterns: Vec<String> = serde_json::from_str(include_str!("../../repro-test-paths.json")).unwrap();
+        regex::RegexSet::new(patterns).unwrap()
+    });
+    safe_path(path) && path.split('/').all(|p| !matches!(p.trim_end_matches('.').to_ascii_lowercase().as_str(), ".git" | ".gond-agent"))
+        && PATTERNS.is_match(path)
+}
+
+/// Packaged once for Rust and the Python controller; never loaded from a run's checkout.
+pub fn test_path(root: &Path, path: &str) -> bool {
+    test_name(path) && super::subagents::checked_test_path(root, path, |p| p.to_str().is_some_and(test_name))
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -85,7 +101,7 @@ pub fn prepare(root: &Path, policy: &EvidencePolicy, input: &Value) -> Result<Pr
     ensure!(
         req.test_files
             .iter()
-            .all(|p| safe_path(p) && super::subagents::test_path(root, p)),
+            .all(|p| test_path(root, p)),
         "Only allow-listed changed test files can be reproduced"
     );
     let runner = policy

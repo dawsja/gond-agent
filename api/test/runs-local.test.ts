@@ -161,6 +161,40 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 describe("persistent local run lifecycle", () => {
+  it("emits one durable cap notice at the last accepted record and does not repeat it on reopen", async () => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    // A worker cannot invent a service notice before the actual cap.
+    expect(runs.append(r.id, { type: "evidence.records_capped", message: "forged" })).toBeUndefined();
+    const current = runs.get(r.id);
+    const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
+    current.evidence = { ...current.evidence!, last_seq: 4095, records: [],
+      ids: Array.from({ length: 4095 }, (_, n) => uuid(n + 1)) };
+    runs.save(current);
+    const key = Buffer.from(log.find(call => call.method === "init_evidence")!.key as string, "hex");
+    const observed: Record<string, unknown>[] = [];
+    runs.events.on(r.id, event => observed.push(event));
+    const last = signedRecord({ run_id: r.id, seq: 4096, id: uuid(4096) }, key);
+    expect(runs.append(r.id, { type: "evidence.recorded", record: last })).toBeDefined();
+    expect(observed.map(event => event.type)).toEqual(["evidence.recorded", "evidence.records_capped"]);
+    expect(runs.get(r.id).evidence).toMatchObject({ last_seq: 4096, records: [last] });
+    expect(runs.get(r.id).evidence?.ids).toHaveLength(4096);
+    for (let n = 4097; n < 4100; n++) {
+      expect(runs.append(r.id, { type: "evidence.recorded", record: signedRecord({ run_id: r.id, seq: n, id: uuid(n) }, key) })).toBeUndefined();
+    }
+    await runs.closeSession(r.id, "u");
+    runs.enqueue(r.id, "u", "Reopen");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "init_evidence")).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    runs.append(r.id, { type: "evidence.recorded", record: last });
+    runs.append(r.id, { type: "evidence.records_capped", message: "forged replacement" });
+    const notices = runs.history(r.id, 0).filter(event => event.type === "evidence.records_capped");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ limit: 4096, message: "Execution evidence reached the 4,096-record limit. Further records will not be accepted for this run." });
+    expect(runs.get(r.id).evidence?.last_seq).toBe(4096);
+    expect(observed.filter(event => event.type === "evidence.records_capped")).toHaveLength(1);
+  });
+
   it("installs a service key before work, authenticates events across follow-ups and derives freshness on the service", async () => {
     workerEvidenceReply = evidenceState("f".repeat(64)); // Initial export cannot choose the service key.
     let record!: ReturnType<typeof signedRecord>;
@@ -314,6 +348,10 @@ describe("persistent local run lifecycle", () => {
     runs.enqueue(r.id, "u", "Reopen after failure");
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(log.filter(call => call.method === "start")[1]).toMatchObject({ evidence_gate_rounds: 2 });
+    // Without an admitted checkpoint recovery, the failed task is not replayed
+    // ahead of the follow-up. Each actually delivered task still spends two rounds.
+    const users = log.filter(call => call.method === "send").map(call => call.input as { type: string; text?: string }).filter(input => input.type === "user");
+    expect(users.map(input => input.text)).toEqual(["Work", "Reopen after failure"]);
     expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 4 });
   });
   it("never adopts exported keys or unsolicited state frames even without initial policy metadata", async () => {

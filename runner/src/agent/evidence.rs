@@ -428,6 +428,23 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn restore_with_service(
+        &mut self,
+        tree: Option<&str>,
+        service: &Self,
+    ) -> Result<(), &'static str> {
+        self.restore(tree);
+        // The public ledger and pre-delivery reservations may be newer than the
+        // saved checkpoint. Never replenish its replay or gate/resume budgets.
+        self.seq = self.seq.max(service.seq);
+        self.gate_rounds = self.gate_rounds.max(service.gate_rounds);
+        self.resumes = self.resumes.max(service.resumes);
+        if let Some(key) = &service.key {
+            self.initialize(&service.run_id, key.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn restore(&mut self, tree: Option<&str>) {
         self.resumes = self.resumes.saturating_add(1).min(MAX_RESUMES);
         let missing_key = self.key.is_none();
@@ -477,7 +494,8 @@ impl Ledger {
         !self.records.iter().any(|red| {
             let EvidenceKind::ReproRed { test_id, cases, .. } = &red.kind else { return false; };
             self.records.iter().any(|green| matches!(&green.kind, EvidenceKind::ReproGreen { test_id: id, cases: c, .. } if id == test_id && c == cases)
-                && green.seq > red.seq && tree.is_some_and(|t| green.fresh(t)) && !self.stale_ids.contains(&green.id))
+                && green.seq > red.seq && green.tree_hash_before != red.tree_hash_before
+                && tree.is_some_and(|t| green.fresh(t)) && !self.stale_ids.contains(&green.id))
         })
     }
 
@@ -587,7 +605,7 @@ impl Ledger {
     }
 }
 
-/// Exactly the environment installed by run_checks' shell launcher. Its digest
+/// Exactly the environment installed for eligible foreground run_checks. Its digest
 /// describes the allow-list values, not the absence of secrets in HOME/.npmrc.
 pub fn check_environment() -> BTreeMap<String, String> {
     const ALLOWED: &[&str] = &[
@@ -625,8 +643,11 @@ pub fn check_environment() -> BTreeMap<String, String> {
         .collect()
 }
 pub fn environment_digest() -> String {
+    environment_digest_for(&check_environment())
+}
+pub fn environment_digest_for(environment: &BTreeMap<String, String>) -> String {
     hex(&Sha256::digest(
-        serde_json::to_vec(&check_environment()).unwrap(),
+        serde_json::to_vec(environment).unwrap(),
     ))
 }
 
