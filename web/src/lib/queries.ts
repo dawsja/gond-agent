@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useEffect, useState } from "react"
-import { api, type GithubStatus, type Me, type ModelCatalog, type Repo, type Run, type Runner } from "./api"
+import { api, type GithubStatus, type Me, type ModelCatalog, type Repo, type Run, type RunPage, type Runner } from "./api"
 
 const LIVE: Run["status"][] = ["queued", "working"]
 
@@ -14,12 +14,24 @@ export function useRefreshModels() {
   return useMutation({ mutationFn: () => api<ModelCatalog>("/v1/models?refresh=1"), onSuccess: catalog => qc.setQueryData(["models"], catalog) })
 }
 
-/** Every run in the workspace (newest first). Polls while any run is still working. */
+/** Bounded recent runs for the sidebar/search and composer, independent of Home's page. */
 export const useRuns = () =>
   useQuery({
     queryKey: ["runs"],
     queryFn: () => api<{ runs: Run[] }>("/v1/runs?limit=100").then((r) => r.runs),
     refetchInterval: (q) => (q.state.data?.some((r) => LIVE.includes(r.status)) ? 3_000 : 20_000),
+  })
+
+/** Keys include all filters; never show the previous page under a new page label. */
+export const useRunPage = (page: number, size: number, tab: string, repo: string) =>
+  useQuery({
+    queryKey: ["runs", "page", page, size, tab, repo],
+    queryFn: () => {
+      const query = new URLSearchParams({ limit: String(size), offset: String((page - 1) * size), tab })
+      if (repo !== "all") query.set("repo", repo)
+      return api<RunPage>(`/v1/runs?${query}`)
+    },
+    refetchInterval: q => q.state.data?.counts.working ? 3_000 : 20_000,
   })
 
 export const useRun = (id: string | undefined) =>

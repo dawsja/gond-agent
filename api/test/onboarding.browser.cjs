@@ -1,4 +1,6 @@
-// Runs inside the worker image against the real packaged service, never API/browser mocks.
+// Runs inside the worker image against the packaged service. Explicit UI preview
+// fixtures below replace selected endpoints without starting paid model calls.
+const { verifyPagination } = require((process.env.GOND_AGENT_GH_FIXTURE_DIR || '/fixture') + '/home-pagination.browser.cjs');
 const { chromium, expect } = require('@playwright/test');
 const { createServer } = require('node:http');
 const { mkdirSync, writeFileSync, unlinkSync } = require('node:fs');
@@ -359,7 +361,10 @@ const key = 'fixture-only-provider-key';
     const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: largeDiff ? 'Failing test first for bug fixes' : 'Composer preview', prompt: 'Review the settings', status: queuePosition ? 'queued' : activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', queue_position: queuePosition, queue_length: queuePosition ? 3 : undefined, pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: largeDiff ? 77 : 0, additions: largeDiff ? 11456 : 0, deletions: largeDiff ? 99999 : 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
-    const listRoute = route => route.fulfill({ json: { runs: prState || queuePosition || largeDiff ? [run()] : [] } });
+    const listRoute = route => {
+      const rows = prState || queuePosition || largeDiff ? [run()] : [];
+      return route.fulfill({ json: { runs: rows, total: rows.length, limit: 100, offset: 0, repositories: ['acme/app'], counts: { all: rows.length, working: rows.filter(r => ['working', 'queued'].includes(r.status)).length, active: rows.filter(r => r.status === 'working').length, queued: queuePosition ? 1 : 0, ready: rows.filter(r => r.status === 'ready').length, merged: rows.filter(r => r.status === 'merged').length } } });
+    };
     const stopRoute = route => { queuePosition = undefined; return route.fulfill({ json: { ok: true } }); };
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
@@ -368,7 +373,7 @@ const key = 'fixture-only-provider-key';
     const imageRoute = route => { imageRequests++; return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64') }); };
     await page.route(catalogURL, modelRoute);
     await page.route(fixtureRunURL, runRoute);
-    await page.route(origin + '/api/v1/runs?limit=100', listRoute);
+    await page.route(origin + '/api/v1/runs?*', listRoute);
     await page.route(fixtureRunURL + '/messages', messagesRoute);
     await page.route(fixtureRunURL + '/stop', stopRoute);
     await page.route(fixtureRunURL + '/ticket', ticketRoute);
@@ -834,7 +839,7 @@ const key = 'fixture-only-provider-key';
       await page.unroute(fixtureRunURL + '/images/stream-image', imageRoute);
       await page.unroute(catalogURL, modelRoute);
       await page.unroute(fixtureRunURL, runRoute);
-      await page.unroute(origin + '/api/v1/runs?limit=100', listRoute);
+      await page.unroute(origin + '/api/v1/runs?*', listRoute);
       await page.unroute(fixtureRunURL + '/messages', messagesRoute);
       await page.unroute(fixtureRunURL + '/stop', stopRoute);
       await page.unroute(fixtureRunURL + '/ticket', ticketRoute);
@@ -958,7 +963,7 @@ const key = 'fixture-only-provider-key';
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     await verifyTheme();
     if (!returning) {
-      const categoryNames = ['Personal settings', 'Models', 'Security', 'Connections', 'People', 'Agent access', 'Account management'];
+      const categoryNames = ['Personal settings', 'Models', 'Security', 'People', 'Agent access', 'Account management'];
       await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
       for (const name of categoryNames) {
         const heading = page.getByRole('heading', { name, exact: true, level: 2 });
@@ -1083,7 +1088,10 @@ const key = 'fixture-only-provider-key';
       await page.keyboard.press('Escape');
       await page.goto(origin + '/agents/settings');
     }
-    if (!returning) await verifyComposers();
+    if (!returning) {
+      await verifyPagination({ page, expect, origin, capture });
+      await verifyComposers();
+    }
     if (!returning) {
       const meURL = origin + '/api/v1/me';
       const externalAvatar = async route => {
@@ -1140,8 +1148,17 @@ const key = 'fixture-only-provider-key';
     await captureThemes('automations-switches');
     await capture('automations');
     await page.goto(origin + '/agents/plugins');
-    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Plugins', exact: true })).toBeVisible();
+    await page.getByRole('link', { name: /GitHub Manage your GitHub connection/ }).click();
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
+    await expect(page.getByRole('heading', { name: 'GitHub', level: 1, exact: true })).toBeVisible();
+    // The first account is an administrator: both connection cards belong here,
+    // including before connecting GitHub and after restarting the service.
+    await expect(page.getByRole('heading', { level: 2 })).toHaveText(['Your connection', 'Shared connection']);
+    await expect(page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true })).toBeEnabled();
+    await expect(page.getByText('No shared GitHub account connected', { exact: true })).toBeVisible();
     if (!returning) {
+      await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(2);
       await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
       await expect(page.getByRole('link', { name: 'Continue on GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
@@ -1166,6 +1183,7 @@ const key = 'fixture-only-provider-key';
     expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
     await capture(returning ? 'github-after-restart' : 'github-connected');
     await page.goto(origin + '/agents/settings#connections');
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
     const sharedFallback = page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true });
     await expect(sharedFallback).not.toBeChecked();
     await expect(sharedFallback).toBeEnabled();
@@ -1178,9 +1196,12 @@ const key = 'fixture-only-provider-key';
       await expect(sharedFallback).toBeEnabled();
       await expect(sharedFallback).toHaveAttribute('aria-checked', String(checked));
     }
-    await expect(page.getByText('Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on.', { exact: true })).toBeVisible();
+    await expect(page.getByText('Administrators manage this connection for accounts without their own GitHub connection. When enabled, those accounts can use the shared connection or service credentials configured on this server.', { exact: true })).toBeVisible();
     await page.getByRole('heading', { name: 'Shared connection', exact: true }).scrollIntoViewIfNeeded();
     await captureThemes('github-admin-shared-switch');
+    await page.goto(origin + '/agents/settings#oidc');
+    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(0);
     const singleSignOn = page.getByRole('switch', { name: 'Enable single sign-on', exact: true });
     await singleSignOn.scrollIntoViewIfNeeded();
     await expect(singleSignOn).toBeEnabled();
@@ -1200,6 +1221,7 @@ const key = 'fixture-only-provider-key';
         expect((await (await member.request.get(origin + '/api/v1/me')).json()).theme).toBe('light');
         expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
         await member.goto(origin + '/agents/settings#connections');
+        await expect(member).toHaveURL(origin + '/agents/plugins/github');
         await resolvedTheme('light', member);
         await expect(member.getByText('Connect your own GitHub account here. Your runs and pull requests use it.', { exact: true })).toBeVisible();
         await expect(member.getByRole('button', { name: 'Connect GitHub', exact: true })).toBeVisible();

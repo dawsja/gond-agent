@@ -20,6 +20,7 @@ export function openStore(data: string) {
     CREATE TABLE IF NOT EXISTS profile_photos (user_id TEXT PRIMARY KEY REFERENCES "user"(id) ON DELETE CASCADE, revision TEXT NOT NULL, bytes BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, repo TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS runs_owner_time ON runs(user_id,created_at);
+    CREATE INDEX IF NOT EXISTS runs_owner_page ON runs(user_id,created_at DESC,id DESC) WHERE deleted_at IS NULL;
     CREATE TABLE IF NOT EXISTS run_checkpoints (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, bundle_path TEXT NOT NULL UNIQUE, state_path TEXT NOT NULL UNIQUE, bundle_size INTEGER NOT NULL CHECK(bundle_size>=0), state_size INTEGER NOT NULL CHECK(state_size>=0), consumed_at INTEGER, runner_version TEXT NOT NULL, claimed_by TEXT);
     CREATE INDEX IF NOT EXISTS run_checkpoints_run_seq ON run_checkpoints(run_id,seq);
     CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, data TEXT NOT NULL);

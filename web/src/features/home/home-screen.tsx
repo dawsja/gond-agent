@@ -1,10 +1,13 @@
 import { Check, ChevronDown, ExternalLink, GitBranch, MoreHorizontal, Square, Trash2 } from "lucide-react"
-import { useMemo, useState } from "react"
-import { useLocation, useNavigate } from "react-router"
+import { useEffect, useState } from "react"
+import { useLocation, useNavigate, useSearchParams } from "react-router"
+import { Pagination } from "@shared/ui/pagination"
+import { homePage, pageRows } from "@shared/pagination"
+import { prefs } from "@/lib/prefs"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import type { Run } from "@/lib/api"
 import { ago, greeting, queueLabel, repoName, runElapsed } from "@/lib/format"
-import { useCloseRun, useDeleteRun, useMe, useModels, useRuns, useStopRun } from "@/lib/queries"
+import { useCloseRun, useDeleteRun, useMe, useModels, useRunPage, useStopRun } from "@/lib/queries"
 import { QueueReason } from "../run/queue-reason"
 import { ConfirmDialog } from "../studio/confirm-dialog"
 import { devOpen } from "@/lib/dev-open"
@@ -177,26 +180,43 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
 
 type Filter = "all" | "working" | "ready" | "merged"
 
-function matches(r: Run, f: Filter) {
-  if (f === "working") return r.status === "working" || r.status === "queued"
-  if (f === "all") return true
-  return r.status === f
-}
-
 export function HomeScreen() {
   const location = useLocation()
   const focus = (location.state as { focus?: number } | null)?.focus
   const { data: me } = useMe()
-  const { data: runs, isLoading } = useRuns()
+  const [search, setSearch] = useSearchParams()
+  const [rememberedSize] = useState(() => prefs.get("runs-page-size"))
+  const { page, size } = homePage(search, rememberedSize)
+  const tab = search.get("tab")
+  const filter: Filter = tab === "working" || tab === "ready" || tab === "merged" ? tab : "all"
+  const repo = search.get("repo") || "all"
+  const { data: response, isLoading, isFetching, error } = useRunPage(page, size, filter, repo)
+  // A cached response may have been clamped before history grew again. Wait for
+  // this request before accepting that offset as a new URL or rendering its rows.
+  const awaitingPage = isFetching && response?.offset !== (page - 1) * size
+  const data = awaitingPage ? undefined : response
   const { data: models } = useModels()
-  const [filter, setFilter] = useState<Filter>("all")
-  const [repo, setRepo] = useState<string>("all")
+  const setPage = (next: number, changes: Record<string, string> = {}) => {
+    const params = new URLSearchParams(search)
+    params.set("page", String(next))
+    params.set("size", String(size))
+    for (const [key, value] of Object.entries(changes)) params.set(key, value)
+    setSearch(params)
+  }
+  // Only shrink to the last page when necessary. Starts/finishes/refetches never
+  // reset the current page; newly inserted rows shift the offset window.
+  useEffect(() => {
+    const params = new URLSearchParams(search)
+    params.set("page", String(data && !isFetching ? Math.floor(data.offset / size) + 1 : page))
+    params.set("size", String(size))
+    prefs.set("runs-page-size", String(size))
+    if (params.toString() !== search.toString()) setSearch(params, { replace: true })
+  }, [data, isFetching, page, size, search, setSearch])
   const [seed, setSeed] = useState<{ text: string; key: number } | undefined>(focus ? { text: "", key: focus } : undefined)
 
-  const all = useMemo(() => runs ?? [], [runs])
-  const count = (f: Filter) => all.filter((r) => matches(r, f)).length
-  const repos = useMemo(() => [...new Set(all.map((r) => r.repo))].sort(), [all])
-  const shown = all.filter((r) => matches(r, filter) && (repo === "all" || r.repo === repo))
+  const count = (f: Filter) => data?.counts[f] ?? 0
+  const repos = data?.repositories ?? []
+  const shown = pageRows(data?.runs ?? [], size)
   const modelName = (id: string) => models?.find((m) => m.id === id)?.display_name
   const first = (me?.user?.name ?? "").split(" ")[0]
 
@@ -216,7 +236,7 @@ export function HomeScreen() {
             <p className="mt-2 flex flex-wrap items-center gap-2 text-[14px] text-muted-foreground max-md:text-[13px]">
               <Dot status="working" size={6} />
               <span>
-                <span className="font-medium text-foreground">{all.filter((r) => r.status === "working").length}</span> working
+                <span className="font-medium text-foreground">{data?.counts.active ?? 0}</span> working
               </span>
               <Sep />
               <Dot status="ready" size={6} />
@@ -226,7 +246,7 @@ export function HomeScreen() {
               <Sep />
               <Dot status="queued" size={6} />
               <span>
-                <span className="font-medium text-foreground">{all.filter((r) => r.status === "queued").length}</span> queued
+                <span className="font-medium text-foreground">{data?.counts.queued ?? 0}</span> queued
               </span>
             </p>
           </div>
@@ -250,13 +270,13 @@ export function HomeScreen() {
             <h2 className={cn(T.title, "text-foreground")}>Runs</h2>
             <Tabs
               value={filter}
-              onValueChange={(v) => setFilter(v as Filter)}
+              onValueChange={v => setPage(1, { tab: v })}
 
               className="max-md:order-3 max-md:-mx-4 max-md:w-[calc(100%+2rem)] max-md:overflow-x-auto max-md:px-4 max-md:[scrollbar-width:none]"
             >
               <TabsList className={tabs.list}>
                 <TabsTrigger value="all" className={tabs.trigger}>
-                  All
+                  All <span className="tabular-nums opacity-60">{count("all")}</span>
                 </TabsTrigger>
                 <TabsTrigger value="working" className={tabs.trigger}>
                   Working <span className="tabular-nums opacity-60">{count("working")}</span>
@@ -265,7 +285,7 @@ export function HomeScreen() {
                   PR ready <span className="tabular-nums opacity-60">{count("ready")}</span>
                 </TabsTrigger>
                 <TabsTrigger value="merged" className={tabs.trigger}>
-                  Merged
+                  Merged <span className="tabular-nums opacity-60">{count("merged")}</span>
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -281,7 +301,7 @@ export function HomeScreen() {
                 </MenuTrigger>
                 <MenuContent align="end" side="bottom" className="w-64">
                   <MenuLabel>Repository</MenuLabel>
-                  <MenuRadioGroup value={repo} onValueChange={setRepo}>
+                  <MenuRadioGroup value={repo} onValueChange={value => setPage(1, { repo: value })}>
                     {["all", ...repos].map((r) => (
                       <MenuRadioItem key={r} value={r}>
                         {r === "all" ? "All repositories" : r}
@@ -292,27 +312,30 @@ export function HomeScreen() {
               </Menu>
             </div>
           </div>
-          {isLoading ? (
+          {error ? (
+            <p role="alert" className="py-6 text-[13px] text-destructive">{error.message}</p>
+          ) : isLoading || awaitingPage ? (
             <div className="h-[94px] rounded-[4px] border border-border bg-surface" />
           ) : shown.length === 0 ? (
             <div className="flex flex-col items-center gap-2 rounded-[4px] border border-dashed border-border-strong px-6 py-12 text-center">
               <span className="grid size-8 place-items-center rounded-[4px] border border-border bg-surface text-muted-foreground">
                 <Check className="size-4" />
               </span>
-              <p className="text-[14px] font-medium text-foreground">{all.length ? "Nothing here" : "No runs yet"}</p>
+              <p className="text-[14px] font-medium text-foreground">{repo !== "all" || filter !== "all" ? "Nothing here" : "No runs yet"}</p>
               <p className="max-w-sm text-[13px] text-muted-foreground">
-                {all.length
+                {repo !== "all" || filter !== "all"
                   ? "No runs match these filters."
                   : "Describe a task above. A agent clones the repo, does the work, and opens a pull request for you to review."}
               </p>
             </div>
           ) : (
-            <ul className="overflow-hidden rounded-[4px] border border-border bg-surface">
+            <ul aria-label="Runs" aria-busy={isFetching} className="overflow-hidden rounded-[4px] border border-border bg-surface">
               {shown.map((r, i) => (
                 <RunRow key={r.id} run={r} first={i === 0} modelName={modelName(r.model_id)} />
               ))}
             </ul>
           )}
+          <Pagination total={data?.total ?? 0} page={data ? Math.floor(data.offset / size) + 1 : page} size={size} busy={isFetching} onPageChange={setPage} onSizeChange={value => setPage(1, { size: String(value) })} />
         </section>
       </div>
     </Shell>

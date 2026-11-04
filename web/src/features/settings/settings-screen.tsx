@@ -1,4 +1,3 @@
-import { GithubConnection } from "../plugins/plugins-screen"
 import { People, SignInMethods } from "./accounts"
 import { WebSearchSettings } from "./web-search"
 import { ChatGPTPlanSettings } from "./chatgpt-plan"
@@ -40,7 +39,6 @@ export function SettingsScreen() {
       {me?.admin && <div id="oidc"><OIDCSettings /></div>}
       <div id="sessions"><SessionsSection /></div>
     </SettingsCategory>
-    <SettingsCategory id="connections-settings" title="Connections"><div id="connections"><GithubConnection /></div>{me?.admin && <GithubConnection shared />}</SettingsCategory>
     {me?.admin && <SettingsCategory id="people-settings" title="People"><People /></SettingsCategory>}
     <SettingsCategory id="agent-access-settings" title="Agent access">
       {me?.admin && <div id="web-search"><WebSearchSettings /></div>}

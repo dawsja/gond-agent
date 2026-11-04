@@ -498,8 +498,10 @@ export function createApp(
     c.json(await runs.create(c.get("user").id, await c.req.json()), 201),
   );
   app.get("/api/v1/runs", async (c) => {
-    await runs.refreshPulls(c.get("user").id);
-    return c.json({ runs: runs.list(c.get("user").id).map(r => ({ ...r, description: descriptionFor(r) })) });
+    const options = c.req.query();
+    await runs.refreshPulls(c.get("user").id, undefined, options);
+    const page = runs.listPage(c.get("user").id, options);
+    return c.json({ ...page, runs: page.runs.map(r => ({ ...r, description: descriptionFor(r) })) });
   });
   app.get("/api/v1/runs/:id", async (c) => {
     await runs.refreshPulls(c.get("user").id, c.req.param("id"));
@@ -652,6 +654,7 @@ export function createApp(
     });
     return c.json({ ok: true });
   });
+  app.get("/agents", (c) => c.redirect("/agents/" + new URL(c.req.url).search));
   app.get(
     "/agents/*",
     serveStatic({
@@ -659,7 +662,6 @@ export function createApp(
       rewriteRequestPath: (p) => p.replace(/^\/agents/, ""),
     }),
   );
-  app.get("/agents", (c) => c.redirect("/agents/"));
   app.get(
     "/agents/*",
     serveStatic({

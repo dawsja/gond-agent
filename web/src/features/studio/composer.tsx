@@ -81,7 +81,7 @@ export function HeroComposer({ seed }: { seed?: { text: string; key: number } })
     <div {...attach.handlers}>
       <div className="mb-2 flex items-center gap-2">
         {needsGithub ? (
-          <button type="button" onClick={() => navigate("/plugins")} className={cn(chip, "pr-2.5 pl-1.5")}>
+          <button type="button" onClick={() => navigate("/plugins/github")} className={cn(chip, "pr-2.5 pl-1.5")}>
             <span className="grid size-5 place-items-center rounded-[3px] bg-raised"><GithubMark className="size-3 text-foreground" /></span>
             Connect GitHub to pick a repository
           </button>

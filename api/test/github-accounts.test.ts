@@ -48,7 +48,7 @@ it("isolates repository, branch, PR reads and commit identity by account, with n
   expect((await request("/api/v1/github/branches?repo=developer-a/app", b.cookie)).status).toBe(409);
   const denied = await request("/api/v1/runs", b.cookie, { repo: "developer-a/app", prompt: "Work", model: "auto" });
   expect(denied.status).toBe(409);
-  expect((await denied.json()).error.message).toBe("Connect your GitHub account in Settings > Connections");
+  expect((await denied.json()).error.message).toBe("Connect your GitHub account in Plugins > GitHub");
   expect(await (await request("/api/v1/github", b.cookie)).json()).toEqual({ configured: false, login: null, managed: false });
   connect(b.id, "fixture-token-b");
   expect((await (await request("/api/v1/github/repos", b.cookie)).json()).repos[0].full_name).toBe("developer-b/app");
