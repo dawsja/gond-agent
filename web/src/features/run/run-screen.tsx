@@ -1,7 +1,7 @@
 import { ModelPicker } from "@/components/workspace/model-picker"
 import { EffortPicker, effortFor } from "@/components/workspace/effort-picker"
 import { ChevronRight, ExternalLink, GitMerge, GitPullRequest, GitPullRequestClosed, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, Trash2 } from "lucide-react"
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import { FollowUpInput } from "@/components/workspace/task-input"
@@ -21,6 +21,8 @@ import { Menu, MenuContent, MenuItem, MenuTrigger } from "@shared/menu"
 import { SidePanel } from "./side-panel"
 import { TranscriptView } from "./transcript-view"
 import { prefs } from "@/lib/prefs"
+import { ScrollToBottomButton } from "./scroll-to-bottom-button"
+import { useStickToBottom } from "./use-stick-to-bottom"
 
 export function RunScreen() {
   const { id } = useParams()
@@ -54,12 +56,7 @@ export function RunScreen() {
     void refetch()
   }, [statusKey, refetch])
 
-  const scroller = useRef<HTMLDivElement>(null)
-  const pinned = useRef(true)
-  useLayoutEffect(() => {
-    const el = scroller.current
-    if (el && pinned.current) el.scrollTop = el.scrollHeight
-  }, [t])
+  const { scroller, content, composer, resumeFollowing, shown, scrollToBottom } = useStickToBottom(t, !!run.data)
 
   if (run.error) {
     return (
@@ -191,15 +188,15 @@ export function RunScreen() {
         <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-8 bg-gradient-to-b from-background to-transparent" />
         <div
           ref={scroller}
-          onScroll={(e) => {
-            const el = e.currentTarget
-            pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-          }}
+          data-run-scroller
           className="min-h-0 flex-1 overflow-y-auto"
         >
-          <TranscriptView run={r} t={t} author={author} />
+          <div ref={content} data-run-content>
+            <TranscriptView run={r} t={t} author={author} />
+          </div>
         </div>
-        <div {...attach.handlers} className="relative mx-auto w-full max-w-[720px] px-8 pt-2 pb-5 max-md:px-3 max-md:pb-3">
+        <ScrollToBottomButton shown={shown} onClick={scrollToBottom} />
+        <div ref={composer} data-run-composer {...attach.handlers} className="relative mx-auto w-full max-w-[720px] px-8 pt-2 pb-5 max-md:px-3 max-md:pb-3">
           {r.status === "queued" && <p role="status" className="mb-3 px-1 text-[13px] text-muted-foreground">{queueLabel(r)}</p>}
           <DropHint show={attach.dragging} />
           <input {...attach.inputProps} />
@@ -228,7 +225,7 @@ export function RunScreen() {
             onSubmit={(p) => {
               const images = attach.images()
               if (!p && !images.length) return
-              pinned.current = true
+              resumeFollowing()
               // REST rather than the socket, so a refused follow-up (merged, expired) shows its reason.
               send.mutate({ id: r.id, arg: { text: p, images, model:pickedModel || undefined, effort:effortFor(models?.find(m=>m.id===(pickedModel || r.model_id)),effort ?? r.effort ?? "default") } }, { onSuccess: () => { attach.clear(); setDraft("") } })
             }}
