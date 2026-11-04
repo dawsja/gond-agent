@@ -868,6 +868,31 @@ class CheckpointTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "HEAD does not match"):
             self.restore(data)
 
+    def test_restore_rejects_gitlinks_before_applying_any_changes(self):
+        changed_blob = self.git("hash-object", "-w", "--stdin", input=b"checkpoint change\n").strip()
+        entries = [entry for entry in self.git("ls-tree", "-z", self.head).split(b"\0")
+                   if entry and not entry.endswith(b"\tedit.txt")]
+        entries.append(b"100644 blob " + changed_blob + b"\tedit.txt")
+        gitlink = b"160000 commit " + self.base.encode() + b"\tsubmodule\0"
+        nested_tree = self.git("mktree", "-z", input=gitlink).strip()
+        for location, entry in (("root", gitlink), ("nested", b"040000 tree " + nested_tree + b"\tvendor\0")):
+            with self.subTest(location=location):
+                tree = self.git("mktree", "-z", input=b"\0".join(entries) + b"\0" + entry).decode().strip()
+                commit = self.git("commit-tree", tree, "-p", self.head,
+                                  input=agent.checkpoint_message(self.base, self.head).encode()).decode().strip()
+                self.git("update-ref", agent.CHECKPOINT_REF, commit)
+                bundle = pathlib.Path(self.temp.name, "gitlink.bundle")
+                self.git("bundle", "create", str(bundle), agent.CHECKPOINT_REF, "^" + self.head)
+                self.git("update-ref", "-d", agent.CHECKPOINT_REF)
+                before = self.state()
+                with self.assertRaisesRegex(RuntimeError, "Checkpoint submodules are not supported"):
+                    self.restore({"bundle": base64.b64encode(bundle.read_bytes()).decode(),
+                                  "base_sha": self.base, "head_sha": self.head, "checkpoint_sha": commit})
+                self.assertEqual(self.state(), before)
+                self.assertEqual((self.root / "edit.txt").read_text(), "head\n")
+                self.assertFalse((self.root / "submodule").exists())
+                self.assertFalse((self.root / "vendor").exists())
+
     def test_restore_rejects_git_paths_and_existing_symlink_traversal(self):
         blob = self.git("rev-parse", "HEAD:edit.txt").strip()
         tree = self.git("mktree", "-z", input=b"100644 blob " + blob + b"\t.git\0").decode().strip()

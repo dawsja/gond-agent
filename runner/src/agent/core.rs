@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::{self, Checkpoint, Counters};
 use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
-use super::events::{AgentEvent, AgentInput, Decision, ImageInput, QuestionOption, TodoItem};
+use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
 use crate::api::client::SUMMARY_REQUEST_LIMIT;
@@ -237,7 +237,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
     tokio::spawn(async move {
         while let Some(input) = in_rx.recv().await {
             match input {
-                AgentInput::ExportState { request_id, run_id, owner_id } => {
+                AgentInput::ExportState(ExportStateInput { request_id, run_id, owner_id }) => {
                     let req = StateRequest { request_id, run_id, owner_id };
                     if !req.valid() { req.error(&s, "export_state", "invalid_command"); continue; }
                     let mut pending = s.checkpoints.exports.lock().unwrap();
@@ -248,7 +248,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                         s.checkpoints.wake.notify_one();
                     }
                 }
-                AgentInput::ImportState { request_id, run_id, owner_id, state } => {
+                AgentInput::ImportState(ImportStateInput { request_id, run_id, owner_id, state }) => {
                     let req = StateRequest { request_id, run_id, owner_id };
                     if !req.valid() { req.error(&s, "import_state", "invalid_command"); continue; }
                     if !fresh { req.error(&s, "import_state", "runner_not_fresh"); continue; }

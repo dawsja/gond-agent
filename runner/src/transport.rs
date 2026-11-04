@@ -36,7 +36,7 @@ pub async fn jsonl(mut agent: AgentHandle) -> Result<i32> {
             }
             match decode_input(&line) {
                 Ok(i) => {
-                    if matches!(i, AgentInput::ExportState { .. } | AgentInput::ImportState { .. }) {
+                    if matches!(i, AgentInput::ExportState(_) | AgentInput::ImportState(_)) {
                         let _ = control_tx.send(Control::Pending);
                     }
                     let _ = input.send(i);
@@ -86,12 +86,55 @@ pub async fn jsonl(mut agent: AgentHandle) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::{Decision, ExportStateInput, ImageInput, ImportStateInput};
+    use crate::permissions::Mode;
+
+    #[test]
+    fn api_and_controller_frames_decode_without_losing_user_messages() {
+        // Wire shapes from runs/service.ts rpc("send"), controller state_rpc,
+        // and the remaining existing AgentInput controls forwarded by send.
+        let image = ImageInput { media_type: "image/png".into(), data: "aW1hZ2U=".into(), id: None };
+        let frames = [
+            (r#"{"type":"user","text":"Continue","effort":"high","images":[{"media_type":"image/png","data":"aW1hZ2U="}]}"#,
+                AgentInput::User { text: "Continue".into(), images: vec![image.clone()] }),
+            (r#"{"type":"user","text":"","effort":"high","images":[{"media_type":"image/png","data":"aW1hZ2U="}]}"#,
+                AgentInput::User { text: String::new(), images: vec![image.clone()] }),
+            (r#"{"type":"user","images":[{"media_type":"image/png","data":"aW1hZ2U="}]}"#,
+                AgentInput::User { text: String::new(), images: vec![image] }),
+            (r#"{"type":"model","model":"connection/model","context_window":100000}"#,
+                AgentInput::Model { model: "connection/model".into(), context_window: 100000 }),
+            (r#"{"type":"effort","effort":"high"}"#, AgentInput::Effort { effort: "high".into() }),
+            (r#"{"type":"compact"}"#, AgentInput::Compact),
+            (r#"{"type":"question.reply","request_id":"q","answer":"Yes"}"#,
+                AgentInput::QuestionReply { request_id: "q".into(), answer: "Yes".into() }),
+            (r#"{"type":"permission.reply","request_id":"p","decision":"allow_once","message":"Approved"}"#,
+                AgentInput::PermissionReply { request_id: "p".into(), decision: Decision::AllowOnce, message: Some("Approved".into()) }),
+            (r#"{"type":"interrupt"}"#, AgentInput::Interrupt),
+            (r#"{"type":"mode","mode":"plan"}"#, AgentInput::Mode { mode: Mode::Plan }),
+            (r#"{"type":"skill","name":"review","enabled":true}"#,
+                AgentInput::Skill { name: "review".into(), enabled: true }),
+            (r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o"}"#,
+                AgentInput::ExportState(ExportStateInput { request_id: "e".into(), run_id: "r".into(), owner_id: "o".into() })),
+            (r#"{"type":"import_state","request_id":"i","run_id":"r","owner_id":"o","state":{}}"#,
+                AgentInput::ImportState(ImportStateInput { request_id: "i".into(), run_id: "r".into(), owner_id: "o".into(), state: serde_json::json!({}) })),
+        ];
+        for (wire, expected) in frames {
+            assert_eq!(decode_input(wire).unwrap(), expected, "rejected {wire}");
+            if !matches!(expected, AgentInput::ExportState(_) | AgentInput::ImportState(_)) {
+                let mut extended: serde_json::Value = serde_json::from_str(wire).unwrap();
+                extended["api_metadata"] = serde_json::json!({"ignored": true});
+                assert_eq!(decode_input(&extended.to_string()).unwrap(), expected);
+            }
+        }
+    }
 
     #[test]
     fn state_commands_are_strict_and_bad_commands_have_correlated_control_errors() {
-        assert!(matches!(decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o"}"#).unwrap(), AgentInput::ExportState { .. }));
+        assert!(matches!(decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o"}"#).unwrap(), AgentInput::ExportState(_)));
         let error = decode_input(r#"{"type":"import_state","request_id":"i","run_id":"r","owner_id":"o","state":{},"unexpected":"private data"}"#).unwrap_err().unwrap();
         assert!(matches!(*error, AgentEvent::StateError { request_id, operation, code } if request_id == "i" && operation == "import_state" && code == "invalid_command"));
+        let error = decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o","unexpected":"private data"}"#).unwrap_err().unwrap();
+        assert!(matches!(*error, AgentEvent::StateError { request_id, operation, code } if request_id == "e" && operation == "export_state" && code == "invalid_command"));
         assert!(decode_input("not JSON").unwrap_err().is_none());
     }
 }

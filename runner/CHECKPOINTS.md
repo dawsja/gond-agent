@@ -56,6 +56,8 @@ EOF waits for accepted state controls as well as active turns.
   is no new general stdin framing limit in this slice; the trusted controller
   must bound incoming frames too. Oversized stored history fails export; export
   never silently filters images or compacts history to make it fit.
+- Import/export command payloads reject unknown fields, while ordinary input
+  frames remain forward-compatible with API metadata such as `user.effort`.
 - Checkpoint, counters, plan items, messages, blocks, result parts and opaque
   envelopes deny unknown fields. Arbitrary tool `input` and provider opaque
   `data` remain JSON payloads by design. Roles are only user/assistant/tool;

@@ -1,10 +1,10 @@
 // Included in core's tests to exercise the real input dispatcher and local history.
 fn export_command(id: &str) -> AgentInput {
-    AgentInput::ExportState { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into() }
+    AgentInput::ExportState(ExportStateInput { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into() })
 }
 
 fn import_command(id: &str, state: &Checkpoint) -> AgentInput {
-    AgentInput::ImportState { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into(), state: serde_json::to_value(state).unwrap() }
+    AgentInput::ImportState(ImportStateInput { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into(), state: serde_json::to_value(state).unwrap() })
 }
 
 async fn exported(h: &mut AgentHandle, id: &str) -> Checkpoint {
@@ -52,7 +52,7 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     assert!(events.iter().all(|e| matches!(e, AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. })));
     restored.input.send(export_command("again")).unwrap();
     assert_eq!(exported(&mut restored, "again").await, state);
-    restored.input.send(AgentInput::ExportState { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into() }).unwrap();
+    restored.input.send(AgentInput::ExportState(ExportStateInput { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into() })).unwrap();
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateError { .. })).await;
     assert!(matches!(events.last(), Some(AgentEvent::StateError { request_id, code, .. }) if request_id == "wrong-owner" && code == "binding_mismatch"));
     restored.input.send(AgentInput::User { text: "Continue".into(), images: vec![] }).unwrap();
@@ -150,7 +150,7 @@ async fn checkpoint_waits_for_complete_stream_and_paired_tool_results() {
     until(&mut h, |e| matches!(e, AgentEvent::TextDelta { .. })).await;
     h.input.send(export_command("stream")).unwrap();
     // An invalid import is a deterministic ingress barrier while the stream is open.
-    h.input.send(AgentInput::ImportState { request_id: "barrier".into(), run_id: "run".into(), owner_id: "owner".into(), state: json!({}) }).unwrap();
+    h.input.send(AgentInput::ImportState(ImportStateInput { request_id: "barrier".into(), run_id: "run".into(), owner_id: "owner".into(), state: json!({}) })).unwrap();
     let events = until(&mut h, |e| matches!(e, AgentEvent::StateError { request_id, .. } if request_id == "barrier")).await;
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::StateExported { .. })));
     assert!(h.events.try_recv().is_err(), "must not export while the stream is blocked");

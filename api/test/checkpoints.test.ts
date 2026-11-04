@@ -92,6 +92,28 @@ it("round-trips only supplied state, seals it with the auth secret, and stores o
   expect(fs.readdirSync(join(root(), runId(1))).sort()).toEqual([saved.bundle_path.split("/")[1], saved.state_path.split("/")[1]].sort());
 });
 
+it("never captures environment secrets in checkpoint files or sealed metadata", () => {
+  const secrets = {
+    GH_TOKEN: "ghp_checkpoint_environment_only_1234567890",
+    GITHUB_TOKEN: "github_pat_checkpoint_environment_only_1234567890",
+    GOND_AGENT_RELAY_TOKEN: "checkpoint-relay-environment-only-1234567890",
+    BETTER_AUTH_SECRET: secret,
+  };
+  for (const [name, value] of Object.entries(secrets)) vi.stubEnv(name, value);
+  const saved = save();
+  for (const value of Object.values(secrets)) {
+    // Search every file, including the unencrypted bundle; no shell expansion
+    // or real inherited credentials are involved in this fixture-only probe.
+    const grep = spawnSync("grep", ["-r", "-a", "-F", "-q", "--", value, root()]);
+    expect(grep.error).toBeUndefined();
+    expect(grep.status).toBe(1); // no matches, not a grep failure
+    const plaintext = unseal(secret, fs.readFileSync(join(root(), saved.state_path), "utf8"));
+    expect(plaintext).not.toContain(value);
+    expect(JSON.stringify(rows())).not.toContain(value);
+  }
+  expect(store.load(key())?.state).toBe("supplied-state");
+});
+
 it("requires all three exact SHA-1 pins before writing any checkpoint files or metadata", () => {
   for (const invalid of invalidTrees) {
     expect(() => store.save({ ...key(), tree: invalid as CheckpointTree, bundle: Buffer.from("opaque"), state: "opaque" }))

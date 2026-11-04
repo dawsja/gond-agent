@@ -115,16 +115,35 @@ pub struct ImageInput {
     pub id: Option<String>,
 }
 
+// Only checkpoint controls are closed schemas. Ordinary input frames may carry
+// API metadata (for example user.effort) that the runner does not consume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExportStateInput {
+    pub request_id: String,
+    pub run_id: String,
+    pub owner_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+pub struct ImportStateInput {
+    pub request_id: String,
+    pub run_id: String,
+    pub owner_id: String,
+    pub state: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
 pub enum AgentInput {
     #[serde(rename = "export_state")]
-    ExportState { request_id: String, run_id: String, owner_id: String },
+    ExportState(ExportStateInput),
     #[serde(rename = "import_state")]
-    ImportState { request_id: String, run_id: String, owner_id: String, state: Value },
+    ImportState(ImportStateInput),
     #[serde(rename = "user")]
     User {
+        #[serde(default)]
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageInput>,

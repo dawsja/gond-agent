@@ -230,8 +230,13 @@ def restore_checkpoint(req):
                 raise RuntimeError("Invalid checkpoint parent.")
             if git("show", "-s", "--format=%B", commit).decode().strip() != checkpoint_message(base, head).strip():
                 raise RuntimeError("The checkpoint pins do not match.")
-            for path in git("ls-tree", "-rz", "--name-only", commit).split(b"\0"):
-                if path and any(part.lower() == b".git" or part in (b"", b".", b"..") for part in path.split(b"/")):
+            for entry in git("ls-tree", "-rz", commit).split(b"\0"):
+                if not entry:
+                    continue
+                metadata, path = entry.split(b"\t", 1)
+                if metadata.split(b" ", 1)[0] == b"160000":
+                    raise RuntimeError("Checkpoint submodules are not supported.")
+                if any(part.lower() == b".git" or part in (b"", b".", b"..") for part in path.split(b"/")):
                     raise RuntimeError("Unsafe checkpoint path.")
             git("read-tree", head)
             patch = scratch / "tree.patch"
