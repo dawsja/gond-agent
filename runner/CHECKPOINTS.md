@@ -4,19 +4,24 @@ Internal JSONL controls on the existing `AgentInput` / `AgentEvent` transport.
 These are **not** model tools, user messages, or transcript events. The controller
 forwards these over dedicated RPCs and isolates replies from transcript events;
 the API has an opaque sealed storage module. Scheduling, automatic recovery and
-RunService integration are not included.
+checkpoint lifecycle integration are not included. RunService does already use
+private state export to capture evidence keys before task execution and metadata
+at turn finish; this does not enable checkpoint-backed recovery.
 
 ## Commands and replies
 
+These minimal schema examples omit optional `evidence`. Real exports include the
+private ledger described below; never copy its signing key into a transcript.
+
 ```json
 {"type":"export_state","request_id":"save-1","run_id":"run-123","owner_id":"user-456"}
-{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-1","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 ```
 
 Send that **state object**, not its wrapper or a model request, to a fresh worker:
 
 ```json
-{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-1","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 {"type":"state.imported","request_id":"load-1"}
 ```
 
@@ -24,7 +29,8 @@ Failures use `{"type":"state.error","request_id":"…","operation":"import_state
 (or operation `export_state`). Codes are `invalid_command`, `runner_not_fresh`,
 `export_queue_full`, `incompatible_version`, `binding_mismatch`, `invalid_schema`,
 `invalid_counters_or_plan`, `invalid_role_placement`, `invalid_tool_call`,
-`unpaired_tools`, `invalid_image`, and `state_too_large`.
+`unpaired_tools`, `invalid_image`, `state_too_large`, `invalid_evidence_bounds`,
+`invalid_evidence_key`, `invalid_evidence_record`, and `invalid_evidence_staleness`.
 
 Request/run/owner IDs must be nonempty, at most 256 UTF-8 bytes, without control
 characters. Malformed command objects with a usable request ID get a correlated
@@ -69,14 +75,47 @@ EOF waits for accepted state controls as well as active turns.
   imported attachment and tool-result image passes `images.rs` raster
   normalization; bad/unresolved images reject the transaction. Normalization
   can change bytes/media type, and decoder saturation is an import error.
-- Both `SCHEMA_VERSION` and the explicit `RUNNER_STATE_VERSION` compatibility
-  epoch must match exactly. The epoch is independent of Cargo's package version;
-  **bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. No old-version migration or permissive fallback is provided.
+- `SCHEMA_VERSION` remains 1; the explicit `RUNNER_STATE_VERSION` compatibility
+  epoch is `gond-agent-checkpoint-2`, independent of Cargo's package version.
+  **Bump it whenever history/tool/compaction/counter semantics become
+  incompatible**. One narrow compatibility path accepts ledgerless epoch-1 state
+  and upgrades the epoch; it supplies no prior execution evidence. Other epochs,
+  including epoch-1 state with a ledger, are rejected.
 - Commands supply the expected run and owner. Import checks both against state;
   the first export or successful import binds subsequent controls on that
   worker. This is not authentication: the service must independently check
   ownership and prevent checkpoint substitution/tampering.
+
+## Evidence state
+
+Optional `evidence` is a strict typed ledger: private signing key, up to 40 signed
+records (see [event schema](../protocol/README.md#execution-evidence-and-publication)),
+frozen policy, sequence, gate/turn/resume/fix/review counters, stale IDs,
+limitations/declaration flag and initial turn tree. All nested ledger/record/kind
+fields reject unknown fields; validation checks bounds, UUID/sequence uniqueness,
+signatures for non-stale keyed records and staleness references. The advisory gate
+allows at most two continuations per turn, six per run and none at ten resumes;
+actual runner counters persist in sealed state, import preserves them, and restore
+increments the resume count. Separately, RunService durably reserves up to two
+rounds in `gate_budget` at `next`, before each task is delivered, capped at six.
+Before worker startup, gate rounds are seeded from `max(gate_rounds, gate_budget)`.
+A crash may spend unused allowance but cannot replenish it.
+
+The key belongs only in private state RPCs, sealed checkpoint state and API live
+memory, never ordinary run rows, transcript events, child environments or logs.
+The API captures it before the first task and does not adopt a changed finish key.
+These are **evidence recorded by the worker**, not independent proof: signatures
+authenticate records, while same-UID executed code can inspect process memory.
+Only a separate-container rerun could provide independent proof, out of scope.
+`env_clean` means an environment allow-list was applied; `env_digest` hashes its
+values, not an absence of secrets in HOME/`.npmrc` or elsewhere.
+
+Restore marks records stale on missing keys or mismatched trees. Missing keys are
+replaced without re-signing historical records; ledgerless imports request a new
+check. Ignored paths are NOT covered by tree identity, even if executed by a check.
+Capture ignores clone-local/system excludes, but respects worktree `.gitignore`;
+ignored dependencies such as `node_modules` may be absent after restore. Do not
+treat hidden ignored code as trusted based on a matching tree.
 
 ## Restored state and remaining integration seams
 
@@ -87,6 +126,10 @@ length are saved. Imported cadence/nudge/compaction counters are consumed by the
 first subsequent main turn; ordinary later user turns still reset their own
 turn-local budgets. Import itself stays idle and emits no model/tool work or
 ordinary transcript frames. The caller must send the intended continuation.
+
+Frozen evidence policy is restored with the ledger, unlike ordinary runtime
+configuration below. Policy/manifest edits do not alter frozen checks; a later
+run must pin a base containing those edits before discovering them anew.
 
 Runtime configuration (model/effort, prompts/instructions, permission mode/rules,
 skills/tools, cadence interval/nudge limit, question timeout) comes from the new

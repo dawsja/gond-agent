@@ -572,10 +572,17 @@ describe("persistent workspace queue", () => {
     const workspace = workspaces.get(failed.id)!;
     const destroy = workspace.destroy.bind(workspace);
     vi.spyOn(workspace, "destroy").mockImplementationOnce(async () => { await gate.promise; await destroy(); });
+    const close = vi.spyOn(runs, "close");
     let closing: Promise<unknown> | undefined;
     if (action === "close") closing = runs.closeSession(failed.id, "a");
     else if (action === "stop") closing = runs.stop(failed.id, "a");
-    else await vi.advanceTimersByTimeAsync(60_000);
+    else {
+      await vi.advanceTimersByTimeAsync(60_000);
+      // The expiry callback does not return its asynchronous cleanup to the
+      // clock. Await the real close barrier, not a fixed number of event ticks.
+      closing = close.mock.results[0]?.value;
+      expect(closing).toBeInstanceOf(Promise);
+    }
     const waiting = await create("b");
     expect(runs.get(waiting.id).status).toBe("queued");
     expect(starts).toEqual([failed.id]);

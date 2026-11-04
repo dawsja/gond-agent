@@ -5,31 +5,32 @@ import { tmpdir } from "node:os";
 import { assertBranchAvailable, branchSchema, descriptionFor, publicationFields } from "../src/runs/publication";
 import { emptySummary, fold } from "../src/runs/fold";
 import { openStore } from "../src/db";
+import { unverifiedDescription } from "./fixtures/evidence";
 
 it("chooses explicit descriptions, then clean final text, then the plain title, never the prompt", () => {
   let summary = emptySummary();
   const run = () => ({ summary, title: "Safe run title", prompt: "Original task with sensitive pasted text", status: "ready" });
-  expect(descriptionFor(run())).toBe("Safe run title");
+  expect(descriptionFor(run())).toBe(unverifiedDescription("Safe run title"));
   summary = fold(summary, { type: "text.delta", agent_id: "main", text: "Commentary" });
   summary = fold(summary, { type: "tool.call", agent_id: "main", name: "list_plan" });
   expect(summary.text).toBe("");
   summary = fold(summary, { type: "text.delta", agent_id: "main", text: "Final reply" });
-  expect(descriptionFor(run())).toBe("Safe run title"); // Streaming text is not yet a final reply.
+  expect(descriptionFor(run())).toBe(unverifiedDescription("Safe run title")); // Streaming text is not yet a final reply.
   summary = fold(summary, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
-  expect(descriptionFor(run())).toBe("Final reply");
-  expect(descriptionFor({ ...run(), pr_body: "Override" })).toBe("Override");
-  expect(descriptionFor({ ...run(), pr_body: "" })).toBe("");
+  expect(descriptionFor(run())).toBe(unverifiedDescription("Final reply"));
+  expect(descriptionFor({ ...run(), pr_body: "Override" })).toBe(unverifiedDescription("Override"));
+  expect(descriptionFor({ ...run(), pr_body: "" })).toBe(unverifiedDescription(""));
   for (const status of ["failed", "stopped"]) {
-    expect(descriptionFor({ ...run(), status })).toBe("Safe run title");
-    expect(descriptionFor({ ...run(), status, pr_body: "Override" })).toBe("Override");
-    expect(descriptionFor({ ...run(), status, pr_body: "" })).toBe("");
+    expect(descriptionFor({ ...run(), status })).toBe(unverifiedDescription("Safe run title"));
+    expect(descriptionFor({ ...run(), status, pr_body: "Override" })).toBe(unverifiedDescription("Override"));
+    expect(descriptionFor({ ...run(), status, pr_body: "" })).toBe(unverifiedDescription(""));
   }
   summary = fold(summary, { type: "tool.call", agent_id: "main", name: "list_plan" });
   summary = fold(summary, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
   expect(summary.final_reply).toBe(true);
-  expect(descriptionFor(run())).toBe("Safe run title");
+  expect(descriptionFor(run())).toBe(unverifiedDescription("Safe run title"));
   // Historical summaries without a success marker cannot publish their accumulated text.
-  expect(descriptionFor({ ...run(), summary: { ...summary, text: "Old commentary", final_reply: undefined } })).toBe("Safe run title");
+  expect(descriptionFor({ ...run(), summary: { ...summary, text: "Old commentary", final_reply: undefined } })).toBe(unverifiedDescription("Safe run title"));
 });
 
 it.each(["max_tokens", "unknown_stop", "refusal", "content_filter", "context_exceeded", "tool_use", "compacted", "interrupted", "error"])("uses the title rather than a reply ending with %s", stop_reason => {
@@ -38,7 +39,7 @@ it.each(["max_tokens", "unknown_stop", "refusal", "content_filter", "context_exc
     { type: "turn.end", agent_id: "main", stop_reason },
   ].reduce(fold, emptySummary());
   expect(summary.final_reply).toBe(false);
-  expect(descriptionFor({ summary, title: "Safe run title", status: "ready" })).toBe("Safe run title");
+  expect(descriptionFor({ summary, title: "Safe run title", status: "ready" })).toBe(unverifiedDescription("Safe run title"));
 });
 
 it.each(["main", "master", "HEAD", "release", "release/next", "v1", "v1/next", "feat/../escape", "fix/foo..bar", "docs/ok/", "chore/file.lock", "feat/file.lock/child", "feat/.hidden", "feat/trailing.", "feat/UPPER", "other/name", "fix/", "fix/a/b/c/d/e", `feat/${"a".repeat(82)}`])("refuses unsafe branch %s", branch => {

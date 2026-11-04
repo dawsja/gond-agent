@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { emptySummary, fold, type Ev, type Summary } from "../src/runs/fold";
 import { descriptionFor } from "../src/runs/publication";
+import { unverifiedDescription } from "./fixtures/evidence";
 import { createTranscript } from "../../web/src/features/run/transcript";
 
 const text = (value: string, agent_id = "main"): Ev => ({ type: "text.delta", agent_id, text: value });
@@ -27,12 +28,12 @@ describe("run summary final reply", () => {
     expect(summary.text).toBe("");
     summary = foldAll([text("Final reply. "), text("Checks passed.")], summary);
     const run = () => ({ summary, title: "Safe run title", status: "ready" as const });
-    expect(descriptionFor(run())).toBe("Safe run title");
+    expect(descriptionFor(run())).toBe(unverifiedDescription("Safe run title"));
 
     summary = fold(summary, turnEnd("end_turn"));
     expect(summary.final_reply).toBe(true);
     expect(summary.text).toBe("Final reply. Checks passed.");
-    expect(descriptionFor(run())).toBe("Final reply. Checks passed.");
+    expect(descriptionFor(run())).toBe(unverifiedDescription("Final reply. Checks passed."));
   });
 
   it("excludes an overflowing reply after compaction while keeping its transcript and subsequent retry rollback", () => {
@@ -49,8 +50,8 @@ describe("run summary final reply", () => {
     expect(foldAll(events.slice(0, 3)).text).toBe("Partial overflowing response");
     const compacted = foldAll(events.slice(0, 4));
     expect(compacted.text).toBe("");
-    expect(descriptionFor({ summary: compacted, title: "Safe title", status: "working" })).toBe("Safe title");
-    expect(descriptionFor({ summary: foldAll(events), title: "Safe title", status: "ready" })).toBe("Recovered final reply");
+    expect(descriptionFor({ summary: compacted, title: "Safe title", status: "working" })).toBe(unverifiedDescription("Safe title"));
+    expect(descriptionFor({ summary: foldAll(events), title: "Safe title", status: "ready" })).toBe(unverifiedDescription("Recovered final reply"));
     const transcript = createTranscript()(events.map((ev, i) => ({ ...ev, seq: i + 1, ts: i + 1 })));
     expect(transcript.items.filter(item => item.kind === "text").map(item => item.text)).toEqual([
       "Partial overflowing response", "Recovered final reply",

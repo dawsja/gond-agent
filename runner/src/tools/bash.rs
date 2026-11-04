@@ -101,13 +101,23 @@ impl Tool for Bash {
     }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            execute(ctx, input, false).await
+        })
+    }
+}
+
+/// run_checks always launches with the recorded allow-list. Bash never emits
+/// evidence, even when its command happens to look like an eligible check.
+pub(super) async fn execute(ctx: &ToolCtx, input: Value, clean: bool) -> ToolOutput {
             let Some(cmd) = str_arg(&input, "command") else { return ToolOutput::err("command is required") };
             if input.get("run_in_background").and_then(Value::as_bool).unwrap_or(false) {
                 return start_background(ctx, cmd);
             }
             let timeout = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
             let started = Instant::now();
-            let mut child = match shell_command(cmd)
+            let mut command = shell_command(cmd);
+            if clean { command.env_clear().envs(crate::agent::evidence::check_environment()); }
+            let mut child = match command
                 .current_dir(&ctx.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -181,8 +191,6 @@ impl Tool for Bash {
                 _ => {}
             }
             ToolOutput { ok, content: vec![crate::api::wire::ResultPart::Text { text: model_text }], summary, display: out, diff: None }
-        })
-    }
 }
 
 /// A command's output, keeping the start and the end (MAX_OUTPUT each) and counting what's between.

@@ -32,6 +32,8 @@ pub struct QuestionOption {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
+    #[serde(rename = "evidence.recorded")]
+    EvidenceRecorded { record: super::evidence::Record },
     #[serde(rename = "session.start")]
     SessionStart { session_id: String, model: String, cwd: String, mode: Mode },
     #[serde(rename = "turn.start")]

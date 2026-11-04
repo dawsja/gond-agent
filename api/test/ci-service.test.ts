@@ -21,7 +21,8 @@ vi.mock("../src/github", async original => ({
   git: vi.fn(),
 }));
 
-const SHA = "a".repeat(40), NEXT = "b".repeat(40), BASE = "c".repeat(40);
+const SHA = "a".repeat(40), NEXT = "b".repeat(40), BASE = "c".repeat(40), TREE = "d".repeat(40);
+const isCiGuard = (args: string[]) => args[0] === "diff" && args.includes("--no-ext-diff") && args.includes("--name-only");
 const pushed = vi.fn();
 let dir: string, db: ReturnType<typeof openStore>, runs: Runs, cfg: Config;
 const factory = vi.fn<WorkspaceFactory>(async () => { throw new Error("Tests must not boot a workspace"); });
@@ -89,6 +90,7 @@ beforeEach(async () => {
     pushed();
   });
   vi.mocked(git).mockImplementation(async (_cwd, ...args) => {
+    if (args[0] === "rev-parse") return Buffer.from(TREE);
     if (args[0] !== "diff") throw new Error(`Unexpected git command: ${args.join(" ")}`);
     return Buffer.from(args.includes("--name-only") ? "src/app.ts\0"
       : args.includes("--numstat") ? "2\t1\tsrc/app.ts\n"
@@ -386,7 +388,9 @@ describe("run service automatic CI hooks", () => {
   it("rejects an automatic .github diff before push, gives up needing a person and leaves the published head unchanged", async () => {
     seed({ ci_turn: true, ci_round: 1, ci_previous_sha: SHA, ci_failing: ["tests"] });
     const { live, destroy } = workspace();
-    vi.mocked(git).mockResolvedValueOnce(Buffer.from("src/app.ts\0.github/workflows/test.yml\0"));
+    const inspect = vi.mocked(git).getMockImplementation()!;
+    vi.mocked(git).mockImplementation(async (cwd, ...args) => isCiGuard(args)
+      ? Buffer.from("src/app.ts\0.github/workflows/test.yml\0") : inspect(cwd, ...args));
     const start = vi.spyOn(watcher(), "start");
     const merge = vi.spyOn(runs, "merge");
     await service().finish("run", live);
@@ -395,9 +399,12 @@ describe("run service automatic CI hooks", () => {
       "/fake", Buffer.from("bundle"), "gond-agent/fix", expect.objectContaining({ GH_TOKEN: "test-owner-github-token" }), undefined,
       expect.objectContaining({ beforePush: expect.any(Function) }),
     );
-    expect(git).toHaveBeenCalledExactlyOnceWith(
-      "/fake", "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", SHA, NEXT, "--",
-    );
+    expect(vi.mocked(git).mock.calls.filter(([_cwd, ...args]) => isCiGuard(args))).toEqual([
+      ["/fake", "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", SHA, NEXT, "--"],
+    ]);
+    expect(vi.mocked(git).mock.calls.filter(([_cwd, command]) => command === "rev-parse")).toEqual([
+      ["/fake", "rev-parse", `${NEXT}^{tree}`],
+    ]);
     expect(pushed).not.toHaveBeenCalled();
     expect(runs.get("run")).toMatchObject({
       status: "ready", head_sha: SHA, ci_round: 1, ci_state: "gave_up", ci_active: false,
@@ -416,6 +423,7 @@ describe("run service automatic CI hooks", () => {
     seed({ ci_turn: true, ci_round: 1, ci_previous_sha: SHA });
     const { live } = workspace();
     vi.mocked(git).mockImplementation(async (_cwd, ...args) => {
+      if (args[0] === "rev-parse") return Buffer.from(TREE);
       if (args[0] === "diff") return Buffer.from("src/app.ts\0");
       if (args[0] === "merge-base") return Buffer.alloc(0);
       if (args[0] === "log") return Buffer.from(".github/workflows/test.yml\0");

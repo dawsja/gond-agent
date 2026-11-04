@@ -40,6 +40,7 @@ pub type Shells = Arc<Mutex<HashMap<String, bash::BgShell>>>;
 /// exist). Used to track edits inside the workspace container.
 pub type Baseline = Arc<Mutex<HashMap<PathBuf, Option<Vec<u8>>>>>;
 
+#[derive(Clone)]
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub agent_id: String,

@@ -11,6 +11,9 @@ import { checkout, gh } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
 import { emptySummary } from "../src/runs/fold";
 import { Runs, type Run } from "../src/runs/service";
+import { acceptEvidence, emptyEvidence } from "../src/runs/evidence";
+import { descriptionFor } from "../src/runs/publication";
+import { evidenceSigningKey, evidenceState, signedRecord } from "./fixtures/evidence";
 
 // Only transport failures and external GitHub reads are faked. In particular,
 // importBundle, pushBranch, the CI guard and withRetry all execute their real code.
@@ -36,6 +39,9 @@ const token = "owner-only-fixture-token";
 const availabilityEndpoint = `repos/acme/app/git/matching-refs/heads/${branch}`;
 const prEndpoint = "repos/acme/app/pulls/7";
 const githubRequests = () => vi.mocked(gh).mock.calls.map(([endpoint]) => endpoint);
+// Evidence classification also inspects paths. Only the CI guard may consume
+// guard counters, retry failure injection or the queued-message race hook.
+const isCiGuard = (args: string[]) => args.includes("diff") && args.includes("--no-ext-diff") && args.includes("--name-only");
 type Event = { kind: "guard" | "push" | "ls-remote"; args: string[] };
 let dir: string, db: ReturnType<typeof openStore>, runs: Runs;
 const service = () => runs as any;
@@ -80,6 +86,7 @@ afterEach(async () => {
 
 async function fixture(options: {
   failPushes?: number; loseResponse?: boolean; configOnRetry?: boolean; removeBaselineOnFailure?: boolean; configChange?: boolean;
+  docsOnly?: boolean; testWeakening?: boolean;
 } = {}) {
   const actual = await vi.importActual<typeof import("../src/command")>("../src/command");
   const remote = join(dir, "remote.git"), cwd = join(dir, "checkouts", "run"), worker = join(dir, "worker");
@@ -97,7 +104,9 @@ async function fixture(options: {
   await git(worker, "push", "origin", "main");
   await git(cwd, "clone", "--no-tags", remote, ".");
   await git(worker, "checkout", "-b", branch);
-  await writeFile(join(worker, "work.txt"), "fixed\n");
+  if (options.docsOnly) await writeFile(join(worker, "README.md"), "Documentation only\n");
+  else await writeFile(join(worker, "work.txt"), "fixed\n");
+  if (options.testWeakening) await writeFile(join(worker, "work.test.ts"), 'it.skip("important behavior", () => {});\n');
   if (options.configChange) {
     await mkdir(join(worker, ".github", "workflows"), { recursive: true });
     await writeFile(join(worker, ".github", "workflows", "test.yml"), "name: changed CI\n");
@@ -123,6 +132,7 @@ async function fixture(options: {
     .run(run.id, run.user_id, run.repo, run.status, run.created_at, run.updated_at, JSON.stringify(run));
   const rpc = vi.fn(async (method: string) => {
     if (method === "send") return undefined as never;
+    if (method === "export_state") return { state: {} } as never; // Legacy worker: no evidence key.
     if (method !== "snapshot") throw new Error(`Unexpected worker call: ${method}`);
     return { bundle: bundle.toString("base64"), head };
   });
@@ -134,7 +144,7 @@ async function fixture(options: {
   let pushes = 0, guards = 0;
   vi.mocked(command).mockImplementation(async (file, args, commandOptions) => {
     if (file === "git") {
-      if (args.includes("diff") && args.includes("--name-only") && args.includes("--no-renames")) {
+      if (isCiGuard(args)) {
         events.push({ kind: "guard", args: [...args] });
         expect(runs.get("run").pushed).toBe(false);
         if (++guards > 1 && options.configOnRetry) return Buffer.from(".github/workflows/test.yml\0");
@@ -197,6 +207,38 @@ async function fixture(options: {
 }
 
 describe("automatic CI publication with explicit-branch leases", () => {
+  it.each(["no records", "gate off", "docs only"])("inspects the pinned publication tree without execution records: %s", async mode => {
+    const f = await fixture({ docsOnly: mode === "docs only", testWeakening: mode !== "docs only" });
+    const current = runs.get("run");
+    if (mode !== "no records") current.evidence = { ...emptyEvidence(), policy: { ...evidenceState().state.evidence.policy, enabled: mode !== "gate off" } };
+    runs.save(current);
+    const tree = await f.git(join(dir, "worker"), "rev-parse", `${f.head}^{tree}`);
+    expect(await service().publish("run", f.live)).toBe(true);
+    expect(runs.get("run").evidence).toMatchObject({ records: [], publication_tree: tree });
+    expect(vi.mocked(command).mock.calls.filter(([file, args]) => file === "git" && isCiGuard(args))).toHaveLength(1);
+    const body = descriptionFor(runs.get("run"));
+    expect(body).toContain("Not verified.");
+    expect(body).toContain("### Evidence weakened");
+    if (mode === "docs only") expect(runs.get("run").evidence?.weakened).toEqual([]);
+    else expect(body).toContain("Skipped or narrowed tests added: work.test.ts");
+    if (mode === "gate off") expect(body).toContain("Verification gate: off.");
+    expect(f.events.map(event => event.kind)).toEqual(["guard", "push"]);
+    f.expectLeasedPushes();
+  });
+  it.each([true, false])("uses the real pinned imported commit tree for evidence freshness (matching=%s), preserving the CI guard", async matching => {
+    const f = await fixture();
+    const tree = await f.git(join(dir, "worker"), "rev-parse", `${f.head}^{tree}`);
+    const current = runs.get("run");
+    const claimed = matching ? tree : "f".repeat(40);
+    current.evidence = acceptEvidence(undefined, signedRecord({ tree_hash_before: claimed, tree_hash_after: claimed }), evidenceSigningKey);
+    runs.save(current);
+    expect(await service().publish("run", f.live)).toBe(true);
+    expect(runs.get("run").evidence?.publication_tree).toBe(tree);
+    expect(descriptionFor(runs.get("run"))).toContain(matching ? "1 fresh successful check(s)" : "Not verified.");
+    expect(f.events.map(event => event.kind)).toEqual(["guard", "push"]);
+    f.expectLeasedPushes();
+    expect(await f.remoteHead()).toBe(f.head);
+  });
   it.each(["first import", "already imported retry"])("refuses a real .github change on %s before any remote push", async path => {
     const f = await fixture({ configChange: true });
     if (path === "already imported retry") {
@@ -222,7 +264,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     f.expectGaveUp();
     expect(runs.get("run").head_sha).toBe(f.base);
     expect(await f.remoteHead()).toBe("");
-    expect(f.rpc).toHaveBeenCalledTimes(1);
+    expect(f.rpc.mock.calls.filter(([method]) => method === "snapshot")).toHaveLength(1);
     expect(f.destroy).toHaveBeenCalledTimes(1);
     expect(githubRequests()).toEqual([availabilityEndpoint, prEndpoint]);
     await expect(readFile(join(f.cwd, ".git", "gond-agent.bundle"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -238,13 +280,14 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(runs.get("run").ci_state).not.toBe("gave_up");
     // Retry/reconciliation must not repeat availability checks after the ref was created.
     expect(githubRequests()).toEqual([availabilityEndpoint, prEndpoint, prEndpoint]);
-    expect(f.rpc).toHaveBeenCalledTimes(1);
+    expect(f.rpc.mock.calls.filter(([method]) => method === "snapshot")).toHaveLength(1);
     expect(f.start).toHaveBeenCalledExactlyOnceWith("run", f.head);
   }, 20_000);
 
   it("retains a genuinely imported failed publication and rechecks the current PR before its direct push retry", async () => {
     const f = await fixture({ failPushes: 5 });
     await expect(service().publish("run", f.live)).rejects.toMatchObject({ step: "push", attempts: 5 });
+    expect(f.events.map(event => event.kind)).toEqual(Array.from({ length: 5 }, () => ["guard", "push"]).flat());
     expect(service().live.get("run").publishPending).toMatchObject({ imported: true, snapshot: { head: f.head } });
     expect(await f.git(f.cwd, "rev-parse", "HEAD")).toBe(f.head);
     expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
@@ -259,7 +302,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     f.expectGaveUp();
     expect(runs.get("run").head_sha).toBe(f.base);
     expect(await f.remoteHead()).toBe("");
-    expect(f.rpc).toHaveBeenCalledTimes(1); // No new snapshot/import from the retained worker.
+    expect(f.rpc.mock.calls.filter(([method]) => method === "snapshot")).toHaveLength(1); // No new snapshot/import from the retained worker.
     expect(githubRequests()).toEqual([availabilityEndpoint, ...Array(6).fill(prEndpoint)]);
   }, 20_000);
 
@@ -273,7 +316,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     f.expectLeasedPushes();
     expect(await f.remoteHead()).toBe(f.head);
     expect(runs.get("run")).toMatchObject({ pushed: true, head_sha: f.head, ci_pending_sha: f.head });
-    expect(f.rpc).toHaveBeenCalledTimes(1);
+    expect(f.rpc.mock.calls.filter(([method]) => method === "snapshot")).toHaveLength(1);
     expect(githubRequests()).toEqual([availabilityEndpoint, ...Array(6).fill(prEndpoint)]);
     expect(f.start).toHaveBeenCalledExactlyOnceWith("run", f.head);
   }, 20_000);
@@ -368,7 +411,9 @@ describe("automatic CI publication with explicit-branch leases", () => {
     if (timing === "before publication") runs.enqueue("run", "u", "Do not lose this queued message");
     // Also cover a human request arriving after publication captured the turn,
     // but before the pinned-commit guard executes.
-    f.rpc.mockImplementationOnce(async () => {
+    const originalRpc = f.rpc.getMockImplementation()!;
+    f.rpc.mockImplementation(async method => {
+      if (method !== "snapshot") return originalRpc(method);
       if (timing === "after stop") await runs.stop("run", "u");
       if (timing !== "before publication") runs.enqueue("run", "u", "Do not lose this queued message");
       expect(runs.get("run").ci_turn).toBe(false);
@@ -424,7 +469,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     const execute = vi.mocked(command).getMockImplementation()!;
     let queued = false;
     vi.mocked(command).mockImplementation(async (file, args, options) => {
-      if (!queued && file === "git" && args.includes("--name-only")) {
+      if (!queued && file === "git" && isCiGuard(args)) {
         queued = true;
         runs.enqueue("run", "u", "I arrived during boot");
       }

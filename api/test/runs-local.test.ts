@@ -9,10 +9,11 @@ import { ApiError } from "../src/wire";
 import { saveProviderSettings } from "../src/providers";
 import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
-import { gh, checkout, importBundle, pushBranch } from "../src/github";
+import { gh, git, checkout, importBundle, pushBranch } from "../src/github";
 import { RetryError } from "../src/retry";
 import { command } from "../src/command";
 import * as publication from "../src/runs/publication";
+import { evidenceSigningKey, evidenceState, signedRecord, unverifiedDescription } from "./fixtures/evidence";
 import { createMcp, createToken, sessionState } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 vi.mock("../src/github", async (original) => {
@@ -52,6 +53,7 @@ let dir: string,
   destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
 let workerFailure: string | null;
 let workerTurns: Record<string, unknown>[][];
+let workerEvidenceReply: unknown;
 let relay: (req: Request) => Promise<Response>;
 const cfg = (): Config => ({
   data: dir,
@@ -81,6 +83,7 @@ beforeEach(async () => {
   events = [];
   workerFailure = null;
   workerTurns = [];
+  workerEvidenceReply = true;
   destroy = vi.fn(async () => {});
   runs = new Runs(db, cfg(), async (_id, handler) => {
     relay = handler;
@@ -115,6 +118,7 @@ beforeEach(async () => {
               { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
             );
         }
+        if (method === "export_state") return workerEvidenceReply as any;
         if (method === "events") {
           const batch = events.splice(0);
           return { events: batch, alive: true } as any;
@@ -137,6 +141,127 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 describe("persistent local run lifecycle", () => {
+  it("captures the private evidence key before work, authenticates events across follow-ups and derives freshness on the service", async () => {
+    workerEvidenceReply = evidenceState();
+    const record = signedRecord();
+    workerTurns.push([
+      { type: "evidence.recorded", record },
+      { type: "evidence.recorded", record }, // replay
+      { type: "evidence.recorded", record: { ...record, command: "forged" } },
+      { type: "evidence.recorded", record: signedRecord({ seq: 3 }), extra: "not allowed" },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ]);
+    const guardedImport = async (cwd: string, _bundle: Buffer, branch: string, _env?: NodeJS.ProcessEnv, _retry?: unknown, options?: import("../src/github").PushOptions) => {
+      await options?.beforePush?.({ cwd, branch, head: "b".repeat(40) });
+    };
+    vi.mocked(importBundle).mockImplementationOnce(guardedImport);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.findIndex(call => call.method === "export_state")).toBeLessThan(log.findIndex(call => call.method === "send"));
+    expect(log.filter(call => call.method === "export_state")).toEqual([
+      { method: "export_state", run_id: r.id, owner_id: "u" }, { method: "export_state", run_id: r.id, owner_id: "u" },
+    ]);
+    expect(runs.get(r.id).evidence).toMatchObject({ records: [record], last_seq: 1, publication_tree: "a".repeat(40), policy: { enabled: true } });
+    expect(publication.descriptionFor(runs.get(r.id))).toContain("1 fresh successful check(s)");
+    expect(git).toHaveBeenCalledWith("/fake", "rev-parse", `${"b".repeat(40)}^{tree}`);
+    const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+    expect(stored.data).not.toContain(evidenceSigningKey.toString("hex"));
+    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(evidenceSigningKey.toString("hex"));
+    expect(runs.history(r.id, 0).filter(e => e.type === "evidence.recorded")).toHaveLength(1);
+    const stale = runs.get(r.id);
+    // Finish-time key rotation cannot authorize a new signature, nor replace the original key.
+    workerEvidenceReply = evidenceState("f".repeat(64));
+    const next = signedRecord({ seq: 2, id: "00000000-0000-4000-8000-000000000002", tree_hash_after: "c".repeat(40) });
+    workerTurns.push([
+      { type: "evidence.recorded", record: next },
+      { type: "evidence.recorded", record: signedRecord({ seq: 3, id: "00000000-0000-4000-8000-000000000003" }, Buffer.alloc(32, 255)) },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ]);
+    vi.mocked(importBundle).mockImplementationOnce(guardedImport);
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(runs.get(r.id).evidence?.last_seq).toBe(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).evidence?.policy).toBeUndefined();
+    expect(publication.descriptionFor(runs.get(r.id))).toContain("Not verified.");
+    runs.save(stale);
+    expect(runs.get(r.id).evidence?.last_seq).toBe(2);
+    expect(runs.get(r.id).evidence?.ids).toHaveLength(2);
+  });
+  it.each([false, true])("preserves run-wide evidence budgets through reopen and stale saves (records=%s)", async withRecord => {
+    const reply = evidenceState();
+    reply.state.evidence.gate_rounds = 6;
+    workerEvidenceReply = reply;
+    workerTurns.push([
+      ...(withRecord ? [{ type: "evidence.recorded", record: signedRecord({ seq: 8 }) }] : []),
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ]);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.find(call => call.method === "start")).toMatchObject({ evidence_seq: 0, evidence_gate_rounds: 0, evidence_resumes: 0 });
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_rounds: 6, resumes: 0, last_seq: withRecord ? 8 : 0 });
+    const stale = runs.get(r.id);
+    await runs.closeSession(r.id, "u");
+    // A fresh worker's lower counters cannot reset the durable global budget.
+    workerEvidenceReply = evidenceState();
+    runs.enqueue(r.id, "u", "Reopen");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "start")).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.filter(call => call.method === "start")[1]).toMatchObject({ evidence_seq: withRecord ? 8 : 0, evidence_gate_rounds: 6, evidence_resumes: 1 });
+    runs.save(stale);
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_rounds: 6, resumes: 1 });
+    await runs.closeSession(r.id, "u");
+    workerEvidenceReply = true; // No private finish metadata must not reset budgets either.
+    runs.enqueue(r.id, "u", "Reopen again");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "start")).toHaveLength(3));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.filter(call => call.method === "start")[2]).toMatchObject({ evidence_gate_rounds: 6, evidence_resumes: 2 });
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_rounds: 6, resumes: 2 });
+  });
+  it("charges a crash-safe gate reservation before work even when no finish metadata exists", async () => {
+    // No turn.end means there is no safe finish-state export at all.
+    workerTurns.push([{ type: "error", agent_id: "main", message: "The worker connection failed.", retryable: false }]);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 2, records: [] });
+    expect(log.filter(call => call.method === "export_state")).toHaveLength(1);
+    await runs.closeSession(r.id, "u");
+    workerFailure = null;
+    runs.enqueue(r.id, "u", "Reopen after failure");
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(log.filter(call => call.method === "start")[1]).toMatchObject({ evidence_gate_rounds: 2 });
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 4 });
+  });
+  it("fails closed for legacy initial exports even if a key appears at turn finish or in unsolicited events", async () => {
+    workerTurns.push([{ type: "evidence.recorded", record: signedRecord() }, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" }]);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    workerEvidenceReply = evidenceState();
+    workerTurns.push([
+      { type: "state.exported", ...evidenceState() }, { type: "evidence.recorded", record: signedRecord() },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ]);
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "export_state")).toHaveLength(3));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).evidence?.records).toEqual([]);
+    expect(runs.history(r.id, 0).some(e => e.type === "evidence.recorded" || e.type === "state.exported")).toBe(false);
+    expect(publication.descriptionFor(runs.get(r.id))).toContain("Not verified.");
+    expect(JSON.stringify(runs.get(r.id))).not.toContain(evidenceSigningKey.toString("hex"));
+  });
+  it("does not publish if Stop arrives during the private finish-state export", async () => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const snapshots = log.filter(call => call.method === "snapshot").length;
+    let release!: (reply: unknown) => void;
+    workerEvidenceReply = new Promise(resolve => { release = resolve; });
+    runs.enqueue(r.id, "u", "Continue");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "export_state")).toHaveLength(3));
+    await runs.stop(r.id, "u");
+    release(true);
+    await vi.waitFor(() => expect((runs as any).live.get(r.id).busy).toBe(false));
+    expect(runs.get(r.id).status).toBe("stopped");
+    expect(log.filter(call => call.method === "snapshot")).toHaveLength(snapshots);
+  });
   it.each([['runner', false], ['web', true], ['mcp', true], ['unknown', false]] as const)("starts %s runs with interactive=%s", async (source, interactive) => {
     const r = await runs.create("u", {repo:"acme/app", model:"auto", prompt:"Work", source});
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
@@ -478,7 +603,7 @@ describe("persistent local run lifecycle", () => {
       expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,work_kept:true,head_sha:null});
       expect(vi.mocked(importBundle).mock.calls[0]?.slice(2)).toEqual([
         branch, expect.objectContaining({GH_TOKEN:"test-managed-github-token"}), undefined,
-        {lease:"create-only",beforePush:undefined},
+        {lease:"create-only",beforePush:expect.any(Function)},
       ]);
       const preflights = () => vi.mocked(gh).mock.calls.filter(call => call[0] === endpoint);
       expect(preflights()).toHaveLength(2); // Creation and the fresh snapshot only.
@@ -502,7 +627,7 @@ describe("persistent local run lifecycle", () => {
       expect(vi.mocked(pushBranch).mock.calls[0]).toEqual([
         path === "retained" ? "/fake" : join(dir, "checkouts", r.id), branch,
         expect.objectContaining({GH_TOKEN:"test-managed-github-token"}), undefined,
-        {lease:"create-only",beforePush:undefined},
+        {lease:"create-only",beforePush:expect.any(Function)},
       ]);
       expect(preflights()).toHaveLength(2);
       expect(checkout).toHaveBeenCalledTimes(clones);
@@ -517,7 +642,7 @@ describe("persistent local run lifecycle", () => {
       if (path === "capacity-reclaimed") expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
       const imports = vi.mocked(importBundle).mock.calls.filter(call => call[2] === branch);
       expect(imports).toHaveLength(2); // No re-import of the kept commit; only the completed follow-up.
-      expect(imports[1]?.slice(4)).toEqual([undefined, {lease:undefined,beforePush:undefined}]);
+      expect(imports[1]?.slice(4)).toEqual([undefined, {lease:undefined,beforePush:expect.any(Function)}]);
     } finally {
       release?.();
       vi.mocked(gh).mockImplementation(original);
@@ -831,7 +956,7 @@ describe("persistent local run lifecycle", () => {
     expect(vi.mocked(importBundle).mock.calls[0]?.[2]).toBe(branch);
     expect(log.find(call => call.method === "snapshot")).toMatchObject({ title });
     expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toEqual({
-      title, head: branch, base: "main", body: "Fixed it and tested it.",
+      title, head: branch, base: "main", body: unverifiedDescription("Fixed it and tested it."),
     });
   });
   it("refuses an existing remote branch before reserving or starting a run", async () => {
@@ -864,7 +989,7 @@ describe("persistent local run lifecycle", () => {
   it.each(["Release notes supplied by the caller.\n\nKeep this description.", ""])("persists explicit PR body %j through follow-ups and later PATCH overrides", async body => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it", pr_body: body });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
-    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: unverifiedDescription(body) });
     const patches = () => vi.mocked(gh).mock.calls.filter(call => call[0] === "repos/acme/app/pulls/42" && call[1] === "PATCH");
     runs.enqueue(r.id, "u", "Add a regression test");
     await vi.waitFor(() => expect(patches()).toHaveLength(1));
@@ -878,7 +1003,7 @@ describe("persistent local run lifecycle", () => {
     runs.enqueue(r.id, "u", "One more check");
     await vi.waitFor(() => expect(patches()).toHaveLength(3));
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
-    expect(patches().map(call => call[2])).toEqual([{ body }, { body: replacement }, { body: replacement }]);
+    expect(patches().map(call => call[2])).toEqual([{ body: unverifiedDescription(body) }, { body: unverifiedDescription(replacement) }, { body: unverifiedDescription(replacement) }]);
     runs.save(stale);
     expect(runs.get(r.id).pr_body).toBe(replacement);
     const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
@@ -914,7 +1039,7 @@ describe("persistent local run lifecycle", () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt, title });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary).toMatchObject({ text: reply, final_reply: true });
-    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: reply });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: unverifiedDescription(reply) });
     const types = new Set(fixture.map(event => event.type));
     expect(runs.history(r.id, 0).filter(event => types.has(event.type))).toMatchObject(fixture);
 
@@ -930,12 +1055,12 @@ describe("persistent local run lifecycle", () => {
     await vi.waitFor(() => expect(patches()).toHaveLength(1));
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary.text).toBe("");
-    expect(patches()[0]?.[2]).toEqual({ body: title });
+    expect(patches()[0]?.[2]).toEqual({ body: unverifiedDescription(title) });
     runs.enqueue(r.id, "u", "Finish with a new reply");
     await vi.waitFor(() => expect(patches()).toHaveLength(2));
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary).toMatchObject({ text: "Fixed it and tested it.", final_reply: true });
-    expect(patches()[1]?.[2]).toEqual({ body: "Fixed it and tested it." });
+    expect(patches()[1]?.[2]).toEqual({ body: unverifiedDescription("Fixed it and tested it.") });
   });
   it.each(["max_tokens", "unknown_stop"])("publishes the title instead of text ending with %s without altering the transcript", async stop_reason => {
     const fixture = [
@@ -948,7 +1073,7 @@ describe("persistent local run lifecycle", () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", title, prompt: "Task with sensitive pasted text" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary.final_reply).toBe(false);
-    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: title });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: unverifiedDescription(title) });
     expect(runs.history(r.id, 0).filter(event => fixture.some(item => item.type === event.type))).toMatchObject(fixture);
   });
   it("refreshes externally merged PRs once, preserves concurrent run updates and blocks follow-ups", async () => {

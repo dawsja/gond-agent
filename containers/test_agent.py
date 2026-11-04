@@ -177,7 +177,20 @@ print(output)
         self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
         self.assertEqual(env["GOND_AGENT_RELAY_TOKEN"], agent.relay_token)
         added = set(env) - set(os.environ)
-        self.assertEqual(added, {"GOND_AGENT_RELAY_TOKEN", "GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES"} - set(os.environ))
+        self.assertEqual(added, {"GOND_AGENT_RELAY_TOKEN", "GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES",
+                                "GOND_AGENT_EVIDENCE_BASE_SHA", "GOND_AGENT_EVIDENCE", "GOND_AGENT_EVIDENCE_REPO_POLICY",
+                                "GOND_AGENT_EVIDENCE_SEQ", "GOND_AGENT_EVIDENCE_GATE_ROUNDS", "GOND_AGENT_EVIDENCE_RESUMES"} - set(os.environ))
+        self.assertEqual(env["GOND_AGENT_EVIDENCE"], "on")
+        self.assertEqual(env["GOND_AGENT_EVIDENCE_GATE_ROUNDS"], "0")
+        configured = agent.worker_env({"model": "fixture", "evidence_base_sha": "a" * 40,
+                                       "evidence_mode": "off", "evidence_repo_policy": "allow-weaken",
+                                       "evidence_seq": 7, "evidence_gate_rounds": 4, "evidence_resumes": 2})
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_BASE_SHA"], "a" * 40)
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE"], "off")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_REPO_POLICY"], "allow-weaken")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_SEQ"], "7")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_GATE_ROUNDS"], "4")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_RESUMES"], "2")
 
     def test_each_dispatch_start_passes_a_fresh_token_only_in_worker_environment(self):
         output, errors, log = io.StringIO(), io.StringIO(), io.BytesIO()
@@ -732,7 +745,90 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD^").decode().strip(), self.head)
         self.assertNotEqual(published["head"], data["checkpoint_sha"])
         self.assertNotIn(b"ignored-secret", self.git("ls-tree", "-r", "--name-only", "HEAD"))
-        self.assertFalse((fresh / "local-exclude").exists())
+        self.assertEqual((fresh / "local-exclude").read_text(), "also do not export\n")
+
+    def test_tree_hash_ignores_private_excludes_and_detects_changes_without_mutation(self):
+        self.write("edit.txt", "staged\n")
+        self.git("add", "edit.txt")
+        self.write("edit.txt", "working\n")
+        self.write("untracked", "new\n")
+        self.write("ignored-code", "outside evidence\n")
+        (self.root / ".git/info/exclude").write_text("untracked\n")
+        excludes = pathlib.Path(self.temp.name, "global-excludes")
+        excludes.write_text("untracked\n")
+        self.git("config", "core.excludesFile", str(excludes))
+        before = self.state()
+        first = agent.tree_hash()
+        self.assertEqual(agent.tree_hash(), first)
+        self.assertEqual(self.state(), before)
+        self.write("untracked", "changed\n")
+        self.assertNotEqual(agent.tree_hash(), first)
+        self.write("untracked", "new\n")
+        self.assertEqual(agent.tree_hash(), first)
+        self.write("ignored-code", "still outside evidence\n")
+        self.assertEqual(agent.tree_hash(), first)
+        # .gitignore changes themselves invalidate evidence, but an already
+        # ignored path remains outside the tree: callers must not trust its code.
+        self.write(".gitignore", "ignored*\nuntracked\n")
+        self.assertNotEqual(agent.tree_hash(), first)
+        self.write(".gitignore", "ignored*\n")
+        self.assertEqual(self.state(), before)
+        data = self.export()
+        bundle = pathlib.Path(self.temp.name, "tree.bundle")
+        bundle.write_bytes(base64.b64decode(data["bundle"]))
+        self.git("fetch", "-q", str(bundle), agent.CHECKPOINT_REF)
+        self.assertEqual(self.git("rev-parse", data["checkpoint_sha"] + "^{tree}").decode().strip(), first)
+        published = agent.dispatch({"method": "snapshot", "identity": self.identity, "title": "Publication"})
+        self.assertEqual(self.git("rev-parse", published["head"] + "^{tree}").decode().strip(), first)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
+        self.assertEqual(self.git("show", "HEAD:untracked"), b"new\n")
+        self.assertEqual(agent.tree_hash(), first)
+
+    def test_snapshot_ignores_hostile_config_hooks_environment_and_preserves_bundles(self):
+        shallow = pathlib.Path(self.temp.name, "publication-shallow")
+        self.git("clone", "-q", "--depth", "1", "--no-tags", self.root.as_uri(), str(shallow))
+        self.root = shallow
+        agent.ROOT = str(shallow)
+        self.write(".gitattributes", "*.txt filter=unsafe\n")
+        self.write("edit.txt", "published\n")
+        self.write("hidden", "included despite private excludes\n")
+        (self.root / ".git/info/exclude").write_text("hidden\n")
+        self.git("config", "filter.unsafe.clean", "touch filter-ran; cat")
+        self.git("config", "core.fsmonitor", "touch fsmonitor-ran")
+        self.git("config", "core.worktree", "/missing")
+        bad_config = pathlib.Path(self.temp.name, "bad-publication-config")
+        bad_config.write_text("invalid Git config\n")
+        self.git("config", "include.path", str(bad_config))
+        hooks = self.root / ".git/hooks"
+        for name in ("pre-commit", "post-commit", "reference-transaction"):
+            hook = hooks / name
+            hook.write_text("#!/bin/sh\ntouch hook-ran\nexit 1\n")
+            hook.chmod(0o755)
+        config_before = (self.root / ".git/config").read_bytes()
+        expected = agent.tree_hash()
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/missing", "GIT_INDEX_FILE": "/missing",
+                                         "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                                         "GIT_CONFIG_VALUE_0": "touch env-ran", "GIT_OBJECT_DIRECTORY": "/missing"}):
+            published = agent.dispatch({"method": "snapshot", "identity": self.identity, "title": "Safe snapshot"})
+            # An unchanged tree needs no identity and must not create a commit.
+            unchanged = agent.dispatch({"method": "snapshot"})
+        self.assertEqual(published["head"], unchanged["head"])
+        self.assertEqual((self.root / ".git/config").read_bytes(), config_before)
+        for name in ("filter-ran", "fsmonitor-ran", "hook-ran", "env-ran"):
+            self.assertFalse((self.root / name).exists())
+        with agent.checkpoint_repository() as (git, _, _, head):
+            self.assertEqual(head, published["head"])
+            self.assertEqual(git("rev-parse", head + "^{tree}").decode().strip(), expected)
+            self.assertEqual(git("rev-list", "--parents", "-n", "1", head).decode().strip(), f"{head} {self.head}")
+        # A normal receiver can import the shallow publication bundle against its
+        # existing history, without rewriting that history or losing new files.
+        receiver = pathlib.Path(self.temp.name, "receiver")
+        self.git("clone", "-q", "--no-local", str(pathlib.Path(self.temp.name, "clone")), str(receiver))
+        bundle = pathlib.Path(self.temp.name, "publication.bundle")
+        bundle.write_bytes(base64.b64decode(published["bundle"]))
+        self.git("fetch", "-q", str(bundle), "HEAD", cwd=receiver)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), published["head"])
+        self.assertEqual(self.git("show", "FETCH_HEAD:hidden", cwd=receiver), b"included despite private excludes\n")
 
     def test_newly_staged_ignored_files_fail_closed_without_mutating_clone(self):
         self.write("ignored-tracked", "private work\n")
@@ -740,6 +836,10 @@ class CheckpointTest(unittest.TestCase):
         before = self.state()
         with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
             self.export()
+        with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
+            agent.tree_hash()
+        with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
+            agent.dispatch({"method": "snapshot", "identity": self.identity})
         self.assertEqual(self.state(), before)
         self.assertEqual((self.root / "ignored-tracked").read_text(), "private work\n")
 

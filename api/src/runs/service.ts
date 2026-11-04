@@ -40,9 +40,12 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
+import { acceptEvidence, emptyEvidence, evidenceKey, finishEvidence, weakenedEvidence, type Evidence } from "./evidence";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
+  /** Validated public evidence only. Signing keys belong exclusively to Live. */
+  evidence?: Evidence;
   ci_turn?: boolean;
   /** Unpublished work still belongs to an automatic round, even after a human queues work. */
   ci_publication_pending?: boolean;
@@ -100,6 +103,8 @@ export function parseRun(data: string): Run {
   return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
 }
 interface Live {
+  /** Captured once, before the first task, never serialized or refreshed at turn end. */
+  evidenceKey?: Buffer;
   workspace: Workspace;
   cwd: string;
   cursor: number;
@@ -224,7 +229,7 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body,json_extract(data, '$.evidence') AS evidence FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null; pr_body: string | null; evidence: string | null} | undefined;
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
@@ -232,6 +237,16 @@ export class Runs {
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
+    if (stored?.evidence) {
+      const evidence = JSON.parse(stored.evidence) as Evidence;
+      // Async lifecycle snapshots cannot roll replay protection or budgets back,
+      // including turns that consumed gate rounds without producing a record.
+      const rounds = Math.max(evidence.gate_rounds ?? 0, r.evidence?.gate_rounds ?? 0);
+      const resumes = Math.max(evidence.resumes ?? 0, r.evidence?.resumes ?? 0);
+      const gateBudget = Math.max(evidence.gate_budget ?? 0, r.evidence?.gate_budget ?? 0);
+      if (!r.evidence || evidence.last_seq > r.evidence.last_seq) r.evidence = evidence;
+      r.evidence = { ...r.evidence, gate_rounds: rounds, gate_budget: gateBudget, resumes };
+    }
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -262,6 +277,17 @@ export class Runs {
     }
   }
   append(id: string, event: Record<string, unknown>) {
+    // State replies are private control data, never transcript events.
+    if (typeof event.type === "string" && event.type.startsWith("state.")) return;
+    if (event.type === "evidence.recorded") {
+      if (Object.keys(event).some(key => key !== "type" && key !== "record")) return;
+      const run = this.get(id);
+      const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey);
+      if (!evidence) return;
+      run.evidence = evidence;
+      this.save(run);
+      event = { type: "evidence.recorded", record: evidence.records.at(-1) };
+    }
     if (event.type === "tool.images") {
       const run = this.get(id);
       const images: { id: string; media_type: string }[] = [];
@@ -671,7 +697,7 @@ export class Runs {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
         try {
-          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
+          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r, r.pending[0]?.source === "ci"))));
         } catch (error) {
           if (!this.ciPublicationRefused(id, error)) throw error;
           r = this.get(id);
@@ -738,7 +764,18 @@ export class Runs {
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
       this.status(r, "working", "Starting the agent");
+      r.base_sha ??= (await git(checked.cwd, "rev-parse", `origin/${r.base_branch}`)).toString().trim();
+      // Persist before startup so a failed/reopened worker cannot replenish the
+      // run-wide resume budget, even when it never emitted an evidence record.
+      r.evidence = { ...(r.evidence ?? emptyEvidence()), resumes: r.evidence ? (r.evidence.resumes ?? 0) + 1 : 0 };
+      this.save(r);
       await workspace.rpc("start", {
+        evidence_base_sha: r.base_sha,
+        evidence_mode: process.env.GOND_AGENT_EVIDENCE === "off" ? "off" : "on",
+        evidence_repo_policy: process.env.GOND_AGENT_EVIDENCE_REPO_POLICY === "allow-weaken" ? "allow-weaken" : "",
+        evidence_seq: r.evidence.last_seq,
+        evidence_gate_rounds: Math.max(r.evidence.gate_rounds ?? 0, r.evidence.gate_budget ?? 0),
+        evidence_resumes: r.evidence.resumes,
         model: r.model_id, effort: r.effort ?? "high",
         interactive: r.pending[0]?.source !== "ci" && (r.source === "web" || r.source === "mcp"),
         question_wait_minutes: questionWaitMinutes(),
@@ -747,7 +784,13 @@ export class Runs {
         ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
       });
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
+      // Legacy workers/mocks may not export evidence. Fail closed without logging
+      // the reply or blocking ordinary work; never retry key acquisition later.
+      let signingKey: Buffer | undefined;
+      try { signingKey = evidenceKey(await workspace.rpc("export_state", { run_id: id, owner_id: r.user_id })); } catch { /* unavailable */ }
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
+        evidenceKey: signingKey,
         workspace,
         cwd: checked.cwd,
         cursor: 0,
@@ -815,6 +858,9 @@ export class Runs {
     r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
+    // Reserve before delivering the task: a crash before the private finish
+    // export may spend unused allowance, but can never reset the global budget.
+    r.evidence = { ...(r.evidence ?? emptyEvidence()), gate_budget: Math.min(6, Math.max(r.evidence?.gate_budget ?? 0, r.evidence?.gate_rounds ?? 0) + 2) };
     r.work_kept = false;
     delete r.last_error;
     r.phase = "agent";
@@ -893,11 +939,13 @@ export class Runs {
           continue;
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
-          if (event.stop_reason === "error") continue;
+          if (event.stop_reason === "error") { await this.captureEvidence(id, live); continue; }
           if (event.stop_reason === "interrupted") {
+            await this.captureEvidence(id, live);
             live.busy = false;
-            r.phase = "agent";
-            this.status(r, "stopped");
+            const stopped = this.get(id);
+            stopped.phase = "agent";
+            this.status(stopped, "stopped");
           } else if (event.stop_reason !== "compacted") {
             await this.finish(id, live);
           }
@@ -912,9 +960,20 @@ export class Runs {
       await delay(batch.events.length ? 50 : 300);
     }
   }
+  private async captureEvidence(id: string, live: Live) {
+    let r = this.get(id);
+    let reply: unknown;
+    try { reply = await live.workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable; no private reply is logged */ }
+    r = this.get(id);
+    r.evidence = finishEvidence(r.evidence, reply, live.evidenceKey);
+    this.save(r);
+  }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
     if (r.status === "stopped") { live.busy = false; return; }
+    await this.captureEvidence(id, live);
+    r = this.get(id);
+    if (live.closed || r.status === "stopped") { live.busy = false; return; }
     r.phase = "finishing";
     this.status(r, "working", "Pushing changes");
     const published = await this.publish(id, live);
@@ -937,6 +996,33 @@ export class Runs {
       if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
     }
     this.drain();
+  }
+  /** Derive freshness on the service clone from the exact pinned commit being pushed. */
+  private evidenceBeforePush(run: Run, guard?: PushOptions["beforePush"]): PushOptions["beforePush"] {
+    // Inspect every publication, including gate-off/docs-only/no-record turns.
+    return async context => {
+      const current = this.get(run.id);
+      let tree: string | undefined;
+      let uiRequired: boolean | undefined;
+      let docsOnly = false;
+      let warnings = ["Publication tree or verification diff unavailable."];
+      try {
+        const candidate = (await git(context.cwd, "rev-parse", `${context.head}^{tree}`)).toString().trim();
+        if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(candidate)) tree = candidate;
+        const diff = (await git(context.cwd, "diff", "--no-ext-diff", "--no-textconv", current.base_sha!, context.head, "--")).toString();
+        const paths = (await git(context.cwd, "diff", "--name-only", "--no-renames", "-z", current.base_sha!, context.head, "--")).toString().split("\0").filter(Boolean);
+        uiRequired = paths.some(path => path.startsWith("web/") || /\.(?:tsx|css)$/.test(path));
+        // Symlink mode changes must never inherit the regular-Markdown waiver.
+        docsOnly = paths.length > 0 && paths.every(path => path.endsWith(".md") && (!path.includes("/") || path.startsWith("docs/"))) && !/^(?:(?:old|new) mode 120000|(?:new|deleted) file mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/m.test(diff);
+        warnings = weakenedEvidence(diff.slice(0, 2_000_000));
+        if (diff.length > 2_000_000) warnings.push("Verification diff truncated; additional test/policy changes may be omitted.");
+      } catch { tree = undefined; /* no freshness claim on incomplete service-side Git inspection */ }
+      // Keep the CI guard's final stop/PR recheck closest to the actual push.
+      if (guard) await guard(context);
+      const latest = this.get(run.id);
+      latest.evidence = { ...(latest.evidence ?? emptyEvidence()), publication_tree: tree, weakened: warnings, ui_required: uiRequired, docs_only: docsOnly };
+      this.save(latest);
+    };
   }
   /** Recheck automatic-round policy against the pinned commit on every push attempt. */
   private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
@@ -1011,7 +1097,7 @@ export class Runs {
     // Only preflight a fresh snapshot. An imported retry may already exist remotely
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
-    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
+    const pushOptions = publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r)));
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       options.backgroundPublication
@@ -1077,6 +1163,8 @@ export class Runs {
       r.deletions += Number(d) || 0;
     }
     r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, ci_pending_sha: pushed ? head : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    // Also surface weakening for legacy workers, which have no signed records.
+    if (r.evidence) r.evidence.weakened = [...new Set([...(r.evidence.weakened ?? []), ...weakenedEvidence(r.diff)])].sort().slice(0, 32);
     this.save(r);
     this.append(id, {
       type: "run.diff",
