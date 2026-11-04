@@ -216,7 +216,7 @@ export interface PushOptions {
   /** Set for an explicit new branch until publication is confirmed; never infer it from a name. */
   lease?: "create-only";
   /** Policy guard for every push attempt, outside retry classification. */
-  beforeAttempt?: (context: { cwd: string; branch: string; head: string }) => Promise<void>;
+  beforePush?: (context: { cwd: string; branch: string; head: string }) => Promise<void>;
 }
 
 export async function importBundle(
@@ -245,9 +245,9 @@ export async function importBundle(
 /** Retry publication of an already imported commit without needing the worker bundle again. */
 export async function pushBranch(cwd: string, branch: string, env: NodeJS.ProcessEnv = process.env, retryOptions?: RetryOptions, options: PushOptions = {}) {
   if (!validBranch(branch)) throw new Error("Invalid branch");
-  const { lease, beforeAttempt } = options;
+  const { lease, beforePush } = options;
   // Pin guarded/create-only publication so reconciliation compares the exact commit sent.
-  const head = lease || beforeAttempt ? (await git(cwd, "rev-parse", "HEAD")).toString().trim() : "HEAD";
+  const head = lease || beforePush ? (await git(cwd, "rev-parse", "HEAD")).toString().trim() : "HEAD";
   if (head !== "HEAD" && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error("Invalid publication commit");
   const ref = `refs/heads/${branch}`;
   await withRetry("push", async () => {
@@ -266,9 +266,9 @@ export async function pushBranch(cwd: string, branch: string, env: NodeJS.Proces
     }
   }, {
     ...retryOptions,
-    beforeAttempt: beforeAttempt ? async () => {
+    beforeAttempt: beforePush ? async () => {
       if (retryOptions?.beforeAttempt) await retryOptions.beforeAttempt();
-      await beforeAttempt({ cwd, branch, head });
+      await beforePush({ cwd, branch, head });
     } : retryOptions?.beforeAttempt,
   });
 }

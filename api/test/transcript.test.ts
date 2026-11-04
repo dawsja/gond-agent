@@ -181,6 +181,19 @@ it("keeps CI status compact and automatic follow-ups separate from user messages
   expect(createTranscript()([pending, ...updates])).toEqual(after);
 });
 
+it("refreshes queue metadata on position changes and dequeue without duplicating replay", () => {
+  const append = createTranscript();
+  const queued = {seq:1, ts:1, type:"run.queued", position:2, length:3};
+  const before = append([queued]);
+  expect(append([queued]).queueRevision).toBe(before.queueRevision);
+  const after = append([
+    {seq:2, ts:2, type:"run.queued", position:1, length:2},
+    {seq:3, ts:3, type:"run.dequeued"},
+  ]);
+  expect(after.queueRevision).toBe(before.queueRevision + 2);
+  expect(after.items).toEqual([]);
+});
+
 it("discards aborted attempts and shows the successful reply once in transcript and summary", () => {
   const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq, type, agent_id: "main", ...fields });
   const append = createTranscript();

@@ -101,7 +101,7 @@ async function fixture(options: {
   const bundle = await readFile(bundlePath);
   const run: Run = {
     id: "run", user_id: "u", repo: "acme/app", base_branch: "main", branch,
-    branch_explicit: true, model_id: "local:coder", backend: "builtin",
+    explicit_branch: true, model_id: "local:coder", backend: "builtin",
     title: "Fix CI", prompt: "Fix CI", status: "ready", step: null,
     created_at: 1, updated_at: 1, started_at: 1, finished_at: null,
     pr_number: 7, pr_url: "https://github.com/acme/app/pull/7", pr_state: "open",
@@ -132,6 +132,7 @@ async function fixture(options: {
       if (args.includes("ls-remote")) {
         events.push({ kind: "ls-remote", args: [...args] });
         expect(commandOptions?.env?.GH_TOKEN).toBe(token);
+        expect(runs.get("run").pushed).toBe(false);
       }
       if (args.includes("push")) {
         events.push({ kind: "push", args: [...args] });
@@ -186,6 +187,22 @@ async function fixture(options: {
 }
 
 describe("automatic CI publication with explicit-branch leases", () => {
+  it.each(["first import", "already imported retry"])("refuses a real .github change on %s before any remote push", async path => {
+    const f = await fixture({ configChange: true });
+    if (path === "already imported retry") {
+      await f.git(f.cwd, "fetch", "--no-tags", f.bundlePath, "HEAD");
+      await f.git(f.cwd, "reset", "--hard", "FETCH_HEAD");
+      Object.assign(f.live, { publishPending: { imported: true, snapshot: { head: f.head, bundle: "" } } });
+    }
+    expect(await service().publish("run", f.live)).toBe(false);
+    expect(f.events.map(event => event.kind)).toEqual(["guard"]);
+    f.expectGaveUp();
+    expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
+    expect(await f.remoteHead()).toBe("");
+    expect(f.rpc).toHaveBeenCalledTimes(path === "first import" ? 1 : 0);
+    expect(gh).not.toHaveBeenCalled();
+  });
+
   it("rechecks the pinned diff after a transient first import push failure and refuses CI changes before a second push", async () => {
     const f = await fixture({ failPushes: 1, configOnRetry: true });
     await service().finish("run", f.live);
@@ -217,7 +234,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     await expect(service().publish("run", f.live)).rejects.toMatchObject({ step: "push", attempts: 5 });
     expect(service().live.get("run").publishPending).toMatchObject({ imported: true, snapshot: { head: f.head } });
     expect(await f.git(f.cwd, "rev-parse", "HEAD")).toBe(f.head);
-    expect(runs.get("run").head_sha).toBe(f.base);
+    expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
     expect(await f.remoteHead()).toBe("");
     const previous = f.events.length;
     // The same kept commit is no longer safe to publish, even though its diff is safe.
@@ -234,6 +251,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
   it("watches the kept commit after a retained publication succeeds without another snapshot or import", async () => {
     const f = await fixture({ failPushes: 5 });
     await expect(service().publish("run", f.live)).rejects.toMatchObject({ step: "push", attempts: 5 });
+    expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
     const previous = f.events.length;
     await service().finish("run", f.live);
     expect(f.events.slice(previous).map(event => event.kind)).toEqual(["guard", "push"]);

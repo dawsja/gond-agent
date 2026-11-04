@@ -4,15 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAuthentication, seal } from "../src/auth";
 import type { Config } from "../src/config";
+import type { Workspace, WorkspaceFactory } from "../src/containers";
 import { openStore } from "../src/db";
-import { gh, git, importBundle } from "../src/github";
+import { checkout, gh, git, importBundle } from "../src/github";
 import { emptySummary } from "../src/runs/fold";
+import { saveProviderSettings } from "../src/providers";
 import { Runs, type Run } from "../src/runs/service";
 import type { CiDeps, CiTransport, CiWatch } from "../src/runs/ci-watch";
 
 vi.mock("../src/github", async original => ({
   ...await original<typeof import("../src/github")>(),
   gh: vi.fn(async () => { throw new Error("Unexpected GitHub mutation/request"); }),
+  checkout: vi.fn(async () => { throw new Error("Unexpected repository checkout"); }),
   commitIdentity: vi.fn(async () => ({ name: "Fixture", email: "fixture@example.test" })),
   importBundle: vi.fn(),
   git: vi.fn(),
@@ -21,9 +24,9 @@ vi.mock("../src/github", async original => ({
 const SHA = "a".repeat(40), NEXT = "b".repeat(40), BASE = "c".repeat(40);
 const pushed = vi.fn();
 let dir: string, db: ReturnType<typeof openStore>, runs: Runs, cfg: Config;
-const factory = vi.fn(async () => { throw new Error("Tests must not boot a workspace"); });
+const factory = vi.fn<WorkspaceFactory>(async () => { throw new Error("Tests must not boot a workspace"); });
 
-// Exercise lifecycle hooks without starting boot/pump or real watcher timers.
+// Access lifecycle hooks; boot/pump and watcher timers are isolated per test.
 const service = () => runs as any;
 const watcher = () => service().ci as CiWatch;
 const ciDeps = () => service().ci.deps as CiDeps;
@@ -76,10 +79,13 @@ beforeEach(async () => {
     .run("u", "User", "user@example.test", 0, Date.now(), Date.now());
   db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
     .run("u", seal(cfg.secret, "test-owner-github-token"), Date.now());
+  saveProviderSettings(db, cfg.secret, { connections: [{ id: "local", name: "Local", format: "openai",
+    baseURL: "http://127.0.0.1:9/v1", apiKey: "fixture-provider-key", discover: false,
+    models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }], defaultModel: "local:coder" });
   runs = new Runs(db, cfg, factory);
   vi.mocked(importBundle).mockImplementation(async (cwd, _bundle, branch, _env, _retry, options) => {
     // Match importBundle's real ordering: validation must complete before push.
-    await options?.beforeAttempt?.({ cwd, branch, head: NEXT });
+    await options?.beforePush?.({ cwd, branch, head: NEXT });
     pushed();
   });
   vi.mocked(git).mockImplementation(async (_cwd, ...args) => {
@@ -131,7 +137,8 @@ describe("run service automatic CI hooks", () => {
       expect(runs.get(status)).toMatchObject({ ci_active: false, ci_state: "pending", ci_round: 1, ci_sha: SHA });
     }
     expect(runs.get("ready").status).toBe("ready");
-    for (const status of ["queued", "working"]) expect(runs.get(status)).toMatchObject({ status: "failed", phase: "idle", pending: [] });
+    expect(runs.get("queued")).toMatchObject({ status: "queued", phase: "idle", pending: [] });
+    expect(runs.get("working")).toMatchObject({ status: "failed", phase: "idle", pending: [] });
     await runs.recover(); // Idempotent, including persisted JSON boolean values.
     const rows = db.prepare("SELECT data FROM runs").all() as { data: string }[];
     expect(rows.every(row => JSON.parse(row.data).ci_active === false)).toBe(true);
@@ -139,17 +146,64 @@ describe("run service automatic CI hooks", () => {
     expect(factory).not.toHaveBeenCalled();
   });
 
-  it("rolls back the CI round and queue on capacity failure, then enqueues exactly once after capacity frees", async () => {
+  it("queues one durable CI round without a worker when capacity is full, then starts it once", async () => {
+    seed();
+    const boot = vi.spyOn(service(), "boot").mockResolvedValue(undefined);
+    service().booting.add("other-run");
+    expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(true);
+    expect(runs.get("run")).toMatchObject({ status: "queued", ci_round: 1, pending: [{ text: "Fix CI", source: "ci" }] });
+    expect(service().queue.has("run")).toBe(true);
+    expect(await ciDeps().followUp("run", "Duplicate fix", SHA)).toBe(false);
+    expect(boot).not.toHaveBeenCalled();
+    expect(factory).not.toHaveBeenCalled();
+    expect(runs.history("run", 0).filter(event => event.type === "ci")).toHaveLength(1);
+    service().booting.delete("other-run");
+    runs.drain();
+    expect(boot).toHaveBeenCalledExactlyOnceWith("run");
+    expect(service().queue.has("run")).toBe(false);
+  });
+
+  it("rolls back both the round and message when the persistent queue is full", async () => {
     seed();
     service().booting.add("other-run");
-    await expect(ciDeps().followUp("run", "Fix CI", SHA)).rejects.toMatchObject({ code: "run_limit" });
-    expect(runs.get("run")).toMatchObject({ ci_round: 0, pending: [] });
+    cfg.queueMax = 0;
+    await expect(ciDeps().followUp("run", "Fix CI", SHA)).rejects.toMatchObject({ code: "queue_full" });
+    expect(runs.get("run")).toMatchObject({ status: "ready", ci_round: 0, pending: [] });
+    expect(service().queue.has("run")).toBe(false);
     expect(runs.history("run", 0)).toEqual([]);
-    service().booting.delete("other-run");
-    vi.spyOn(service(), "boot").mockResolvedValue(undefined);
+  });
+
+  it("boots accepted automatic CI follow-ups non-interactively even when the run originated in the browser", async () => {
+    cfg.maxRuns = 2;
+    seed({ id: "browser", source: "web" });
+    seed({ source: "web" });
+    const browserRpc = vi.fn<Workspace["rpc"]>().mockResolvedValue(undefined);
+    const ciRpc = vi.fn<Workspace["rpc"]>().mockResolvedValue(undefined);
+    const checked = { cwd: "/fake", archive: Buffer.from("checkout") };
+    vi.mocked(checkout).mockResolvedValueOnce(checked).mockResolvedValueOnce(checked);
+    factory.mockResolvedValueOnce({ rpc: browserRpc as Workspace["rpc"], destroy: vi.fn(async () => {}) })
+      .mockResolvedValueOnce({ rpc: ciRpc as Workspace["rpc"], destroy: vi.fn(async () => {}) });
+    // Keep real enqueue, boot and message delivery, but never poll worker events.
+    vi.spyOn(service(), "pump").mockResolvedValue(undefined);
+
+    runs.enqueue("browser", "u", "Continue from the browser");
+    await service().launches.get("browser");
+    expect(browserRpc).toHaveBeenCalledWith("start", expect.objectContaining({ interactive: true }));
+
     expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(true);
-    expect(runs.get("run")).toMatchObject({ ci_round: 1, pending: [{ text: "Fix CI", source: "ci" }] });
-    expect(runs.history("run", 0).filter(event => event.type === "ci")).toHaveLength(1);
+    await service().launches.get("run");
+    expect(ciRpc.mock.calls.filter(([method]) => method === "start")).toEqual([
+      ["start", expect.objectContaining({ interactive: false })],
+    ]);
+    expect(ciRpc).toHaveBeenCalledWith("send", {
+      input: expect.objectContaining({ type: "user", text: "Fix CI" }),
+    });
+    expect(runs.get("run")).toMatchObject({
+      source: "web", status: "working", phase: "agent", ci_round: 1, ci_turn: true, pending: [],
+    });
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(gh).not.toHaveBeenCalled();
+    expect(git).not.toHaveBeenCalled();
   });
 
   it.each(["stop", "user follow-up"])("does not restore a stale ci_active snapshot after %s", async action => {
@@ -247,7 +301,7 @@ describe("run service automatic CI hooks", () => {
     for (const busy of [false, true]) {
       live.busy = busy;
       expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(false);
-      expect(() => runs.enqueue("run", "u", "Fix CI", [], undefined, undefined, "ci"))
+      expect(() => runs.enqueue("run", "u", "Fix CI", [], undefined, undefined, undefined, "ci"))
         .toThrow(/idle run with no pending question/);
       expect(runs.get("run")).toMatchObject({ ci_round: 0, pending: [], summary: { question } });
     }
@@ -277,8 +331,9 @@ describe("run service automatic CI hooks", () => {
     service().ci.io.request = request;
     const finishing = service().finish("run", live);
     await destroying.promise;
-    await runs.closeSession("run", "u");
-    release.resolve(); await finishing;
+    try { await runs.closeSession("run", "u"); }
+    finally { release.resolve(); }
+    await finishing;
     await watcher().settled("run");
     expect(request).not.toHaveBeenCalled();
     expect(runs.get("run").ci_cancelled_sha).toBe(NEXT);
@@ -314,12 +369,15 @@ describe("run service automatic CI hooks", () => {
       expect(runs.get("run").ci_round).toBe(1);
       expect(runs.get("legacy").ci_round).toBe(0);
     }
-    // Isolate the persisted handoff limit; enqueue behavior is covered above.
+    // Simulate the first round having completed; isolate the persisted handoff limit.
+    const completed = runs.get("run");
+    completed.status = "ready"; completed.pending = []; runs.save(completed);
+    service().queue.leave("run");
     const enqueue = vi.spyOn(runs, "enqueue").mockImplementation(() => {});
     expect(await ciDeps().followUp("run", "Second fix", SHA)).toBe(true);
     expect(runs.get("run").ci_round).toBe(2);
     expect(await ciDeps().followUp("run", "Third fix", SHA)).toBe(false);
-    expect(enqueue).toHaveBeenCalledExactlyOnceWith("run", "u", "Second fix", [], undefined, undefined, "ci");
+    expect(enqueue).toHaveBeenCalledExactlyOnceWith("run", "u", "Second fix", [], undefined, undefined, undefined, "ci");
     expect(factory).not.toHaveBeenCalled();
   });
 
@@ -333,7 +391,7 @@ describe("run service automatic CI hooks", () => {
 
     expect(importBundle).toHaveBeenCalledExactlyOnceWith(
       "/fake", Buffer.from("bundle"), "gond-agent/fix", expect.objectContaining({ GH_TOKEN: "test-owner-github-token" }), undefined,
-      expect.objectContaining({ beforeAttempt: expect.any(Function) }),
+      expect.objectContaining({ beforePush: expect.any(Function) }),
     );
     expect(git).toHaveBeenCalledExactlyOnceWith(
       "/fake", "diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", SHA, NEXT, "--",

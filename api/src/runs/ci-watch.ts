@@ -296,29 +296,21 @@ export class CiWatch {
   }
 
   private async handoff(id: string, watch: Watch, rounds: number, names: string[], text: string) {
-    for (let attempt = 0; attempt < 120; attempt++) {
-      await this.pullOpen(id, watch);
-      if (roundOf(this.guard(id, watch)) >= rounds) {
-        this.emit(id, watch, "gave_up", names, "The CI fix limit was reached.");
-        return;
-      }
-      // Re-resolve on every attempt, even with only legacy status diagnostics.
-      this.deps.env(watch.owner);
-      try {
-        await this.deps.followUp(id, text, watch.sha);
-        this.emit(id, watch, "failing", names);
-        return;
-      } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== "run_limit") throw error;
-        this.guard(id, watch);
-        this.emit(id, watch, "failing", names, "Waiting for a free workspace.", true);
-      }
-      if (attempt < 119) {
-        await this.io.sleep(Math.min(20_000, Math.max(0, watch.deadline - this.io.now())), watch.abort.signal);
-        this.guard(id, watch);
-      }
+    await this.pullOpen(id, watch);
+    if (roundOf(this.guard(id, watch)) >= rounds) {
+      this.emit(id, watch, "gave_up", names, "The CI fix limit was reached.");
+      return;
     }
-    this.emit(id, watch, "gave_up", names, "No workspace became available within the CI handoff limit.");
+    this.deps.env(watch.owner);
+    try {
+      // Closed sessions enter the durable run queue when capacity is full.
+      // Admission and round consumption are atomic; never duplicate its retry loop.
+      await this.deps.followUp(id, text, watch.sha);
+      this.emit(id, watch, "failing", names);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "queue_full") throw error;
+      this.emit(id, watch, "gave_up", names, "The workspace queue is full. Send a follow-up when space is available.");
+    }
   }
 
   private async output(id: string, watch: Watch, failures: Check[], statuses: Status[]) {

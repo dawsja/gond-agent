@@ -54,13 +54,13 @@ process.exit(result.status??1);
   await git(cwd, "commit", "-am", "new work");
   const head = await git(cwd, "rev-parse", "HEAD");
   const events = async () => JSON.parse(await readFile(state, "utf8")).events as { kind: string; args?: string[]; head?: string }[];
-  const beforeAttempt: PushOptions["beforeAttempt"] = async context => {
+  const beforePush: PushOptions["beforePush"] = async context => {
     expect(context).toEqual({ cwd, branch, head: await git(cwd, "rev-parse", "HEAD") });
     const current = JSON.parse(await readFile(state, "utf8"));
     current.events.push({ kind: "guard", head: context.head });
     await writeFile(state, JSON.stringify(current));
   };
-  return { cwd, remote, env, git, branch, ref, head, base, events, beforeAttempt };
+  return { cwd, remote, env, git, branch, ref, head, base, events, beforePush };
 }
 
 describe("create-only publication leases", () => {
@@ -68,7 +68,7 @@ describe("create-only publication leases", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const f = await fixture({ rejectLease: true });
     await f.git(f.cwd, "push", "origin", `${f.head}:${f.ref}`);
-    await pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforeAttempt: f.beforeAttempt });
+    await pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforePush: f.beforePush });
     expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(f.head);
     const events = await f.events();
     expect(events.map(event => event.kind)).toEqual(["guard", "push", "ls-remote"]);
@@ -81,7 +81,7 @@ describe("create-only publication leases", () => {
     const f = await fixture({ rejectLease: state !== "different", failRemoteRead: state === "unavailable" });
     // The different-head case is a real Git lease rejection even though a plain push could fast-forward it.
     if (state !== "missing") await f.git(f.remote, "update-ref", f.ref, f.base);
-    await expect(pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforeAttempt: f.beforeAttempt }))
+    await expect(pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforePush: f.beforePush }))
       .rejects.toMatchObject({ step: "push", class: "rejected", attempts: 1, retryable: false });
     expect(await f.git(f.remote, "for-each-ref", "--format=%(objectname)", f.ref)).toBe(state === "missing" ? "" : f.base);
     expect((await f.events()).map(event => event.kind)).toEqual(["guard", "push", "ls-remote"]);
@@ -92,7 +92,7 @@ describe("create-only publication leases", () => {
     const f = await fixture({ loseResponse: true });
     const bundle = join(f.cwd, ".git", "fixture.bundle");
     await f.git(f.cwd, "bundle", "create", bundle, "HEAD");
-    await importBundle(f.cwd, await readFile(bundle), f.branch, f.env, retry, { lease: "create-only", beforeAttempt: f.beforeAttempt });
+    await importBundle(f.cwd, await readFile(bundle), f.branch, f.env, retry, { lease: "create-only", beforePush: f.beforePush });
     expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(f.head);
     const events = await f.events();
     expect(events.map(event => event.kind)).toEqual(["guard", "push", "guard", "push", "ls-remote"]);
@@ -104,7 +104,7 @@ describe("create-only publication leases", () => {
     await writeFile(join(f.cwd, "work.txt"), "follow-up work\n");
     await f.git(f.cwd, "commit", "-am", "follow-up");
     const next = await f.git(f.cwd, "rev-parse", "HEAD");
-    await pushBranch(f.cwd, f.branch, f.env, retry, { beforeAttempt: f.beforeAttempt });
+    await pushBranch(f.cwd, f.branch, f.env, retry, { beforePush: f.beforePush });
     expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(next);
     const later = (await f.events()).slice(events.length);
     expect(later.map(event => event.kind)).toEqual(["guard", "push"]);
@@ -116,11 +116,11 @@ describe("create-only publication leases", () => {
     const f = await fixture({ failBeforePush: 1 });
     const blocked = new ApiError(409, "ci_needs_person", "Automatic fixes cannot push CI configuration changes.");
     let guards = 0;
-    const beforeAttempt: PushOptions["beforeAttempt"] = async context => {
-      await f.beforeAttempt!(context);
+    const beforePush: PushOptions["beforePush"] = async context => {
+      await f.beforePush!(context);
       if (++guards === 2) throw blocked;
     };
-    await expect(pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforeAttempt })).rejects.toBe(blocked);
+    await expect(pushBranch(f.cwd, f.branch, f.env, retry, { lease: "create-only", beforePush })).rejects.toBe(blocked);
     expect((await f.events()).map(event => event.kind)).toEqual(["guard", "push", "guard"]);
     expect(await f.git(f.remote, "for-each-ref", "--format=%(refname)", f.ref)).toBe("");
   });
