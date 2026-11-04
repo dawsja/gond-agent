@@ -109,7 +109,7 @@ fn load_config(cwd: &Path, trusted: bool) -> Vec<(String, ServerConfig)> {
     v
 }
 
-/// Replace `${VAR}` with the environment value (empty if unset; `GOND_AGENT_TOKEN` is never expanded).
+/// Replace `${VAR}` with the environment value (empty if unset; internal tokens never expand).
 pub fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
@@ -118,7 +118,7 @@ pub fn expand_env(s: &str) -> String {
         match rest[i + 2..].find('}') {
             Some(j) => {
                 let name = &rest[i + 2..i + 2 + j];
-                if name != "GOND_AGENT_TOKEN" {
+                if name != "GOND_AGENT_TOKEN" && name != crate::config::RELAY_TOKEN_ENV {
                     out.push_str(&std::env::var(name).unwrap_or_default());
                 }
                 rest = &rest[i + 3 + j..];
@@ -182,6 +182,7 @@ impl Client {
             .args(&cfg.args)
             .envs(cfg.env.iter().map(|(k, v)| (k, expand_env(v))))
             .env_remove("GOND_AGENT_TOKEN")
+            .env_remove(crate::config::RELAY_TOKEN_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
