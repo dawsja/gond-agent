@@ -9,7 +9,7 @@ import { unverifiedDescription } from "./fixtures/evidence";
 
 it("chooses explicit descriptions, then clean final text, then the plain title, never the prompt", () => {
   let summary = emptySummary();
-  const run = () => ({ summary, title: "Safe run title", prompt: "Original task with sensitive pasted text", status: "ready" });
+  const run = () => ({ summary, title: "Safe run title", prompt: "Original task with sensitive pasted text", status: "ready" as const });
   expect(descriptionFor(run())).toBe(unverifiedDescription("Safe run title"));
   summary = fold(summary, { type: "text.delta", agent_id: "main", text: "Commentary" });
   summary = fold(summary, { type: "tool.call", agent_id: "main", name: "list_plan" });
@@ -20,7 +20,7 @@ it("chooses explicit descriptions, then clean final text, then the plain title, 
   expect(descriptionFor(run())).toBe(unverifiedDescription("Final reply"));
   expect(descriptionFor({ ...run(), pr_body: "Override" })).toBe(unverifiedDescription("Override"));
   expect(descriptionFor({ ...run(), pr_body: "" })).toBe(unverifiedDescription(""));
-  for (const status of ["failed", "stopped"]) {
+  for (const status of ["failed", "stopped"] as const) {
     expect(descriptionFor({ ...run(), status })).toBe(unverifiedDescription("Safe run title"));
     expect(descriptionFor({ ...run(), status, pr_body: "Override" })).toBe(unverifiedDescription("Override"));
     expect(descriptionFor({ ...run(), status, pr_body: "" })).toBe(unverifiedDescription(""));

@@ -12,6 +12,8 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const SCHEMA_VERSION: u32 = 1;
 // Deliberate compatibility epoch, NOT Cargo's package version. Bump for changes to
 // history semantics, tool replay, compaction or counter interpretation.
+// Epoch 2 made sub_counter a consumed bounded-delegation allowance; epoch 3
+// adds service-issued, run-bound evidence. Epoch 1 counters cannot be restored.
 pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-3";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -70,7 +72,7 @@ pub fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, &'static str> {
 impl Checkpoint {
     pub fn validate(&self, run: &str, owner: &str) -> Result<(), &'static str> {
         if self.schema_version != SCHEMA_VERSION || (self.runner_state_version != RUNNER_STATE_VERSION
-            && !(matches!(self.runner_state_version.as_str(), "gond-agent-checkpoint-1" | "gond-agent-checkpoint-2") && self.evidence.is_none())) {
+            && !(self.runner_state_version == "gond-agent-checkpoint-2" && self.evidence.is_none())) {
             return Err("incompatible_version");
         }
         if let Some(evidence) = &self.evidence {
@@ -185,6 +187,7 @@ mod tests {
         let cases = [
             ("/schema_version", json!(2)),
             ("/runner_state_version", json!("future")),
+            ("/runner_state_version", json!("gond-agent-checkpoint-1")),
             ("/run_id", json!("other")),
             ("/owner_id", json!("other")),
             ("/history/0/role", json!("system")),

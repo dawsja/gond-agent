@@ -108,8 +108,8 @@ afterEach(async () => {
 });
 
 describe("run service automatic CI hooks", () => {
-  it("defaults OFF: a pushed turn keeps its workspace and does not watch CI", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", undefined);
+  it.each([undefined, "0"])("keeps CI disabled with rounds=%s: a pushed turn retains its workspace", async rounds => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", rounds);
     seed();
     const { live, destroy } = workspace();
     const start = vi.spyOn(watcher(), "start");
@@ -124,9 +124,40 @@ describe("run service automatic CI hooks", () => {
     expect(live.busy).toBe(false);
     expect(runs.get("run")).toMatchObject({ status: "ready", phase: "agent", head_sha: NEXT, ci_round: 0, pending: [] });
     expect(runs.get("run").ci_state).toBeUndefined();
-    watcher().start("run", NEXT); // The watcher itself also honors the default.
+    watcher().start("run", NEXT); // The watcher honors both the default and explicit zero.
     await watcher().settled("run");
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("releases the pushed workspace before watching with explicit CI opt-in", async () => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
+    seed({ ci_round: 1 }); // Explicit opt-in still permits watching after the first round.
+    const { live, destroy } = workspace();
+    const request = vi.fn(async (endpoint: string): Promise<unknown> => {
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(service().live.has("run")).toBe(false);
+      if (endpoint.endsWith("/pulls/7")) return { state: "open", head: { sha: NEXT } };
+      if (endpoint.includes("/check-runs?")) return { total_count: 0, check_runs: [] };
+      if (endpoint.includes("/status?")) return {
+        sha: NEXT, total_count: 1, statuses: [{ context: "tests", state: "success" }],
+      };
+      throw new Error(`Unexpected watcher request: ${endpoint}`);
+    });
+    service().ci.io = {
+      request, now: () => 0, sleep: async () => {},
+      log: async () => { throw new Error("No logs expected for passing CI"); },
+    };
+    const start = vi.spyOn(watcher(), "start");
+    await service().finish("run", live);
+    await watcher().settled("run");
+    expect(pushed).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledExactlyOnceWith("run", NEXT);
+    expect(request).toHaveBeenCalled();
+    expect(runs.get("run")).toMatchObject({
+      status: "ready", phase: "idle", head_sha: NEXT, ci_round: 1, ci_state: "passing", ci_active: false,
+    });
+    expect(factory).not.toHaveBeenCalled();
+    expect(gh).not.toHaveBeenCalled();
   });
 
   it("clears stale ci_active on every run at startup without resuming watches or losing CI history", async () => {

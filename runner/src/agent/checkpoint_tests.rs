@@ -1,6 +1,6 @@
 // Included in core's tests to exercise the real input dispatcher and local history.
 fn export_command(id: &str) -> AgentInput {
-    AgentInput::ExportState(ExportStateInput { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into() })
+    AgentInput::ExportState(ExportStateInput { request_id: id.into(), run_id: "run".into(), owner_id: "owner".into(), quiescent: None, boundary_id: None, hold: false })
 }
 
 fn import_command(id: &str, state: &Checkpoint) -> AgentInput {
@@ -11,6 +11,107 @@ async fn exported(h: &mut AgentHandle, id: &str) -> Checkpoint {
     let events = until(h, |e| matches!(e, AgentEvent::StateExported { request_id, .. } if request_id == id)).await;
     let AgentEvent::StateExported { state, .. } = events.into_iter().last().unwrap() else { unreachable!() };
     *state
+}
+
+async fn ready(h: &mut AgentHandle) -> String {
+    let events = until(h, |e| matches!(e, AgentEvent::CheckpointReady { .. })).await;
+    let AgentEvent::CheckpointReady { boundary_id } = events.into_iter().last().unwrap() else { unreachable!() };
+    boundary_id
+}
+
+fn release_command(id: &str) -> AgentInput {
+    AgentInput::CheckpointRelease(super::super::events::CheckpointReleaseInput {
+        request_id: format!("release-{id}"), boundary_id: id.into(),
+    })
+}
+
+async fn held_state(h: &mut AgentHandle, boundary: &str) -> Checkpoint {
+    h.input.send(AgentInput::ExportState(ExportStateInput {
+        request_id: "held".into(), run_id: "run".into(), owner_id: "owner".into(),
+        quiescent: None, boundary_id: Some(boundary.into()), hold: false,
+    })).unwrap();
+    exported(h, "held").await
+}
+
+#[tokio::test]
+async fn checkpoint_holds_each_paired_round_and_keeps_pre_question_replay_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(StdMutex::new(vec![]));
+    let url = mock(Arc::new(|req| {
+        match req["messages"].as_array().unwrap().len() {
+            1 => sse(&[json!({"type":"tool_call","id":"write","name":"write","input":{"path":"a.txt","content":"one"}})], "tool_use"),
+            3 => sse(&[json!({"type":"tool_call","id":"question","name":"ask_user","input":{"question":"Choose?","options":[]}})], "tool_use"),
+            _ => sse(&[json!({"type":"text","text":"Done"})], "end_turn"),
+        }
+    }), seen.clone()).await;
+    let mut cfg = config(dir.path(), Mode::Allow);
+    cfg.context_window = 100_000;
+    let mut h = spawn(ApiClient::new(url, None), cfg);
+    h.input.send(AgentInput::ExportState(ExportStateInput {
+        request_id: "enable".into(), run_id: "run".into(), owner_id: "owner".into(),
+        quiescent: Some(true), boundary_id: None, hold: false,
+    })).unwrap();
+    exported(&mut h, "enable").await;
+    h.input.send(AgentInput::User { text: "Work".into(), images: vec![] }).unwrap();
+    let initial = ready(&mut h).await;
+    let state = held_state(&mut h, &initial).await;
+    assert_eq!(state.history.len(), 1);
+    assert!(seen.lock().unwrap().is_empty(), "model must wait for the initial capture");
+    h.input.send(AgentInput::ExportState(ExportStateInput {
+        request_id: "active-hold".into(), run_id: "run".into(), owner_id: "owner".into(),
+        quiescent: Some(true), boundary_id: None, hold: true,
+    })).unwrap();
+    let rejected = until(&mut h, |e| matches!(e, AgentEvent::StateError { request_id, .. } if request_id == "active-hold")).await;
+    assert!(matches!(rejected.last(), Some(AgentEvent::StateError { code, .. }) if code == "runner_not_idle"));
+    h.input.send(release_command("stale")).unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::StateError { operation, code, .. } if operation == "checkpoint.release" && code == "boundary_mismatch")).await;
+    assert!(seen.lock().unwrap().is_empty());
+    h.input.send(release_command(&initial)).unwrap();
+
+    let written = ready(&mut h).await;
+    let state = held_state(&mut h, &written).await;
+    state.validate("run", "owner").unwrap();
+    assert_eq!(state.history.len(), 3);
+    assert_eq!(state.history.last().unwrap().role, Role::Tool);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one");
+    assert_eq!(seen.lock().unwrap().len(), 1, "next model must not run during capture");
+    assert!(!serde_json::to_string(&state).unwrap().contains("Choose?"));
+    assert!(h.events.try_recv().is_err(), "no tools or question may start while held");
+    h.input.send(release_command(&written)).unwrap();
+    let question = until(&mut h, |e| matches!(e, AgentEvent::Question { .. })).await;
+    assert!(!question.iter().any(|e| matches!(e, AgentEvent::CheckpointReady { .. })), "unpaired question cannot replace the prior replay point");
+    let AgentEvent::Question { request_id, .. } = question.into_iter().last().unwrap() else { unreachable!() };
+    h.input.send(AgentInput::QuestionReply { request_id, answer: "Yes".into() }).unwrap();
+    let answered = ready(&mut h).await;
+    let state = held_state(&mut h, &answered).await;
+    state.validate("run", "owner").unwrap();
+    assert_eq!(state.history.len(), 5);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    h.input.send(release_command(&answered)).unwrap();
+    let final_round = ready(&mut h).await;
+    let state = held_state(&mut h, &final_round).await;
+    assert_eq!(state.history.len(), 6);
+    assert!(h.events.try_recv().is_err(), "turn.end must wait for persistence and release");
+    h.input.send(release_command(&final_round)).unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+
+    // Publication can now change HEAD. Explicit idle capture holds the same
+    // completed history without starting another turn/model request.
+    h.input.send(AgentInput::ExportState(ExportStateInput {
+        request_id: "idle-hold".into(), run_id: "run".into(), owner_id: "owner".into(),
+        quiescent: Some(true), boundary_id: None, hold: true,
+    })).unwrap();
+    let idle = ready(&mut h).await;
+    assert_ne!(idle, final_round);
+    assert_eq!(exported(&mut h, "idle-hold").await, state);
+    h.input.send(AgentInput::User { text: "Next turn".into(), images: vec![] }).unwrap();
+    h.input.send(import_command("idle-barrier", &state)).unwrap();
+    let events = until(&mut h, |e| matches!(e, AgentEvent::StateError { request_id, .. } if request_id == "idle-barrier")).await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::TurnStart { .. })));
+    assert_eq!(held_state(&mut h, &idle).await, state);
+    h.input.send(release_command(&idle)).unwrap();
+    let events = until(&mut h, |e| matches!(e, AgentEvent::CheckpointReady { .. })).await;
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnStart { .. })));
 }
 
 #[tokio::test]
@@ -52,13 +153,12 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     assert!(events.iter().all(|e| matches!(e, AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. })));
     restored.input.send(export_command("again")).unwrap();
     let mut expected = state.clone();
-    // Restore deliberately advances its durable resume budget and records the
-    // missing ignored-dependency caveat; all history, plans and counters survive.
+    // Restore advances its durable resume budget; history and counters survive.
     let ledger = expected.evidence.as_mut().unwrap();
     ledger.resumes += 1;
     ledger.unverified.push("Ignored files such as node_modules may be absent after restore.".into());
     assert_eq!(exported(&mut restored, "again").await, expected);
-    restored.input.send(AgentInput::ExportState(ExportStateInput { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into() })).unwrap();
+    restored.input.send(AgentInput::ExportState(ExportStateInput { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into(), quiescent: None, boundary_id: None, hold: false })).unwrap();
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateError { .. })).await;
     assert!(matches!(events.last(), Some(AgentEvent::StateError { request_id, code, .. }) if request_id == "wrong-owner" && code == "binding_mismatch"));
     restored.input.send(AgentInput::User { text: "Continue".into(), images: vec![] }).unwrap();

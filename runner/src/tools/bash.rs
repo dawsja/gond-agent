@@ -248,6 +248,10 @@ pub struct BgShell {
     spill_path: Option<std::path::PathBuf>,
 }
 
+impl BgShell {
+    pub fn is_running(&self) -> bool { self.status.lock().unwrap().is_none() }
+}
+
 impl Drop for BgShell {
     fn drop(&mut self) {
         if let Some(k) = self.kill.take() {

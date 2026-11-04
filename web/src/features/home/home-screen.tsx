@@ -18,6 +18,16 @@ const Sep = () => <span className="text-subtle">·</span>
 
 const SUGGESTIONS = ["Fix the failing CI on main", "Add tests for the untested modules", "Upgrade dependencies and fix what breaks"]
 
+function InterruptedStopItem({ run }: { run: Run }) {
+  const stop = useStopRun()
+  return (
+    <MenuItem disabled={stop.isPending} onSelect={() => stop.mutate({ id: run.id, arg: undefined })}>
+      <Square className="size-3 fill-current" />
+      <span className="min-w-0 flex-1 truncate">Stop</span>
+    </MenuItem>
+  )
+}
+
 function RunMenu({ run, first }: { run: Run; first?: boolean }) {
   const stop = useStopRun()
   const del = useDeleteRun()
@@ -59,7 +69,8 @@ function RunMenu({ run, first }: { run: Run; first?: boolean }) {
               <span className="min-w-0 flex-1 truncate">{run.status === "queued" ? "Cancel" : "Stop"}</span>
             </MenuItem>
           )}
-          {(run.pr_url || live) && <MenuSeparator />}
+          {run.status === "interrupted" && <InterruptedStopItem run={run} />}
+          {(run.pr_url || live || run.status === "interrupted") && <MenuSeparator />}
           <MenuItem onSelect={() => setConfirming(true)} className="text-destructive">
             <Trash2 className="size-3.5" />
             <span className="min-w-0 flex-1 truncate">Delete run</span>
@@ -74,7 +85,7 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
   const navigate = useNavigate()
   const live = run.status === "working" || run.status === "queued"
   const ended = run.status === "failed" || run.status === "stopped"
-  const note = run.status === "queued" ? queueLabel(run) : live ? (run.step ?? "Working") : ended ? (run.error ?? "Stopped") : undefined
+  const note = run.status === "interrupted" ? "Resume to continue from saved progress" : run.status === "queued" ? queueLabel(run) : live ? (run.step ?? "Working") : ended ? (run.error ?? "Stopped") : undefined
   const elapsed = runElapsed(run)
   return (
     <li

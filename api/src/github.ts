@@ -145,6 +145,14 @@ export const git = (cwd: string, ...args: string[]) => gitEnv(process.env, cwd, 
 const authenticatedGit = (env: NodeJS.ProcessEnv, cwd: string, args: string[], onStderr?: (text: string) => void) => gitEnv(env, cwd,
   ["-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", ...args], args[0] === "clone" ? 600_000 : 120_000, onStderr);
 
+/** Owner-scoped publication reconciliation; an absent branch returns null. */
+export async function branchHead(repo: string, branch: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  if (!validRepo(repo) || !validBranch(branch)) throw new Error("Invalid publication branch");
+  const output = (await authenticatedGit(env, "/tmp", ["ls-remote", "--refs", `https://github.com/${repo}.git`, `refs/heads/${branch}`])).toString().trim();
+  const sha = output.split(/\s+/)[0];
+  return sha && /^[a-f0-9]{40}$/.test(sha) ? sha : null;
+}
+
 export function cloneProgress(report: (step: string) => void) {
   let tail = "", last = "", updated = 0;
   return (text: string) => {
@@ -169,10 +177,13 @@ export async function checkout(
   progress: (step: string) => void = () => {},
   baseSHA?: string,
   retryOptions?: RetryOptions,
+  checkpointHead?: string,
+  preservePublishedHead = false,
 ) {
   if (!validRepo(repo) || !validBranch(base) || !validBranch(branch))
     throw new Error("Invalid repository or branch");
   if (baseSHA && !/^[a-f0-9]{40}$/.test(baseSHA)) throw new Error("Invalid base revision");
+  if (checkpointHead && !/^[a-f0-9]{40}$/.test(checkpointHead)) throw new Error("Invalid checkpoint revision");
   const cwd = join(data, "checkouts", id);
   await rm(cwd, { recursive: true, force: true });
   await mkdir(join(data, "checkouts"), { recursive: true, mode: 0o700 });
@@ -185,9 +196,14 @@ export async function checkout(
       await authenticatedGit({ ...env, LC_ALL: "C" }, data,
         ["clone", "--depth", "1", "--single-branch", "--no-tags", "--progress", "--branch", resume ? branch : base, `https://github.com/${repo}.git`, cwd], cloneProgress(progress));
     }, retryOptions);
-    if (resume && baseSHA) {
+    if ((resume || checkpointHead) && baseSHA) {
       progress("Loading the run's base revision");
       await withRetry("fetch", () => authenticatedGit(env, cwd, ["fetch", "--depth", "1", "--no-tags", "origin", baseSHA]), retryOptions);
+    }
+    if (checkpointHead) {
+      progress("Loading the checkpoint revision");
+      await withRetry("fetch", () => authenticatedGit(env, cwd, ["fetch", "--depth", "1", "--no-tags", "origin", checkpointHead]), retryOptions);
+      if (!preservePublishedHead) await git(cwd, "checkout", "-B", branch, checkpointHead);
     }
   } catch (error) {
     // Cleanup must not replace the safe operation failure with a filesystem path/error.
@@ -200,7 +216,7 @@ export async function checkout(
   const identity = await commitIdentity(env);
   await git(cwd, "config", "user.name", identity.name);
   await git(cwd, "config", "user.email", identity.email);
-  if (!resume) await git(cwd, "checkout", "-b", branch);
+  if (!resume && !checkpointHead) await git(cwd, "checkout", "-b", branch);
   progress("Packing repository for the workspace");
   let archive: Buffer;
   try {

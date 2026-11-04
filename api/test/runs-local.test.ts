@@ -296,7 +296,11 @@ describe("persistent local run lifecycle", () => {
     runs.enqueue(r.id, "u", "Reopen after failure");
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(log.filter(call => call.method === "start")[1]).toMatchObject({ evidence_gate_rounds: 2 });
-    expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 4 });
+    // Recovery replays the failed active task before the queued follow-up; each
+    // delivered task reserves two rounds, even without private finish metadata.
+    const users = log.filter(call => call.method === "send").map(call => call.input as { type: string; text?: string }).filter(input => input.type === "user");
+    expect(users.map(input => input.text)).toEqual(["Work", "Work", "Reopen after failure"]);
+    expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 6 });
   });
   it("never adopts exported keys or unsolicited state frames even without initial policy metadata", async () => {
     workerTurns.push(runId => [{ type: "evidence.recorded", record: signedRecord({ run_id: runId }) }, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" }]);

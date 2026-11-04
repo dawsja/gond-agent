@@ -346,6 +346,23 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn restore_with_service(
+        &mut self,
+        tree: Option<&str>,
+        service: &Self,
+    ) -> Result<(), &'static str> {
+        self.restore(tree);
+        // The public ledger and pre-delivery reservations may be newer than the
+        // saved checkpoint. Never replenish its replay or gate/resume budgets.
+        self.seq = self.seq.max(service.seq);
+        self.gate_rounds = self.gate_rounds.max(service.gate_rounds);
+        self.resumes = self.resumes.max(service.resumes);
+        if let Some(key) = &service.key {
+            self.initialize(&service.run_id, key.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn restore(&mut self, tree: Option<&str>) {
         self.resumes = self.resumes.saturating_add(1).min(MAX_RESUMES);
         let missing_key = self.key.is_none();

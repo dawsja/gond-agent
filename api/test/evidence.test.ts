@@ -182,7 +182,7 @@ it("snapshots the complete empty verification block without implying proof or se
 
 it("keeps the deterministic description chooser and neutralizes model headings/reserved blocks", () => {
   const summary = { ...emptySummary(), final_reply: true, text: "Final answer" };
-  const run = { title: "Safe title", summary, status: "ready", pr_body: undefined as string | undefined };
+  const run = { title: "Safe title", summary, status: "ready" as const, pr_body: undefined as string | undefined };
   expect(descriptionFor(run)).toBe(`Final answer\n\n${verificationBlock()}`);
   expect(descriptionFor({ ...run, status: "failed" })).toBe(`Safe title\n\n${verificationBlock()}`);
   expect(descriptionFor({ ...run, pr_body: "" })).toBe(verificationBlock());

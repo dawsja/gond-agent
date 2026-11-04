@@ -1,13 +1,10 @@
-# Runner checkpoints — first slice
+# Runner checkpoints and restart recovery
 
 Internal JSONL controls on the existing `AgentInput` / `AgentEvent` transport.
 These are **not** model tools, user messages, or transcript events. The controller
-forwards these over dedicated RPCs and isolates replies from transcript events;
-the API has an opaque sealed storage module. Scheduling, automatic recovery and
-checkpoint lifecycle integration are not included. RunService does already use
-private `init_evidence` to install a service-issued key before task execution and
-state export for metadata at turn finish, never to adopt exported signing authority.
-This does not enable checkpoint-backed recovery.
+forwards these over dedicated RPCs and isolates replies from transcript events.
+RunService pairs held runner history with a private Git tree bundle, stores it
+through the sealed checkpoint store, and coordinates recovery and cleanup.
 
 ## Commands and replies
 
@@ -45,6 +42,121 @@ control error. Unparseable JSON or missing/oversized correlation IDs cannot be
 correlated. Diagnostic logs never contain state or deserialization details.
 EOF waits for accepted state controls as well as active turns.
 
+## Opt-in quiescent capture
+
+After start/import, before sending work, send `export_state` with
+`"quiescent":true`. A successful export opts the worker into held main boundaries;
+without it, existing export behavior is unchanged. `"quiescent":false` disables
+future holds but does not release an already held boundary.
+
+For a fresh capture **after publication**, send `export_state` with
+`"quiescent":true,"hold":true` after the main `turn.end`. This closed-schema
+boolean requires quiescent true and forbids boundary_id. Only the idle main loop
+can accept it; an active/held worker returns `runner_not_idle`. A successful
+request establishes a new hold, emits `checkpoint.ready`, then acknowledges
+`state.exported`. Queued user/compact work cannot start until release. Capture
+and persist through the normal ready handshake, not the initial exported state
+alone. This captures the published HEAD rather than the prepublication tree pin.
+
+The runner emits `{"type":"checkpoint.ready","boundary_id":"1"}` before the
+first model request of each turn (after user images are normalized), and after
+each completed main model/tool round. All tool results and joined subagents are
+finished and paired in local history. Final `turn.end` waits for release too.
+No next model request, compaction, queued user work or tool dispatch starts while
+held. Export with `"boundary_id":"1"` to require that exact held history; stale
+IDs fail with `boundary_mismatch`. Live tracked background shells make this
+capture fail with `background_shells_active`, rather than claim an atomic tree.
+This is agent-dispatch quiescence, not an OS/filesystem snapshot. Background
+shells, dev servers and watchers may keep writing while the runner is held.
+Tracked live shells reject capture, but untracked/detached processes are not
+frozen. External side effects are not quiesced either.
+
+Capture the tree while still held, persist both artifacts together, then send:
+
+```json
+{"type":"checkpoint.release","request_id":"release-1","boundary_id":"1"}
+{"type":"checkpoint.released","request_id":"release-1"}
+```
+
+Release is a closed-schema dedicated control, not ordinary input. Invalid/stale
+releases return a correlated `state.error` with operation `checkpoint.release`.
+Interrupt cancels the turn but does not release the hold: the controller must
+finish/abort capture and release (or discard the worker). No hold deadline may
+silently resume tools underneath an in-progress tree capture.
+
+The controller hides **all** `state.*` and `checkpoint.*` frames from transcript
+events. It replaces runner boundary IDs with worker-scoped opaque tokens and
+emits `{"checkpoint":{"boundary_id":"<token>"}}` over its attached transport.
+Dedicated RPC `checkpoint` accepts that token plus `run_id`, `owner_id`,
+`base_sha`, `identity: {name,email}` and optional `head_sha`. It validates the hold, exports history,
+then captures the tree, returning `{boundary_id,state,bundle,base_sha,head_sha,
+checkpoint_sha,fingerprint}`. Optional `previous_fingerprint` compares tree,
+state and revision pins, returning `unchanged:true` before bundle creation when
+all match. It never releases. Dedicated RPC `checkpoint.release` accepts
+the controller token and releases the runner. Captures/releases reject overlap
+rather than build a queue. Raw `checkpoint_tree` is only available without a
+live runner; publication `snapshot` cannot overlap capture or run during a hold.
+Late/stale worker controls cannot capture or release a replacement worker.
+
+`Workspace.enableCheckpoints(options, save, onError?)` in `api/src/containers.ts`
+opts in using `{owner_id,base_sha,identity,head_sha?}`. Await setup before sending work. The
+save callback receives the paired RPC result and must finish persistence before
+returning. Only one callback runs at a time; at most one subsequent held boundary
+can wait while the previous release acknowledgement is delivered. Capture/save
+failure reports through optional `onError` and releases in `finally`, preserving
+the prior saved checkpoint. Ordinary attempts are at least 30 seconds apart;
+intervening boundaries release immediately. Unchanged pairs skip persistence.
+Explicit post-publication capture bypasses the interval. Failed release discards
+the workspace. RunService enables this interface with the paired sealed-store
+save callback and coordinates recovery and cleanup.
+
+`Workspace.flushCheckpoints?(): Promise<void>` waits for in-flight capture,
+persistence **and release acknowledgement**, including a subsequent boundary
+already received. It rejects on save/release failure (also reported to onError
+for save failures), or disconnection. The most recent failed save remains visible
+until a later successful save; flushing does not start a capture.
+
+`Workspace.captureCheckpoint?(options?: {head_sha:string}): Promise<void>` requires enableCheckpoints and
+an idle worker (after turn.end). It settles prior work (a previous save error
+must not prevent a fresh attempt), requests the explicit idle
+hold above, then waits for the ready consumer's single save and release. It
+rejects overlapping explicit captures and propagates capture/save/release errors.
+The ready consumer waits for the hold-request acknowledgement before issuing its
+paired state/tree RPC, avoiding concurrent controller state operations. Callers
+must not send new work concurrently.
+
+The optional `head_sha` is a restore baseline, not an assertion about the worker's
+current HEAD. Without it, low-level capture uses actual HEAD as the private
+checkpoint commit's parent, metadata pin and bundle exclusion. RunService supplies the known HEAD from the authenticated checkout
+when enabling capture. A worker may make unpublished local commits; using those
+as restore prerequisites would require fetching SHAs that upstream does not have.
+With an explicit pin, the controller validates that it names an existing commit
+object and uses it for the private parent, metadata and bundle exclusion instead.
+The captured tree still includes local-committed and dirty work, starting from the
+actual clone HEAD. Newly staged ignored-file validation also uses actual HEAD's
+tracked baseline, not the restore pin. Neither capture nor restore rewrites actual
+HEAD, index or refs; local commit history itself is not preserved by tree restore.
+No checkpoint metadata/schema extension or upstream history rewrite is required.
+
+Service ordering: await `flushCheckpoints?.()` **before**
+publication `snapshot`; publish/push; await `captureCheckpoint?.({head_sha:publishedSHA})` **after**
+publication and **before** auto-close/CI watching. Awaiting the final turn.end
+alone does not imply that its release acknowledgement has reached the API. The
+postpublication capture pins the pushed HEAD, not its prepublication parent.
+RunService catches save/flush/capture failures and emits
+`run.checkpoint_unavailable`: checkpoint availability must never block publishing
+completed work. Recovery may instead use an older pair or fail after restart.
+The optional capture argument updates the saved handler options inside the
+serialized explicit capture, after prior captures flush and before requesting the
+idle export/hold. It applies to that capture and all later captures; overlapping
+explicit captures are rejected before they can change the pin. Omitting the
+argument preserves the existing pin (or default actual-HEAD behavior).
+
+Pending questions/permissions are not stored. The pre-model boundary preserves
+the preceding paired round (including an initial user-only turn), so restoration
+can ask the model again instead of importing an unpaired question tool call.
+Once a question resolves, the next checkpoint includes its paired result.
+
 ## Boundaries and validation
 
 - Export requests queue separately from user work, at most four pending requests.
@@ -57,7 +169,8 @@ EOF waits for accepted state controls as well as active turns.
 - **Pending questions/permission requests cannot be snapshotted.** Export waits
   until the entire round resolves, times out, or is interrupted and has paired
   results. There is no restoration of pending questions or reply IDs. A caller
-  that needs an immediate checkpoint must interrupt and await the export.
+  that needs an immediate legacy export must interrupt and await it. Quiescent
+  mode instead retains the previous pre-model replay point described above.
 - Import is accepted only before any user/compact work or earlier import has
   been accepted, with empty initial history. The input dispatcher reserves this
   eligibility immediately: an import cannot sit behind active or queued work
@@ -69,7 +182,7 @@ EOF waits for accepted state controls as well as active turns.
   is no new general stdin framing limit in this slice; the trusted controller
   must bound incoming frames too. Oversized stored history fails export; export
   never silently filters images or compacts history to make it fit.
-- Import/export command payloads reject unknown fields, while ordinary input
+- Import/export/release command payloads reject unknown fields, while ordinary input
   frames remain forward-compatible with API metadata such as `user.effort`.
 - Checkpoint, counters, plan items, messages, blocks, result parts and opaque
   envelopes deny unknown fields. Arbitrary tool `input` and provider opaque
@@ -85,10 +198,16 @@ EOF waits for accepted state controls as well as active turns.
 - `SCHEMA_VERSION` remains 1; the explicit `RUNNER_STATE_VERSION` compatibility
   epoch is `gond-agent-checkpoint-3`, independent of Cargo's package version.
   **Bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. The legacy compatibility path accepts only ledgerless epoch-1
-  or epoch-2 state and upgrades the epoch; it supplies no prior execution evidence.
-  **Old ledger-bearing epoch-2 state is rejected**, as is ledger-bearing epoch-1
-  state and other incompatible epochs.
+  incompatible**. Service and runner both use epoch 3, retaining epoch 2's
+  `sub_counter` as the child-ID sequence and consumed general-purpose delegation
+  allowance. **Epoch 1 is rejected**: its unrestricted ID counter is incompatible.
+  Only the runner's direct codec may accept ledgerless epoch-2 input, without
+  supplying prior execution evidence; ledger-bearing epoch-2 input is rejected.
+  **Service sealed-checkpoint orchestration requires exact epoch 3**. Old epoch-2
+  checkpoints fall back to the last pushed branch rather than recovering their
+  sealed tree/history pair. This is a deliberate compatibility limitation, not
+  a silent checkpoint upgrade; direct codec compatibility does not widen service
+  admission.
 - Controls supply the expected run and owner; initialization binds the signing
   authority to them, and import checks both against state. Subsequent controls
   must respect the worker's binding. This is not authentication: the service must
@@ -131,15 +250,21 @@ helper, ignoring clone-local/system configuration and excludes but respecting
 worktree `.gitignore`; ignored dependencies such as `node_modules` may be absent after restore. Do not
 treat hidden ignored code as trusted based on a matching tree.
 
-## Restored state and remaining integration seams
+## Restored state and service integration
 
 History preserves compaction's untrusted user-role summary and deterministic
-file notes verbatim. The current plan, main context estimate, subagent ID counter,
+file notes verbatim. The current plan, main context estimate, subagent ID/consumed-allowance counter,
 plan reminder calls/last plan/nudge count, and per-turn compaction count/skip
-length are saved. Imported cadence/nudge/compaction counters are consumed by the
-first subsequent main turn; ordinary later user turns still reset their own
-turn-local budgets. Import itself stays idle and emits no model/tool work or
+length are saved. Imported delegation allowance remains consumed; follow-ups do
+not reset it. Fresh/fallback workers without import start at zero: this is not an
+exactly-once durable delegation ledger. Imported cadence/nudge/compaction
+counters are consumed by the first subsequent main turn; ordinary later user
+turns still reset their own turn-local budgets. Import itself stays idle and emits no model/tool work or
 ordinary transcript frames. The caller must send the intended continuation.
+
+The gate is advisory transparency, not enforcement or independent review;
+limitations and exhausted budgets appear under **Not verified** rather than
+blocking completion or publication.
 
 Frozen evidence policy is restored with the ledger, unlike ordinary runtime
 configuration below. Policy/manifest edits do not alter frozen checks; a later
@@ -155,7 +280,8 @@ produces a weakening warning. Unknown test counts never count as success.
 Runtime configuration (model/effort, prompts/instructions, permission mode/rules,
 skills/tools, cadence interval/nudge limit, question timeout) comes from the new
 worker, not checkpoint JSON. The service must supply the intended configuration.
-Live subagent histories, shells/processes, read sets, edit baselines, pending
+Browser sessions/profiles/refs, LSP processes, live subagent histories,
+shells/processes, read sets, edit baselines, pending
 permissions/questions, filesystem/Git state and external side effects are not
 restored. A checkpoint alone is not exactly-once execution or a filesystem
 snapshot: the service must pair it with the correct checkout/bundle and define
@@ -163,13 +289,34 @@ crash/publication ordering, continuation, persistence, retention and version
 upgrade behavior. State payloads may contain private repository/tool/provider
 content and must not enter normal logs or browser transcripts.
 
-The root guide, README and protocol describe this foundation and the remaining
-lifecycle work. RunService must pair these primitives under a quiescent tree/history
-boundary and wire recovery and cleanup before enabling persistence.
+RunService exclusively claims the latest usable checkpoint, restores the paired
+tree/history into a fresh worker and sends explicit continuation framing. A failed
+prerequisite checkout, tree restore or history import falls back to a fresh checkout
+of the last pushed branch and records `run.checkpoint_fallback`. The predecessor
+claim is consumed only when a replacement pair is durable, released on worker
+loss/closure, and expires after ten minutes as a retention/quota backstop. Bad
+validation/restore pairs are quarantined with a fixed reason, never retried.
+Answer replay remains
+in a durable service ledger until that same publication transaction acknowledges
+its captured history; a second restart before replacement rebuilds, rather than
+stacks, synthetic continuation inputs. Only model-authored questions are quoted
+as data; human answers are ordinary user text. Delivery framing never mutates
+stored human/CI messages. Finishing-phase recovery verifies publication and
+finishes instead of replaying the original task. Pending live request IDs are
+never reused. MCP has no explicit resume tool: `send_session_message` resumes;
+`state:interrupted,done:true` is not successful completion.
+
+At startup, eligible interactive runs resume through the ordinary queue one at a
+time, at most twice while their checkpoint is under 24 hours old. Scheduled,
+stopped and quota-exhausted runs do not auto-resume. Other recoverable runs stay
+`interrupted` for a human Resume/follow-up. Explicit close/Stop/deletion removes
+checkpoint files; shutdown and automatic CI workspace release preserve them.
+See the root README for configuration, retention and operational limits.
 
 The controller bounds both state pipe writes and reply waits with one 120-second
 deadline. Failed writes discard the worker/process group and its relay credential:
 a partial JSONL frame must never be followed by new work. Reply timeout alone
-leaves the worker alive and late replies are dropped. Tree restore deliberately
+leaves the worker alive and late replies are dropped; the Workspace boundary
+callback attempts release, discarding the worker if release fails. Tree restore deliberately
 does not restore staging metadata; export rejects newly staged ignored files to
 avoid silently losing them during capture or later publication.

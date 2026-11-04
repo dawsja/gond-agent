@@ -123,6 +123,7 @@ function queuedIds() {
 function countRuns() { return (db.prepare("SELECT count(*) AS n FROM runs").get() as { n: number }).n; }
 
 beforeEach(async () => {
+  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   vi.clearAllMocks();
   vi.mocked(checkout).mockReset().mockResolvedValue({ cwd: "/fake", archive: Buffer.from("repo") });
   dir = mkdtempSync(join(tmpdir(), "gond-run-queue-"));

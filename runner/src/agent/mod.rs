@@ -1,5 +1,6 @@
 pub mod checkpoint;
 mod compaction;
+mod subagents;
 pub mod core;
 pub mod events;
 pub mod evidence;

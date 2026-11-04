@@ -9,7 +9,7 @@ use crate::agent::events::{AgentEvent, AgentInput};
 // Never include checkpoint contents (or serde errors containing field names) in logs.
 fn decode_input(line: &str) -> std::result::Result<AgentInput, Option<Box<AgentEvent>>> {
     let value: serde_json::Value = serde_json::from_str(line).map_err(|_| None)?;
-    let correlation = value["type"].as_str().filter(|op| matches!(*op, "export_state" | "import_state" | "init_evidence"))
+    let correlation = value["type"].as_str().filter(|op| matches!(*op, "export_state" | "import_state" | "init_evidence" | "checkpoint.release"))
         .zip(value["request_id"].as_str().filter(|id| id.len() <= 256))
         .map(|(op, id)| (op.to_owned(), id.to_owned()));
     serde_json::from_value(value).map_err(|_| correlation.map(|(operation, request_id)| {
@@ -44,7 +44,7 @@ async fn jsonl_inner(agent: &mut AgentHandle) -> Result<i32> {
             }
             match decode_input(&line) {
                 Ok(i) => {
-                    if matches!(i, AgentInput::ExportState(_) | AgentInput::ImportState(_) | AgentInput::InitEvidence(_)) {
+                    if matches!(i, AgentInput::ExportState(_) | AgentInput::ImportState(_) | AgentInput::InitEvidence(_) | AgentInput::CheckpointRelease(_)) {
                         let _ = control_tx.send(Control::Pending);
                     }
                     let _ = input.send(i);
@@ -74,7 +74,7 @@ async fn jsonl_inner(agent: &mut AgentHandle) -> Result<i32> {
                 match &ev {
                     AgentEvent::TurnStart { agent_id } if agent_id == "main" => busy += 1,
                     AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main" => busy -= 1,
-                    AgentEvent::StateExported { .. } | AgentEvent::StateImported { .. } | AgentEvent::EvidenceInitialized { .. } | AgentEvent::StateError { .. } => pending_controls -= 1,
+                    AgentEvent::StateExported { .. } | AgentEvent::StateImported { .. } | AgentEvent::EvidenceInitialized { .. } | AgentEvent::StateError { .. } | AgentEvent::CheckpointReleased { .. } => pending_controls -= 1,
                     _ => {}
                 }
                 writeln!(out, "{}", serde_json::to_string(&ev)?)?;
@@ -122,13 +122,13 @@ mod tests {
             (r#"{"type":"skill","name":"review","enabled":true}"#,
                 AgentInput::Skill { name: "review".into(), enabled: true }),
             (r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o"}"#,
-                AgentInput::ExportState(ExportStateInput { request_id: "e".into(), run_id: "r".into(), owner_id: "o".into() })),
+                AgentInput::ExportState(ExportStateInput { request_id: "e".into(), run_id: "r".into(), owner_id: "o".into(), quiescent: None, boundary_id: None, hold: false })),
             (r#"{"type":"import_state","request_id":"i","run_id":"r","owner_id":"o","state":{}}"#,
                 AgentInput::ImportState(ImportStateInput { request_id: "i".into(), run_id: "r".into(), owner_id: "o".into(), state: serde_json::json!({}) })),
         ];
         for (wire, expected) in frames {
             assert_eq!(decode_input(wire).unwrap(), expected, "rejected {wire}");
-            if !matches!(expected, AgentInput::ExportState(_) | AgentInput::ImportState(_)) {
+            if !matches!(expected, AgentInput::ExportState(_) | AgentInput::ImportState(_) | AgentInput::CheckpointRelease(_)) {
                 let mut extended: serde_json::Value = serde_json::from_str(wire).unwrap();
                 extended["api_metadata"] = serde_json::json!({"ignored": true});
                 assert_eq!(decode_input(&extended.to_string()).unwrap(), expected);
@@ -143,6 +143,15 @@ mod tests {
         assert!(matches!(*error, AgentEvent::StateError { request_id, operation, code } if request_id == "i" && operation == "import_state" && code == "invalid_command"));
         let error = decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o","unexpected":"private data"}"#).unwrap_err().unwrap();
         assert!(matches!(*error, AgentEvent::StateError { request_id, operation, code } if request_id == "e" && operation == "export_state" && code == "invalid_command"));
+        assert!(matches!(decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o","quiescent":true,"boundary_id":"1"}"#).unwrap(), AgentInput::ExportState(ExportStateInput { quiescent: Some(true), boundary_id: Some(_), .. })));
+        assert!(matches!(decode_input(r#"{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o","quiescent":true,"hold":true}"#).unwrap(), AgentInput::ExportState(ExportStateInput { hold: true, .. })));
+        for hold in ["null", "1", "\"true\""] {
+            let wire = format!(r#"{{"type":"export_state","request_id":"e","run_id":"r","owner_id":"o","hold":{hold}}}"#);
+            assert!(matches!(*decode_input(&wire).unwrap_err().unwrap(), AgentEvent::StateError { code, .. } if code == "invalid_command"));
+        }
+        assert!(matches!(decode_input(r#"{"type":"checkpoint.release","request_id":"e","boundary_id":"1"}"#).unwrap(), AgentInput::CheckpointRelease(_)));
+        let error = decode_input(r#"{"type":"checkpoint.release","request_id":"e","boundary_id":"1","extra":true}"#).unwrap_err().unwrap();
+        assert!(matches!(*error, AgentEvent::StateError { operation, code, .. } if operation == "checkpoint.release" && code == "invalid_command"));
         assert!(decode_input("not JSON").unwrap_err().is_none());
     }
 }

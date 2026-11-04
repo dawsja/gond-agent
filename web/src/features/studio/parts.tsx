@@ -6,18 +6,10 @@ import { providerOf } from "@shared/providers"
 import { cn } from "@/lib/utils"
 import type { Run, RunStatus } from "@/lib/api"
 import { Badge } from "@shared/ui/badge"
+import { RUN_UI } from "@/lib/run-state"
 import { STATUS, mono } from "./theme"
 
 const statusColor: Record<RunStatus, string> = STATUS
-
-const statusLabel: Record<RunStatus, string> = {
-  queued: "Queued",
-  working: "Working",
-  ready: "PR ready",
-  merged: "Merged",
-  failed: "Failed",
-  stopped: "Stopped",
-}
 
 /** The TUI's ● bullet. Working gets a soft breathing halo. */
 export function Dot({ status, className, size = 7 }: { status: RunStatus; className?: string; size?: number }) {
@@ -41,8 +33,8 @@ export function Dot({ status, className, size = 7 }: { status: RunStatus; classN
 }
 
 export function StatusPill({ status, children }: { status: RunStatus; children?: ReactNode }) {
-  const variant = status === "ready" ? "good" : status === "working" || status === "queued" ? "warning" : status === "failed" ? "bad" : status === "merged" ? "merged" : "neutral"
-  return <Badge variant={variant} className="shrink-0 whitespace-nowrap">{status === "merged" ? <GitMerge className="size-3" /> : <Dot status={status} size={6} />}{children ?? statusLabel[status]}</Badge>
+  const ui = RUN_UI[status]
+  return <Badge variant={ui.variant} className="shrink-0 whitespace-nowrap">{status === "merged" ? <GitMerge className="size-3" /> : <Dot status={status} size={6} />}{children ?? ui.label}</Badge>
 }
 
 /** The xAI mark (Grok models). */
@@ -130,14 +122,15 @@ export function DiffTile({ files, add, del, status }: { files: number; add: numb
 
 /** Right-hand PR column: what happened to the pull request. */
 export function PrChip({ status, state, number, files }: { status: RunStatus; state?: Run["pr_state"]; number?: number | null; files?: number }) {
-  if (!number && (status === "working" || status === "queued")) return <span className="text-[12px] text-subtle">PR on finish</span>
+  const pr = RUN_UI[status].pr
+  if (!number && pr === "pending") return <span className="text-[12px] text-subtle">PR on finish</span>
   const map = {
     ready: { icon: GitPullRequest, color: STATUS.ready, label: number ? "Open" : files ? "No PR" : "No changes" },
     merged: { icon: GitMerge, color: STATUS.merged, label: "Merged" },
-    failed: { icon: GitPullRequestClosed, color: STATUS.stopped, label: "No PR" },
-    stopped: { icon: GitPullRequestClosed, color: STATUS.stopped, label: "No PR" },
+    none: { icon: GitPullRequestClosed, color: STATUS.stopped, label: "No PR" },
+    pending: { icon: GitPullRequest, color: STATUS.working, label: "PR on finish" },
   } as const
-  const s = number ? state === "merged" || status === "merged" ? map.merged : state === "closed" ? { icon: GitPullRequestClosed, color: STATUS.failed, label: "Closed" } : map.ready : map[status as keyof typeof map]
+  const s = number ? state === "merged" || status === "merged" ? map.merged : state === "closed" ? { icon: GitPullRequestClosed, color: STATUS.failed, label: "Closed" } : map.ready : map[pr]
   const Icon = s.icon
   return (
     <span aria-label={number ? `${s.label} pull request #${number}` : undefined} className="inline-flex items-center gap-1.5 text-[12px]">

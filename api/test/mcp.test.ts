@@ -234,6 +234,12 @@ it("negotiates with the official HTTP client and reads only owned browser runs",
     "read_session_events", "read_session_event", "get_session_diff", "send_session_message",
     "stop_session", "close_session", "open_session_pull_request",
   ].sort());
+  for (const name of ["get_session", "read_session_events", "send_session_message"]) {
+    const description = tools.tools.find(tool => tool.name === name)!.description!;
+    expect(description).toContain("done true");
+    expect(description).toContain("resume tool");
+    if (name !== "send_session_message") expect(description).toContain("send_session_message");
+  }
   const list = await call(client, "list_sessions");
   expect(list.body.sessions.map((r: Run) => r.id)).toEqual(["run_test"]);
   expect(JSON.stringify(list)).not.toContain("private-volume");
@@ -522,9 +528,9 @@ it.each([
   ["queued", "queued", false], ["working", "working", false],
   ["ready", "done", true], ["failed", "failed", true],
   ["stopped", "stopped", true], ["merged", "merged", true],
-])("exposes completion consistently for %s", async (status, state, done) => {
+] as const)("exposes completion consistently for %s", async (status, state, done) => {
   const r = seed();
-  r.status = status as string;
+  r.status = status;
   r.pr_url = "https://github.com/acme/app/pull/42";
   r.error = status === "failed" ? "Model unavailable" : null;
   db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(status, JSON.stringify(r), r.id);
