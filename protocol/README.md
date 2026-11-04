@@ -87,9 +87,9 @@ Runner JSONL uses private `init_evidence {request_id,run_id,owner_id,key}`, `exp
 
 The controller's 120-second state RPC deadline covers pipe backpressure and the reply wait. Reply waiting releases the worker lock so interruption remains possible. A failed pipe write may leave an incomplete JSONL frame: the controller kills that worker's process group, revokes its relay credential and requires a fresh worker rather than reusing the stream. A reply timeout alone does not kill the worker; late control frames are filtered out.
 
-State schema version 1 / runner compatibility epoch `gond-agent-checkpoint-3` contains run/owner binding, stored `history`, `plan`, counters (subagent ID/consumed delegation allowance, context estimate, plan cadence/nudges and turn-compaction budget), and optional `evidence`.
+State schema version 1 / runner compatibility epoch `gond-agent-checkpoint-4` contains run/owner binding, stored `history`, `plan`, counters (subagent ID/consumed delegation allowance, context estimate, plan cadence/nudges and turn-compaction budget), and optional `evidence`.
 
-New captures use epoch 3. **Epoch 1 is rejected** because its unrestricted subagent ID counter is incompatible with epoch 2's consumed bounded-delegation allowance. Service recovery also accepts the **latest authenticated ledgerless epoch-2 sealed pair**, with `evidence` absent or null only. The shared service validator requires the payload's `runner_state_version` to match the authenticated row/envelope version; epoch-2 ledgers, future epochs and mismatches are rejected. Load authenticates epoch-2 ciphertext under the original epoch-2 key, never relabeling ciphertext or rows, and never searches older checkpoints when the latest is unavailable or incompatible. Claim/release/quarantine/consume use that original epoch-2 key. The runner codec upgrades accepted state in memory to epoch 3 without supplying prior execution evidence; the next normal paired capture seals a new epoch-3 checkpoint and transactionally consumes the claimed predecessor.
+New captures use epoch 4. **Epoch 1 is rejected** because its unrestricted subagent ID counter is incompatible with epoch 2's consumed bounded-delegation allowance. Service recovery also accepts the **latest authenticated ledgerless epoch-2 sealed pair**, with `evidence` absent or null only. The shared service validator requires the payload's `runner_state_version` to match the authenticated row/envelope version; epoch-2 ledgers, future epochs and mismatches are rejected. Load authenticates epoch-2 ciphertext under the original epoch-2 key, never relabeling ciphertext or rows, and never searches older checkpoints when the latest is unavailable or incompatible. Claim/release/quarantine/consume use that original epoch-2 key. The runner codec upgrades accepted state in memory to epoch 4 without supplying prior execution evidence; the next normal paired capture seals a new epoch-4 checkpoint and transactionally consumes the claimed predecessor.
 
 Evidence is a strict typed ledger with up to 40 records, a private signing key, frozen policy, sequence, gate/resume/fix/review counters, stale IDs, limitations/declaration and the turn's initial tree. Gate counters (two per turn, six per run, no further rounds at ten resumes) survive import, not just conversation compaction. Resume installs a fresh service-issued key, marks old records historical/stale without re-signing them, and preserves sequence and budget counters. Mismatched restored trees also make records stale; an imported/exported key never becomes signing authority. Ignored dependencies such as `node_modules` may be absent after restore. The summary is preserved in stored user-role history. This is not a `ResponsesRequest`: old images are not removed. Only user/assistant/tool roles are allowed, nested schema fields are strict, tool rounds must pair fully and images are normalized on import. Import does not run a model or restore processes, tools, subagent histories or pending questions. Export waits through streaming/tools/compaction/questions to a safe main-round boundary. The caller must coordinate the matching tree snapshot before allowing further tool mutations; merely exporting state then snapshotting a changing tree is insufficient.
 
@@ -133,15 +133,16 @@ interface EvidenceRecorded {
     env_digest: string;        // SHA-256 hex digest of allow-list values
     output_tail: string;       // scrubbed, bounded untrusted excerpt
     kind: { type: "check" }
-        | { type: "ui_attempt"; url: string; title: string };
+        | { type: "ui_attempt"; url: string; title: string }
+        | { type: "repro_red" | "repro_green"; test_id: string; test_files: string[]; cases: string[] };
     sig: string;               // HMAC-SHA256 hex; no signing key
   };
 }
 ```
 
-`duration_ms` and `started_at` are milliseconds; numeric counts/times are nonnegative integers. HMAC-SHA256 covers compact JSON `{domain:"gond-agent:evidence:v1",run_id,record}`, with object keys sorted recursively (arrays retain order). `record` contains **all fields except `sig`**, including its run_id, seq, both tree hashes and `command_definition_changed`; the envelope and record run IDs must match the service-bound run. The API uses strict typed schemas, rejects unknown fields/invalid signatures, duplicate IDs, replay and sequences at or below the last accepted sequence. It retains the latest 40 public records and up to 4,096 accepted IDs per run; further records are not admitted after the ID cap. Upon accepting the 4,096th ID, the service persists and broadcasts one canonical `evidence.records_capped {limit:4096,message}` event per run. Its durable event history prevents duplicates across follow-ups/restarts; already-capped older runs receive the notice on the next attempted record. The worker/checkpoint ledger retains only the latest 40 records. Worker emission caps command at 4,096 bytes, cwd at 1,024, output at 4,096, UI URL at 2,048 and title at 300; API schema bounds are sometimes looser for compatibility, not permission for the worker to exceed its own limits.
+`duration_ms` and `started_at` are milliseconds; numeric counts/times are nonnegative integers. HMAC-SHA256 covers compact JSON `{domain:"gond-agent:evidence:v1",run_id,record}`, with object keys sorted recursively (arrays retain order). `record` contains **all fields except `sig`**, including its run_id, seq, both tree hashes and `command_definition_changed`; the envelope and record run IDs must match the service-bound run. The API uses strict typed schemas, rejects unknown fields/invalid signatures, duplicate IDs, replay and sequences at or below the last accepted sequence. It retains up to 40 public records with the active red/green pair pinned and up to 4,096 accepted IDs per run; further records are not admitted after the ID cap. Upon accepting the 4,096th ID, the service persists and broadcasts one canonical `evidence.records_capped {limit:4096,message}` event per run. Its durable event history prevents duplicates across follow-ups/restarts; already-capped older runs receive the notice on the next attempted record. The worker/checkpoint ledger uses the same bound and active-pair pinning rule. Worker emission caps command at 4,096 bytes, cwd at 1,024, output at 4,096, UI URL at 2,048 and title at 300; API schema bounds are sometimes looser for compatibility, not permission for the worker to exceed its own limits.
 
-Only foreground **`run_checks`** whose `command` and `cwd` exactly match a frozen policy entry records checks. The new `cwd` tool argument defaults to `.` and must be repository-relative/confined to the checkout. `cd … && …`, added flags, `bash`, background checks and other command variants are not equivalent evidence. For those exact eligible foreground checks only, the launcher clears inherited environment and installs a trusted allow-list snapshot of shell/user/locale, scratch/cache and toolchain variables, including the image's non-secret `PLAYWRIGHT_BROWSERS_PATH`, `NODE_PATH`, `BUN_INSTALL` and `BUN_INSTALL_CACHE_DIR` locations. Credentials and all `GOND_AGENT_*` variables remain excluded. Other `run_checks` calls, including background checks, inherit browser/toolchain variables while omitting `GH_TOKEN`, `GITHUB_TOKEN` and all `GOND_AGENT_*` variables (including the relay token). Tool arguments cannot request clean-environment eligibility. `env_clean` and `env_digest` describe the actual snapshot and its digest, not proof of no secrets: HOME/`.npmrc`, repository code and same-UID processes may still expose configuration/credentials.
+Only foreground **`run_checks`** whose `command` and `cwd` exactly match a frozen policy entry records checks. The new `cwd` tool argument defaults to `.` and must be repository-relative/confined to the checkout. `cd … && …`, added flags, `bash`, background checks and other command variants are not equivalent evidence. For exact eligible foreground checks and closed-grammar repro checks, the launcher clears inherited environment and installs a trusted allow-list snapshot of shell/user/locale, scratch/cache and toolchain variables, including the image's non-secret `PLAYWRIGHT_BROWSERS_PATH`, `NODE_PATH`, `BUN_INSTALL` and `BUN_INSTALL_CACHE_DIR` locations. Credentials and all `GOND_AGENT_*` variables remain excluded. Other `run_checks` calls, including background checks, inherit browser/toolchain variables while omitting `GH_TOKEN`, `GITHUB_TOKEN` and all `GOND_AGENT_*` variables (including the relay token). Tool arguments cannot request clean-environment eligibility. `env_clean` and `env_digest` describe the actual snapshot and its digest, not proof of no secrets: HOME/`.npmrc`, repository code and same-UID processes may still expose configuration/credentials.
 
 A successful check needs `exit_code === 0`, `env_clean === true`, `tests_ran > 0`, `command_definition_changed === false`, and both tree hashes equal to the final tree. Command definitions/configuration are compared against pinned BASE before and after execution. A changed definition is signed as `command_definition_changed`, excludes the record from both gate and publication success, and produces an **Evidence weakened** warning. Node, Cargo, pytest and Vitest/Jest-style summary parsers observe counts (Cargo per-binary counts are summed); unsupported, truncated or unrecognized output yields an unknown count, not a pass. Zero tests at exit 0 does not satisfy the gate. Failure-name parsers for other tools do not imply test-count support. Eligible lint/typecheck commands usually cannot satisfy the positive-count requirement alone.
 
@@ -422,9 +423,9 @@ The existing worker `task` accepts `{description,prompt,kind?}`. `description` i
 | `test_writer` | Same reads; `write`, `edit`, `multi_edit`, `apply_patch` only for test paths; `run_checks` only for exact foreground test commands | `{added:["path and behavior"],results:["command, exit status and result"]}` |
 | `explore` | Same reads as reviewer | Concise text |
 
-The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. The parent-state dispatch denylist also reserves `declare_task`, `declare_unverified`, and `skip_repro` for a future evidence gate, even before those tools exist. Optional tools (including browser and language-server execution) are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
+The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. The parent-state dispatch denylist also reserves `declare_task`, `declare_unverified`, and `skip_repro` for the parent-only evidence workflow. Optional tools (including browser and language-server execution) are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
 
-The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Both lexical and resolved paths must qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
+The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`. The broader repro-path policy below does not expand delegated write access. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Lexical and resolved paths must be identical and qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
 
 Exact test command allow-list (no added shell syntax/arguments or background execution):
 
@@ -439,7 +440,7 @@ python3 -m unittest discover -s containers -p 'test_*.py'
 
 These commands use the existing `run_checks` exec/permission path and relay-token scrubbing. Test code and package scripts execute with normal workspace trust; this is not a hostile-code filesystem/network sandbox. The container remains the boundary.
 
-Named global bounds: `MAX_CALLS=4` total call slots per parent worker lifetime, split into `MAX_GENERAL_CALLS=3` general-purpose calls shared by all current kinds (including follow-ups and failed children) plus `RESERVED_REVIEWER_CALLS=1` for a future reviewer kind. The reserved slot is unavailable to all current `task` calls. Other bounds: `MAX_CONCURRENT=2`, `MAX_DEPTH=1`, `MAX_ROUNDS=48`, `MAX_TOOL_CALLS=128`, `MAX_SECONDS=180` including queued time, `CANCEL_GRACE_MILLIS=1000`, `MAX_OUTPUT_TOKENS=2048` requested per response, `MAX_RESPONSE_BYTES=131072` independent streamed-event guard, `MAX_REPORT_BYTES=8192`, `MAX_INPUT_BYTES=32000`. Saturated calls fail before spawn; queued calls consume allowance/time but not active slots. Parent cancellation cancels queued/active children; active work receives at most the cancellation grace to terminate/reap command groups before its future is dropped. No background child commands survive normally. Checkpoint `sub_counter` preserves consumed allowance on service recovery/import; fresh or fallback workers without import start at zero. This is checkpoint-scoped accounting, not an exactly-once durable delegation ledger. Service and runner epoch `gond-agent-checkpoint-3` retains epoch 2's bounded counter semantics and rejects epoch 1's unrestricted ID counter. Service recovery accepts the latest authenticated epoch-2 sealed pair only with absent/null `evidence` and matching payload/row/envelope versions, retaining the original epoch-2 storage/claim key. The runner upgrades accepted state only in memory; the next normal epoch-3 paired save transactionally consumes the predecessor. Epoch-2 ledgers and future epochs are rejected, with no ciphertext/row relabeling or search of older checkpoints. The runner state schema and service continuation-ledger format are unchanged. Recovery adds a finishing-phase run marker and additive SQLite `claimed_at`/`invalid_reason` metadata.
+Named global bounds: `MAX_CALLS=4` total call slots per parent worker lifetime, split into `MAX_GENERAL_CALLS=3` general-purpose calls shared by all current kinds (including follow-ups and failed children) plus `RESERVED_REVIEWER_CALLS=1` for a future reviewer kind. The reserved slot is unavailable to all current `task` calls. Other bounds: `MAX_CONCURRENT=2`, `MAX_DEPTH=1`, `MAX_ROUNDS=48`, `MAX_TOOL_CALLS=128`, `MAX_SECONDS=180` including queued time, `CANCEL_GRACE_MILLIS=1000`, `MAX_OUTPUT_TOKENS=2048` requested per response, `MAX_RESPONSE_BYTES=131072` independent streamed-event guard, `MAX_REPORT_BYTES=8192`, `MAX_INPUT_BYTES=32000`. Saturated calls fail before spawn; queued calls consume allowance/time but not active slots. Parent cancellation cancels queued/active children; active work receives at most the cancellation grace to terminate/reap command groups before its future is dropped. No background child commands survive normally. Checkpoint `sub_counter` preserves consumed allowance on service recovery/import; fresh or fallback workers without import start at zero. This is checkpoint-scoped accounting, not an exactly-once durable delegation ledger. Service and runner epoch `gond-agent-checkpoint-4` retains epoch 2's bounded counter semantics and rejects epoch 1's unrestricted ID counter. Service recovery accepts the latest authenticated epoch-2 sealed pair only with absent/null `evidence` and matching payload/row/envelope versions, retaining the original epoch-2 storage/claim key. The runner upgrades accepted state only in memory; the next normal epoch-4 paired save transactionally consumes the predecessor. Epoch-2 ledgers and future epochs are rejected, with no ciphertext/row relabeling or search of older checkpoints. The runner state schema and service continuation-ledger format are unchanged. Recovery adds a finishing-phase run marker and additive SQLite `claimed_at`/`invalid_reason` metadata.
 
 Child histories are discarded after completion and never appended to the parent's model history. Only the bounded report returns as a tool result (child events still appear in the transcript). Structured reports are validated; invalid/oversized reports return bounded tool errors. Every child response is framed with a fresh UUID-based delimiter, an explicit untrusted-data warning, stripped Unicode Cf/tag/variation-selector characters and a UTF-8-safe length cap. The parent prompt says reviewer output is advice, not instructions. This framing is defense in depth, not a guarantee of review accuracy or injection immunity. None of these bounds gates main-turn completion.
 
@@ -470,3 +471,102 @@ Worker `start` accepts `interactive: boolean`. The service sets it true only for
 `GOND_AGENT_WEB_SEARCH_LIMIT` caps service-side web search attempts per run (default 30, 0 unlimited). It accepts only unsigned decimal integers through u32; invalid values warn without echoing the value and use 30. Compose exposes the setting in `.env.example`. Attempts, including errors/cancellations, are counted and saved in SQLite before provider work; the count is shared across concurrent calls, follow-ups, worker reopen and service restart. A limit response says "web search limit for this run reached" as a tool error, never a failed run. Settings connection tests are not run calls and do not consume a run's allowance.
 
 Interactive browser/MCP questions wait at most `GOND_AGENT_QUESTION_WAIT_MINUTES` (default 240 minutes / 4 hours; 0 waits indefinitely). This is only a wait-for-a-human/bot timeout, **not a run time budget**: expiry returns "No one answered; decide yourself and continue" and the same run continues. Answers before expiry still resume normally. The service validates unsigned decimal u32 integers (invalid values warn without echoing them and use 240), reads the setting and passes `question_wait_minutes` at worker start; Compose and `.env.example` expose it. A matching `question.resolved {request_id,agent_id}` event clears pending input on answer or timeout, returning MCP state from `waiting_for_input` to `working` before the turn ends. Scheduled runs remain non-interactive and never wait at all.
+
+## Failing regression first
+
+`start_session` and HTTP run creation accept optional `kind`:
+`bug|feature|refactor|other`. Omission is unspecified; prose is never classified
+silently. Parent-only `declare_task {kind,repro_plan}` pins the explicit kind and
+plan (2000 bytes). A run considered a bug fix must call it first, before edits.
+Callers should set run/start_session `kind:"bug"` for known bug tasks instead of
+relying on the model to classify them. A model declaring `feature` skips bug
+rules; classification is explicit guidance, not a semantic classifier.
+`skip_repro {reason}` accepts only `no_cheap_test_path`,
+`needs_external_service`, `ui_only`, or `cannot_reproduce_locally`; skips are
+limitations, never successful verification. Neither declaration is advertised or
+callable by any subagent kind.
+
+For repro execution, `run_checks` uses a separate closed grammar:
+`{repro:"red"|"green", test_files:["changed/test/path"], cwd:"."}`.
+No command, flags, shell strings, background execution or timeout argument is
+accepted. Paths must be safe literal, newly added/changed regular test files in
+the diff against pinned BASE and pass the fixed repro-path policy in
+`runner/repro-test-paths.json`; repositories cannot widen it. Rust embeds that
+policy and the Python controller loads the same packaged file. A cross-language
+corpus test guards matching parity. This is deliberately broader than the narrow,
+unchanged repository-specific `test_writer` write scope in `subagents.rs`.
+In particular, `**/tests/**/*.rs` classifies every Rust file under a `tests/`
+directory as test code, including production-like helpers placed there. Such
+helpers are excluded from the non-test comparison; directory naming is not
+semantic proof that a file is test-only. The runner comes only from pinned
+manifests, with a hard 120-second execution/acceptance limit:
+
+| Discovered runner | Generated invocation |
+| --- | --- |
+| `vitest` / `vitest run` npm test script | `npm test -- --reporter=json <files>` |
+| `jest` / `jest --runInBand` npm test script | `npm test -- --json --runInBand --runTestsByPath <files>` |
+| pytest manifests | `pytest --junitxml=<private temporary report> <files>` |
+| Cargo manifest | `cargo test --locked --test <target> -- --nocapture` (one `tests/<target>.rs`) |
+| `go.mod` | `go test -json <packages containing changed files>` |
+
+Jest's built-in JSON mode is `--json`, not Vitest's `--reporter=json`.
+Unsupported scripts/runners (including node:test in this version), unsupported
+Cargo inline-test paths, truncated/unrecognized output and tests over the cheap
+limit require an honest enumerated skip. Pytest JUnit failure assertions,
+Vitest/Jest assertion results, Cargo assertion panics after tests start, and Go
+JSON failures with an assertion-style `_test.go:line` location are recognized.
+Go additionally requires a matching test declaration in a requested changed
+file; arbitrary runtime panics are inconclusive. Exit-before-tests, compile,
+import, syntax errors and exits 124/126/127/137 never count as red.
+
+At red time, an isolated Git snapshot compares all non-test entries to pinned
+BASE. Bash edits, redirects, formatters and code generation cannot bypass this
+comparison. The execution tree must remain unchanged. Green requires exit 0,
+identical test-content SHA-256 identity and all the same reporter test ids passing
+on the final tree, plus a non-test tree change since red. Since admitted red has
+the BASE non-test tree, green must differ from BASE in at least one non-test
+entry; an unchanged tree, external timing/state change, or only other test edits
+does not count. Missing matching green is listed under Not verified.
+
+Red proves only that some assertion in a new or changed test failed on base code.
+An unrelated or trivially failing assertion can still count if the same test
+later passes after a non-test change. Neither assertion parsing nor the presence
+of a non-test delta establishes relevance or causality; this is worker-reported
+transparency, not proof that the reported bug was reproduced or fixed.
+
+Repro records never satisfy the ordinary exact-command check
+requirement. A bug without red/green or an explicit skip consumes at most the
+existing two gate continuations and reports a fixed Not verified limitation.
+
+After admitted red, private service `stage_repro` reconstructs the exact signed
+red tree and creates a local tests-only commit titled
+`Add failing test for: <single-line sanitized title>`, using the resolved platform
+identity, without trailers or a push. The fix is the last commit and keeps the
+normal title. `stage_repro` moves worker HEAD and the index to the tests-only
+commit mid-turn without changing worktree contents, so subsequent `git status`
+looks different. Optional mid-turn staging waits at most one second, checks
+worker liveness before and after identity lookup, and never starts after that
+wait expires or the workspace is released. An already-started RPC is not
+cancelled by the timeout. A busy lock or concurrent commit may prevent staging:
+publication can defer identical reconstruction until snapshot publication, or disclose
+`single commit` if the expected base/ancestry no longer permits reconstruction.
+Ledger ordering is retained either way. The shared pre-push guard derives
+ancestry from the pinned candidate on initial import, retry and kept-commit
+publication, without changing the create-only lease.
+
+The deterministic Verification section includes kind, red command, test id,
+scrubbed/capped/fenced assertion tail, green command/passing tail, or skip reason.
+Ledger version is 2; runner/service compatibility epoch is
+`gond-agent-checkpoint-4`. Epoch 3 and epoch-2 evidence ledgers are rejected;
+only the authenticated ledgerless epoch-2 recovery exception described above is
+upgraded in memory without inventing evidence. Gate counters,
+frozen runners and the active pair survive sealed checkpoint import. This is
+worker-recorded transparency, not independent proof.
+
+Runtime fixture: build the debug worker, `cd api && npm ci`, then
+`python3 containers/smoke-repro.py` with Cargo on PATH. It sequentially exercises
+real Vitest and Cargo through a local fake model, authenticated API admission,
+tests-only ancestry and the resulting PR section; no GitHub or Docker is used.
+The worker's `cargo test --locked` repro integration tests instead use real,
+dependency-free Cargo fixtures: they require no API `node_modules`, npm install,
+network service, or fabricated reporter output.

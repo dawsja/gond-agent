@@ -18,13 +18,15 @@ private ledger described below; never copy its signing key into a transcript.
 
 ```json
 {"type":"export_state","request_id":"save-1","run_id":"run-123","owner_id":"user-456"}
-{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-3","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-4","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+
 ```
 
 Send that **state object**, not its wrapper or a model request, to a fresh worker:
 
 ```json
-{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-3","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-4","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+
 {"type":"state.imported","request_id":"load-1"}
 ```
 
@@ -198,9 +200,9 @@ Once a question resolves, the next checkpoint includes its paired result.
   normalization; bad/unresolved images reject the transaction. Normalization
   can change bytes/media type, and decoder saturation is an import error.
 - `SCHEMA_VERSION` remains 1; the explicit `RUNNER_STATE_VERSION` compatibility
-  epoch is `gond-agent-checkpoint-3`, independent of Cargo's package version.
+  epoch is `gond-agent-checkpoint-4`, independent of Cargo's package version.
   **Bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. Service and runner both use epoch 3, retaining epoch 2's
+  incompatible**. Service and runner both use epoch 4, retaining epoch 2's
   `sub_counter` as the child-ID sequence and consumed general-purpose delegation
   allowance. **Epoch 1 is rejected**: its unrestricted ID counter is incompatible.
   Service recovery also accepts the **latest authenticated ledgerless epoch-2
@@ -210,8 +212,8 @@ Once a question resolves, the next checkpoint includes its paired result.
   under the original epoch-2 storage key; never relabel ciphertext/rows or search
   older checkpoints when the latest is unavailable or incompatible. Claim,
   release, quarantine and consume retain the original epoch-2 key. The runner
-  codec upgrades accepted state in memory to epoch 3 without supplying prior
-  execution evidence. The next normal paired capture seals a new epoch-3
+  codec upgrades accepted state in memory to epoch 4 without supplying prior
+  execution evidence. The next normal paired capture seals a new epoch-4
   checkpoint and transactionally consumes the claimed predecessor; the old
   ciphertext and row version are not rewritten.
 - Controls supply the expected run and owner; initialization binds the signing
@@ -221,8 +223,8 @@ Once a question resolves, the next checkpoint includes its paired result.
 
 ## Evidence state
 
-Optional `evidence` is a strict typed ledger: private signing key, up to 40 signed
-records (see [event schema](../protocol/README.md#execution-evidence-and-publication)),
+Optional `evidence` is a strict version-2 typed ledger: explicit task declaration/skip, private signing key, up to 40 signed
+records (including a pinned active red/green pair; ordinary FIFO eviction cannot erase it; see [event schema](../protocol/README.md#execution-evidence-and-publication)),
 frozen policy, sequence, gate/turn/resume/fix/review counters, stale IDs,
 limitations/declaration flag and initial turn tree. All nested ledger/record/kind
 fields reject unknown fields; validation checks bounds, UUID/sequence uniqueness,
@@ -296,7 +298,7 @@ upgrade behavior. State payloads may contain private repository/tool/provider
 content and must not enter normal logs or browser transcripts.
 
 RunService exclusively claims the latest checkpoint admitted by the shared
-validator (epoch 3 or authenticated ledgerless epoch 2), restores the paired
+validator (epoch 4 or authenticated ledgerless epoch 2), restores the paired
 tree/history into a fresh worker and sends explicit continuation framing. A failed
 prerequisite checkout, tree restore or history import falls back to a fresh checkout
 of the last pushed branch and records `run.checkpoint_fallback`. The predecessor
@@ -337,3 +339,29 @@ leaves the worker alive and late replies are dropped; the Workspace boundary
 callback attempts release, discarding the worker if release fails. Tree restore deliberately
 does not restore staging metadata; export rejects newly staged ignored files to
 avoid silently losing them during capture or later publication.
+
+## Regression ordering and publication
+
+Task kind (`bug|feature|refactor|other`), bounded repro plan and enumerated skip live
+in the sealed ledger. `repro_red` and `repro_green` records retain sequence order,
+exact test-content identity, reporter test ids, and execution tree hashes. The
+active pair is pinned inside the 40-record bound; a new red replaces the previous
+pair. Rekeying never re-signs old red. A historical red may establish ordering,
+but green must run again on the current publication tree after restart, with a
+non-test delta since red. An unchanged or test-only-changed tree cannot satisfy
+green even if an external-state-dependent assertion passes.
+
+After admitting red, the service requests private `stage_repro` with its resolved
+commit identity. It reconstructs `BASE + changed test files` and requires the
+result to equal the signed red tree before creating the tests-only ancestor. No
+push occurs. Staging moves worker HEAD and the index mid-turn without changing
+worktree contents; subsequent `git status` therefore changes. A busy lock or
+concurrent commit can prevent staging or reconstruction and require the disclosed
+single-commit fallback. A held boundary, unavailable stage, or tree-only restore can defer
+materialization: publication may reconstruct the identical test tree from the
+ledger and final test blobs. It never invents an upstream prerequisite for an
+unpublished local commit. If reconstruction is impossible, the description says
+`single commit`; ledger ordering still survives. Existing imported/kept commits
+retain their ancestors unchanged on all push/retry paths and keep the create-only
+branch lease. The service confirms ordering from the exact candidate's parent
+objects before every push, not from a snapshot response or title alone.

@@ -178,7 +178,7 @@ print(output)
         self.assertEqual(env["GOND_AGENT_RELAY_TOKEN"], agent.relay_token)
         added = set(env) - set(os.environ)
         self.assertEqual(added, {"GOND_AGENT_RELAY_TOKEN", "GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES",
-                                "GOND_AGENT_EVIDENCE_BASE_SHA", "GOND_AGENT_EVIDENCE", "GOND_AGENT_EVIDENCE_REPO_POLICY",
+                                "GOND_AGENT_TASK_KIND", "GOND_AGENT_EVIDENCE_BASE_SHA", "GOND_AGENT_EVIDENCE", "GOND_AGENT_EVIDENCE_REPO_POLICY",
                                 "GOND_AGENT_EVIDENCE_SEQ", "GOND_AGENT_EVIDENCE_GATE_ROUNDS", "GOND_AGENT_EVIDENCE_RESUMES"} - set(os.environ))
         self.assertEqual(env["GOND_AGENT_EVIDENCE"], "on")
         self.assertEqual(env["GOND_AGENT_EVIDENCE_GATE_ROUNDS"], "0")
@@ -1200,7 +1200,9 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD^").decode().strip(), self.head)
         self.assertNotEqual(published["head"], data["checkpoint_sha"])
         self.assertNotIn(b"ignored-secret", self.git("ls-tree", "-r", "--name-only", "HEAD"))
+        # Clone-local excludes cannot hide executable files from canonical capture.
         self.assertEqual((fresh / "local-exclude").read_text(), "also do not export\n")
+        self.assertIn(b"local-exclude", self.git("ls-tree", "-r", "--name-only", "HEAD"))
         # Without a journal-authenticated published HEAD, recovery from the
         # pushed branch rejects the old HEAD pin but accepts the new one.
         final = self.export()

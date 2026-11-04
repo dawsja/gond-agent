@@ -62,6 +62,7 @@ export interface Run {
   retired_backend?: string;
   title: string;
   prompt: string;
+  kind?: "bug" | "feature" | "refactor" | "other";
   pr_body?: string | null;
   status: RunStatus;
   queue_position?: number;
@@ -110,7 +111,7 @@ export interface Run {
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; recovery?: boolean }
-const RUNNER_STATE_VERSION = "gond-agent-checkpoint-3";
+const RUNNER_STATE_VERSION = "gond-agent-checkpoint-4";
 const LEGACY_RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
 const EVIDENCE_EXPORT_TIMEOUT_MS = 10_000;
 const EVIDENCE_FLUSH_TIMEOUT_MS = 30_000;
@@ -665,6 +666,7 @@ export class Runs {
       model: string;
       effort?: string;
       prompt: string;
+      kind?: "bug" | "feature" | "refactor" | "other";
       title?: string;
       branch?: string;
       pr_body?: string;
@@ -679,6 +681,7 @@ export class Runs {
       attribution.authorize?.();
       return this.get(attribution.id, user);
     }
+    if (input.kind !== undefined && !["bug", "feature", "refactor", "other"].includes(input.kind)) throw new ApiError(400, "invalid_kind", "Choose a valid task kind.");
     const backend = assertBackend(input.backend);
     const fields = publicationFields(input);
     if (
@@ -719,6 +722,7 @@ export class Runs {
       effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
+      ...(input.kind ? {kind: input.kind} : {}),
       pr_body: fields.pr_body ?? null,
       status: "queued",
       step: null,
@@ -1015,6 +1019,7 @@ export class Runs {
         this.save(r); // A failed start cannot replenish counters or freshness.
         this.status(r, "working", "Starting the agent");
         await workspace!.rpc("start", {
+          ...(r.kind ? { kind: r.kind } : {}),
           evidence_base_sha: r.base_sha,
           evidence_mode: process.env.GOND_AGENT_EVIDENCE === "off" ? "off" : "on",
           evidence_repo_policy: process.env.GOND_AGENT_EVIDENCE_REPO_POLICY === "allow-weaken" ? "allow-weaken" : "",
@@ -1321,7 +1326,23 @@ export class Runs {
         const modelDropped = event.type === "error" && event.message === "The model connection dropped 3 times";
         if (event.type === "error" && event.agent_id === "main")
           event.message = modelDropped ? "The model connection dropped 3 times" : "The model request failed.";
-        this.append(id, event);
+        const admitted = this.append(id, event);
+        if (event.type === "evidence.recorded" && !admitted) continue;
+        if (event.type === "evidence.recorded" && event.record?.kind?.type === "repro_red" && this.workerAlive(live) && this.live.get(id) === live) {
+          // The authenticated tree, not timing/tool refusals, establishes red.
+          // Staging is optional; do not delay recovery or touch a released worker.
+          const current = this.get(id);
+          let staging = true;
+          try {
+            await evidenceRequest(async () => {
+              const identity = await commitIdentity(githubEnvFor(this.db, this.cfg.secret, current.user_id));
+              if (!staging || !this.workerAlive(live) || this.live.get(id) !== live) return;
+              await live.workspace.rpc("stage_repro", {title: current.title, identity,
+                repro_stage: {base: current.base_sha, tree: event.record.tree_hash_before, test_files: event.record.kind.test_files}});
+            }, 1_000);
+          } catch { /* Resume/busy boundaries may defer materialization to publication. */ }
+          finally { staging = false; }
+        }
         const r = this.get(id);
         r.summary = fold(r.summary, event as any);
         Object.assign(r, totals(r.summary), {
@@ -1463,6 +1484,7 @@ export class Runs {
       let tree: string | undefined;
       let uiRequired: boolean | undefined;
       let docsOnly = false;
+      let staging: "tests_first" | "single_commit" = "single_commit";
       let warnings = ["Publication tree or verification diff unavailable."];
       try {
         const candidate = (await git(context.cwd, "rev-parse", `${context.head}^{tree}`)).toString().trim();
@@ -1472,11 +1494,20 @@ export class Runs {
         uiRequired = paths.some(path => path.startsWith("web/") || /\.(?:tsx|css)$/.test(path));
         // Symlink mode changes must never inherit the regular-Markdown waiver.
         docsOnly = paths.length > 0 && paths.every(path => path.endsWith(".md") && (!path.includes("/") || path.startsWith("docs/"))) && !/^(?:(?:old|new) mode 120000|(?:new|deleted) file mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/m.test(diff);
+        const red = [...(current.evidence?.records ?? [])].reverse().find(record => record.kind.type === "repro_red");
+        if (red && current.base_sha) {
+          try {
+            const parent = (await git(context.cwd, "rev-parse", `${context.head}^`)).toString().trim();
+            const parentTree = (await git(context.cwd, "rev-parse", `${parent}^{tree}`)).toString().trim();
+            const grandparent = (await git(context.cwd, "rev-parse", `${parent}^`)).toString().trim();
+            if (parentTree === red.tree_hash_before && grandparent === current.base_sha) staging = "tests_first";
+          } catch { /* No stage ancestor: disclose single commit, retain check freshness. */ }
+        }
         warnings = weakenedEvidence(diff.slice(0, 2_000_000));
         if (diff.length > 2_000_000) warnings.push("Verification diff truncated; additional test/policy changes may be omitted.");
       } catch { tree = undefined; /* no freshness claim on incomplete service-side Git inspection */ }
       const latest = this.get(run.id);
-      latest.evidence = { ...(latest.evidence ?? emptyEvidence()), publication_tree: tree, weakened: warnings, ui_required: uiRequired, docs_only: docsOnly };
+      latest.evidence = { ...(latest.evidence ?? emptyEvidence()), publication_tree: tree, staging, weakened: warnings, ui_required: uiRequired, docs_only: docsOnly };
       this.save(latest);
     };
   }
@@ -1504,6 +1535,9 @@ export class Runs {
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
     const pushOptions = publicationPushOptions(r, this.evidenceBeforePush(r));
+    const red = [...(r.evidence?.records ?? [])].reverse().find(record => record.kind.type === "repro_red");
+    const reproStage = red && red.kind.type === "repro_red" && r.evidence?.task?.kind === "bug" && !r.evidence.task.skip
+      ? {repro_stage: {base: r.base_sha, tree: red.tree_hash_before, test_files: red.kind.test_files}} : {};
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => {
       const identity = options.backgroundPublication
         ? await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options)
@@ -1511,7 +1545,7 @@ export class Runs {
       // Identity/preflight can yield while a concurrent close destroys the worker.
       if (!this.workerAlive(live) || this.live.get(id) !== live)
         throw new ApiError(409, "workspace_closed", "The workspace is no longer available.");
-      return live.workspace.rpc<{ bundle: string; head: string }>("snapshot", { title: r.title, identity });
+      return live.workspace.rpc<{ bundle: string; head: string }>("snapshot", { ...reproStage, title: r.title, identity });
     }, { maxAttempts: 1 });
     const journal = this.get(id);
     journal.publication_head = snapshot.head;

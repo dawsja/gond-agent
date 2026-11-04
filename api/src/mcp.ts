@@ -364,6 +364,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
           request_id: id,
           repo: z.string().min(1).max(140),
           prompt: text,
+          kind: z.enum(["bug", "feature", "refactor", "other"]).optional(),
           title: titleSchema.optional(),
           branch: branchSchema.optional(),
           pr_body: bodySchema.optional(),

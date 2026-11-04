@@ -22,7 +22,20 @@ type HmacSha256 = Hmac<Sha256>;
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EvidenceKind {
     Check,
-    UiAttempt { url: String, title: String },
+    ReproRed {
+        test_id: String,
+        test_files: Vec<String>,
+        cases: Vec<String>,
+    },
+    ReproGreen {
+        test_id: String,
+        test_files: Vec<String>,
+        cases: Vec<String>,
+    },
+    UiAttempt {
+        url: String,
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,6 +115,25 @@ impl Record {
             && unhex(&self.sig).is_some()
             && match &self.kind {
                 EvidenceKind::Check => true,
+                EvidenceKind::ReproRed {
+                    test_id,
+                    test_files,
+                    cases,
+                }
+                | EvidenceKind::ReproGreen {
+                    test_id,
+                    test_files,
+                    cases,
+                } => {
+                    test_id.len() == 64
+                        && unhex(test_id).is_some()
+                        && !test_files.is_empty()
+                        && test_files.len() <= 32
+                        && test_files.iter().all(|s| s.len() <= 512 && relative(s))
+                        && !cases.is_empty()
+                        && cases.len() <= 100
+                        && cases.iter().all(|s| s.len() <= 1024)
+                }
                 EvidenceKind::UiAttempt { url, title } => {
                     url.len() <= 2048
                         && title.len() <= 300
@@ -152,6 +184,8 @@ pub fn now_ms() -> u64 {
 pub struct Ledger {
     // Private state-RPC/checkpoint data only. Never emitted in transcript events,
     // put in a child environment, source file, ordinary run row, or logs.
+    pub version: u32,
+    pub task: Option<super::repro::TaskDeclaration>,
     pub key: Option<String>,
     pub run_id: String,
     pub records: Vec<Record>,
@@ -192,6 +226,17 @@ impl Ledger {
                 .unwrap_or(0)
         };
         Self {
+            version: 2,
+            task: std::env::var("GOND_AGENT_TASK_KIND")
+                .ok()
+                .and_then(|s| {
+                    serde_json::from_value::<super::repro::TaskKind>(serde_json::json!(s)).ok()
+                })
+                .map(|kind| super::repro::TaskDeclaration {
+                    kind,
+                    repro_plan: String::new(),
+                    skip: None,
+                }),
             key: None,
             run_id: String::new(),
             records: vec![],
@@ -250,7 +295,10 @@ impl Ledger {
     }
 
     pub fn check<'a>(&'a self, name: &str, input: &serde_json::Value) -> Option<&'a CheckCommand> {
-        if name != "run_checks" || input["run_in_background"] == true {
+        if name != "run_checks"
+            || input.get("repro").is_some()
+            || input["run_in_background"] == true
+        {
             return None;
         }
         let command = input["command"].as_str()?;
@@ -272,17 +320,51 @@ impl Ledger {
         if !record.validate() {
             return None;
         }
-        if self.records.len() == MAX_RECORDS {
-            let removed = self.records.remove(0);
-            self.stale_ids.retain(|id| id != &removed.id);
-            self.historical_ids.retain(|id| id != &removed.id);
+        // Keep the active pair outside ordinary FIFO eviction. A new red starts
+        // a new bounded sequence; later checks cannot erase its ordering on resume.
+        if matches!(record.kind, EvidenceKind::ReproRed { .. }) {
+            self.records.retain(|r| {
+                !matches!(
+                    r.kind,
+                    EvidenceKind::ReproRed { .. } | EvidenceKind::ReproGreen { .. }
+                )
+            });
+        } else if matches!(record.kind, EvidenceKind::ReproGreen { .. }) {
+            self.records
+                .retain(|r| !matches!(r.kind, EvidenceKind::ReproGreen { .. }));
         }
+        if self.records.len() == MAX_RECORDS {
+            let index = self.records.iter().position(|r| {
+                !matches!(
+                    r.kind,
+                    EvidenceKind::ReproRed { .. } | EvidenceKind::ReproGreen { .. }
+                )
+            })?;
+            self.records.remove(index);
+        }
+        self.stale_ids
+            .retain(|id| self.records.iter().any(|r| &r.id == id));
+        self.historical_ids
+            .retain(|id| self.records.iter().any(|r| &r.id == id));
         self.records.push(record.clone());
         Some(record)
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.records.len() > MAX_RECORDS
+        if self.version != 2
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|t| t.repro_plan.len() > 2000)
+            || self.policy.repro_runners.len() > 128
+            || self.policy.repro_runners.iter().any(|r| {
+                !relative(&r.cwd)
+                    || !matches!(
+                        r.runner.as_str(),
+                        "vitest" | "jest" | "cargo" | "pytest" | "go"
+                    )
+            })
+            || self.records.len() > MAX_RECORDS
             || self.stale_ids.len() > MAX_RECORDS
             || self.historical_ids.len() > MAX_RECORDS
             || self.unverified.len() > 32
@@ -401,7 +483,40 @@ impl Ledger {
         }
     }
 
+    pub fn repro_missing(&self, tree: Option<&str>) -> bool {
+        if !self
+            .task
+            .as_ref()
+            .is_some_and(|t| t.kind == super::repro::TaskKind::Bug && t.skip.is_none())
+        {
+            return false;
+        }
+        !self.records.iter().any(|red| {
+            let EvidenceKind::ReproRed { test_id, cases, .. } = &red.kind else { return false; };
+            self.records.iter().any(|green| matches!(&green.kind, EvidenceKind::ReproGreen { test_id: id, cases: c, .. } if id == test_id && c == cases)
+                && green.seq > red.seq && green.tree_hash_before != red.tree_hash_before
+                && tree.is_some_and(|t| green.fresh(t)) && !self.stale_ids.contains(&green.id))
+        })
+    }
+
     pub fn gate(&mut self, cwd: &Path, tree: Option<&str>) -> Option<String> {
+        let repro_missing = self.repro_missing(tree);
+        self.unverified.retain(|s| {
+            s != "no failing repro recorded" && s != "no matching fresh passing repro recorded"
+        });
+        if repro_missing {
+            self.note(
+                if self
+                    .records
+                    .iter()
+                    .any(|r| matches!(r.kind, EvidenceKind::ReproRed { .. }))
+                {
+                    "no matching fresh passing repro recorded"
+                } else {
+                    "no failing repro recorded"
+                },
+            );
+        }
         if !self.policy.enabled || self.declared {
             return None;
         }
@@ -411,7 +526,7 @@ impl Ledger {
         }
         // A no-change follow-up never consumes a gate round. A missing hash
         // fails closed rather than silently claiming that nothing changed.
-        if tree.is_some() && tree == self.turn_tree.as_deref() {
+        if !repro_missing && tree.is_some() && tree == self.turn_tree.as_deref() {
             return None;
         }
         let requirements = tree.and_then(|t| self.policy.requirements(cwd, t).ok());
@@ -419,7 +534,7 @@ impl Ledger {
         if docs_only {
             self.note("Docs-only change: the check requirement is waived.");
         }
-        if requirements.as_ref().is_some_and(|r| !r.changed) {
+        if !repro_missing && requirements.as_ref().is_some_and(|r| !r.changed) {
             return None;
         }
         let fresh =
@@ -444,7 +559,7 @@ impl Ledger {
                 .iter()
                 .filter(fresh)
                 .any(|r| matches!(r.kind, EvidenceKind::UiAttempt { .. }));
-        if !check_missing && !ui_missing {
+        if !check_missing && !ui_missing && !repro_missing {
             return None;
         }
         if self.turn_gate_rounds >= 2
@@ -465,6 +580,9 @@ impl Ledger {
         let mut message = String::from(
             "Evidence gate (transparency, not enforcement). Evidence recorded by the worker is missing or stale.\n",
         );
+        if repro_missing {
+            message.push_str("Requirement REPRO: a matching red/green sequence is missing. Declare a bug first, run a changed test with run_checks repro=red before production edits, then the same test with repro=green; or use skip_repro with an enumerated reason.\n");
+        }
         if check_missing {
             message.push_str("Requirement CHECK: run one eligible exact command with run_checks; it must report more than zero tests and leave the tree unchanged.\n");
             message.push_str("A changed command definition or unknown test count does not satisfy CHECK; restore the base definition and re-run, or declare_unverified.\n");

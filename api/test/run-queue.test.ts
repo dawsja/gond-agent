@@ -365,6 +365,48 @@ describe("persistent workspace queue", () => {
     expect(workspace.calls.some(call => call.method === "snapshot")).toBe(false);
   });
 
+  it.each(["buffered exit", "exit during identity lookup"])("does not stage authenticated red after %s", async boundary => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    const workspace = workspaces.get(active.id)!;
+    const key = Buffer.from(workspace.calls.find(call => call.method === "init_evidence")!.args!.key as string, "hex");
+    const red = { type: "evidence.recorded", record: signedRecord({ run_id: active.id, exit_code: 1,
+      kind: { type: "repro_red", test_id: "c".repeat(64), test_files: ["regression.test.js"], cases: ["regression"] } }, key) };
+    if (boundary === "buffered exit") workspace.exit(red);
+    else {
+      vi.mocked(commitIdentity).mockImplementationOnce(async () => {
+        Object.assign(workspace, { isAlive: () => false });
+        return { name: "fixture", email: "123+fixture@users.noreply.github.com" };
+      });
+      workspace.emit(red);
+    }
+    await waitForCondition(() => expect(starts).toEqual([active.id, waiting.id]));
+    expect(runs.get(active.id).evidence?.records).toHaveLength(1);
+    expect(workspace.calls.some(call => call.method === "stage_repro")).toBe(false);
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("bounds optional repro staging without blocking clean-turn completion", async () => {
+    const active = await create();
+    const workspace = workspaces.get(active.id)!;
+    const rpc = workspace.rpc.bind(workspace);
+    const stage = deferred<void>(); gates.push(stage);
+    vi.spyOn(workspace, "rpc").mockImplementation(async (method, args) => {
+      if (method === "stage_repro") await stage.promise;
+      return rpc(method, args);
+    });
+    const key = Buffer.from(workspace.calls.find(call => call.method === "init_evidence")!.args!.key as string, "hex");
+    workspace.emit({ type: "evidence.recorded", record: signedRecord({ run_id: active.id, exit_code: 1,
+      kind: { type: "repro_red", test_id: "c".repeat(64), test_files: ["regression.test.js"], cases: ["regression"] } }, key) },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await waitForCondition(() => expect(workspace.rpc).toHaveBeenCalledWith("stage_repro", expect.any(Object)));
+    expect(runs.get(active.id).status).toBe("working");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitForCondition(() => expect(runs.get(active.id).status).toBe("ready"));
+    expect(runs.get(active.id).evidence?.records).toHaveLength(1);
+  });
+
   it("drains a destroyed worker's slot before checkout cleanup, but does not reopen that checkout until cleanup finishes", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const active = await create(), waiting = await create("b");

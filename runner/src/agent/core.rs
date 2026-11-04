@@ -631,6 +631,16 @@ fn agent_tool_defs(sub: bool) -> Vec<ToolDef> {
     let mut defs = vec![];
     if !sub {
         defs.push(ToolDef {
+            name: "declare_task".into(),
+            description: "Declare task kind explicitly. Call this first for any run you consider a bug fix, before edits; never infer classification from prose. Bug runs require an assertion-failing changed test on the pinned non-test base, then the same test green, or an enumerated skip.".into(),
+            input_schema: schema(json!({"kind":{"type":"string","enum":["bug","feature","refactor","other"]},"repro_plan":{"type":"string","maxLength":2000}}), &["kind","repro_plan"]),
+        });
+        defs.push(ToolDef {
+            name: "skip_repro".into(),
+            description: "Record why a failing local regression test cannot cheaply run. Always disclosed, never presented as verification.".into(),
+            input_schema: schema(json!({"reason":{"type":"string","enum":["no_cheap_test_path","needs_external_service","ui_only","cannot_reproduce_locally"]}}), &["reason"]),
+        });
+        defs.push(ToolDef {
             name: "declare_unverified".into(),
             description: "End the advisory evidence gate with a plain reason. Always reported under Not verified in the generated publication section.".into(),
             input_schema: schema(json!({"reason":{"type":"string","maxLength":1000}}), &["reason"]),
@@ -1070,7 +1080,7 @@ struct Turn<'a> {
     tool_count: u32,
 }
 
-async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, input: Value) -> Block {
+async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut input: Value) -> Block {
     let Turn { run, cancel, started, tool_count } = turn;
     s.emit(AgentEvent::ToolCall { agent_id: run.id.clone(), call_id: id.clone(), name: name.clone() });
     if cancel.is_cancelled() {
@@ -1080,6 +1090,28 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
         return result(id, name, "subagent depth/capability limit: no delegation or parent state tools", true);
     }
     match name.as_str() {
+        "declare_task" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Declaration { kind: super::repro::TaskKind, repro_plan: String }
+            let Ok(d) = serde_json::from_value::<Declaration>(input.clone()) else { return result(id, name, "Expected kind and repro_plan", true); };
+            if d.repro_plan.len() > 2000 { return result(id, name, "repro_plan exceeds 2000 bytes", true); }
+            let mut ledger = s.evidence.lock().unwrap();
+            if ledger.task.as_ref().is_some_and(|t| t.kind != d.kind) { return result(id, name, "Task kind is already pinned for this run", true); }
+            let skip = ledger.task.as_ref().and_then(|t| t.skip);
+            ledger.task = Some(super::repro::TaskDeclaration { kind: d.kind, repro_plan: evidence::scrub(&d.repro_plan, 2000), skip });
+            return result(id, name, "Task kind recorded explicitly. For bugs, record red before production edits, then matching green, or skip_repro.", false);
+        }
+        "skip_repro" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Skip { reason: super::repro::SkipReason }
+            let Ok(skip) = serde_json::from_value::<Skip>(input.clone()) else { return result(id, name, "Expected an enumerated repro skip reason", true); };
+            let mut ledger = s.evidence.lock().unwrap();
+            let Some(task) = ledger.task.as_mut().filter(|t| t.kind == super::repro::TaskKind::Bug) else { return result(id, name, "Declare kind=bug first", true); };
+            task.skip = Some(skip.reason);
+            return result(id, name, "Repro skip recorded under Not verified", false);
+        }
         "declare_unverified" => {
             let Some(reason) = str_arg(&input, "reason") else { return result(id, name, "reason is required", true) };
             s.evidence.lock().unwrap().declare(reason);
@@ -1101,6 +1133,24 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
             return result(id, name, text, !ok);
         }
         _ => {}
+    }
+    let repro = if name == "run_checks" && input.get("repro").is_some() {
+        if run.is_sub() { return result(id, name, "Repro records are parent-only", true); }
+        let policy = {
+            let ledger = s.evidence.lock().unwrap();
+            if !ledger.task.as_ref().is_some_and(|t| t.kind == super::repro::TaskKind::Bug) { return result(id, name, "Declare kind=bug first", true); }
+            ledger.policy.clone()
+        };
+        match super::repro::prepare(&s.cwd, &policy, &input) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => return result(id, name, e.to_string(), true),
+        }
+    } else { None };
+    // Never accept internal execution parameters from a caller.
+    if input.get("_repro_runner").is_some() || input.get("_repro_report").is_some() { return result(id, name, "Internal repro parameters are not tool arguments", true); }
+    if let Some(prepared) = &repro {
+        input = json!({"command":prepared.command,"cwd":prepared.request.cwd,"timeout_ms":super::repro::CHEAP_MS,"_repro_runner":prepared.runner});
+        if let Some(path) = &prepared.report { input["_repro_report"] = json!(path); }
     }
     let Some(tool) = s.tools.iter().find(|t| t.name() == name && tool_visible(t.as_ref(), run)).cloned() else {
         return result(id, name.clone(), format!("unknown tool `{name}`"), true);
@@ -1211,8 +1261,8 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
             return result(id, name, why, true);
         }
     }
-    let eligible = s.evidence.lock().unwrap().check(&name, &input).cloned();
-    ctx.check_environment = eligible.as_ref().map(|_| evidence::check_environment());
+    let eligible = if repro.is_none() { s.evidence.lock().unwrap().check(&name, &input).cloned() } else { None };
+    ctx.check_environment = (eligible.is_some() || repro.is_some()).then(evidence::check_environment);
     let ui_attempt = matches!(name.as_str(), "browser" | "browser_open")
         && input["url"].as_str().is_some_and(|url| (url.starts_with("http://") || url.starts_with("https://")) && url.len() <= 2048);
     let before = if eligible.is_some() || ui_attempt { evidence_tree::tree_hash(&s.cwd).ok() } else { None };
@@ -1223,7 +1273,52 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
     let record_clock = Instant::now();
     let record_input = input.clone();
     let env_digest = ctx.check_environment.as_ref().map(evidence::environment_digest_for).unwrap_or_else(evidence::environment_digest);
-    let out = tool.run(&ctx, input).await;
+    let mut out = tool.run(&ctx, input).await;
+    if let Some(prepared) = repro {
+        let accepted = (|| -> anyhow::Result<evidence::Record> {
+            use super::repro::Phase;
+            let parsed = out.content.iter().find_map(|p| match p { ResultPart::Text { text } => serde_json::from_str::<Value>(text).ok(), _ => None }).unwrap_or(Value::Null);
+            let exit = parsed["exit_code"].as_i64().and_then(|v| i32::try_from(v).ok());
+            let duration_ms = record_clock.elapsed().as_millis() as u64;
+            anyhow::ensure!(duration_ms < super::repro::CHEAP_MS, "Repro exceeded cheap limit (120s)");
+            let ledger = s.evidence.lock().unwrap();
+            let after = evidence_tree::repro_snapshot(&s.cwd, &ledger.policy.base, &prepared.request.test_files)?;
+            anyhow::ensure!(after.tree == prepared.tree, "Repro changed its execution tree");
+            anyhow::ensure!(prepared.request.repro != Phase::Red || after.non_test_equal, "Red refused: non-test tree differs from pinned base");
+            let cases = if prepared.request.repro == Phase::Red {
+                anyhow::ensure!(exit.is_some_and(|c| c != 0 && ![124,126,127,137].contains(&c)), "Red requires an assertion failure, not an infrastructure exit");
+                let cases: Vec<String> = serde_json::from_value(parsed["repro_results"]["failed"].clone()).unwrap_or_default();
+                anyhow::ensure!(!cases.is_empty(), "No structured assertion failure; compile/import/syntax errors do not count as red");
+                anyhow::ensure!(super::repro::attributed(&s.cwd, &prepared, &parsed["repro_results"], &cases), "Assertion failure did not originate in a requested changed test file");
+                cases
+            } else {
+                anyhow::ensure!(exit == Some(0), "Green requires exit 0");
+                // Admitted red has the BASE non-test tree. A different test or
+                // external timing/state alone is not a non-test fix since red.
+                anyhow::ensure!(after.non_test_changed, "Green requires a non-test change since red; no matching fresh passing repro recorded");
+                let cases = ledger.records.iter().rev().find_map(|r| match &r.kind { evidence::EvidenceKind::ReproRed { test_id, cases, .. } if test_id == &prepared.fingerprint => Some(cases.clone()), _ => None }).ok_or_else(|| anyhow::anyhow!("No red record for these exact test contents"))?;
+                let passed: Vec<String> = serde_json::from_value(parsed["repro_results"]["passed"].clone()).unwrap_or_default();
+                anyhow::ensure!(cases.iter().all(|c| passed.contains(c)), "Same failing test ids were not observed passing");
+                cases
+            };
+            let kind = if prepared.request.repro == Phase::Red { evidence::EvidenceKind::ReproRed { test_id: prepared.fingerprint, test_files: prepared.request.test_files, cases: cases.clone() } } else { evidence::EvidenceKind::ReproGreen { test_id: prepared.fingerprint, test_files: prepared.request.test_files, cases: cases.clone() } };
+            Ok(evidence::Record {
+                run_id: String::new(), seq: 0, id: String::new(), command: prepared.command, cwd: prepared.request.cwd,
+                command_definition_changed: false, exit_code: exit, duration_ms, started_at: record_start,
+                tree_hash_before: prepared.tree, tree_hash_after: after.tree, tests_ran: Some(cases.len() as u64), env_clean: true, env_digest: env_digest.clone(),
+                output_tail: if matches!(kind, evidence::EvidenceKind::ReproRed { .. }) { parsed["repro_results"]["assertion"].as_str().unwrap_or("").into() } else { format!("Passed: {}", cases.join("\nPassed: ")) }, kind, sig: String::new(),
+            })
+        })();
+        match accepted {
+            Ok(record) => {
+                if let Some(record) = s.evidence.lock().unwrap().record(record) {
+                    s.emit(AgentEvent::EvidenceRecorded { record: Box::new(record) });
+                    out.content.push(ResultPart::Text { text: "Regression evidence recorded (worker transparency, not independent proof).".into() });
+                } else { out = crate::tools::ToolOutput::err("Repro could not be authenticated; no record created"); }
+            }
+            Err(e) => out = crate::tools::ToolOutput::err(format!("Repro not recorded: {e}")),
+        }
+    }
     if let Some(before) = before {
         if let Ok(after) = evidence_tree::tree_hash(&s.cwd) {
             let parsed = out.content.iter().find_map(|p| match p {
@@ -1250,7 +1345,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
                 output_tail: if eligible.is_some() { parsed["output_tail"].as_str().unwrap_or("").into() } else { String::new() }, kind, sig: String::new(),
             };
             let recorded = s.evidence.lock().unwrap().record(record);
-            if let Some(record) = recorded { s.emit(AgentEvent::EvidenceRecorded { record }); }
+            if let Some(record) = recorded { s.emit(AgentEvent::EvidenceRecorded { record: Box::new(record) }); }
         }
     }
     let images: Vec<_> = out.content.iter().filter_map(|p| match p {

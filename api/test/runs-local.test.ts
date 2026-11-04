@@ -321,6 +321,24 @@ describe("persistent local run lifecycle", () => {
     expect(log.filter(call => call.method === "start")[2]).toMatchObject({ evidence_gate_rounds: 6, evidence_resumes: 2 });
     expect(runs.get(r.id).evidence).toMatchObject({ gate_rounds: 6, resumes: 2 });
   });
+  it("requests a tests-only local stage only after authenticating red", async () => {
+    workerTurns.push((runId, signingKey) => [{type:"evidence.recorded",record:signedRecord({run_id:runId,exit_code:1,
+      kind:{type:"repro_red",test_id:"c".repeat(64),test_files:["regression.test.js"],cases:["regression"]}}, signingKey)},
+      {type:"turn.end",agent_id:"main",stop_reason:"end_turn"}]);
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Repair the edge case",kind:"bug"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const stage = log.find(call => call.method === "stage_repro");
+    expect(stage).toMatchObject({title:r.title,repro_stage:{tree:"a".repeat(40),test_files:["regression.test.js"]}});
+    expect(stage).toHaveProperty("identity");
+    expect(log.findIndex(call => call.method === "stage_repro")).toBeLessThan(log.findIndex(call => call.method === "snapshot"));
+  });
+  it("passes an explicit task kind to the worker and rejects unknown kinds without inference", async () => {
+    const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Repair the edge case",kind:"bug"});
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).kind).toBe("bug");
+    expect(log.find(call => call.method === "start")).toMatchObject({kind:"bug"});
+    await expect(runs.create("u", {repo:"acme/app",model:"auto",prompt:"Work",kind:"guess" as any})).rejects.toMatchObject({code:"invalid_kind"});
+  });
   it("charges a crash-safe gate reservation before work even when no finish metadata exists", async () => {
     // No turn.end means there is no safe finish-state export at all.
     workerTurns.push([{ type: "error", agent_id: "main", message: "The worker connection failed.", retryable: false }]);

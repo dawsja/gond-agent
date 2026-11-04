@@ -36,7 +36,7 @@ vi.mock("../src/github", async original => {
 });
 
 const BASE = "a".repeat(40), HEAD = "b".repeat(40), TREE = "c".repeat(40);
-const VERSION = "gond-agent-checkpoint-3", LEGACY_VERSION = "gond-agent-checkpoint-2";
+const VERSION = "gond-agent-checkpoint-4", LEGACY_VERSION = "gond-agent-checkpoint-2";
 const COUNTERS = { sub_counter: 3, main_context: 12345, plan_calls: 7,
   plan_last: [{ text: "Inspect parser", status: "done" }], plan_nudges: 2, turn_compactions: 1, skipped_history_len: 2 };
 const PROMPT = "Repair the checkout without losing the original requirements.";
@@ -402,7 +402,7 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     expect(runs.get(run.id).evidence).toMatchObject({ last_seq: 9, recorded_before_restart: [record.id] });
   });
 
-  it.each(["absent", "null"])("authenticates ledgerless epoch-2 recovery (evidence %s) and consumes the original claim with an epoch-3 replacement", async evidence => {
+  it.each(["absent", "null"])("authenticates ledgerless epoch-2 recovery (evidence %s) and consumes the original claim with an epoch-4 replacement", async evidence => {
     const { run } = await checkpointed();
     const saved = storedState(rows(run.id).at(-1)!);
     saved.runner.runner_state_version = LEGACY_VERSION;
@@ -447,9 +447,10 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
   it.each([
     { name: "epoch-2 ledger", envelope: LEGACY_VERSION, payload: LEGACY_VERSION, ledger: {} },
     { name: "epoch-1", envelope: "gond-agent-checkpoint-1", payload: "gond-agent-checkpoint-1" },
-    { name: "future epoch", envelope: "gond-agent-checkpoint-4", payload: "gond-agent-checkpoint-4" },
-    { name: "epoch-2 envelope/epoch-3 payload", envelope: LEGACY_VERSION, payload: VERSION },
-    { name: "epoch-3 envelope/epoch-2 payload", envelope: VERSION, payload: LEGACY_VERSION },
+    { name: "future epoch", envelope: "gond-agent-checkpoint-5", payload: "gond-agent-checkpoint-5" },
+    { name: "pre-repro epoch-3", envelope: "gond-agent-checkpoint-3", payload: "gond-agent-checkpoint-3" },
+    { name: "epoch-2 envelope/epoch-4 payload", envelope: LEGACY_VERSION, payload: VERSION },
+    { name: "epoch-4 envelope/epoch-2 payload", envelope: VERSION, payload: LEGACY_VERSION },
     { name: "row/envelope mismatch", envelope: VERSION, payload: VERSION, relabel: true },
   ])("rejects $name without importing or searching an older checkpoint", async fixture => {
     const { run } = await checkpointed();

@@ -6,19 +6,24 @@ const text = (bytes: number) => z.string().max(bytes).refine(s => Buffer.byteLen
 const hash = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
 const cwd = text(1024).refine(s => s === "." || (!!s && !s.startsWith("/") && !s.includes("\\") && s.split("/").every(p => p && p !== "." && p !== "..") && !/[\x00-\x1f\x7f]/.test(s)));
 const check = z.strictObject({ command: text(8192), cwd });
-const policySchema = z.strictObject({ enabled: z.boolean(), checks: z.array(check).max(128), ui: z.enum(["attempt", "none"]), source: text(2048), notes: z.array(text(1024)).max(32), base: hash.or(z.literal("")) });
+const policySchema = z.strictObject({ repro_runners: z.array(z.strictObject({runner: z.enum(["vitest", "jest", "pytest", "cargo", "go"]), cwd})).max(128).optional(), enabled: z.boolean(), checks: z.array(check).max(128), ui: z.enum(["attempt", "none"]), source: text(2048), notes: z.array(text(1024)).max(32), base: hash.or(z.literal("")) });
+export const taskKindSchema = z.enum(["bug", "feature", "refactor", "other"]);
+const taskSchema = z.strictObject({kind: taskKindSchema, repro_plan: text(2000), skip: z.enum(["no_cheap_test_path", "needs_external_service", "ui_only", "cannot_reproduce_locally"]).nullable()});
+const reproFields = {test_id: z.string().regex(/^[a-f0-9]{64}$/), test_files: z.array(text(512).regex(/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/).refine(s => s.split("/").every(p => p && p !== "." && p !== ".."))).min(1).max(32), cases: z.array(text(1024)).min(1).max(100)};
 export const evidenceRecordSchema = z.strictObject({
   run_id: z.string(), command_definition_changed: z.boolean(),
   seq: uint, id: z.string().regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i),
   command: text(8192), cwd, exit_code: z.number().int().min(-2147483648).max(2147483647).nullable(),
   duration_ms: uint, started_at: uint, tree_hash_before: hash.or(z.literal("")), tree_hash_after: hash.or(z.literal("")),
   tests_ran: uint.nullable(), env_clean: z.boolean(), env_digest: z.string().regex(/^[a-f0-9]{64}$/), output_tail: text(4096),
-  kind: z.discriminatedUnion("type", [z.strictObject({ type: z.literal("check") }), z.strictObject({ type: z.literal("ui_attempt"), url: text(4096), title: text(1024) })]),
+  kind: z.discriminatedUnion("type", [z.strictObject({ type: z.literal("check") }), z.strictObject({type: z.literal("repro_red"), ...reproFields}), z.strictObject({type: z.literal("repro_green"), ...reproFields}), z.strictObject({ type: z.literal("ui_attempt"), url: text(4096), title: text(1024) })]),
   sig: z.string().regex(/^[a-f0-9]{64}$/),
 });
 export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
 export const MAX_EVIDENCE_IDS = 4096;
 export interface Evidence {
+  task?: z.infer<typeof taskSchema>;
+  staging?: "tests_first" | "single_commit";
   records: EvidenceRecord[];
   last_seq: number;
   ids: string[];
@@ -55,7 +60,14 @@ export function acceptEvidence(current: Evidence | undefined, value: unknown, ke
   const { sig, ...unsigned } = record;
   const expected = createHmac("sha256", key).update(canonicalEvidence({ domain: "gond-agent:evidence:v1", run_id: record.run_id, record: unsigned })).digest();
   if (!timingSafeEqual(expected, Buffer.from(sig, "hex"))) return;
-  return { ...state, records: [...state.records, record].slice(-40), last_seq: record.seq, ids: [...state.ids, record.id.toLowerCase()] };
+  if (record.kind.type === "repro_red" || record.kind.type === "repro_green") {
+    if (!record.env_clean || record.command_definition_changed || record.duration_ms >= 120000 || !record.tests_ran || record.tree_hash_before !== record.tree_hash_after || !record.tree_hash_before) return;
+    if (record.kind.type === "repro_red" && (record.exit_code === null || [0, 124, 126, 127, 137].includes(record.exit_code))) return;
+    if (record.kind.type === "repro_green" && (record.exit_code !== 0 || !state.records.some(r => r.kind.type === "repro_red" && r.tree_hash_before !== record.tree_hash_before && (record.kind.type === "repro_green" && r.kind.test_id === record.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(record.kind.cases))))) return;
+  }
+  const retained = state.records.filter(r => record.kind.type === "repro_red" ? r.kind.type !== "repro_red" && r.kind.type !== "repro_green" : record.kind.type === "repro_green" ? r.kind.type !== "repro_green" : true);
+  if (retained.length === 40) retained.splice(retained.findIndex(r => r.kind.type !== "repro_red" && r.kind.type !== "repro_green"), 1);
+  return { ...state, records: [...retained, record], last_seq: record.seq, ids: [...state.ids, record.id.toLowerCase()] };
 }
 
 /** The private export_state RPC returns {state: ...}; tolerate only absent legacy replies. */
@@ -76,6 +88,8 @@ export function finishEvidence(current: Evidence | undefined, reply: unknown, ke
   const evidence = exportedEvidence(reply);
   // A later key is never adopted, and metadata from a changed-key worker is ignored.
   if (!evidence || (key && evidence.key !== key.toString("hex"))) return state;
+  const task = taskSchema.safeParse(evidence.task);
+  if (task.success) state.task = task.data;
   const policy = policySchema.safeParse(evidence.policy);
   const notes = z.array(text(1024)).max(64).safeParse(evidence.unverified);
   const rounds = uint.max(4294967295).safeParse(evidence.gate_rounds);
@@ -176,6 +190,22 @@ export function verificationBlock(evidence?: Evidence): string {
     ].join("\n"), 4096)));
   } else lines.push("Verification gate and policy source: unavailable.");
   const missing = [...(evidence?.unverified ?? [])];
+  if (evidence?.task) {
+    lines.push("", "### Regression sequence", `Kind: ${evidence.task.kind}`);
+    if (evidence.task.skip) {
+      lines.push(`Repro skipped: ${evidence.task.skip}`);
+      missing.push(`Repro skipped: ${evidence.task.skip}`);
+    } else if (evidence.task.kind === "bug") {
+      lines.push("Red records only that some assertion in a new or changed test failed on base code. An unrelated or trivially failing assertion can qualify if the same test later passes after a non-test change. Worker-reported transparency does not establish relevance or causality.");
+      const red = [...records].reverse().find(r => r.kind.type === "repro_red");
+      const green = red && [...records].reverse().find(r => r.kind.type === "repro_green" && red.kind.type === "repro_red" && r.tree_hash_before !== red.tree_hash_before && r.kind.test_id === red.kind.test_id && JSON.stringify(r.kind.cases) === JSON.stringify(red.kind.cases) && r.seq > red.seq && r.exit_code === 0 && fresh(r));
+      if (!red) missing.push("no failing repro recorded");
+      else if (!green) missing.push("no matching fresh passing repro recorded");
+      if (red && red.kind.type === "repro_red") lines.push("repro_red command and test id:", fenced(bounded(`${red.cwd}: ${red.command}\nTest id: ${red.kind.test_id}\n${red.kind.cases.join("\n")}`, 2000)), "Failing tail (assertion):", fenced(bounded(red.output_tail, 1200)));
+      if (green) lines.push("repro_green command:", fenced(bounded(`${green.cwd}: ${green.command}`, 1200)), "Passing tail:", fenced(bounded(green.output_tail, 1200)));
+      lines.push(evidence.staging === "tests_first" ? "Commit ordering: tests first, then fix." : "Commit ordering: single commit (staging unavailable or not confirmed).");
+    }
+  }
   const definitionWarnings = records.filter(r => r.command_definition_changed).map(r => `Command definition changed: ${r.cwd}: ${r.command}`);
   if (!passed.length && !evidence?.docs_only) missing.push("No fresh successful check with a positive parsed test count.");
   if (evidence?.docs_only) lines.push("Docs-only change: the check requirement is waived; stale records remain stale.");
@@ -201,7 +231,7 @@ export function verificationBlock(evidence?: Evidence): string {
   for (const record of ordered) {
     const status = record.exit_code === null ? "exit unavailable" : `exit ${record.exit_code}`;
     const freshness = evidence?.recorded_before_restart?.includes(record.id) ? "recorded before restart; re-run required" : fresh(record) ? "fresh" : "stale or tree unavailable";
-    const detail = ["", `<details><summary>${record.kind.type === "check" ? "Check" : "UI attempt"}: ${status}; ${freshness}</summary>`, "", fenced([
+    const detail = ["", `<details><summary>${record.kind.type === "check" ? "Check" : record.kind.type === "ui_attempt" ? "UI attempt" : record.kind.type}: ${status}; ${freshness}</summary>`, "", fenced([
       `Command: ${bounded(record.command, 1024)}`, `Directory: ${record.cwd}`, `Duration: ${record.duration_ms} ms`, `Started: ${record.started_at} (Unix ms)`,
       `Tests observed: ${record.tests_ran ?? "unknown"}`, `Environment allow-list applied: ${record.env_clean ? "yes" : "no"}; allow-list digest: ${record.env_digest}`,
       `Command definition changed: ${record.command_definition_changed ? "yes" : "no"}`,

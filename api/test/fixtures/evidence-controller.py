@@ -11,7 +11,7 @@ import time
 
 
 def fake_worker():
-    state = {"runner_state_version": "gond-agent-checkpoint-3"}
+    state = {"runner_state_version": "gond-agent-checkpoint-4"}
     export_delay = 0
     boundary = 0
 

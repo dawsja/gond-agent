@@ -12,9 +12,8 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const SCHEMA_VERSION: u32 = 1;
 // Deliberate compatibility epoch, NOT Cargo's package version. Bump for changes to
 // history semantics, tool replay, compaction or counter interpretation.
-// Epoch 2 made sub_counter a consumed bounded-delegation allowance; epoch 3
-// adds service-issued, run-bound evidence. Epoch 1 counters cannot be restored.
-pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-3";
+// Epoch 4 combines bounded delegation, recovery and regression evidence.
+pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-4";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

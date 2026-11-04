@@ -97,6 +97,7 @@ afterEach(async () => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("Sign in with ChatGPT by pasting the loopback address", () => {
@@ -317,6 +318,9 @@ describe("Sign in with ChatGPT by pasting the loopback address", () => {
 
 describe("ChatGPT plan models and inference", () => {
   it("lists listed models with efforts in the catalog and MCP, and starts sessions with them", async () => {
+    // Pin allowed startup controls rather than depending on the test host's environment.
+    vi.stubEnv("GOND_AGENT_PLAN_REMINDER_EVERY", "6");
+    vi.stubEnv("GOND_AGENT_PLAN_NUDGE_LIMIT", "2");
     const id = (await signIn()).body.account.id, model = `chatgpt.${id}:gpt-5.5`;
     const catalog = await (await call("/api/v1/models")).json();
     expect(catalog.models.map((m: { id: string }) => m.id)).toEqual([model, `chatgpt.${id}:gpt-5.5-mini`]);
@@ -344,6 +348,7 @@ describe("ChatGPT plan models and inference", () => {
     for (const value of mock.issued) expect(workerTraffic).not.toContain(value);
     expect(rpcs.filter(r => r.method === "start")).toEqual([{ method: "start", args: {
       model, effort: "xhigh", interactive: true, question_wait_minutes: 240,
+      plan_reminder_every: 6, plan_nudge_limit: 2,
       evidence_seq: 0, evidence_gate_rounds: 0, evidence_resumes: 0,
       evidence_base_sha: "a".repeat(40), evidence_mode: "on", evidence_repo_policy: "",
     } }]);

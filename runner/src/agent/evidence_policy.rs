@@ -27,6 +27,7 @@ const DISCOVERY_FAILED: &str =
 pub struct EvidencePolicy {
     pub enabled: bool,
     pub checks: Vec<CheckCommand>,
+    pub repro_runners: Vec<super::repro::Runner>,
     pub ui: UiRequirement,
     pub source: String,
     pub notes: Vec<String>,
@@ -54,6 +55,7 @@ impl Default for EvidencePolicy {
         Self {
             enabled: true,
             checks: Vec::new(),
+            repro_runners: Vec::new(),
             ui: UiRequirement::Attempt,
             source: "defaults".into(),
             notes: Vec::new(),
@@ -131,6 +133,10 @@ fn discover_with(cwd: &Path, base: Option<&str>, off: bool, allow_weaken: bool) 
             }
             match name {
                 "Cargo.toml" => {
+                    policy.repro_runners.push(super::repro::Runner {
+                        runner: "cargo".into(),
+                        cwd: directory.into(),
+                    });
                     policy.add("cargo test --locked", directory);
                     policy.add(
                         "cargo clippy --all-targets --locked -- -D warnings",
@@ -144,6 +150,21 @@ fn discover_with(cwd: &Path, base: Option<&str>, off: bool, allow_weaken: bool) 
                     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                         continue;
                     };
+                    if let Some(script) = value["scripts"]["test"].as_str() {
+                        let runner = if matches!(script.trim(), "vitest" | "vitest run") {
+                            Some("vitest")
+                        } else if matches!(script.trim(), "jest" | "jest --runInBand") {
+                            Some("jest")
+                        } else {
+                            None
+                        };
+                        if let Some(runner) = runner {
+                            policy.repro_runners.push(super::repro::Runner {
+                                runner: runner.into(),
+                                cwd: directory.into(),
+                            });
+                        }
+                    }
                     for (script, command) in [
                         ("test", "npm test"),
                         ("lint", "npm run lint"),
@@ -159,7 +180,19 @@ fn discover_with(cwd: &Path, base: Option<&str>, off: bool, allow_weaken: bool) 
                         }
                     }
                 }
-                "pytest.ini" => policy.add("pytest", directory),
+                "go.mod" => {
+                    policy.repro_runners.push(super::repro::Runner {
+                        runner: "go".into(),
+                        cwd: directory.into(),
+                    });
+                }
+                "pytest.ini" => {
+                    policy.add("pytest", directory);
+                    policy.repro_runners.push(super::repro::Runner {
+                        runner: "pytest".into(),
+                        cwd: directory.into(),
+                    });
+                }
                 "pyproject.toml" | "setup.cfg" | "requirements.txt" => {
                     let Some(bytes) = repo.blob(&file.oid, MANIFEST_LIMIT)? else {
                         continue;
@@ -167,6 +200,10 @@ fn discover_with(cwd: &Path, base: Option<&str>, off: bool, allow_weaken: bool) 
                     if let Ok(text) = std::str::from_utf8(&bytes) {
                         if pytest_manifest(name, text) {
                             policy.add("pytest", directory);
+                            policy.repro_runners.push(super::repro::Runner {
+                                runner: "pytest".into(),
+                                cwd: directory.into(),
+                            });
                         }
                     }
                 }
@@ -239,15 +276,48 @@ impl EvidencePolicy {
     /// snapshot, never the checkout's index/config or a moving HEAD as baseline.
     /// Errors must be treated as changed by the caller (fail closed).
     pub fn command_definition_changed(&self, cwd: &Path, command: &CheckCommand) -> Result<bool> {
+        self.definition_changed(cwd, command, true)
+    }
+
+    pub fn repro_definition_changed(
+        &self,
+        cwd: &Path,
+        runner: &super::repro::Runner,
+    ) -> Result<bool> {
+        ensure!(
+            self.repro_runners.contains(runner),
+            "Runner is not in pinned policy"
+        );
+        normalized_cwd(&runner.cwd)?;
+        self.definition_changed(
+            cwd,
+            &CheckCommand {
+                command: String::new(),
+                cwd: runner.cwd.clone(),
+            },
+            false,
+        )
+    }
+
+    fn definition_changed(
+        &self,
+        cwd: &Path,
+        command: &CheckCommand,
+        ordinary: bool,
+    ) -> Result<bool> {
         oid(&self.base)?;
-        validate_check(command)?;
+        if ordinary {
+            validate_check(command)?;
+        }
         let repo = Repository::new(cwd)?;
         ensure!(
             repo.git(&["cat-file", "-t", &self.base])? == b"commit\n",
             "Invalid evidence base"
         );
         let base_files = repo.files(&self.base)?;
-        validate_base_script(&repo, &base_files, command)?;
+        if ordinary {
+            validate_base_script(&repo, &base_files, command)?;
+        }
         let tree = repo.snapshot()?;
         let paths = repo.git(&[
             "diff-tree",

@@ -255,6 +255,66 @@ def tree_hash():
         return capture_tree(git, env, head)
 
 
+def publication_title(req):
+    import unicodedata
+    value = req.get("title", "Changes")
+    if not isinstance(value, str) or not value.splitlines():
+        return "Changes"
+    return "".join(c for c in value.splitlines()[0] if not unicodedata.category(c).startswith("C"))[:120]
+
+
+def repro_test_path(path):
+    # Trusted installed policy (or its source-tree location in local tests).
+    policy = pathlib.Path(__file__).resolve().with_name("repro-test-paths.json")
+    if not policy.is_file():
+        policy = pathlib.Path(__file__).resolve().parents[1] / "runner/repro-test-paths.json"
+    return (isinstance(path, str) and 0 < len(path) <= 512 and not path.startswith(("/", "-")) and
+            all(part not in ("", ".", "..") and part.lower().rstrip(".") not in (".git", ".gond-agent") for part in path.split("/")) and
+            all(c.isascii() and (c.isalnum() or c in "_./-") for c in path) and
+            any(re.search(pattern, path) for pattern in json.loads(policy.read_text())))
+
+
+def repro_parent(git, head, tree, req):
+    """Reconstruct the authenticated red tree, never stage production changes.
+
+    The service requests this after admitting red. If a held boundary defers it,
+    publication may reconstruct the exact red tree. The sealed ledger preserves
+    ordering across tree-only restore; unavailable staging is a single commit.
+    """
+    stage = req.get("repro_stage")
+    if not isinstance(stage, dict) or not head:
+        return head
+    try:
+        base = checkpoint_sha(stage.get("base"))
+        red = checkpoint_sha(stage.get("tree"))
+        files = stage.get("test_files")
+        if head != base or not isinstance(files, list) or not 1 <= len(files) <= 32:
+            return head
+        if not all(repro_test_path(path) for path in files):
+            return head
+        entries = {}
+        for entry in git("ls-tree", "-rz", tree).split(b"\0"):
+            if entry:
+                meta, path = entry.split(b"\t", 1)
+                entries[path.decode()] = meta.decode().split()
+        git("read-tree", base)
+        for path in files:
+            mode, kind, oid = entries[path]
+            if mode not in ("100644", "100755") or kind != "blob":
+                return head
+            git("update-index", "--add", "--cacheinfo", mode, oid, path)
+        if git("write-tree").decode().strip() != red:
+            return head
+        # A single line without trailers or hidden controls, even for raw RPCs.
+        title = publication_title(req)
+        return git("commit-tree", red, "-p", base,
+                   input=("Add failing test for: " + title + "\n").encode()).decode().strip()
+    except (RuntimeError, KeyError, ValueError, UnicodeError):
+        return head
+    finally:
+        git("read-tree", tree)
+
+
 def snapshot_tree(req):
     """Publish the canonical tree without loading clone config or running hooks."""
     with checkpoint_lock, checkpoint_repository(allow_unborn=True) as (git, env, scratch, head):
@@ -269,9 +329,17 @@ def snapshot_tree(req):
                 raise RuntimeError("A connected GitHub commit identity is required.")
             env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER")
                         for key, field in (("NAME", "name"), ("EMAIL", "email"))})
-            parent = ("-p", head) if head else ()
-            commit = git("commit-tree", tree, *parent,
-                         input=(req.get("title", "Changes") + "\n").encode()).decode().strip()
+            staging_parent = repro_parent(git, head, tree, req)
+            if req.get("stage_only"):
+                if staging_parent == head:
+                    return {"staged": False}
+                commit = staging_parent
+                # Record only the test tree in the index; do not touch the worktree.
+                git("read-tree", commit)
+            else:
+                parent = ("-p", staging_parent) if staging_parent else ()
+                commit = git("commit-tree", tree, *parent,
+                             input=(publication_title(req) + "\n").encode()).decode().strip()
         git("update-ref", "HEAD", commit)
         bundle = scratch / "publication.bundle"
         git("bundle", "create", "--version=2", str(bundle), "HEAD")
@@ -310,7 +378,7 @@ def snapshot_tree(req):
                         lock.unlink(missing_ok=True)
             finally:
                 index_lock.unlink(missing_ok=True)
-        return {"bundle": base64.b64encode(body).decode(), "head": commit}
+        return {"staged": True, "head": commit} if req.get("stage_only") else {"bundle": base64.b64encode(body).decode(), "head": commit}
 
 
 def checkpoint_tree(req, state_digest=None):
@@ -599,6 +667,7 @@ def worker_env(req):
     if not relay_token:
         raise RuntimeError("The model relay is not ready.")
     return {**os.environ, "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
+            "GOND_AGENT_TASK_KIND": req.get("kind", "") if req.get("kind") in ("bug", "feature", "refactor", "other") else "",
             "GOND_AGENT_EVIDENCE_BASE_SHA": req.get("evidence_base_sha", ""),
             "GOND_AGENT_EVIDENCE": "off" if req.get("evidence_mode") == "off" else "on",
             "GOND_AGENT_EVIDENCE_REPO_POLICY": "allow-weaken" if req.get("evidence_repo_policy") == "allow-weaken" else "",
@@ -678,14 +747,14 @@ def dispatch(req):
             return checkpoint_tree(req)
     if method == "restore_checkpoint":
         return restore_checkpoint(req)
-    if method == "snapshot":
+    if method in ("snapshot", "stage_repro"):
         if not capture_lock.acquire(blocking=False):
             raise RuntimeError("A checkpoint operation is already pending.")
         try:
             with worker_lock:
                 if held_boundary:
                     raise RuntimeError("The worker is held for a checkpoint.")
-            return snapshot_tree(req)
+            return snapshot_tree({**req, "stage_only": True}) if method == "stage_repro" else snapshot_tree(req)
         finally:
             capture_lock.release()
     if method == "diff":

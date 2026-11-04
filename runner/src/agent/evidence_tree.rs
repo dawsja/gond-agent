@@ -220,6 +220,10 @@ fn oid(value: &str) -> Result<()> {
 /// Newly force-staged ignored files fail closed, just as in the service.
 pub fn tree_hash(cwd: &Path) -> Result<String> {
     let repo = Repository::new(cwd)?;
+    capture(&repo)
+}
+
+fn capture(repo: &Repository) -> Result<String> {
     let head = repo.head()?;
     let index = repo.clone_file("index")?;
     if index.exists() {
@@ -264,6 +268,71 @@ pub fn tree_hash(cwd: &Path) -> Result<String> {
         .to_owned();
     oid(&tree)?;
     Ok(tree)
+}
+
+pub struct ReproSnapshot {
+    pub tree: String,
+    pub non_test_equal: bool,
+    pub non_test_changed: bool,
+    pub test_identity: String,
+}
+
+pub fn repro_snapshot(cwd: &Path, base: &str, paths: &[String]) -> Result<ReproSnapshot> {
+    oid(base)?;
+    let repo = Repository::new(cwd)?;
+    let tree = capture(&repo)?;
+    let entries = |rev: &str| -> Result<std::collections::BTreeMap<String, String>> {
+        let bytes = repo.git(&["ls-tree", "-rz", rev], None)?;
+        let text = String::from_utf8(bytes)?;
+        text.split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let (metadata, path) = s.split_once('\t').context("Invalid tree entry")?;
+                Ok((path.to_owned(), metadata.to_owned()))
+            })
+            .collect()
+    };
+    let original = entries(base)?;
+    let current = entries(&tree)?;
+    let all = original
+        .keys()
+        .chain(current.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    let changed = all
+        .into_iter()
+        .filter(|p| original.get(*p) != current.get(*p))
+        .collect::<Vec<_>>();
+    // Positive non-test evidence is based on the naming policy, not a failed
+    // filesystem safety check on an otherwise test-named hardlink/symlink.
+    let non_test_changed = changed.iter().any(|p| !super::repro::test_name(p));
+    let non_test_equal = changed.iter().all(|p| {
+        let regular = |entry: Option<&String>| {
+            entry.is_none_or(|s| s.starts_with("100644 blob ") || s.starts_with("100755 blob "))
+        };
+        regular(original.get(*p)) && regular(current.get(*p)) && super::repro::test_path(cwd, p)
+    });
+    // A repro may execute only newly added or changed regular test files.
+    let mut identity = String::new();
+    for path in paths {
+        ensure!(
+            changed.contains(&path),
+            "Repro file is not changed from pinned base"
+        );
+        let entry = current
+            .get(path)
+            .context("Deleted tests cannot reproduce a failure")?;
+        ensure!(
+            entry.starts_with("100644 blob ") || entry.starts_with("100755 blob "),
+            "Repro must be a regular test file"
+        );
+        identity.push_str(&format!("{path}\t{entry}\n"));
+    }
+    Ok(ReproSnapshot {
+        tree,
+        non_test_equal,
+        non_test_changed,
+        test_identity: identity,
+    })
 }
 
 #[cfg(test)]

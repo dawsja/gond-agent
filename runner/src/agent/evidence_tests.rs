@@ -347,7 +347,7 @@ async fn changed_tree_finish_gates_then_exact_npm_test_records_real_evidence() {
     assert!(ledger.unverified.is_empty());
     assert_eq!(gate_count(&state.history), 1);
     assert_eq!(ledger.records.len(), 1);
-    assert!(ledger.records[0] == *record);
+    assert!(ledger.records[0] == **record);
     let requests = seen.lock().unwrap();
     assert_eq!(requests.len(), 5);
     assert_gate_request(&requests[3]);
@@ -997,7 +997,7 @@ async fn service_rekey_on_resume_preserves_counters_and_does_not_refresh_histori
 }
 
 #[tokio::test]
-async fn old_checkpoint_without_ledger_and_missing_key_restore_without_trusting_history() {
+async fn incompatible_checkpoint_rejected_and_missing_ledger_or_key_never_trusts_history() {
     let dir = repository();
     let mut old = serde_json::to_value(checkpoint_fixture(dir.path())).unwrap();
     old["runner_state_version"] = json!("gond-agent-checkpoint-2");
@@ -1152,3 +1152,5 @@ fn input_frames_keep_metadata_compatibility_but_checkpoint_controls_remain_exact
         serde_json::from_str::<AgentInput>(r#"{"type":"evidence.recorded","record":{}}"#).is_err()
     );
 }
+
+include!("repro_tests.rs");

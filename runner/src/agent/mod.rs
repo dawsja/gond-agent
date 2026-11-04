@@ -8,3 +8,4 @@ pub mod evidence_policy;
 pub mod evidence_tree;
 
 pub use core::{AgentConfig, AgentHandle, spawn};
+pub mod repro;
