@@ -109,6 +109,8 @@ class FakeWorkspace implements Workspace {
       result = { base_sha: BASE, head_sha: HEAD, checkpoint_sha: TREE };
     } else if (method === "events") {
       result = { events: this.events.splice(0), alive: !this.destroyed };
+    } else if (method === "workspace_state") {
+      result = { head: HEAD, clean: true };
     } else if (method === "snapshot") {
       result = { bundle: Buffer.from("publication-bundle").toString("base64"), head: HEAD };
     } else if (method === "send") {
@@ -199,6 +201,60 @@ afterEach(async () => {
 });
 
 describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", () => {
+  it.each([false, true])("restores idle-released conversation for a follow-up (first reopen fails: %s)", async reopenFails => {
+    cfg.maxRuns = 1;
+    finishUsers = true;
+    const { run, worker } = await checkpointed();
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    const checkpoint = rows(run.id).at(-1)!;
+    const history = storedState(checkpoint).runner.history;
+    expect(history).toContainEqual(message("assistant", EARLIER));
+    finishUsers = false;
+    const waiting = await create();
+    expect(runs.get(waiting.id).status).toBe("queued");
+    const live = (runs as unknown as { live: Map<string, { idleSince?: number }> }).live.get(run.id)!;
+    live.idleSince = Date.now() - 600_000;
+    runs.drain();
+    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => {
+      expect(workers.find(worker => worker.id === waiting.id)!.users()).toHaveLength(1);
+      expect((runs as unknown as { booting: Set<string> }).booting.has(waiting.id)).toBe(false);
+    });
+    expect(rows(run.id)).toContainEqual(expect.objectContaining({ seq: checkpoint.seq, consumed_at: null }));
+    expect(runs.get(run.id)).toMatchObject({ status: "ready", resume_from_checkpoint: true });
+    expect(runs.history(run.id, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
+
+    const followUp = "Handle the next parser edge case.";
+    await runs.validateFollowUp(run.id, "u");
+    runs.enqueue(run.id, "u", followUp);
+    expect(runs.get(run.id).status).toBe("queued");
+    await runs.stop(waiting.id, "u");
+    await vi.waitFor(() => {
+      expect(runs.get(waiting.id).status).toBe("stopped");
+      expect((runs as unknown as { live: Map<string, { busy: boolean }> }).live.get(waiting.id)?.busy).toBe(false);
+    });
+    if (reopenFails) {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      factory.mockRejectedValueOnce(new Error("temporary workspace startup failure"));
+    }
+    await runs.closeSession(waiting.id, "u");
+    if (reopenFails) {
+      await vi.waitFor(() => expect(runs.get(run.id).status).toBe("interrupted"));
+      expect(runs.get(run.id).pending.map(message => message.text)).toEqual([followUp]);
+      await runs.resume(run.id, "u");
+    }
+    await vi.waitFor(() => expect(workers).toHaveLength(3));
+    const reopened = workers.at(-1)!;
+    await vi.waitFor(() => expect(reopened.users()).toHaveLength(1));
+    expect(reopened.imported?.history).toEqual(history);
+    expect(reopened.users()[0]).toContain(followUp);
+    expect(reopened.users()[0]!.split("The run was restarted.")).toHaveLength(2);
+    expect(reopened.users()[0]).not.toContain(PROMPT);
+    expect(reopened.calls.findIndex(call => call.method === "restore_checkpoint"))
+      .toBeLessThan(reopened.calls.findIndex(call => call.method === "import_state"));
+    expect(runs.history(run.id, 0)).toContainEqual(expect.objectContaining({ type: "run.resumed" }));
+  });
+
   it("publishes a finished turn despite failed flush and post-publication capture", async () => {
     vi.stubEnv("GOND_AGENT_CHECKPOINT_MAX_MB", "1");
     await restart();

@@ -95,5 +95,5 @@ it("explains occupied workspaces without an ETA or another account's queue", () 
     .toBe("All 5 workspaces are in use: 2 working, 3 idle. Idle workspaces can be closed to free a slot.");
   expect(capacityReason({ max: 2, occupied: 1, working: 1, idle_releasable: 0, queued_total_for_account: 1 }))
     .toBe("Waiting for a workspace to start. Work starts in account queue order as capacity becomes available.");
-  expect(idleReleaseMs()).toBe(120_000);
+  expect(idleReleaseMs()).toBe(600_000);
 });

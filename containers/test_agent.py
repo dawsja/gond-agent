@@ -792,6 +792,16 @@ class CheckpointTest(unittest.TestCase):
         self.assertTrue(agent.dispatch({"method": "workspace_state"})["clean"])
 
     @mock.patch.object(agent, "workspace_quiescent", return_value=True)
+    def test_workspace_state_rejects_files_hidden_by_clone_info_exclude(self, _quiescent):
+        self.write(".git/info/exclude", "private-work\n")
+        self.write("private-work", "must survive release\n")
+        self.assertEqual(self.git("status", "--porcelain"), b"")
+        before = self.state()
+        self.assertEqual(agent.dispatch({"method": "workspace_state"}), {"head": self.head, "clean": False})
+        self.assertEqual(self.state(), before)
+        self.assertEqual((self.root / "private-work").read_text(), "must survive release\n")
+
+    @mock.patch.object(agent, "workspace_quiescent", return_value=True)
     def test_workspace_state_does_not_execute_checkout_filters_or_fsmonitor(self, _quiescent):
         marker = self.root / "executed"
         self.git("config", "filter.hostile.clean", f"touch {marker}; cat")

@@ -169,7 +169,10 @@ def workspace_quiescent():
 
 def workspace_state():
     """Fail-closed release evidence using private Git config/index, without staging edits."""
-    with checkpoint_lock, checkpoint_repository() as (git, env, _, head):
+    with checkpoint_lock, checkpoint_repository() as (git, env, scratch, head):
+        # Release evidence must not trust clone-local exclusions, even if paired
+        # capture chooses to copy them. Otherwise hidden work could be discarded.
+        (scratch / "repo/.git/info/exclude").unlink(missing_ok=True)
         gitdir = pathlib.Path(ROOT).resolve() / ".git"
         # Publication exports HEAD only. Stashes, tags/notes and commits on other
         # local branches must not disappear just because the current tree is clean.

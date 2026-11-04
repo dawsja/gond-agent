@@ -62,7 +62,7 @@ export type StreamEvent =
 
 export const emptyUsage = (): Usage => ({ input_uncached: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0 });
 
-/** Service workspace admission view; queue totals are scoped to the requesting account. */
+/** Deliberately aggregate shared-instance workspace load; only queue totals are account-scoped. */
 export interface Capacity {
   max: number;
   occupied: number;

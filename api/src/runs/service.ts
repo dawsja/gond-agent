@@ -128,6 +128,10 @@ interface Live {
   busy: boolean;
   closing?: boolean;
   destruction?: Promise<void>;
+  destroyAttempts?: number;
+  destroyRetry?: ReturnType<typeof setTimeout>;
+  destroyGaveUp?: boolean;
+  releaseForWaiting?: boolean;
   keepTimer?: ReturnType<typeof setTimeout>;
   keptSince?: number;
   idleSince?: number;
@@ -263,7 +267,7 @@ export class Runs {
       idleSince: live.idleSince, delayMs: this.idleDelay, state: live.state,
     };
   }
-  private capacity(user: string): Capacity {
+  private capacity(user?: string): Capacity {
     let working = 0, idle_releasable = 0;
     for (const id of this.occupied()) {
       const live = this.live.get(id);
@@ -453,7 +457,22 @@ export class Runs {
     return { ok: true };
   }
   private occupied() { return new Set([...this.live.keys(), ...this.booting]); }
-  private hasCapacity() { return this.occupied().size < this.cfg.maxRuns; }
+  private hasCapacity(reclaim = false) {
+    if (this.occupied().size < this.cfg.maxRuns) return true;
+    if (reclaim) {
+      // Failed-kept reclaim is separate from clean ready-session release. Give a
+      // person a short retry grace, then preserve the existing imported-commit path.
+      const oldest = [...this.live].filter(([id, live]) => !live.busy && !live.closed && !live.closing &&
+        !this.booting.has(id) && live.keptSince !== undefined && Date.now() - live.keptSince >= 60_000 && this.get(id).work_kept)
+        .sort((a, b) => a[1].keptSince! - b[1].keptSince!)[0];
+      // Serialize active teardown/retries, not exhausted ones: a failed-destroy
+      // reservation must not prevent reclaiming another legitimately occupied slot.
+      if (oldest && ![...this.live.values()].some(live => (live.closed || live.closing) && !live.destroyGaveUp))
+        void this.close(oldest[0], true).catch(() => console.error("Couldn't reclaim failed workspace", oldest[0]));
+    }
+    // Destruction retains its reservation; its completion re-enters normal drain.
+    return false;
+  }
   private releaseIdleForWaitingWork() {
     if (this.idleRelease || this.shuttingDown || this.hasCapacity() || !this.queue.first(new Map(), this.occupied())) return;
     const now = Date.now();
@@ -476,7 +495,7 @@ export class Runs {
         if (this.shuttingDown || this.hasCapacity() || !this.queue.first(new Map(), this.occupied()) || !releasable(candidate, Date.now())) return;
         live.closing = false;
         // Same snapshot/push and teardown path as an explicit Close workspace.
-        const result = await this.closeSession(id, this.get(id).user_id, async () => {
+        await this.closeSession(id, this.get(id).user_id, async () => {
           // Snapshot can run repository filters. Verify again afterwards so a
           // writer or edit created during publication cannot be discarded.
           live.state = await live.workspace.rpc<WorkspaceState>("workspace_state");
@@ -484,7 +503,6 @@ export class Runs {
           return !this.shuttingDown && !this.hasCapacity() && !!this.queue.first(new Map(), this.occupied()) &&
             releasable({ ...current, closing: false }, Date.now());
         });
-        if (result.closed) this.append(id, { type: "run.released", reason: "idle_for_waiting_work" });
       } catch {
         live.state = undefined;
         console.error("Couldn't release idle workspace", id);
@@ -511,13 +529,15 @@ export class Runs {
     const lengths = new Map<string, number>();
     const positions = new Map<string, number>();
     for (const entry of waiting) lengths.set(entry.user_id, (lengths.get(entry.user_id) ?? 0) + 1);
+    // One shared load snapshot per pass; only queue lengths differ by account.
+    const load = waiting.length ? this.capacity() : undefined;
     for (const entry of waiting) {
       const position = (positions.get(entry.user_id) ?? 0) + 1;
       positions.set(entry.user_id, position);
       const length = lengths.get(entry.user_id)!;
       const previous = this.db.prepare("SELECT data FROM events WHERE run_id=? AND json_extract(data,'$.type') IN ('run.queued','run.dequeued') ORDER BY seq DESC LIMIT 1").get(entry.id) as { data: string } | undefined;
       const last = previous && JSON.parse(previous.data);
-      const capacity = this.capacity(entry.user_id);
+      const capacity = { ...load!, queued_total_for_account: length };
       const reason = capacityReason(capacity);
       if (last?.type !== "run.queued" || last?.position !== position || last?.length !== length || JSON.stringify(last?.capacity) !== JSON.stringify(capacity) || last?.queue_reason !== reason)
         this.append(entry.id, { type: "run.queued", position, length, capacity, queue_reason: reason });
@@ -542,7 +562,7 @@ export class Runs {
       // Check for an eligible head before reclaiming: a cancelled boot's
       // replacement can be queued while still reserved by the old startup.
       const reserved = () => new Set([...this.occupied(), ...this.queue.waiting().filter(e => this.autoResuming.size && this.get(e.id).auto_resume_pending).map(e => e.id)]);
-      while (this.queue.first(new Map(), reserved()) && this.hasCapacity()) {
+      while (this.queue.first(new Map(), reserved()) && this.hasCapacity(true)) {
         const accounts = new Map<string, number>();
         for (const id of this.occupied()) {
           // A deleted run can still own a container or an outstanding startup.
@@ -1036,7 +1056,9 @@ export class Runs {
       }
       const active = r.active_message;
       const finishing = r.recovery_phase === "finishing";
-      const continuation = !!restored && (!!active || r.resume_from_checkpoint);
+      // Without an active task, queued new work only needs restored history plus
+      // delivery framing—even if an earlier reopening attempt failed.
+      const continuation = !!restored && (!!active || (r.resume_from_checkpoint && !r.pending.some(message => !message.recovery)));
       // Rebuild synthetic continuation inputs from durable data, rather than stacking
       // another copy if this worker also dies before its first replacement checkpoint.
       r.pending = r.pending.filter(message => !message.recovery);
@@ -1559,10 +1581,20 @@ export class Runs {
     r.ci_cancelled_sha = r.head_sha ?? undefined;
     this.save(r);
     this.ci.stop(id);
-    if (!live) { this.discardCheckpoint(id, user); return { closed: true }; }
+    if (!live) {
+      this.discardCheckpoint(id, user);
+      r.resume_from_checkpoint = false;
+      this.save(r);
+      return { closed: true };
+    }
     // A failed destroy retains its capacity reservation. Retry teardown instead
     // of reporting success or accepting a message into a closed worker.
     if (live.closed) {
+      // Apply explicit-close policy even when joining automatic teardown. Do not
+      // await its destruction here: CI close can race its own post-push cleanup.
+      this.discardCheckpoint(id, user);
+      r.resume_from_checkpoint = false;
+      this.save(r);
       if (!live.destruction) await this.close(id);
       return { closed: true };
     }
@@ -1571,11 +1603,15 @@ export class Runs {
     try {
       await this.publish(id, live, {});
       if (beforeClose && !await beforeClose()) return { closed: false };
-      // Reuse the existing capacity-reclaim teardown after the idle safety check.
-      await this.close(id, !!beforeClose);
+      // Automatic idle release preserves the paired tree/conversation checkpoint,
+      // just like CI auto-close; explicit Close still discards it.
+      live.releaseForWaiting = !!beforeClose;
+      await this.close(id, false, !!beforeClose);
       return { closed: true };
     } catch (error) {
-      await this.fail(id, error);
+      // A teardown failure is not a model/publication failure. close() owns its
+      // bounded retry, reservation and checkpoint-preservation policy.
+      if (!live.closed) await this.fail(id, error);
       throw error;
     } finally { live.closing = false; }
   }
@@ -1607,7 +1643,10 @@ export class Runs {
       if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
     }
     if (r) {
-      if (!preserveCheckpoint) this.discardCheckpoint(id, r.user_id);
+      if (!preserveCheckpoint) {
+        this.discardCheckpoint(id, r.user_id);
+        r.resume_from_checkpoint = false;
+      } else r.resume_from_checkpoint = !!this.usableCheckpoint(r);
       if (forCapacity && live?.publishPending?.imported)
         r.kept_commit = live.publishPending.snapshot?.head;
       r.phase = "idle";
@@ -1624,18 +1663,46 @@ export class Runs {
       live.closed = true;
       live.closing = true;
       live.publishPending = undefined;
-      try { await (live.destruction ??= live.workspace.destroy()); }
-      catch (error) { live.destruction = undefined; throw error; }
+      clearTimeout(live.destroyRetry);
+      live.destroyRetry = undefined;
+      try {
+        if (!live.destruction) {
+          live.destroyAttempts = (live.destroyAttempts ?? 0) + 1;
+          live.destruction = live.workspace.destroy();
+        }
+        await live.destruction;
+      } catch (error) {
+        live.destruction = undefined;
+        const attempts = live.destroyAttempts!;
+        if (!this.shuttingDown && !live.destroyRetry && attempts < 5) {
+          live.destroyRetry = setTimeout(() => {
+            live.destroyRetry = undefined;
+            if (!this.shuttingDown && this.live.get(id) === live)
+              void this.close(id, forCapacity, preserveCheckpoint).catch(() => console.error("Couldn't retry workspace teardown", id));
+          }, 1000 * 2 ** (attempts - 1));
+          live.destroyRetry.unref();
+        } else if (attempts >= 5 && !live.destroyGaveUp) {
+          live.destroyGaveUp = true;
+          this.append(id, { type: "run.cleanup", state: "gave_up", attempts,
+            message: "Couldn't close the workspace. Try Close workspace again or ask an administrator to check the worker service." });
+        }
+        throw error;
+      }
       this.live.delete(id);
     }
     // Only an imported commit survives capacity eviction, not the worker's
     // uncommitted edits or a bundle that could not be imported.
     if (!r?.kept_commit) await rm(join(this.cfg.data, "checkouts", id), { recursive: true, force: true });
     this.autoResuming.delete(id);
+    if (live?.releaseForWaiting) {
+      live.releaseForWaiting = false;
+      this.append(id, { type: "run.released", reason: "idle_for_waiting_work" });
+    }
     this.drain();
   }
   async shutdown() {
     this.shuttingDown = true;
+    for (const live of this.live.values()) clearTimeout(live.destroyRetry);
     this.ci.stopAll();
     clearInterval(this.queueTimer);
     clearInterval(this.checkpointTimer);

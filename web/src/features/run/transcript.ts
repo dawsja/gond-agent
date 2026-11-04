@@ -231,6 +231,13 @@ export function createTranscript() {
         case "run.dequeued":
           queueRevision++
           break
+        case "run.cleanup":
+          if (ev.state === "gave_up") {
+            const text = "Couldn't close the workspace. Try Close workspace again or ask an administrator to check the worker service."
+            items.push({ kind: "run-message", key: `rm${ev.seq}`, text })
+            log.push({ ts: ev.ts, source: "runner", text })
+          }
+          break
         case "run.resumed":
         case "run.checkpoint_fallback": {
           const text = ev.type === "run.resumed"
