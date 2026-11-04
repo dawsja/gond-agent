@@ -21,6 +21,8 @@ export interface Run {
   effort?: string
   title: string
   prompt: string
+  pr_body?: string | null
+  description?: string
   status: RunStatus
   queue_position?: number
   queue_length?: number

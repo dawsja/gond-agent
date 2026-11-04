@@ -735,6 +735,7 @@ struct Turn<'a> {
 
 async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, input: Value) -> Block {
     let Turn { run, cancel, started, tool_count } = turn;
+    s.emit(AgentEvent::ToolCall { agent_id: run.id.clone(), call_id: id.clone(), name: name.clone() });
     if cancel.is_cancelled() {
         return result(id, name, "interrupted by the user before this call ran", true);
     }
@@ -1049,6 +1050,78 @@ mod tests {
             out.push(ev);
             if done {
                 return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_marks_every_dispatch_without_changing_visible_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let handler: Handler = Arc::new(|req: &Value| {
+            if req["messages"].as_array().unwrap().len() != 1 {
+                return sse(&[json!({"type":"text","text":"Done."})], "end_turn");
+            }
+            if req["metadata"]["agent_id"] != "main" {
+                return sse(&[
+                    json!({"type":"tool_call","id":"sub-read","name":"read","input":{"path":"a.txt"}}),
+                    json!({"type":"tool_call","id":"sub-read-2","name":"read","input":{"path":"a.txt"}}),
+                ], "tool_use");
+            }
+            sse(&[
+                json!({"type":"text","text":"Working."}),
+                json!({"type":"tool_call","id":"plan","name":"update_plan","input":{"plan":[{"step":"Work","status":"done"}]}}),
+                json!({"type":"tool_call","id":"list","name":"list_plan","input":{}}),
+                json!({"type":"tool_call","id":"question","name":"ask_user","input":{"question":"Continue?"}}),
+                json!({"type":"tool_call","id":"task","name":"task","input":{"description":"Read file","prompt":"Read a.txt","kind":"explore"}}),
+                json!({"type":"tool_call","id":"bad-plan","name":"update_plan","input":{}}),
+                json!({"type":"tool_call","id":"bad-task","name":"task","input":{}}),
+                json!({"type":"tool_call","id":"unknown","name":"unknown","input":{}}),
+                json!({"type":"tool_call","id":"skill","name":"skill","input":{"name":"missing"}}),
+                json!({"type":"tool_call","id":"read","name":"read","input":{"path":"a.txt"}}),
+                json!({"type":"tool_call","id":"bad-read","name":"read","input":{}}),
+            ], "tool_use")
+        });
+        let url = mock(handler, Arc::new(StdMutex::new(vec![]))).await;
+        for interrupt in [false, true] {
+            let mut h = spawn(ApiClient::new(url.clone(), None), config(dir.path(), Mode::Allow));
+            h.input.send(AgentInput::User { text: "go".into(), images: vec![] }).unwrap();
+            let mut events = until(&mut h, |e| matches!(e, AgentEvent::Question { .. })).await;
+            let AgentEvent::Question { request_id, .. } = events.last().unwrap() else { unreachable!() };
+            assert!(matches!(&events[events.len() - 2], AgentEvent::ToolCall { call_id, .. } if call_id == "question"));
+            h.input.send(if interrupt { AgentInput::Interrupt } else {
+                AgentInput::QuestionReply { request_id: request_id.clone(), answer: "yes".into() }
+            }).unwrap();
+            events.extend(until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await);
+
+            let calls: Vec<_> = events.iter().filter_map(|e| match e {
+                AgentEvent::ToolCall { agent_id, call_id, name } if agent_id == "main" => Some((call_id.as_str(), name.as_str())),
+                _ => None,
+            }).collect();
+            assert_eq!(calls, vec![
+                ("plan", "update_plan"), ("list", "list_plan"), ("question", "ask_user"), ("task", "task"),
+                ("bad-plan", "update_plan"), ("bad-task", "task"), ("unknown", "unknown"),
+                ("skill", "skill"), ("read", "read"), ("bad-read", "read"),
+            ], "exactly one boundary per main call, even after cancellation");
+            let sub_calls: Vec<_> = events.iter().filter_map(|e| match e {
+                AgentEvent::ToolCall { agent_id, call_id, .. } if agent_id != "main" => Some((agent_id.as_str(), call_id.as_str())),
+                _ => None,
+            }).collect();
+            assert_eq!(sub_calls, if interrupt { vec![] } else { vec![("explore-1", "sub-read"), ("explore-1", "sub-read-2")] });
+
+            let visible: Vec<_> = events.iter().filter_map(|e| match e {
+                AgentEvent::ToolStart { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(visible, if interrupt { vec![] } else { vec!["sub-read", "sub-read-2", "skill", "read", "bad-read"] }, "no new visible activity for internal or unknown tools");
+            assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolEnd { .. })).count(), visible.len());
+            for (i, event) in events.iter().enumerate() {
+                if let AgentEvent::ToolStart { agent_id, call_id, .. } = event {
+                    assert!(events[..i].iter().any(|e| matches!(e, AgentEvent::ToolCall { agent_id: a, call_id: c, .. } if a == agent_id && c == call_id)));
+                }
+                if matches!(event, AgentEvent::Todos { .. } | AgentEvent::AgentSpawn { .. }) {
+                    assert!(matches!(&events[i - 1], AgentEvent::ToolCall { .. }), "boundary precedes internal dispatch effects");
+                }
             }
         }
     }

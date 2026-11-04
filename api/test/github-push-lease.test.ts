@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { command } from "../src/command";
 import { importBundle, pushBranch, type PushOptions } from "../src/github";
 import { ApiError } from "../src/wire";
+import { publicationPushOptions } from "../src/runs/publication";
 
 const retry = { sleep: async () => {}, random: () => 0 };
 const directories: string[] = [];
@@ -13,7 +14,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })));
 });
 
-async function fixture(initial: { rejectLease?: boolean; loseResponse?: boolean; failBeforePush?: number; failRemoteRead?: boolean } = {}) {
+async function fixture(initial: { rejectLease?: boolean; loseResponse?: boolean; failBeforePush?: number; failBeforePushMessage?: string; failRemoteRead?: boolean } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "gond-agent-push-lease-"));
   directories.push(dir);
   const remote = join(dir, "remote"), cwd = join(dir, "api"), bin = join(dir, "bin"), state = join(dir, "state.json");
@@ -28,7 +29,7 @@ const save=()=>fs.writeFileSync(path,JSON.stringify(state));
 if(action){state.events.push({kind:action,args});save();}
 if(action==='ls-remote' && state.failRemoteRead){process.stderr.write('connection refused');process.exit(1);}
 if(action==='push'){
-  if(state.failBeforePush>0){state.failBeforePush--;save();process.stderr.write('HTTP 500');process.exit(1);}
+  if(state.failBeforePush>0){state.failBeforePush--;save();process.stderr.write(state.failBeforePushMessage || 'HTTP 500');process.exit(1);}
   if(state.rejectLease && args.some(arg=>arg.startsWith('--force-with-lease='))){process.stderr.write('! [rejected] HEAD -> fixture (stale info)');process.exit(1);}
 }
 const result=cp.spawnSync('/usr/bin/git',args,{stdio:'inherit',env:process.env});
@@ -109,6 +110,75 @@ describe("create-only publication leases", () => {
     const later = (await f.events()).slice(events.length);
     expect(later.map(event => event.kind)).toEqual(["guard", "push"]);
     expect(later[1].args?.some(arg => arg.startsWith("--force"))).toBe(false);
+  });
+
+  it("keeps helper-selected leases and guards through a network failure and lost-response reconciliation, then publishes normally", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const f = await fixture({ failBeforePush: 1, failBeforePushMessage: "connection reset by peer", loseResponse: true });
+    const run = { explicit_branch: true, pushed: false };
+    const options = publicationPushOptions(run, f.beforePush);
+    expect(options).toEqual({ lease: "create-only", beforePush: f.beforePush });
+    const beforeAttempt = vi.fn(async () => {});
+    let waits = 0;
+    const sleep = vi.fn(async () => {
+      // The first attempt never reached Git; the second wrote the exact commit but lost its response.
+      expect(await f.git(f.remote, "for-each-ref", "--format=%(objectname)", f.ref))
+        .toBe(++waits === 1 ? "" : f.head);
+    });
+    const bundle = join(f.cwd, ".git", "helper.bundle");
+    await f.git(f.cwd, "bundle", "create", bundle, "HEAD");
+    await importBundle(f.cwd, await readFile(bundle), f.branch, f.env, { ...retry, sleep, beforeAttempt }, options);
+    expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(f.head);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(beforeAttempt).toHaveBeenCalledTimes(3);
+    const events = await f.events();
+    expect(events.map(event => event.kind)).toEqual(["guard", "push", "guard", "push", "guard", "push", "ls-remote"]);
+    expect(events.filter(event => event.kind === "guard").map(event => event.head)).toEqual([f.head, f.head, f.head]);
+    for (const event of events.filter(event => event.kind === "push")) {
+      expect(event.args).toContain(`--force-with-lease=${f.ref}:`);
+      expect(event.args?.at(-1)).toBe(`${f.head}:${f.ref}`);
+    }
+    expect(events.at(-1)?.args?.slice(-4)).toEqual(["ls-remote", "--refs", "origin", f.ref]);
+    await expect(readFile(join(f.cwd, ".git", "gond-agent.bundle"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    run.pushed = true;
+    await writeFile(join(f.cwd, "work.txt"), "published follow-up\n");
+    await f.git(f.cwd, "commit", "-am", "published follow-up");
+    const next = await f.git(f.cwd, "rev-parse", "HEAD");
+    const laterOptions = publicationPushOptions(run, f.beforePush);
+    expect(laterOptions).toEqual({ lease: undefined, beforePush: f.beforePush });
+    await pushBranch(f.cwd, f.branch, f.env, { ...retry, beforeAttempt }, laterOptions);
+    expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(next);
+    expect(beforeAttempt).toHaveBeenCalledTimes(4);
+    const later = (await f.events()).slice(events.length);
+    expect(later.map(event => event.kind)).toEqual(["guard", "push"]);
+    expect(later[0].head).toBe(next);
+    expect(later[1].args?.at(-1)).toBe(`${next}:${f.ref}`);
+    expect(later[1].args?.some(arg => arg.startsWith("--force"))).toBe(false);
+  });
+
+  it("never fast-forwards a branch created by someone else between a network failure and the retry", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const f = await fixture({ failBeforePush: 1, failBeforePushMessage: "connection reset by peer" });
+    const sleep = vi.fn(async () => {
+      expect((await f.events()).map(event => event.kind)).toEqual(["guard", "push"]);
+      expect(await f.git(f.remote, "for-each-ref", "--format=%(refname)", f.ref)).toBe("");
+      // Another publisher creates an ancestor ref: a normal push would silently fast-forward it.
+      await f.git(f.remote, "update-ref", f.ref, f.base);
+      await f.git(f.cwd, "merge-base", "--is-ancestor", f.base, f.head);
+    });
+    await expect(pushBranch(f.cwd, f.branch, f.env, { ...retry, sleep },
+      publicationPushOptions({ explicit_branch: true, pushed: false }, f.beforePush)))
+      .rejects.toMatchObject({ step: "push", class: "rejected", attempts: 2, retryable: false });
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(await f.git(f.remote, "rev-parse", f.ref)).toBe(f.base);
+    const events = await f.events();
+    expect(events.map(event => event.kind)).toEqual(["guard", "push", "guard", "push", "ls-remote"]);
+    expect(events.filter(event => event.kind === "guard").map(event => event.head)).toEqual([f.head, f.head]);
+    for (const event of events.filter(event => event.kind === "push")) {
+      expect(event.args).toContain(`--force-with-lease=${f.ref}:`);
+      expect(event.args?.at(-1)).toBe(`${f.head}:${f.ref}`);
+    }
   });
 
   it("lets a guard refuse a retry before any further push, preserving its original policy error", async () => {

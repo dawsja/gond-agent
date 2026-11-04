@@ -11,6 +11,8 @@ import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
 import { gh, checkout, importBundle, pushBranch } from "../src/github";
 import { RetryError } from "../src/retry";
+import { command } from "../src/command";
+import * as publication from "../src/runs/publication";
 import { createMcp, createToken, sessionState } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 vi.mock("../src/github", async (original) => {
@@ -20,7 +22,7 @@ vi.mock("../src/github", async (original) => {
     gh: vi.fn(async (endpoint: string, method: string) =>
       method === "POST"
         ? { number: 42, html_url: "https://github.com/acme/app/pull/42" }
-        : endpoint.includes("/pulls?")
+        : endpoint.includes("/pulls?") || endpoint.includes("/git/matching-refs/")
           ? []
           : { default_branch: "main" },
     ),
@@ -49,6 +51,7 @@ let dir: string,
   events: Record<string, unknown>[],
   destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
 let workerFailure: string | null;
+let workerTurns: Record<string, unknown>[][];
 let relay: (req: Request) => Promise<Response>;
 const cfg = (): Config => ({
   data: dir,
@@ -75,6 +78,7 @@ beforeEach(async () => {
   log = [];
   events = [];
   workerFailure = null;
+  workerTurns = [];
   destroy = vi.fn(async () => {});
   runs = new Runs(db, cfg(), async (_id, handler) => {
     relay = handler;
@@ -91,6 +95,7 @@ beforeEach(async () => {
               stop_reason: "interrupted",
             });
           else if (input.type !== "user") return true as any;
+          else if (workerTurns.length) events.push(...workerTurns.shift()!);
           else if (workerFailure)
             events.push(
               { type: "turn.start", agent_id: "main" },
@@ -451,6 +456,136 @@ describe("persistent local run lifecycle", () => {
       expect(JSON.stringify(captured.mock.calls)).not.toMatch(/test-managed-github-token|https:\/\//);
     } finally { captured.mockRestore(); }
   });
+  it.each(["retained", "capacity-reclaimed"] as const)("preserves first-publication options on a %s retry without a stale branch preflight", async path => {
+    const branch = "fix/ambiguous-publication", endpoint = `repos/acme/app/git/matching-refs/heads/${branch}`;
+    const original = vi.mocked(gh).getMockImplementation()!;
+    let remoteExists = false;
+    vi.mocked(gh).mockImplementation(async (...args) => {
+      if (args[0] === endpoint) return (remoteExists ? [{ ref: `refs/heads/${branch}` }] : []) as never;
+      return original(...args);
+    });
+    const captured = vi.spyOn(console, "error").mockImplementation(() => {});
+    let release: (() => void) | undefined;
+    try {
+      // Import succeeded locally; publication may also have succeeded before its response was lost.
+      vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"network",retryable:true,reason:"Connection reset"}, 5));
+      const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Publish this",branch});
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+      expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,work_kept:true,head_sha:"b".repeat(40)});
+      expect(vi.mocked(importBundle).mock.calls[0]?.slice(2)).toEqual([
+        branch, expect.objectContaining({GH_TOKEN:"test-managed-github-token"}), undefined,
+        {lease:"create-only",beforePush:undefined},
+      ]);
+      const preflights = () => vi.mocked(gh).mock.calls.filter(call => call[0] === endpoint);
+      expect(preflights()).toHaveLength(2); // Creation and the fresh snapshot only.
+      remoteExists = true; // A repeated availability check would incorrectly block reconciliation.
+
+      if (path === "capacity-reclaimed") {
+        const healthy = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Healthy"});
+        await vi.waitFor(() => expect(runs.get(healthy.id).status).toBe("ready"));
+        const replacement = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Reclaim failed workspace"});
+        await vi.waitFor(() => expect(runs.get(replacement.id).status).toBe("ready"));
+        expect(destroy).toHaveBeenCalledTimes(1);
+        expect(runs.get(r.id)).toMatchObject({work_kept:false,kept_commit:"b".repeat(40),pushed:false});
+        await runs.close(replacement.id); // Leave room to boot the reclaimed run.
+      }
+      const clones = vi.mocked(checkout).mock.calls.length;
+      const snapshots = log.filter(call => call.method === "snapshot").length;
+      const sends = log.filter(call => call.method === "send" && (call.input as any)?.type === "user").length;
+      vi.mocked(pushBranch).mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
+      runs.enqueue(r.id, "u", "Reconcile and continue");
+      await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(pushBranch).mock.calls[0]).toEqual([
+        path === "retained" ? "/fake" : join(dir, "checkouts", r.id), branch,
+        expect.objectContaining({GH_TOKEN:"test-managed-github-token"}), undefined,
+        {lease:"create-only",beforePush:undefined},
+      ]);
+      expect(preflights()).toHaveLength(2);
+      expect(checkout).toHaveBeenCalledTimes(clones);
+      expect(log.filter(call => call.method === "snapshot")).toHaveLength(snapshots);
+      expect(log.filter(call => call.method === "send" && (call.input as any)?.type === "user")).toHaveLength(sends);
+      release!(); release = undefined;
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+      expect(runs.get(r.id)).toMatchObject({pushed:true,work_kept:false,head_sha:"b".repeat(40)});
+      expect(runs.get(r.id).kept_commit).toBeUndefined();
+      expect(preflights()).toHaveLength(2);
+      expect(checkout).toHaveBeenCalledTimes(clones + (path === "retained" ? 0 : 1));
+      if (path === "capacity-reclaimed") expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
+      const imports = vi.mocked(importBundle).mock.calls.filter(call => call[2] === branch);
+      expect(imports).toHaveLength(2); // No re-import of the kept commit; only the completed follow-up.
+      expect(imports[1]?.slice(4)).toEqual([undefined, {lease:undefined,beforePush:undefined}]);
+    } finally {
+      release?.();
+      vi.mocked(gh).mockImplementation(original);
+      captured.mockRestore();
+    }
+  });
+  it("keeps boot publication create-only and pushed false when someone else creates the explicit branch", async () => {
+    const captured = vi.spyOn(console, "error").mockImplementation(() => {});
+    const optionsFor = publication.publicationPushOptions;
+    let optionsSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"network",retryable:true,reason:"Connection reset"}, 5));
+      const branch = "fix/kept-commit-race", ref = `refs/heads/${branch}`;
+      const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Keep my unpublished work",branch});
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+      await runs.close(r.id, true); // Reclaim the worker, retaining its imported commit for boot().
+      expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,kept_commit:"b".repeat(40),work_kept:false});
+
+      // Replace the mocked imported commit with a real API clone and local bare remote.
+      const cwd = join(dir, "checkouts", r.id), remote = join(dir, "remote.git");
+      mkdirSync(cwd, {recursive:true});
+      mkdirSync(remote);
+      const git = async (folder: string, ...args: string[]) => (await command("git", args, {cwd:folder})).toString().trim();
+      await git(remote, "init", "--bare", "-b", "main");
+      await git(cwd, "init", "-b", branch);
+      await git(cwd, "config", "user.name", "Fixture");
+      await git(cwd, "config", "user.email", "fixture@example.test");
+      writeFileSync(join(cwd, "work.txt"), "base\n");
+      await git(cwd, "add", ".");
+      await git(cwd, "commit", "-m", "base");
+      const base = await git(cwd, "rev-parse", "HEAD");
+      await git(cwd, "remote", "add", "origin", remote);
+      await git(cwd, "push", "origin", "HEAD:refs/heads/main");
+      writeFileSync(join(cwd, "work.txt"), "kept work\n");
+      await git(cwd, "commit", "-am", "kept work");
+      const head = await git(cwd, "rev-parse", "HEAD");
+      runs.save({...runs.get(r.id),kept_commit:head,head_sha:head});
+      // Someone else creates an ancestor ref after reclamation; a plain push would fast-forward it.
+      await git(remote, "update-ref", ref, base);
+      await git(cwd, "merge-base", "--is-ancestor", base, head);
+
+      const guard = vi.fn(async (context: {cwd:string;branch:string;head:string}) => {
+        expect(context).toEqual({cwd,branch,head});
+        expect(runs.get(r.id).pushed).toBe(false);
+      });
+      optionsSpy = vi.spyOn(publication, "publicationPushOptions").mockImplementation(run => optionsFor(run, guard));
+      const actual = await vi.importActual<typeof import("../src/github")>("../src/github");
+      const clones = vi.mocked(checkout).mock.calls.length, activity = log.length;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        vi.mocked(pushBranch).mockImplementationOnce(async (...args) => {
+          expect(args).toEqual([cwd,branch,expect.objectContaining({GH_TOKEN:"test-managed-github-token"}),undefined,{lease:"create-only",beforePush:guard}]);
+          expect(runs.get(r.id)).toMatchObject({pushed:false,kept_commit:head});
+          await actual.pushBranch(...args); // Real Git must reject instead of fast-forwarding the competing ref.
+        });
+        runs.enqueue(r.id, "u", "Retry the kept publication");
+        await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(attempt));
+        await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+        expect(runs.get(r.id)).toMatchObject({pushed:false,kept_commit:head,work_kept:false,last_error:{step:"push",class:"rejected",attempts:1}});
+        const stored = JSON.parse((db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as {data:string}).data);
+        expect(stored).toMatchObject({pushed:false,kept_commit:head});
+        expect(await git(remote, "rev-parse", ref)).toBe(base);
+        expect(await git(cwd, "rev-parse", "HEAD")).toBe(head);
+      }
+      expect(guard).toHaveBeenCalledTimes(2);
+      expect(optionsSpy).toHaveBeenCalledTimes(2);
+      expect(checkout).toHaveBeenCalledTimes(clones);
+      expect(log).toHaveLength(activity); // No replacement worker or follow-up work starts after rejection.
+    } finally {
+      optionsSpy?.mockRestore();
+      captured.mockRestore();
+    }
+  });
   it("reclaims the oldest kept failure at capacity and still releases failures on stop", async () => {
     workerFailure = "The model connection dropped 3 times";
     const first = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"First"});
@@ -676,6 +811,141 @@ describe("persistent local run lifecycle", () => {
     expect(vi.mocked(importBundle).mock.calls[0]?.[3]?.GH_TOKEN === "test-managed-github-token").toBe(true);
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(runs.get(r.id).status).toBe("merged");
+  });
+  it("uses an explicit title for commits and PRs and accepts an available custom branch", async () => {
+    const title = "Fix session redirects", branch = "fix/session-redirects";
+    const r = await runs.create("u", {
+      repo: "acme/app", model: "auto", prompt: "Investigate the login flow", title, branch,
+    });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id)).toMatchObject({ title, branch });
+    expect(gh).toHaveBeenCalledWith(
+      `repos/acme/app/git/matching-refs/heads/${branch}`, "GET", undefined,
+      expect.objectContaining({ GH_TOKEN: "test-managed-github-token" }),
+    );
+    expect(vi.mocked(checkout).mock.calls[0]?.[4]).toBe(branch);
+    expect(vi.mocked(importBundle).mock.calls[0]?.[2]).toBe(branch);
+    expect(log.find(call => call.method === "snapshot")).toMatchObject({ title });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toEqual({
+      title, head: branch, base: "main", body: "Fixed it and tested it.",
+    });
+  });
+  it("refuses an existing remote branch before reserving or starting a run", async () => {
+    vi.mocked(gh).mockResolvedValueOnce({ default_branch: "main" }).mockResolvedValueOnce([{ ref: "refs/heads/fix/taken" }]);
+    await expect(runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it", branch: "fix/taken" })).rejects.toMatchObject({ status: 400, code: "branch_exists" });
+    expect(runs.list("u")).toHaveLength(0);
+    expect(checkout).not.toHaveBeenCalled();
+  });
+  it("rechecks explicit branches before the first publication", async () => {
+    workerTurns.push([{ type: "turn.start", agent_id: "main" }]);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it", branch: "fix/raced" });
+    await vi.waitFor(() => expect(log.some(call => call.method === "events")).toBe(true));
+    vi.mocked(gh).mockResolvedValueOnce([{ ref: "refs/heads/fix/raced" }]);
+    events.push({ type: "text.delta", agent_id: "main", text: "Done" }, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    expect(runs.get(r.id).summary.text).toBe("");
+    expect(log.some(call => call.method === "snapshot")).toBe(false);
+    expect(importBundle).not.toHaveBeenCalled();
+  });
+  it("keeps the prompt-derived title and generated branch when publication fields are omitted", async () => {
+    const r = await runs.create("u", {
+      repo: "acme/app", model: "auto", prompt: "  Fix   the login redirect\nKeep sessions intact.",
+    });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const title = "Fix the login redirect", branch = `gond-agent/fix-the-login-redirect-${r.id.slice(-6)}`;
+    expect(runs.get(r.id)).toMatchObject({ title, branch });
+    expect(log.find(call => call.method === "snapshot")).toMatchObject({ title });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ title, head: branch });
+  });
+  it.each(["Release notes supplied by the caller.\n\nKeep this description.", ""])("persists explicit PR body %j through follow-ups and later PATCH overrides", async body => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it", pr_body: body });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body });
+    const patches = () => vi.mocked(gh).mock.calls.filter(call => call[0] === "repos/acme/app/pulls/42" && call[1] === "PATCH");
+    runs.enqueue(r.id, "u", "Add a regression test");
+    await vi.waitFor(() => expect(patches()).toHaveLength(1));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).pr_body).toBe(body);
+    const stale = runs.get(r.id);
+    const replacement = body === "" ? "Updated release notes." : "";
+    runs.enqueue(r.id, "u", "Update the description", [], undefined, undefined, undefined, replacement);
+    await vi.waitFor(() => expect(patches()).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    runs.enqueue(r.id, "u", "One more check");
+    await vi.waitFor(() => expect(patches()).toHaveLength(3));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(patches().map(call => call[2])).toEqual([{ body }, { body: replacement }, { body: replacement }]);
+    runs.save(stale);
+    expect(runs.get(r.id).pr_body).toBe(replacement);
+    const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+    expect(JSON.parse(stored.data).pr_body).toBe(replacement);
+  });
+  it("publishes only the final main reply after parallel tools, retaining commentary in the transcript and resetting follow-ups", async () => {
+    const fixture = [
+      { type: "turn.start", agent_id: "main" },
+      { type: "text.delta", agent_id: "main", text: "I'll inspect both files." },
+      { type: "tool.call", agent_id: "main", call_id: "read-1", name: "read" },
+      { type: "tool.start", agent_id: "main", call_id: "read-1", name: "read", title: "src/app.ts", input: { path: "src/app.ts" } },
+      { type: "tool.call", agent_id: "main", call_id: "read-2", name: "read" },
+      { type: "tool.start", agent_id: "main", call_id: "read-2", name: "read", title: "src/auth.ts", input: { path: "src/auth.ts" } },
+      { type: "tool.output", agent_id: "main", call_id: "read-2", chunk: "File contents, not a description" },
+      { type: "tool.end", agent_id: "main", call_id: "read-2", ok: true, summary: "Read auth", output: "Auth source" },
+      { type: "tool.end", agent_id: "main", call_id: "read-1", ok: true, summary: "Read app", output: "App source" },
+      { type: "text.delta", agent_id: "main", text: "I'll check the plan before replying." },
+      { type: "tool.call", agent_id: "main", call_id: "plan-1", name: "list_plan" },
+      { type: "text.delta", agent_id: "main", text: "## Result\n\nFixed the redirect. " },
+      { type: "turn.start", agent_id: "explore-1" },
+      { type: "text.delta", agent_id: "explore-1", text: "Subagent commentary" },
+      { type: "tool.call", agent_id: "explore-1", call_id: "sub-read", name: "read" },
+      { type: "tool.start", agent_id: "explore-1", call_id: "sub-read", name: "read", title: "src/app.ts", input: { path: "src/app.ts" } },
+      { type: "tool.end", agent_id: "explore-1", call_id: "sub-read", ok: true, summary: "Read app", output: "App source" },
+      { type: "text.delta", agent_id: "explore-1", text: "Subagent final reply" },
+      { type: "turn.end", agent_id: "explore-1", stop_reason: "end_turn" },
+      { type: "text.delta", agent_id: "main", text: "Checks passed.\n" },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ];
+    workerTurns.push(fixture);
+    const prompt = "Fix the login flow", reply = "## Result\n\nFixed the redirect. Checks passed.\n";
+    const title = "Fix login redirect";
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt, title });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary).toMatchObject({ text: reply, final_reply: true });
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: reply });
+    const types = new Set(fixture.map(event => event.type));
+    expect(runs.history(r.id, 0).filter(event => types.has(event.type))).toMatchObject(fixture);
+
+    // A successful tools-only follow-up must not publish its commentary or the previous reply.
+    workerTurns.push([
+      { type: "turn.start", agent_id: "main" },
+      { type: "text.delta", agent_id: "main", text: "I'll inspect the plan." },
+      { type: "tool.call", agent_id: "main", call_id: "plan-2", name: "list_plan" },
+      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+    ]);
+    const patches = () => vi.mocked(gh).mock.calls.filter(call => call[1] === "PATCH");
+    runs.enqueue(r.id, "u", "Inspect the plan without a final reply");
+    await vi.waitFor(() => expect(patches()).toHaveLength(1));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary.text).toBe("");
+    expect(patches()[0]?.[2]).toEqual({ body: title });
+    runs.enqueue(r.id, "u", "Finish with a new reply");
+    await vi.waitFor(() => expect(patches()).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary).toMatchObject({ text: "Fixed it and tested it.", final_reply: true });
+    expect(patches()[1]?.[2]).toEqual({ body: "Fixed it and tested it." });
+  });
+  it.each(["max_tokens", "unknown_stop"])("publishes the title instead of text ending with %s without altering the transcript", async stop_reason => {
+    const fixture = [
+      { type: "turn.start", agent_id: "main" },
+      { type: "text.delta", agent_id: "main", text: "Incomplete reply" },
+      { type: "turn.end", agent_id: "main", stop_reason },
+    ];
+    workerTurns.push(fixture);
+    const title = "Safe run title";
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", title, prompt: "Task with sensitive pasted text" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary.final_reply).toBe(false);
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: title });
+    expect(runs.history(r.id, 0).filter(event => fixture.some(item => item.type === event.type))).toMatchObject(fixture);
   });
   it("refreshes externally merged PRs once, preserves concurrent run updates and blocks follow-ups", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it" });
