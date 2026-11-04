@@ -963,7 +963,7 @@ const key = 'fixture-only-provider-key';
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     await verifyTheme();
     if (!returning) {
-      const categoryNames = ['Personal settings', 'Models', 'Security', 'Connections', 'People', 'Agent access', 'Account management'];
+      const categoryNames = ['Personal settings', 'Models', 'Security', 'People', 'Agent access', 'Account management'];
       await expect(page.getByRole('heading', { level: 2 })).toHaveText(categoryNames);
       for (const name of categoryNames) {
         const heading = page.getByRole('heading', { name, exact: true, level: 2 });
@@ -1148,8 +1148,17 @@ const key = 'fixture-only-provider-key';
     await captureThemes('automations-switches');
     await capture('automations');
     await page.goto(origin + '/agents/plugins');
-    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Plugins', exact: true })).toBeVisible();
+    await page.getByRole('link', { name: /GitHub Manage your GitHub connection/ }).click();
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
+    await expect(page.getByRole('heading', { name: 'GitHub', level: 1, exact: true })).toBeVisible();
+    // The first account is an administrator: both connection cards belong here,
+    // including before connecting GitHub and after restarting the service.
+    await expect(page.getByRole('heading', { level: 2 })).toHaveText(['Your connection', 'Shared connection']);
+    await expect(page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true })).toBeEnabled();
+    await expect(page.getByText('No shared GitHub account connected', { exact: true })).toBeVisible();
     if (!returning) {
+      await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(2);
       await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
       await expect(page.getByRole('link', { name: 'Continue on GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
@@ -1174,6 +1183,7 @@ const key = 'fixture-only-provider-key';
     expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
     await capture(returning ? 'github-after-restart' : 'github-connected');
     await page.goto(origin + '/agents/settings#connections');
+    await expect(page).toHaveURL(origin + '/agents/plugins/github');
     const sharedFallback = page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true });
     await expect(sharedFallback).not.toBeChecked();
     await expect(sharedFallback).toBeEnabled();
@@ -1186,9 +1196,12 @@ const key = 'fixture-only-provider-key';
       await expect(sharedFallback).toBeEnabled();
       await expect(sharedFallback).toHaveAttribute('aria-checked', String(checked));
     }
-    await expect(page.getByText('Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on.', { exact: true })).toBeVisible();
+    await expect(page.getByText('Administrators manage this connection for accounts without their own GitHub connection. When enabled, those accounts can use the shared connection or service credentials configured on this server.', { exact: true })).toBeVisible();
     await page.getByRole('heading', { name: 'Shared connection', exact: true }).scrollIntoViewIfNeeded();
     await captureThemes('github-admin-shared-switch');
+    await page.goto(origin + '/agents/settings#oidc');
+    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(0);
     const singleSignOn = page.getByRole('switch', { name: 'Enable single sign-on', exact: true });
     await singleSignOn.scrollIntoViewIfNeeded();
     await expect(singleSignOn).toBeEnabled();
@@ -1208,6 +1221,7 @@ const key = 'fixture-only-provider-key';
         expect((await (await member.request.get(origin + '/api/v1/me')).json()).theme).toBe('light');
         expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
         await member.goto(origin + '/agents/settings#connections');
+        await expect(member).toHaveURL(origin + '/agents/plugins/github');
         await resolvedTheme('light', member);
         await expect(member.getByText('Connect your own GitHub account here. Your runs and pull requests use it.', { exact: true })).toBeVisible();
         await expect(member.getByRole('button', { name: 'Connect GitHub', exact: true })).toBeVisible();

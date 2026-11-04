@@ -11,7 +11,7 @@ import { githubStatus } from "./github";
 import { ApiError } from "./wire";
 
 export function githubEnvFor(db: Store, secret: string, userId: string): NodeJS.ProcessEnv {
-  if (!userId) throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
+  if (!userId) throw new ApiError(409, "github_required", "Connect your GitHub account in Plugins > GitHub");
   const own = db.prepare("SELECT token FROM github_connections WHERE user_id=?").get(userId) as { token: string } | undefined;
   const fallback = getSetting<boolean>(db, "github-shared-fallback");
   const saved = own ?? (fallback ? getSetting<{ token: string }>(db, "github") : null);
@@ -20,7 +20,7 @@ export function githubEnvFor(db: Store, secret: string, userId: string): NodeJS.
     delete env.GITHUB_TOKEN;
     env.GH_TOKEN = unseal(secret, saved.token);
   } else if (!fallback || !hasServiceGithubCredentials(env)) {
-    throw new ApiError(409, "github_required", "Connect your GitHub account in Settings > Connections");
+    throw new ApiError(409, "github_required", "Connect your GitHub account in Plugins > GitHub");
   }
   return env;
 }
