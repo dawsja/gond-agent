@@ -31,6 +31,36 @@ afterEach(() => {
 });
 
 describe("model relay abort handling", () => {
+  it.each([
+    ["error", { error:{type:"server_error",message:"private-upstream-detail"} }, "provider_unavailable", true],
+    ["error", { type:"server_error",message:"private-upstream-detail" }, "provider_unavailable", true],
+    ["response.failed", { response:{error:{code:"overloaded"}} }, "provider_unavailable", true],
+    ["response.incomplete", { response:{incomplete_details:{reason:"server_error"}} }, "provider_unavailable", true],
+    ["response.failed", { response:{error:{code:"insufficient_quota"}} }, "provider_quota", false],
+    ["error", { error:{code:"unknown-secret",message:"private-upstream-detail"} }, "provider_error", false],
+  ])("terminates %s with a single normalized failure", async (kind, data, code, retryable) => {
+    saveProviderSettings(db, secret, {connections:[{id:"p",name:"P",format:"openai-responses",baseURL:"http://provider.invalid/v1",discover:false,
+      models:[{id:"m",name:"M",contextWindow:4096,maxOutput:1024,reasoning:"none",images:false}]}]});
+    vi.spyOn(adapters, "callProvider").mockResolvedValue(new Response(`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`, {headers:{"content-type":"text/event-stream"}}));
+    const response = await modelResponse(db, secret, "u", "r", request());
+    const body = await response.text();
+    expect(body).toContain(`"code":"${code}"`);
+    expect(body).toContain(`"retryable":${retryable}`);
+    expect((body.match(/event: error/g) ?? [])).toHaveLength(1);
+    expect(body).not.toMatch(/response.end|truncated|private-upstream-detail|unknown-secret/);
+  });
+
+  it("surfaces provider usage resets without retrying billing or usage limits", async () => {
+    vi.spyOn(adapters, "callProvider").mockResolvedValue(new Response(JSON.stringify({error:{code:"usage_limit_reached",resets_at:1900000000,message:"secret"}}), {status:429}));
+    const response = await modelResponse(db, secret, "u", "r", request());
+    expect(await response.json()).toMatchObject({error:{code:"provider_usage_limit",retryable:false,reset_at:1900000000,message:expect.stringContaining("2030-03-17T17:46:40.000Z")}});
+  });
+
+  it("passes a bounded Retry-After from provider HTTP errors", async () => {
+    vi.spyOn(adapters, "callProvider").mockResolvedValue(new Response("{}", {status:429,headers:{"retry-after":"30"}}));
+    const response = await modelResponse(db, secret, "u", "r", request());
+    expect(await response.json()).toMatchObject({error:{code:"provider_rate_limit",retryable:true,retry_after_ms:30000}});
+  });
   it("returns a safe retryable error for an upstream AbortError before headers", async () => {
     vi.spyOn(adapters, "callProvider").mockRejectedValue(dropped());
     const response = await modelResponse(db, secret, "u", "r", request());

@@ -93,6 +93,7 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app/api
 COPY --from=api-deps /app/api/node_modules ./node_modules
 COPY api/src/ ./src/
+COPY runner/model-errors.json /app/runner/model-errors.json
 COPY shared/model-names.ts shared/profile-photo.ts shared/theme-preference.ts shared/accents.ts shared/run-state.ts shared/pagination.ts /app/shared/
 COPY api/package.json ./
 COPY --from=frontend /src/web/dist/ /app/web/dist/

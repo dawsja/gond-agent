@@ -48,6 +48,7 @@ import { RunQueue } from "./queue";
 import { acceptEvidence, emptyEvidence, finishEvidence, MAX_EVIDENCE_IDS, weakenedEvidence, type Evidence } from "./evidence";
 import { capacityReason, releasable, type Capacity, type ReleaseCandidate, type WorkspaceState } from "./capacity";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
+import { modelPolicy, modelReason } from "../model-errors";
 
 export interface Run {
   /** Validated public evidence only. Signing keys belong exclusively to Live. */
@@ -1349,9 +1350,15 @@ export class Runs {
       live.cursor += batch.events.length;
       for (const event of batch.events) {
         if (live.closed) return;
-        const modelDropped = event.type === "error" && event.message === "The model connection dropped 3 times";
-        if (event.type === "error" && event.agent_id === "main")
-          event.message = modelDropped ? "The model connection dropped 3 times" : "The model request failed.";
+        if (event.type === "error" && event.agent_id === "main") {
+          const policy = modelPolicy(event.code);
+          event.code = policy.code;
+          event.retryable = policy.retryable;
+          if (!Number.isInteger(event.status) || event.status < 400 || event.status > 599) delete event.status;
+          if (typeof event.reset_at !== "number" || !Number.isFinite(event.reset_at) || event.reset_at <= 0 || event.reset_at >= 253402300800) delete event.reset_at;
+          event.message = modelReason(policy.code, event.status, event.reset_at);
+          event.attempts = Number.isInteger(event.attempts) && event.attempts >= 1 && event.attempts <= 5 ? event.attempts : 1;
+        }
         const admitted = this.append(id, event);
         if (event.type === "evidence.recorded" && !admitted) continue;
         if (event.type === "evidence.recorded" && event.record?.kind?.type === "repro_red" && this.workerAlive(live) && this.live.get(id) === live) {
@@ -1387,11 +1394,9 @@ export class Runs {
         }
         if (event.type === "error" && event.agent_id === "main") {
           this.saveEvidence(id, live);
-          const dropped = modelDropped;
           await this.fail(id, new RetryError("model", {
-            class: dropped ? "network" : "unknown", retryable: !!event.retryable,
-            reason: dropped ? "The model connection dropped 3 times" : "The model request failed",
-          }, dropped ? 3 : 1));
+            class: event.code, retryable: event.retryable, reason: event.message,
+          }, event.attempts));
           continue;
         }
         if (event.type === "turn.end" && event.agent_id === "main") {

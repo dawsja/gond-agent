@@ -141,7 +141,8 @@ pub enum StreamEvent {
     BlockDelta { index: usize, text: Option<String>, partial_json: Option<String> },
     BlockEnd { index: usize, input: Option<Value>, opaque: Option<Opaque> },
     End { stop_reason: String, usage: Usage },
-    Error { code: String, message: String, retryable: bool },
+    Error { code: String, message: String, retryable: bool, status: Option<u16>, retry_after_ms: Option<u64>, reset_at: Option<f64> },
+    Retry { attempt: u32, max_attempts: u32, code: String, wait_seconds: f64 },
 }
 
 impl StreamEvent {
@@ -167,6 +168,9 @@ impl StreamEvent {
                 code: s("code").unwrap_or_else(|| "error".into()),
                 message: s("message").unwrap_or_default(),
                 retryable: v.get("retryable").and_then(Value::as_bool).unwrap_or(false),
+                status: v.get("status").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()),
+                retry_after_ms: v.get("retry_after_ms").and_then(Value::as_u64),
+                reset_at: v.get("reset_at").and_then(Value::as_f64),
             },
             _ => return Ok(None),
         }))

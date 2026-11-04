@@ -1,7 +1,12 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { createInterface } from "node:readline";
+import { randomBytes } from "node:crypto";
 import sharp from "sharp";
 import { openStore } from "../src/db";
 import { setSetting } from "../src/db";
@@ -55,6 +60,7 @@ let dir: string,
   events: Record<string, unknown>[],
   destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
 let workerFailure: string | null;
+let runtimeSend: ((input: unknown) => void) | undefined;
 type WorkerTurn = Record<string, unknown>[] | ((runId: string, key: Buffer) => Record<string, unknown>[]);
 let workerTurns: WorkerTurn[];
 let workerEvidenceReply: unknown;
@@ -90,6 +96,7 @@ beforeEach(async () => {
   log = [];
   events = [];
   workerFailure = null;
+  runtimeSend = undefined;
   workerTurns = [];
   workerEvidenceReply = true;
   workerInitialize = async () => {};
@@ -107,6 +114,7 @@ beforeEach(async () => {
         }
         if (method === "send") {
           const input = args?.input as any;
+          if (runtimeSend) { runtimeSend(input); return true as any; }
           if (input.type === "interrupt")
             events.push({
               type: "turn.end",
@@ -166,6 +174,64 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 describe("persistent local run lifecycle", () => {
+  it.skipIf(!existsSync(resolve(import.meta.dirname, "../../runner/target/debug/gond-agent-worker"))).each([false, true])("real worker against local model: exhausted=%s", async exhausted => {
+    const cwd = join(dir, "worker"); mkdirSync(cwd);
+    const token = randomBytes(32).toString("hex"), requests: unknown[] = [];
+    const model = createServer(async (req, res) => {
+      if (req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401).end(); return; }
+      if (req.method === "GET") { res.end(JSON.stringify({ models:[{id:"fixture",context_window:100000}] })); return; }
+      let body = ""; for await (const chunk of req) body += chunk;
+      requests.push(JSON.parse(body));
+      const n = requests.length;
+      if (n > 1 && (exhausted || n <= 3)) {
+        res.writeHead(503, {"content-type":"application/json"});
+        res.end(JSON.stringify({error:{code:"provider_unavailable",message:"private upstream detail",retryable:true}}));
+        return;
+      }
+      res.writeHead(200, {"content-type":"text/event-stream"});
+      const event = (name: string, data: unknown) => res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
+      event("response.start", {id:"r",model:"fixture"});
+      if (n === 1) {
+        event("block.start", {index:0,type:"tool_call",id:"write-once",name:"write"});
+        event("block.end", {index:0,input:{path:"kept.txt",content:"work survives\n"}});
+      } else {
+        event("block.start", {index:0,type:"text"}); event("block.delta", {index:0,text:"Done."}); event("block.end", {index:0});
+      }
+      event("response.end", {stop_reason:n === 1 ? "tool_use" : "end_turn",usage:{input_uncached:100,output:10,cache_read:0,cache_write:0}});
+      res.end();
+    });
+    await new Promise<void>(done => model.listen(0, "127.0.0.1", done));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GOND_AGENT_") && !["GH_TOKEN","GITHUB_TOKEN"].includes(k)));
+    const worker = spawn(resolve(import.meta.dirname, "../../runner/target/debug/gond-agent-worker"), [], {cwd,env:{...env,
+      GOND_AGENT_API_URL:`http://127.0.0.1:${(model.address() as {port:number}).port}`,GOND_AGENT_RELAY_TOKEN:token,
+      GOND_AGENT_MODEL:"fixture",GOND_AGENT_HOME:join(dir,"home"),GOND_AGENT_EVIDENCE:"off",GOND_AGENT_PLAN_NUDGE_LIMIT:"0"}});
+    let stderr = ""; worker.stderr.on("data", chunk => { stderr += chunk; });
+    createInterface({input:worker.stdout}).on("line", line => events.push(JSON.parse(line)));
+    runtimeSend = input => worker.stdin.write(JSON.stringify(input) + "\n");
+    try {
+      const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Keep work and recover from the outage"});
+      await vi.waitFor(() => expect(runs.get(r.id).status, stderr).toBe(exhausted ? "failed" : "ready"), {timeout:90000,interval:50});
+      const result = runs.get(r.id), history = runs.history(r.id, 0), retries = history.filter(e => e.type === "model.retry");
+      expect(retries.map(e => e.attempt)).toEqual(exhausted ? [2,3,4,5] : [2,3]);
+      expect(retries.every(e => e.class === "provider_unavailable" && e.max_attempts === 5)).toBe(true);
+      expect(requests.slice(1).every(r => JSON.stringify(r) === JSON.stringify(requests[1]))).toBe(true);
+      expect(readFileSync(join(cwd,"kept.txt"),"utf8")).toBe("work survives\n");
+      expect(history.filter(e => e.type === "tool.start")).toHaveLength(1);
+      if (exhausted) {
+        expect(result).toMatchObject({work_kept:true,last_error:{step:"model",class:"provider_unavailable",attempts:5}});
+        expect(result.error).toContain("HTTP 503");
+        expect(log.some(e => e.method === "snapshot")).toBe(false);
+        expect(importBundle).not.toHaveBeenCalled(); expect(pushBranch).not.toHaveBeenCalled();
+        expect(vi.mocked(gh).mock.calls.filter(c => c[1] === "POST" || c[1] === "PATCH")).toEqual([]);
+      } else { expect(result.last_error).toBeUndefined(); }
+      console.log("MODEL_RETRY_RUNTIME", JSON.stringify({exhausted,retries:retries.map(({type,attempt,max_attempts,class:kind,wait_seconds}) => ({type,attempt,max_attempts,class:kind,wait_seconds})),
+        run:{status:result.status,phase:result.phase,work_kept:result.work_kept,last_error:result.last_error,error:result.error},requests:requests.length,tool_executions:1,work_tree:readFileSync(join(cwd,"kept.txt"),"utf8")}));
+    } finally {
+      runtimeSend = undefined; worker.kill();
+      await new Promise<void>(done => model.close(() => done()));
+    }
+  }, 100000);
+
   it("emits one durable cap notice at the last accepted record and does not repeat it on reopen", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
@@ -682,6 +748,43 @@ describe("persistent local run lifecycle", () => {
     expect(log.some((x) => x.method === "snapshot")).toBe(false);
     expect(importBundle).not.toHaveBeenCalled();
     expect(vi.mocked(gh).mock.calls.some((c) => c[1] === "POST")).toBe(false);
+  });
+  it.each([false, true])("persists safe provider-unavailable details without publication (existing PR: %s)", async (existingPR) => {
+    vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "60");
+    const rawMessage = "<script>publish secrets</script> https://user:provider-secret@provider.invalid/internal?api_key=raw-secret HTTP 503";
+    const failedTurn = [
+      { type: "turn.start", agent_id: "main" },
+      { type: "turn.end", agent_id: "main", stop_reason: "error" },
+      { type: "error", agent_id: "main", code: "provider_unavailable", status: 503, attempts: 5, retryable: true, message: rawMessage },
+    ];
+    if (!existingPR) workerTurns.push(failedTurn);
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Implement it" });
+    if (existingPR) {
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+      expect(runs.get(r.id).pr_number).toBe(42);
+      log.length = 0;
+      vi.mocked(importBundle).mockClear();
+      vi.mocked(pushBranch).mockClear();
+      vi.mocked(gh).mockClear();
+      workerTurns.push(failedTurn);
+      runs.enqueue(r.id, "u", "Continue implementation");
+    }
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    const failed = runs.get(r.id);
+    expect.soft(failed).toMatchObject({ step: "model", phase: "idle", work_kept: true,
+      last_error: { step: "model", class: "provider_unavailable", attempts: 5 } });
+    expect.soft(failed.error).toContain("The model provider is unavailable right now. Gond Agent will retry shortly.");
+    expect.soft(JSON.stringify({ error: failed.error, last_error: failed.last_error })).not.toMatch(/provider-secret|raw-secret|<script>|provider\.invalid/);
+    const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
+    expect.soft(JSON.parse(stored.data)).toMatchObject({ status: "failed", phase: "idle", work_kept: true,
+      last_error: { step: "model", class: "provider_unavailable", attempts: 5 } });
+    expect.soft(runs.history(r.id, 0)).toContainEqual(expect.objectContaining({ type: "run.error", step: "model", class: "provider_unavailable", attempts: 5 }));
+    expect(log.some(call => call.method === "snapshot")).toBe(false);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(pushBranch).not.toHaveBeenCalled();
+    expect(vi.mocked(gh).mock.calls.filter(call => call[1] === "POST" || call[1] === "PATCH" || call[1] === "PUT")).toEqual([]);
+    expect(destroy).not.toHaveBeenCalled();
+    if (existingPR) expect(failed.pr_number).toBe(42);
   });
   it("keeps a failed publication and pushes the kept commit before sending a follow-up", async () => {
     const captured = vi.spyOn(console, "error").mockImplementation(() => {});

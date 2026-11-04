@@ -3,6 +3,25 @@ import { createTranscript, type StreamEvent } from "../../web/src/features/run/t
 import { activityLabel, groupLabel, presentTool } from "../../web/src/features/run/tool-presentation";
 import { emptySummary, fold } from "../src/runs/fold";
 
+it("shows bounded retry waits without losing rollback or replay safety", () => {
+  const append = createTranscript();
+  const events: StreamEvent[] = [
+    {seq:1,ts:1,type:"run.status",status:"working"},
+    {seq:2,ts:2,type:"text.delta",agent_id:"main",text:"discarded"},
+    {seq:3,ts:3,type:"model.retry",agent_id:"main",attempt:2,max_attempts:5,class:"provider_unavailable",wait_seconds:7.2},
+    {seq:4,ts:4,type:"stream.reset",agent_id:"main",text_length:9,reasoning_length:0},
+    {seq:5,ts:5,type:"model.retry",agent_id:"helper",attempt:2,max_attempts:5,wait_seconds:10},
+    {seq:6,ts:6,type:"text.delta",agent_id:"main",text:"Finished"},
+  ];
+  const result = append(events);
+  expect(result.status).toBe("working");
+  expect(result.items).toEqual([
+    {kind:"run-message",key:"retry3",text:"Retrying in 8 s (attempt 2 of 5)"},
+    {kind:"text",key:"t6",text:"Finished"},
+  ]);
+  expect(append(events)).toEqual(result);
+});
+
 it("shows teardown give-up once without changing the run status on replay", () => {
   const append = createTranscript();
   const events: StreamEvent[] = [

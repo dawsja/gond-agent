@@ -3,7 +3,7 @@ import type { Block, Message, Opaque, ResponsesRequest, StopReason, StreamEvent,
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { maxOutput, parseArgs, sameModel } from "./common";
-import { errorParts, providerFailure } from "./errors";
+import { providerStreamFailure } from "./errors";
 
 type ABlock = Record<string, unknown>;
 interface AMessage {
@@ -208,8 +208,7 @@ class AnthropicParser implements StreamParser {
         this.done = true;
         return [];
       case "error": {
-        const { code } = errorParts(d), failure = providerFailure(0, d);
-        return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
+        return [providerStreamFailure(d)];
       }
       default:
         return [];

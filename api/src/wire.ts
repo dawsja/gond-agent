@@ -58,7 +58,7 @@ export type StreamEvent =
   | { event: "block.delta"; data: { index: number; text?: string; partial_json?: string } }
   | { event: "block.end"; data: { index: number; input?: Record<string, unknown>; opaque?: Opaque } }
   | { event: "response.end"; data: { stop_reason: StopReason; usage: Usage } }
-  | { event: "error"; data: { code: string; message: string; retryable: boolean } };
+  | { event: "error"; data: { code: string; message: string; retryable: boolean; status?: number; retry_after_ms?: number; reset_at?: number } };
 
 export const emptyUsage = (): Usage => ({ input_uncached: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0 });
 
@@ -72,6 +72,8 @@ export interface Capacity {
 }
 
 export class ApiError extends Error {
+  retryAfterMs?: number;
+  resetAt?: number;
   constructor(
     public status: number,
     public code: string,

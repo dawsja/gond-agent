@@ -120,6 +120,9 @@ export function createTranscript() {
           else items.push({ kind: "text", key: `t${ev.seq}`, text: ev.text })
           break
         }
+        case "model.retry":
+          if (main) items.push({ kind: "run-message", key: `retry${ev.seq}`, text: `Retrying in ${Math.ceil(ev.wait_seconds)} s (attempt ${ev.attempt} of ${ev.max_attempts})` })
+          break
         case "stream.reset": {
           if (!main) break
           let remaining = ev.text_length
