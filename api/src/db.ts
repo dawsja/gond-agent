@@ -36,6 +36,9 @@ export function openStore(data: string) {
   })();
   clearExternalProfileImages(db);
   retireCodingAgents(db);
+  // Add metadata without rewriting historical JSON rows or transcript events.
+  if (!(db.pragma("table_info(runs)") as { name: string }[]).some(column => column.name === "pr_body"))
+    db.exec("ALTER TABLE runs ADD COLUMN pr_body TEXT");
   migrateRunQueue(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {

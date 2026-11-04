@@ -242,7 +242,7 @@ export function SidePanel({ run, t, modelName, className }: { run: Run; t: Trans
     () => parseUnifiedDiff(committed && diff.data ? diff.data : t.editDiffs.join("\n")),
     [committed, diff.data, t.editDiffs],
   )
-  const summary = [...t.items].reverse().find((i) => i.kind === "text")?.text ?? ""
+  const summary = run.description ?? ""
   const [, tick] = useState(0)
   useEffect(() => {
     if (!live) return
