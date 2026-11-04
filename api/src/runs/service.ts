@@ -44,6 +44,8 @@ import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
   ci_turn?: boolean;
+  /** Unpublished work still belongs to an automatic round, even after a human queues work. */
+  ci_publication_pending?: boolean;
   id: string;
   user_id: string;
   repo: string;
@@ -578,7 +580,12 @@ export class Runs {
     assertActive(r);
     if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
       throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
-    if (!source) { this.ci.stop(id); r = this.get(id, user); }
+    if (!source) {
+      this.ci.stop(id);
+      r = this.get(id, user);
+      r.ci_publication_pending ||= r.ci_turn;
+      r.ci_turn = false;
+    }
     if (requestId && this.db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(id, requestId)) return false;
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
@@ -654,25 +661,35 @@ export class Runs {
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
       r.phase = "booting";
       r.started_at ??= Date.now();
+      // A human message is not permission to publish an older automatic round.
+      // Drop its unpushed commit and resume from the confirmed remote branch.
+      if (r.kept_commit && r.pending.some(message => message.source !== "ci") && r.pending[0]?.source !== "ci" && (r.ci_publication_pending || r.ci_turn)) {
+        this.ciPublicationRefused(id, new ApiError(409, "ci_needs_person", "needs a person: unpushed changes from an automatic round require review."));
+        r = this.get(id);
+      }
       if (r.kept_commit) {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
         try {
-          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r)));
+          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
         } catch (error) {
           if (!this.ciPublicationRefused(id, error)) throw error;
           r = this.get(id);
           r.phase = "idle";
-          r.pending = [];
-          this.status(r, r.status === "stopped" ? "stopped" : "ready");
-          return;
+          if (!r.pending.length) {
+            this.status(r, r.status === "stopped" ? "stopped" : "ready");
+            return;
+          }
         }
         r = this.get(id); // Stop and additional follow-ups may have arrived during publication.
-        r.pushed = true;
-        r.head_sha = head;
-        r.ci_pending_sha = head;
-        delete r.kept_commit;
-        this.save(r);
+        if (r.kept_commit) {
+          r.pushed = true;
+          r.head_sha = head;
+          r.ci_pending_sha = head;
+          r.ci_publication_pending = false;
+          delete r.kept_commit;
+          this.save(r);
+        }
         if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
           r.phase = "idle";
           if (r.status === "working") { r.pending = []; this.status(r, "stopped"); }
@@ -765,6 +782,7 @@ export class Runs {
   }
   private async next(id: string, live: Live) {
     let r = this.get(id);
+    if (r.pending.length && live.closed && r.ci_state === "gave_up") return this.resumeAfterCiRefusal(id);
     if(!r.pending.length || live.closed)return;
     if (live.busy) return;
     live.busy = true;
@@ -780,10 +798,7 @@ export class Runs {
       r = this.get(id);
       if (!published) {
         live.busy = false;
-        r.phase = "idle";
-        r.pending = [];
-        this.status(r, r.status === "stopped" ? "stopped" : "ready");
-        await this.close(id);
+        await this.resumeAfterCiRefusal(id);
         return;
       }
       if (r.status === "stopped") { live.busy = false; return; }
@@ -797,6 +812,7 @@ export class Runs {
     }
     r.pending.shift();
     r.ci_turn = message.source === "ci";
+    r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
     r.work_kept = false;
@@ -903,6 +919,11 @@ export class Runs {
     this.status(r, "working", "Pushing changes");
     const published = await this.publish(id, live);
     r = this.get(id);
+    if (!published) {
+      live.busy = false;
+      await this.resumeAfterCiRefusal(id);
+      return;
+    }
     if (published && r.status !== "stopped" && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
     r = this.get(id);
     live.busy = false;
@@ -918,11 +939,10 @@ export class Runs {
     this.drain();
   }
   /** Recheck automatic-round policy against the pinned commit on every push attempt. */
-  private ciBeforePush(run: Run): PushOptions["beforePush"] {
-    if (!run.ci_turn) return undefined;
+  private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
+    if (!automatic) return undefined;
     return async ({ cwd, branch, head }) => {
       const current = this.get(run.id);
-      if (!current.ci_turn) return;
       if (branch !== current.branch || current.status === "stopped" || ["closed", "merged"].includes(current.pr_state ?? ""))
         throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
       const baseline = current.ci_previous_sha;
@@ -943,10 +963,47 @@ export class Runs {
   private ciPublicationRefused(id: string, error: unknown): boolean {
     if (!(error instanceof ApiError) || error.code !== "ci_needs_person") return false;
     const current = this.get(id);
-    Object.assign(current, { ci_state: "gave_up", ci_reason: error.message, ci_active: false });
+    // Refusing an automatic publication must never consume a person's follow-up.
+    current.pending = current.pending.filter(message => message.source !== "ci");
+    if (current.pending.length) {
+      delete current.kept_commit;
+      current.ci_publication_pending = false;
+    }
+    const reason = current.pending.length
+      ? `${error.message} The unpushed automatic changes were dropped; your message will continue from the last pushed branch.`
+      : error.message;
+    Object.assign(current, { ci_state: "gave_up", ci_reason: reason, ci_active: false });
     this.save(current);
-    this.append(id, { type: "run.ci", state: "gave_up", round: current.ci_round ?? 0, sha: current.head_sha, failing: current.ci_failing ?? [], reason: error.message });
+    this.append(id, { type: "run.ci", state: "gave_up", round: current.ci_round ?? 0, sha: current.head_sha, failing: current.ci_failing ?? [], reason });
     return true;
+  }
+  private async resumeAfterCiRefusal(id: string) {
+    // The worker and API clone may both contain the refused configuration. Never
+    // deliver human work there: release them, then reopen from the pushed branch.
+    const reserved = this.booting.has(id);
+    this.booting.add(id); // Reserve the checkout until teardown and requeue finish.
+    try {
+      try { await this.close(id); }
+      catch {
+        console.error("Couldn't release refused automatic workspace", id);
+        const live = this.live.get(id);
+        if (live) live.closing = false; // A follow-up retries cleanup, never the refused publication.
+        this.status(this.get(id), "failed", null, "Couldn't release the automatic workspace. Your queued messages are kept. Send a follow-up to retry.");
+        return;
+      }
+      const r = this.get(id);
+      r.phase = "idle";
+      if (r.pending.length) {
+        this.status(r, "queued");
+        this.queue.join(id);
+      } else this.status(r, r.status === "stopped" ? "stopped" : "ready");
+    } finally {
+      if (!reserved) {
+        this.booting.delete(id);
+        this.cancelledBoots.delete(id);
+      }
+      this.drain();
+    }
   }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
@@ -987,6 +1044,9 @@ export class Runs {
     }
     snapshot.bundle = "";
     await this.recordDiff(id, live, snapshot.head, true);
+    const current = this.get(id);
+    current.ci_publication_pending = false;
+    this.save(current);
     live.publishPending = undefined;
     return true;
   }

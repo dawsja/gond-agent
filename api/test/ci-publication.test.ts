@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { createAuthentication, seal } from "../src/auth";
 import { command } from "../src/command";
 import type { Config } from "../src/config";
+import type { Workspace, WorkspaceFactory } from "../src/containers";
 import { openStore } from "../src/db";
 import { checkout, gh } from "../src/github";
+import { saveProviderSettings } from "../src/providers";
 import { emptySummary } from "../src/runs/fold";
 import { Runs, type Run } from "../src/runs/service";
 
@@ -37,7 +39,7 @@ const githubRequests = () => vi.mocked(gh).mock.calls.map(([endpoint]) => endpoi
 type Event = { kind: "guard" | "push" | "ls-remote"; args: string[] };
 let dir: string, db: ReturnType<typeof openStore>, runs: Runs;
 const service = () => runs as any;
-const factory = vi.fn(async () => { throw new Error("Tests must not boot a worker"); });
+const factory = vi.fn<WorkspaceFactory>(async () => { throw new Error("Tests must not boot a worker"); });
 
 beforeEach(async () => {
   vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
@@ -53,6 +55,9 @@ beforeEach(async () => {
     .run("u", "User", "user@example.test", 0, Date.now(), Date.now());
   db.prepare("INSERT INTO github_connections(user_id,token,connected_at) VALUES(?,?,?)")
     .run("u", seal(cfg.secret, token), Date.now());
+  saveProviderSettings(db, cfg.secret, { connections: [{ id: "local", name: "Local", format: "openai",
+    baseURL: "http://127.0.0.1:9/v1", apiKey: "fixture-provider-key", discover: false,
+    models: [{ id: "coder", name: "Coder", contextWindow: 128000, maxOutput: 8192, reasoning: "none", images: true }] }], defaultModel: "local:coder" });
   runs = new Runs(db, cfg, factory);
   vi.mocked(gh).mockImplementation(async (endpoint, method, body, env) => {
     expect(method).toBe("GET");
@@ -117,6 +122,7 @@ async function fixture(options: {
   db.prepare("INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)")
     .run(run.id, run.user_id, run.repo, run.status, run.created_at, run.updated_at, JSON.stringify(run));
   const rpc = vi.fn(async (method: string) => {
+    if (method === "send") return undefined as never;
     if (method !== "snapshot") throw new Error(`Unexpected worker call: ${method}`);
     return { bundle: bundle.toString("base64"), head };
   });
@@ -279,6 +285,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     service().live.delete("run");
     const current = runs.get("run");
     current.kept_commit = f.head;
+    current.pending.push({ text: "Fix CI", images: [], source: "ci" });
     runs.save(current);
 
     await service().boot("run");
@@ -304,6 +311,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     service().live.delete("run");
     const current = runs.get("run");
     Object.assign(current, { work_kept: true, kept_commit: f.head });
+    current.pending.push({ text: "Fix CI", images: [], source: "ci" });
     runs.save(current);
     await service().boot("run");
     expect(f.events.map(event => event.kind)).toEqual(["guard", "push"]);
@@ -314,4 +322,138 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(f.rpc).not.toHaveBeenCalled();
     expect(service().booting.has("run")).toBe(false);
   }, 20_000);
+
+  it.each(["previously refused", "not yet retried"])("delivers human follow-ups without publishing or looping on a %s automatic kept commit", async state => {
+    const f = await fixture({ configChange: true });
+    await f.git(f.cwd, "fetch", "--no-tags", f.bundlePath, "HEAD");
+    await f.git(f.cwd, "reset", "--hard", "FETCH_HEAD");
+    service().live.delete("run");
+    const current = runs.get("run");
+    current.kept_commit = f.head;
+    if (state === "previously refused") current.pending.push({ text: "Fix CI", images: [], source: "ci" });
+    runs.save(current);
+    if (state === "previously refused") {
+      await service().boot("run");
+      f.expectGaveUp();
+      expect(runs.get("run").kept_commit).toBe(f.head);
+    }
+
+    // Real local Git clones/bundles keep refused files out of the human turn.
+    const rpc = await humanWorkspace(f);
+    runs.enqueue("run", "u", "Please keep my message");
+    await service().launches.get("run");
+    expect(rpc).toHaveBeenCalledWith("send", { input: expect.objectContaining({ type: "user", text: "Please keep my message" }) });
+    expect(runs.get("run")).toMatchObject({ ci_turn: false, pending: [] });
+    expect(runs.get("run").kept_commit).toBeUndefined();
+    expect(await f.remoteHead()).toBe("");
+    expect(f.events.filter(event => event.kind === "push")).toEqual([]);
+    expect(runs.history("run", 0)).toContainEqual(expect.objectContaining({
+      type: "run.ci", reason: expect.stringContaining("unpushed automatic changes were dropped"),
+    }));
+
+    await service().finish("run", service().live.get("run"));
+    expect(await f.remoteHead()).toBe(f.base);
+    expect(await f.git(join(dir, "remote.git"), "ls-tree", "-r", ref, ".github")).toBe("");
+    runs.enqueue("run", "u", "A later follow-up");
+    await service().launches.get("run");
+    expect(rpc).toHaveBeenCalledWith("send", { input: expect.objectContaining({ type: "user", text: "A later follow-up" }) });
+    expect(runs.get("run")).toMatchObject({ ci_turn: false, pending: [], head_sha: f.base });
+    expect(runs.get("run").kept_commit).toBeUndefined();
+    expect(await f.remoteHead()).not.toBe(f.head);
+  }, 20_000);
+
+  it.each(["before publication", "during snapshot", "after stop"])("keeps an automatic push guarded when a human queues work %s, then delivers only the human message", async timing => {
+    const f = await fixture({ configChange: true });
+    const rpc = await humanWorkspace(f);
+    if (timing === "before publication") runs.enqueue("run", "u", "Do not lose this queued message");
+    // Also cover a human request arriving after publication captured the turn,
+    // but before the pinned-commit guard executes.
+    f.rpc.mockImplementationOnce(async () => {
+      if (timing === "after stop") await runs.stop("run", "u");
+      if (timing !== "before publication") runs.enqueue("run", "u", "Do not lose this queued message");
+      expect(runs.get("run").ci_turn).toBe(false);
+      const current = runs.get("run");
+      current.pending.unshift({ text: "Obsolete CI work", images: [], source: "ci" });
+      runs.save(current);
+      return { bundle: (await readFile(f.bundlePath)).toString("base64"), head: f.head };
+    });
+
+    await service().finish("run", f.live);
+    await service().launches.get("run");
+    expect(runs.get("run")).toMatchObject({ ci_state: "gave_up", ci_active: false, ci_reason: expect.stringContaining("needs a person"), pending: [] });
+    expect(f.events.map(event => event.kind)).toEqual(timing === "after stop" ? [] : ["guard"]);
+    expect(await f.remoteHead()).toBe("");
+    expect(rpc).toHaveBeenCalledWith("send", { input: expect.objectContaining({ type: "user", text: "Do not lose this queued message" }) });
+    expect(rpc.mock.calls.filter(([method, params]) => method === "send" && (params as any)?.input?.type === "user")).toHaveLength(1);
+    expect(f.destroy).toHaveBeenCalledTimes(1);
+    await service().finish("run", service().live.get("run"));
+    expect(await f.remoteHead()).toBe(f.base);
+    expect(await f.git(join(dir, "remote.git"), "ls-tree", "-r", ref, ".github")).toBe("");
+  }, 20_000);
+
+  it("preserves accepted human messages if refused-workspace cleanup fails and retries cleanup on a follow-up", async () => {
+    const f = await fixture({ configChange: true });
+    runs.enqueue("run", "u", "Keep this even if cleanup fails");
+    f.destroy.mockRejectedValueOnce(new Error("Fixture cleanup failure"));
+    await service().finish("run", f.live);
+    expect(runs.get("run")).toMatchObject({
+      status: "failed", ci_state: "gave_up", pending: [{ text: "Keep this even if cleanup fails" }],
+      error: expect.stringContaining("Your queued messages are kept"),
+    });
+    expect(await f.remoteHead()).toBe("");
+    expect(service().booting.has("run")).toBe(false);
+    const rpc = await humanWorkspace(f);
+    runs.enqueue("run", "u", "Retry cleanup");
+    await vi.waitFor(() => expect(rpc).toHaveBeenCalledWith("send", {
+      input: expect.objectContaining({ type: "user", text: "Keep this even if cleanup fails" }),
+    }));
+    expect(runs.get("run")).toMatchObject({ pending: [{ text: "Retry cleanup" }] });
+    expect(await f.remoteHead()).toBe("");
+    expect(f.destroy).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it("preserves a human message queued while an automatic kept-commit boot is being refused", async () => {
+    const f = await fixture({ configChange: true });
+    await f.git(f.cwd, "fetch", "--no-tags", f.bundlePath, "HEAD");
+    await f.git(f.cwd, "reset", "--hard", "FETCH_HEAD");
+    service().live.delete("run");
+    const current = runs.get("run");
+    Object.assign(current, { kept_commit: f.head, pending: [{ text: "Fix CI", images: [], source: "ci" }] });
+    runs.save(current);
+    const rpc = await humanWorkspace(f);
+    const execute = vi.mocked(command).getMockImplementation()!;
+    let queued = false;
+    vi.mocked(command).mockImplementation(async (file, args, options) => {
+      if (!queued && file === "git" && args.includes("--name-only")) {
+        queued = true;
+        runs.enqueue("run", "u", "I arrived during boot");
+      }
+      return execute(file, args, options);
+    });
+    service().booting.add("run");
+    await service().boot("run");
+    expect(runs.get("run")).toMatchObject({ ci_state: "gave_up", ci_turn: false, pending: [], head_sha: f.base });
+    expect(runs.get("run").kept_commit).toBeUndefined();
+    expect(f.events.map(event => event.kind)).toEqual(["guard"]);
+    expect(await f.remoteHead()).toBe("");
+    expect(rpc).toHaveBeenCalledWith("send", { input: expect.objectContaining({ type: "user", text: "I arrived during boot" }) });
+  }, 20_000);
 });
+
+async function humanWorkspace(f: Awaited<ReturnType<typeof fixture>>) {
+  vi.spyOn(service(), "pump").mockResolvedValue(undefined);
+  vi.mocked(checkout).mockImplementation(async (_data, _id, _repo, _base, _branch, resume) => {
+    await rm(f.cwd, { recursive: true, force: true });
+    await mkdir(f.cwd, { recursive: true });
+    await f.git(f.cwd, "clone", "--no-tags", "--branch", resume ? branch : "main", join(dir, "remote.git"), ".");
+    return { cwd: f.cwd, archive: Buffer.from("local fixture checkout") };
+  });
+  const rpc = vi.fn<Workspace["rpc"]>().mockImplementation(async method => {
+    if (method !== "snapshot") return undefined as never;
+    const path = join(f.cwd, ".git", "human.bundle");
+    await f.git(f.cwd, "bundle", "create", path, "HEAD");
+    return { bundle: (await readFile(path)).toString("base64"), head: f.base } as never;
+  });
+  factory.mockImplementation(async () => ({ rpc: rpc as Workspace["rpc"], destroy: vi.fn(async () => {}) }));
+  return rpc;
+}

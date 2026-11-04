@@ -201,6 +201,8 @@ An automatic fix is admitted as a closed-session follow-up through the persisten
 
 The watcher respects stops, explicit workspace closes, pending questions and closed or merged pull requests. Automatic pushes that modify CI configuration are refused and need a person. It never merges or performs a review. The local-runner half is deferred to follow-up work.
 
+A follow-up from you is not an automatic CI turn and never authorizes an older CI-configuration change to be pushed. If an automatic publication is refused while your message is waiting, your message stays queued and continues in a clean workspace from the last pushed branch. The unpushed automatic changes are dropped, with a visible needs-person note. Taking over a capacity-reclaimed automatic commit also drops that unpushed commit rather than publishing it implicitly; later follow-ups do not retry it. This is an exception to the kept-work publication recovery described below.
+
 ### Waiting for a workspace
 
 `MAX_ACTIVE_RUNS` limits distinct live plus booting workspaces, not just working turns. Ready, idle, stopped and model-failed workspaces still occupy slots while live. Browser/HTTP creates, MCP starts and follow-ups that reopen a closed workspace are validated first, then queued when capacity is unavailable. Accepted work starts automatically: the service drains on release, admission and startup, with a 60-second safety net. You do not need to retry or poll to start it.
