@@ -354,12 +354,12 @@ const key = 'fixture-only-provider-key';
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
-    let current = models[0], retiredBackend, sent, imageRequests = 0, activePreview = false, prState = null, queuePosition;
+    let current = models[0], retiredBackend, sent, imageRequests = 0, activePreview = false, prState = null, queuePosition, largeDiff = false;
     const sockets = [];
-    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: queuePosition ? 'queued' : activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', queue_position: queuePosition, queue_length: queuePosition ? 3 : undefined, pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
+    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: largeDiff ? 'Failing test first for bug fixes' : 'Composer preview', prompt: 'Review the settings', status: queuePosition ? 'queued' : activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', queue_position: queuePosition, queue_length: queuePosition ? 3 : undefined, pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: largeDiff ? 77 : 0, additions: largeDiff ? 11456 : 0, deletions: largeDiff ? 99999 : 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
-    const listRoute = route => route.fulfill({ json: { runs: prState || queuePosition ? [run()] : [] } });
+    const listRoute = route => route.fulfill({ json: { runs: prState || queuePosition || largeDiff ? [run()] : [] } });
     const stopRoute = route => { queuePosition = undefined; return route.fulfill({ json: { ok: true } }); };
     const messagesRoute = route => { sent = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); };
     const ticketRoute = route => route.fulfill({ json: { ticket: 'composer-fixture' } });
@@ -386,6 +386,27 @@ const key = 'fixture-only-provider-key';
       expect(thinking.x + thinking.width).toBeLessThanOrEqual(width);
     };
     try {
+      largeDiff = true;
+      await page.goto(origin + '/agents/');
+      const card = page.locator('li').filter({ hasText: 'Failing test first for bug fixes' });
+      await expect(card).toBeVisible();
+      const counts = card.locator('[data-diff-counts]').filter({ visible: true });
+      await expect(counts).toHaveText('+11.4k−99.9k');
+      await expect(counts).toHaveAttribute('title', '+11456 −99999');
+      // Check descendants, not just scrollWidth or the flex wrapper: text can
+      // paint outside an otherwise correctly sized flex item.
+      expect(await card.evaluate(card => {
+        const tile = card.querySelector('[data-diff-tile]');
+        const box = tile && tile.getBoundingClientRect().width ? tile : card;
+        const bounds = box.getBoundingClientRect();
+        return [...box.querySelectorAll('[data-diff-counts], [data-diff-counts] > span, [data-diff-squares], [data-diff-squares] > span')].every(el => {
+          const r = el.getBoundingClientRect();
+          return !r.width || r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom;
+        }) && card.scrollWidth <= card.clientWidth;
+      })).toBe(true);
+      if (width >= 768) await expect(card.locator('[data-diff-squares] > span')).toHaveCount(5);
+      await captureThemes('runs-large-diff');
+      largeDiff = false;
       await page.goto(origin + '/agents/');
       await page.getByRole('button', { name: 'Choose model', exact: true }).click();
       for (const model of models) {
