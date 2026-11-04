@@ -486,6 +486,43 @@ describe("local authentication and persistence", () => {
     ).toBe(404);
     expect((await call("/api/v1/runs/run_x/stop", {}, other)).status).toBe(404);
   });
+  it("persists shared images as owner-only references with the existing retention cascade", async () => {
+    const owner = await signup(), other = await signup("shared-other@example.test");
+    const user = (await (await call("/api/v1/me", undefined, owner)).json()).user.id;
+    for (const id of ["share-run", "wrong-run"]) {
+      db.prepare("INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)")
+        .run(id, user, "a/b", "ready", 1, 1, JSON.stringify({ id, user_id: user, status: "ready" }));
+    }
+    const bytes = await sharp({ create: { width: 16, height: 16, channels: 3, background: "white" } }).png().toBuffer();
+    const event = runs.append("share-run", { type: "image.shared", agent_id: "main", caption: "Desktop", image: { media_type: "image/png", data: bytes.toString("base64") } }) as any;
+    expect(event).toMatchObject({ type: "image.shared", caption: "Desktop", media_type: "image/png" });
+    expect(event.image_id).toMatch(/^img_/);
+    expect(JSON.stringify(event)).not.toContain(bytes.toString("base64"));
+    expect(runs.history("share-run", 0)[0]).toEqual(event);
+    const path = `/api/v1/runs/share-run/images/${event.image_id}`;
+    expect((await call(path)).status).toBe(401);
+    expect((await call(path, undefined, other)).status).toBe(404);
+    expect((await call(`/api/v1/runs/wrong-run/images/${event.image_id}`, undefined, owner)).status).toBe(404);
+    const served = await call(path, undefined, owner);
+    expect(served.status).toBe(200);
+    expect(served.headers.get("content-type")).toBe("image/png");
+    expect(served.headers.get("cache-control")).toBe("private, no-store");
+    expect(served.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(served.headers.get("content-security-policy")).toBe("sandbox");
+    expect(Buffer.from(await served.arrayBuffer())).toEqual(bytes);
+    const toolEvent = runs.append("share-run", { type: "tool.images", agent_id: "main", call_id: "browser1", images: [{ media_type: "image/png", data: bytes.toString("base64") }] }) as any;
+    const toolImage = await call(`/api/v1/runs/share-run/images/${toolEvent.images[0].id}`, undefined, owner);
+    expect(toolImage.headers.get("cache-control")).toBe("private, no-store");
+    expect(toolImage.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(toolImage.headers.get("content-security-policy")).toBe("sandbox");
+    expect(Buffer.from(await toolImage.arrayBuffer())).toEqual(bytes);
+    // Attached images do not meet orphan-upload cleanup's run_id IS NULL rule.
+    db.prepare("DELETE FROM images WHERE run_id IS NULL AND created_at<?").run(Date.now() + 1000);
+    expect((await call(path, undefined, owner)).status).toBe(200);
+    db.prepare("DELETE FROM runs WHERE id=?").run("share-run");
+    expect(db.prepare("SELECT 1 FROM images WHERE id=?").get(event.image_id)).toBeUndefined();
+    expect((await call(path, undefined, owner)).status).toBe(404);
+  });
 });
 describe("provider setup access", () => {
   it("keeps subscription-only accounts configured after removing the final API provider", async () => {

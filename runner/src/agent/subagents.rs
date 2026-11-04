@@ -237,7 +237,7 @@ mod tests {
                 "declare_task", "declare_unverified", "skip_repro", "browser",
                 "browser_open", "browser_snapshot", "browser_click", "browser_fill",
                 "browser_press", "browser_wait", "browser_screenshot", "browser_logs",
-                "browser_close", "lsp", "bash", "web_fetch", "batch"] {
+                "browser_close", "lsp", "bash", "web_fetch", "batch", "share_image"] {
                 assert!(!p.tools.iter().any(|(n, _)| *n == name), "{kind:?}: {name}");
             }
             assert!(p.rounds > 0 && p.rounds <= MAX_ROUNDS);

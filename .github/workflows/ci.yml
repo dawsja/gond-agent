@@ -51,7 +51,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rustup toolchain install 1.99.1 --profile minimal --component clippy && rustup default 1.99.1
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # Bound process-global fixture resources without skipping any tests.
+      - run: cargo test --locked -- --test-threads=1
   docker:
     runs-on: ubuntu-24.04
     steps:

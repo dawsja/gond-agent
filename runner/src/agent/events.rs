@@ -56,6 +56,9 @@ pub enum AgentEvent {
     /// Host persists bounded tool images and replaces their bytes with owner-scoped image IDs.
     #[serde(rename = "tool.images")]
     ToolImages { agent_id: String, call_id: String, images: Vec<ImageInput> },
+    /// A reply attachment; the host replaces image bytes with image_id/media_type.
+    #[serde(rename = "image.shared")]
+    ImageShared { agent_id: String, call_id: String, image: ImageInput, caption: String },
     #[serde(rename = "tool.end")]
     ToolEnd {
         agent_id: String,

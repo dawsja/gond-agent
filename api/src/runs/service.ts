@@ -1,4 +1,5 @@
 import { Checkpoints } from "../checkpoints";
+import { storeSharedImage } from "./shared-images";
 import { listRunPage, type RunListOptions } from "./list";
 import { runDiff, preferPullDiff, type PullDiff } from "./diff";
 import { assertRunTransition, type RunStatus } from "../../../shared/run-state";
@@ -371,6 +372,20 @@ export class Runs {
   append(id: string, event: Record<string, unknown>) {
     // State replies are private control data, never transcript events.
     if (typeof event.type === "string" && event.type.startsWith("state.")) return;
+    if (event.type === "image.shared") {
+      const run = this.get(id);
+      // Blob, quota admission and transcript reference commit together. No await
+      // or broadcast inside the transaction; a crash cannot orphan quota usage.
+      const result = this.db.transaction(() => {
+        const stored = storeSharedImage(this.db, id, run.user_id, event);
+        if (!stored) return;
+        const ev = { ...stored, ts: Date.now() };
+        const row = this.db.prepare("INSERT INTO events(run_id,data) VALUES(?,?)").run(id, JSON.stringify(ev));
+        return { ...ev, seq: Number(row.lastInsertRowid) };
+      })();
+      if (result) this.events.emit(id, result);
+      return result;
+    }
     let recordsCapped = false;
     if (event.type === "evidence.records_capped") {
       // Fixed service-owned notice, durable across workers/restarts. Worker

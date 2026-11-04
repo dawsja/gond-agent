@@ -2,6 +2,31 @@
 
 Self-hosted coding agents that turn repository tasks into pull requests. Every account has every feature: all configured models, scheduled runs, pull requests, images and profile photos.
 
+## Images in replies
+
+Images shared in replies appear as captioned cards on the run page, with click or
+keyboard enlargement. Use `share_image {path, caption?}` for screenshots or other
+raster files anywhere under the workspace or `/tmp`, including browser screenshots
+and other tool outputs. Any readable regular raster image in those locations can
+be shared; non-images and SVG are rejected. Symlinked workspace or `/tmp` roots
+are resolved canonically; `TMPDIR` does not grant access to another location.
+Local Markdown paths cannot be served
+and now show “image not available (local path)”. Absolute same-origin HTTP(S) URLs
+render only for static app assets under `/agents/` and saved run images matching
+`^/api/v1/runs/[A-Za-z0-9_-]+/images/[A-Za-z0-9_-]+$`, after URL normalization.
+Credentials, percent encoding, backslashes, query strings and fragments (including
+empty delimiters) are rejected. Other HTTP(S) Markdown images remain links, never
+automatic requests; data/blob previews still render. Shared images survive workspace release and
+follow the run's owner-only access and retention rules. Limits: four sharing
+attempts per execution turn, 32 saved images / 16 MiB per run; 20 MiB input,
+1568px longest side and 1 MiB normalized JPEG/PNG output per image. No new
+network access or dependencies are needed. Both worker and service strip caption
+control/format characters (including bidi controls and ZWJ/ZWNJ), tags and variation
+selectors, with a 1000-character input cap. The service checks PNG/JPEG signatures
+against the declared type; image responses use `private, no-store`, `nosniff` and a
+`sandbox` CSP. Submission is not confirmation: the service may decline at a cap,
+in which case the person sees “Image sharing limit reached” and the image is not saved.
+
 ## Connect an external agent with MCP
 
 Open **Settings → Agent access → MCP access**, name a token, and copy it when it is created. Tokens expire after 90 days and can manage all sessions owned by their account, including browser-created runs. Revoke tokens from the same section; revocation does not stop existing runs.
@@ -93,7 +118,7 @@ In **Settings → Appearance**, choose **System**, **Light** or **Dark**. System
 
 In a run's conversation, scrolling up reveals a square down-arrow above the composer. **Scroll to bottom** smoothly returns to the newest content and resumes following updates; reading earlier messages pauses following. The control stays above growing drafts and attachments and respects reduced motion.
 
-Remote images in rendered Markdown output are shown as links (using their alt text or URL) and never loaded automatically. Same-origin images and data/blob image previews still work. An image Content-Security-Policy (`img-src` only) also blocks remote image requests, including tracking pixels and exfiltration beacons; it does not restrict scripts, frames or other resources.
+Remote images in rendered Markdown output are shown as links (using their alt text or URL) and never loaded automatically. Same-origin images use the path allow-list described in **Images in replies**, not arbitrary API routes; data/blob image previews still work. An image Content-Security-Policy (`img-src` only) also blocks remote image requests, including tracking pixels and exfiltration beacons; it does not restrict scripts, frames or other resources.
 
 The sidebar uses a compact 28px logo in a 48px header: aligned with navigation icons when expanded, centered when collapsed. **Settings → Danger zone → Delete account** permanently removes your local account, sessions, photos, schedules, runs, images and usage records. Search opens that section, not a deletion action. An extra confirmation asks for your email and current password; passwordless accounts require a sign-in within the last 15 minutes. Stop active runs before deleting. You cannot delete the only administrator while other accounts remain. Deleting the final account also clears saved provider, GitHub and single sign-on connections and returns the server to administrator registration and model setup, even when general registration is closed. Work pushed to GitHub is not deleted.
 

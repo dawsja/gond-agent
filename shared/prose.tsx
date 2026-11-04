@@ -13,24 +13,37 @@ export function Code({ children }: { children: ReactNode }) {
   )
 }
 
+function isSameOriginImage(src: string): boolean {
+  if (typeof window === "undefined") return false
+  try {
+    const url = new URL(src)
+    // Check the normalized path, but reject encoded paths and backslashes before
+    // they can disguise traversal. Neither allowed route needs a query/fragment.
+    if (url.origin !== window.location.origin || url.username || url.password || /[\\%?#]/.test(src)) return false
+    return url.pathname.startsWith("/agents/") || /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/images\/[A-Za-z0-9_-]+$/.test(url.pathname)
+  } catch {
+    return false
+  }
+}
+
 /** `small`: secondary text (13px, muted). `className` sets the width and base size where the apps differ. */
 export function Prose({ text, small, className }: { text: string; small?: boolean; className?: string }) {
   return (
     <div className={cn("space-y-3 leading-[1.65] text-foreground", small && "text-[13px] text-muted-foreground", className)}>
       <Markdown
         remarkPlugins={[remarkGfm]}
-        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" && /^(data|blob):/i.test(url) ? url : defaultUrlTransform(url)}
+        urlTransform={(url, key, node) => node.tagName === "img" && key === "src" ? url : defaultUrlTransform(url)}
         components={{
           img: ({ src, alt, title }) => {
-            if (typeof src !== "string" || !src) return <span>{alt}</span>
-            let local = false
-            try {
-              const url = new URL(src, window.location.href)
-              local = url.origin === window.location.origin || url.protocol === "data:" || url.protocol === "blob:"
-            } catch { /* Invalid image URLs render as text links, never image requests. */ }
-            return local ? <img src={src} alt={alt} title={title} /> : (
-              <a href={src} target="_blank" rel="noreferrer" className="break-all text-link underline-offset-2 hover:underline">{alt || src}</a>
+            // Only allow-listed absolute same-origin HTTP(S) images render, not worker paths.
+            // Remote URLs stay links; inline data/blob previews remain compatible.
+            if (typeof src === "string" && /^https?:\/\//i.test(src)) return isSameOriginImage(src) ? (
+              <img src={src} alt={alt} title={title} />
+            ) : (
+              <a href={defaultUrlTransform(src)} target="_blank" rel="noreferrer" className="break-all text-link underline-offset-2 hover:underline">{alt || src}</a>
             )
+            if (typeof src === "string" && /^(data|blob):/i.test(src)) return <img src={src} alt={alt} title={title} />
+            return <span>{alt} <span className="text-muted-foreground">image not available (local path)</span></span>
           },
           code: ({ className, children }) =>
             className ? (

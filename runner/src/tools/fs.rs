@@ -352,6 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn images_are_resized_and_below_service_payload_limit() {
+        let _images = crate::images::test_guard().await;
         let image = image::DynamicImage::new_rgb8(3000, 2200);
         let mut input = std::io::Cursor::new(Vec::new());
         image.write_to(&mut input, image::ImageFormat::Png).unwrap();

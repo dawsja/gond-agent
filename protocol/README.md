@@ -230,6 +230,67 @@ The replacement starts with a fixed untrusted-text warning in a **user-role** me
 
 `tool.images` carries `{agent_id,call_id,images:[{media_type,data}]}` from the worker, where data is base64. The service accepts at most eight raster images (5 MiB each), stores them with the run owner in the existing images table, and emits/persists only `{id,media_type}` references. The existing authenticated run-image endpoint serves the bytes; inline image data is not stored in transcript JSON. Before emitting tool images or sending model input, the worker normalises every tool-result and attached image through `runner/src/images.rs`. API uploads are limited to 5 MB; runner input is limited to 20 MiB, 100 megapixels and 128 MiB decode allocation. Output strips metadata, uses the first animation frame, and is at most 1568px on the long side and 1 MiB (JPEG, or PNG only for transparency when smaller). SVG and undecodable images produce plain errors. Decode/re-encode runs in bounded blocking jobs (two concurrent, 10-second deadline, slots retained until jobs finish). Request serialization retains only the eight newest images across attachments and tool results; older images become `[image removed to save context: <label>]` with an 80-character label cap. This does not mutate the transcript.
 
+### Sharing reply images
+
+`share_image {path,caption?}` is a parent-only, bounded `Access::Read` tool.
+Paths and both allowed roots are canonicalized before component-prefix checks,
+so symlinked workspace/tmp roots work without widening access. Production uses
+only the workspace and literal `/tmp`, never `TMPDIR`; injected roots are test-only.
+Component-prefix checks reject `/tmpfoo`. Descriptor-relative no-follow component
+opens prevent symlink swaps, and the opened descriptor must be a regular file. Any readable regular raster image under either location can be
+shared, including browser screenshots and other tool outputs. Metadata and bounded
+reads enforce 20 MiB before decoding. Non-images are rejected, as are devices,
+`/proc`, network fetches and SVG. The existing normalizer and its
+pixel/allocation/concurrency/deadline limits are unchanged. Captions accept at
+most 1000 Unicode characters. Independently in the runner (before emitting) and
+service (before storing), strip control characters, Unicode Cf (including bidi
+overrides/isolates and ZWJ/ZWNJ), tags U+E0000–E007F, and variation selectors
+U+FE00–FE0F/U+E0100–E01EF. ZWJ/ZWNJ are not retained, matching the LSP sanitizer.
+`MAX_PER_TURN=4` reserves attempts before async work
+(failures count); each main execution turn resets the allowance. Subagents neither
+receive the tool nor pass its runtime guard.
+
+The worker emits `{type:"image.shared",agent_id:"main",call_id,image:{media_type,data},caption}`
+with normalized JPEG/PNG bytes. The API transactionally admits/stores the blob
+and transcript reference only after verifying a PNG/JPEG signature matching the
+declared media type (mismatches consume no quota), replacing it with
+`{type:"image.shared",agent_id:"main",image_id,media_type,caption,seq,ts}`.
+It enforces `MAX_SHARED_PER_TURN=4` accepted images since the latest main
+`turn.start` (queued user messages and child turns do not reset it),
+`MAX_SHARED_PER_RUN=32` and `MAX_SHARED_BYTES=16 MiB`, deriving usage from durable
+events and image rows so worker replacement, old checkpoints and fallback cannot
+replenish the run quota. Excess admissions produce the fixed
+`image.share_rejected` transcript notice. The asynchronous tool result explicitly
+says the service may still decline at a cap; the person then sees “Image sharing
+limit reached. This image was not saved.” Submission is not confirmation.
+Invalid inputs are dropped without inline bytes.
+These constants mirror `runner/src/tools/share_image.rs`.
+
+Shared images use the existing owner/run-scoped image table and authenticated
+GET `/api/v1/runs/:id/images/:image`; responses are `private, no-store` to avoid
+cross-session browser reuse, with `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox` (also for `tool.images`). Retention/account deletion/run deletion is identical
+to `tool.images`. React caches blobs for five inactive minutes; every mounted
+consumer owns/revokes its object URL. The shared React Query blob cache deduplicates
+image GETs across tool details, attachments, card enlargement and remounts during
+that lifetime; HTTP `no-store` does not disable this in-memory cache. Captioned cards use caption alt text (fallback
+“Shared image”), focus-visible keyboard enlargement and Escape/focus restoration.
+Old events keep their existing fold. Local Markdown image paths show a muted
+unavailable note; absolute same-origin HTTP(S) images render only when the normalized
+pathname is under `/agents/` or matches
+`^/api/v1/runs/[A-Za-z0-9_-]+/images/[A-Za-z0-9_-]+$`.
+Credentials, percent encoding, backslashes, query strings and fragments (even empty
+delimiters) are rejected. All other HTTP(S) images stay links, including every other
+API route, so Markdown cannot trigger authenticated image GETs to arbitrary endpoints.
+Existing inline data/blob rendering remains compatible.
+
+Sharing returns text only to the model, including an untrusted-image/injected-
+instructions warning. Neither image bytes nor the transcript event enter model
+history or checkpoints; no wire model block, checkpoint schema/epoch or request
+normalizer changes are required. Runtime coverage:
+`python3 containers/smoke-share-image.py` and
+`cd web && npm exec --call 'node --test test/shared-images.browser.cjs'`.
+
 Built-in additions: `symbols {action:"outline"|"definitions"|"references",path?,symbol?,limit?}` uses Universal Ctags for declarations and whole-identifier lexical matching for references (not semantic/LSP resolution). Searches cap files at 5000, skip files over 1 MB and honor ignores. `batch {calls:[{tool,input}]}` runs 1–8 independent built-in read calls, retaining order and per-result labels/errors; only read, list_directory, glob, grep, symbols and bash_output are allowed. `browser {url,script}` executes a Playwright test body with page/expect at wide and phone sizes; it is an execution tool, unavailable to read-only explore agents and blocked in plan mode. Chromium runs headlessly without its own sandbox; the non-root, limited container is its containment boundary, not a separate kernel.
 
 The worker's built-in `lsp {op,path,line?,column?}` accepts `diagnostics`, `definition`, `references` and `hover` for TypeScript/JavaScript and Rust; it is not a remote MCP tool. Paths are repository-relative and canonicalized within the checkout; navigation requires 1-based lines and 1-based UTF-16 columns, while diagnostics needs only `path`. Locations use the same coordinate convention. It reads current disk contents, exposes no rename/edit operations, and retains `Access::Read`; this read-only protocol is not a filesystem sandbox. Rust requires an ancestor `Cargo.toml` inside the repository and may run Cargo check, build scripts and proc-macros, executing repository code as running Cargo would. Missing rust-analyzer can trigger `rustup component add rust-analyzer` with an existing rustup/toolchain and network access; missing prerequisites return tool errors. Rustup trusts rust-lang HTTPS manifests, not a repository-pinned analyzer hash.
