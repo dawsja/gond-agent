@@ -336,7 +336,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "start_session",
-        "Start a coding run. Optional title sets run, commit and PR titles (120 characters, no newlines); branch sets a new gond-agent/feat/fix/chore/docs branch; pr_body sets a persistent PR description (20,000 characters, including empty). Otherwise only the successful final reply after the last tool call becomes the description, falling back to the prompt. Returns immediately; poll events. Reuse request_id only for an identical retry.",
+        "Start a coding run. Optional title sets run, commit and PR titles (120 characters, no newlines); branch sets a new gond-agent/feat/fix/chore/docs branch; pr_body sets a persistent PR description (20,000 characters, including empty). Otherwise only the clean final reply (end_turn) after the last tool call becomes the description, falling back to the plain run title, never the prompt. Returns immediately; poll events. Reuse request_id only for an identical retry.",
         {
           request_id: id,
           repo: z.string().min(1).max(140),
@@ -523,7 +523,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "send_session_message",
-        "Queue a follow-up, optionally with another available model. Optional pr_body replaces the persistent PR description (up to 20,000 characters, including empty). Otherwise the successful final reply after the last tool call supplies the description. Sessions created by the removed Claude Code and Codex agents are read-only.",
+        "Queue a follow-up, optionally with another available model. Optional pr_body replaces the persistent PR description (up to 20,000 characters, including empty). Otherwise the clean final reply (end_turn) after the last tool call supplies the description, falling back to the plain run title, never the prompt. Sessions created by the removed Claude Code and Codex agents are read-only.",
         { session_id: id, request_id: id, text, pr_body: bodySchema.optional(), ...selection },
         false,
         (args) =>

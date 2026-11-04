@@ -562,7 +562,8 @@ describe("persistent local run lifecycle", () => {
     ];
     workerTurns.push(fixture);
     const prompt = "Fix the login flow", reply = "## Result\n\nFixed the redirect. Checks passed.\n";
-    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt });
+    const title = "Fix login redirect";
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt, title });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary).toMatchObject({ text: reply, final_reply: true });
     expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: reply });
@@ -581,12 +582,26 @@ describe("persistent local run lifecycle", () => {
     await vi.waitFor(() => expect(patches()).toHaveLength(1));
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary.text).toBe("");
-    expect(patches()[0]?.[2]).toEqual({ body: prompt });
+    expect(patches()[0]?.[2]).toEqual({ body: title });
     runs.enqueue(r.id, "u", "Finish with a new reply");
     await vi.waitFor(() => expect(patches()).toHaveLength(2));
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     expect(runs.get(r.id).summary).toMatchObject({ text: "Fixed it and tested it.", final_reply: true });
     expect(patches()[1]?.[2]).toEqual({ body: "Fixed it and tested it." });
+  });
+  it.each(["max_tokens", "unknown_stop"])("publishes the title instead of text ending with %s without altering the transcript", async stop_reason => {
+    const fixture = [
+      { type: "turn.start", agent_id: "main" },
+      { type: "text.delta", agent_id: "main", text: "Incomplete reply" },
+      { type: "turn.end", agent_id: "main", stop_reason },
+    ];
+    workerTurns.push(fixture);
+    const title = "Safe run title";
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", title, prompt: "Task with sensitive pasted text" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(runs.get(r.id).summary.final_reply).toBe(false);
+    expect(vi.mocked(gh).mock.calls.find(call => call[1] === "POST")?.[2]).toMatchObject({ body: title });
+    expect(runs.history(r.id, 0).filter(event => fixture.some(item => item.type === event.type))).toMatchObject(fixture);
   });
   it("refreshes externally merged PRs once, preserves concurrent run updates and blocks follow-ups", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it" });

@@ -21,8 +21,8 @@ export function publicationFields(input: { title?: unknown; branch?: unknown; pr
 }
 
 /** The sole publication-body policy, shared by GitHub, MCP and workspace reads. */
-export function descriptionFor(run: Pick<Run, "pr_body" | "summary" | "prompt" | "status">): string {
-  return run.pr_body ?? (!["failed", "stopped"].includes(run.status) && run.summary?.final_reply && run.summary.text ? run.summary.text : run.prompt);
+export function descriptionFor(run: Pick<Run, "pr_body" | "summary" | "title" | "status">): string {
+  return run.pr_body ?? (!["failed", "stopped"].includes(run.status) && run.summary?.final_reply && run.summary.text ? run.summary.text : run.title);
 }
 
 export async function remoteBranchExists(repo: string, branch: string, env: NodeJS.ProcessEnv): Promise<boolean> {

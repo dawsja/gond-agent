@@ -5,6 +5,9 @@ export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "
 
 export type Ev = { type: string; [k: string]: any };
 
+// The runner forwards normalized provider stops: Chat stop and Responses completed use end_turn.
+const CLEAN_FINAL_STOP_REASONS: readonly string[] = ["end_turn"];
+
 export type PlanStep = { text: string; status: "pending" | "in_progress" | "done" };
 
 export function planState(items: unknown) {
@@ -103,7 +106,7 @@ export function fold(s: Summary, ev: Ev): Summary {
       return main ? {
         ...s,
         text: ev.stop_reason === "interrupted" || ev.stop_reason === "error" ? "" : s.text,
-        final_reply: !["interrupted", "error", "compacted"].includes(ev.stop_reason) && !s.error,
+        final_reply: CLEAN_FINAL_STOP_REASONS.includes(ev.stop_reason) && !s.error,
         question: null,
       } : s;
     case "text.delta":

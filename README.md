@@ -28,7 +28,7 @@ Agents can discover repositories and models, start sessions, read progress and d
 
 `start_session` accepts optional `title`, `branch` and `pr_body`, also supported by workspace run creation. A title is plain text without newlines, at most 120 characters, and supplies the run, commit and PR titles. A custom branch must match `^(gond-agent|feat|fix|chore|docs)/[a-z0-9][a-z0-9._-]{0,80}(/[a-z0-9._-]{1,80}){0,3}$`, with no `..`, trailing slash or `.lock` suffix; protected names `main`, `master`, `HEAD`, `release*` and `v*` are refused. An existing remote branch is refused unless it belongs to this run.
 
-`pr_body` is plain text up to 20,000 characters. Set it on start or override it with `send_session_message` (or a workspace follow-up); the override persists. An explicit body wins even when empty. Otherwise, the PR uses successful main-agent final text after the last tool call, falling back to the prompt. Commentary, subagent text and interrupted/failed turn text are excluded from this fallback; the live event transcript stays unchanged.
+`pr_body` is plain text up to 20,000 characters. Set it on start or override it with `send_session_message` (or a workspace follow-up); the override persists. An explicit body wins even when empty. Otherwise, the PR uses clean main-agent final text after the last tool call, falling back to the plain run title, never the prompt. Only `end_turn` (the runner's normalized clean stop) qualifies; truncated, refusal/filter and unknown stops do not. Failed/stopped runs and successful turns with no final text use the title. Commentary and subagent text are excluded; the live event transcript stays unchanged.
 
 ## Run on your server
 
