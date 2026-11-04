@@ -154,12 +154,14 @@ export async function importBundle(
   bundle: Buffer,
   branch: string,
   env: NodeJS.ProcessEnv = process.env,
+  beforePush?: () => Promise<void>,
 ) {
   const path = join(cwd, ".git", "gond-agent.bundle");
   await writeFile(path, bundle, { mode: 0o600 });
   try {
     await git(cwd, "fetch", "--no-tags", path, "HEAD");
     await git(cwd, "reset", "--hard", "FETCH_HEAD");
+    await beforePush?.();
     await authenticatedGit(env, cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]);
   } finally {
     await rm(path, { force: true });

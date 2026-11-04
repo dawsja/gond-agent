@@ -34,8 +34,10 @@ import { ModelAccess } from "../access";
 import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
+import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 
-export interface Run {
+export interface Run extends CiInfo {
+  ci_turn?: boolean;
   id: string;
   user_id: string;
   repo: string;
@@ -71,7 +73,7 @@ export interface Run {
   pushed: boolean;
   diff: string;
   summary: Summary;
-  pending: { text: string; images: string[]; effort?:string; model?:string }[];
+  pending: { text: string; images: string[]; effort?:string; model?:string; source?: "ci" }[];
   base_sha: string | null;
   auto_pr: boolean;
 }
@@ -98,12 +100,34 @@ export class Runs {
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
+  private ci: CiWatch;
   constructor(
     private db: Store,
     private cfg: Config,
     private workspaceFactory: WorkspaceFactory,
     subscriptions = new SubscriptionAccounts(db, cfg.secret, [new ChatGPTProvider()]),
-  ) { this.access = new ModelAccess(db, cfg.secret, subscriptions); this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user)); }
+  ) {
+    this.access = new ModelAccess(db, cfg.secret, subscriptions);
+    this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user));
+    this.ci = new CiWatch({
+      get: id => this.get(id),
+      env: user => githubEnvFor(db, cfg.secret, user),
+      update: (id, patch, event) => { const r = this.get(id); Object.assign(r, patch); this.save(r); this.append(id, { type: "run.ci", ...event }); },
+      followUp: async (id, text, sha) => {
+        await this.validateFollowUp(id, this.get(id).user_id);
+        const r = this.get(id);
+        if (this.shuttingDown || r.head_sha !== sha || r.ci_cancelled_sha === sha || r.status !== "ready" || r.pending.length || r.summary.question || ["closed", "merged"].includes(r.pr_state ?? "") || this.live.has(id) || this.booting.has(id) || (r.ci_round ?? 0) >= ciSettings().rounds) return false;
+        githubEnvFor(db, cfg.secret, r.user_id);
+        db.transaction(() => {
+          r.ci_round = (r.ci_round ?? 0) + 1;
+          r.ci_previous_sha = sha;
+          this.save(r);
+          this.enqueue(id, r.user_id, text, [], undefined, undefined, "ci");
+        })();
+        return true;
+      },
+    });
+  }
   get subscriptions() { return this.access.subscriptions; }
   catalog(user: string, refresh = false) { return this.access.catalog(user, refresh); }
   resolveSelection(user: string, id: string) { return this.access.resolve(user, id); }
@@ -162,9 +186,10 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls FROM runs WHERE id=?").get(r.id) as {calls: number | null} | undefined;
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null} | undefined;
     // Other lifecycle work may still hold a snapshot from before a search request.
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
+    r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -400,10 +425,14 @@ export class Runs {
     images: string[] = [],
     effort?:string,
     model?:string,
+    source?: "ci",
   ) {
     this.assertAccount(user);
     const r = this.get(id, user);
     assertActive(r);
+    if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
+      throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
+    if (!source) this.ci.stop(id);
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
       throw new ApiError(409, "merged", "Start a new run after merging.");
@@ -441,10 +470,11 @@ export class Runs {
     if(effort !== undefined){
       if(effort !== "default" && (typeof effort!=="string" || effort.length>20))throw new ApiError(400,"invalid_effort","Choose a supported effort.");
     }
-    r.pending.push({ text, images, effort, model });
+    r.pending.push({ text, images, effort, model, source });
     this.save(r);
     this.append(id, {
-      type: "user",
+      type: source === "ci" ? "ci" : "user",
+      ...(source ? { source } : {}),
       text,
       images: images.map((id) => ({ id })),
     });
@@ -545,6 +575,7 @@ export class Runs {
       r.model_id=selected.id;r.effort=validateEffort(selected,message.effort ?? "default");this.save(r);
     }
     r.pending.shift();
+    r.ci_turn = message.source === "ci";
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
     r.phase = "agent";
@@ -620,31 +651,64 @@ export class Runs {
   }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
+    if (r.status === "stopped") { live.busy = false; return; }
     r.phase = "finishing";
     this.status(r, "working", "Pushing changes");
-    await this.publish(id, live);
+    const published = await this.publish(id, live);
     r = this.get(id);
-    if (r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
+    if (published && r.status !== "stopped" && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id);
     r = this.get(id);
     live.busy = false;
     r.phase = "agent";
     r.finished_at = Date.now();
     const merged = r.pr_state === "merged" && !r.pending.length;
-    this.status(r, merged ? "merged" : "ready");
+    this.status(r, r.status === "stopped" ? "stopped" : merged ? "merged" : "ready");
     if (merged) await this.close(id);
+    else if (!r.pending.length && !r.summary.question && r.status === "ready" && (!published || (ciSettings().rounds && r.head_sha && r.ci_pending_sha === r.head_sha && r.ci_sha !== r.head_sha))) {
+      await this.close(id);
+      if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
+    }
   }
   private async publish(id: string, live: Live) {
     let r = this.get(id);
+    const previous = r.head_sha;
     const snapshot = await live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     );
-    await importBundle(
+    try { await importBundle(
       live.cwd,
       Buffer.from(snapshot.bundle, "base64"),
       r.branch,
       githubEnvFor(this.db, this.cfg.secret, r.user_id),
+      async () => {
+        const current = this.get(id);
+        if (!current.ci_turn) return;
+        if (current.status === "stopped" || ["closed", "merged"].includes(current.pr_state ?? ""))
+          throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
+        const baseline = current.ci_previous_sha;
+        if (!baseline) throw new ApiError(409, "ci_needs_person", "needs a person: the previous pushed commit is missing.");
+        let touchesConfig: boolean;
+        try { touchesConfig = await ciPushTouchesConfig(live.cwd, baseline); }
+        catch { throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix's commit history could not be verified."); }
+        if (touchesConfig) throw new ApiError(409, "ci_needs_person", "needs a person: automatic fixes cannot push changes to CI configuration.");
+        if (current.pr_number) {
+          const pr = await gh<{ state: string; merged?: boolean }>(`repos/${current.repo}/pulls/${current.pr_number}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, current.user_id));
+          if (pr.state !== "open" || pr.merged) throw new ApiError(409, "ci_needs_person", "needs a person: the pull request is closed or merged.");
+        }
+        const latest = this.get(id);
+        if (latest.status === "stopped" || ["closed", "merged"].includes(latest.pr_state ?? ""))
+          throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
+      },
     );
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "ci_needs_person") throw error;
+      const current = this.get(id);
+      Object.assign(current, { ci_state: "gave_up", ci_reason: error.message, ci_active: false });
+      this.save(current);
+      this.append(id, { type: "run.ci", state: "gave_up", round: current.ci_round ?? 0, sha: current.head_sha, failing: current.ci_failing ?? [], reason: error.message });
+      return false;
+    }
     r = this.get(id);
     r.pushed = true;
     r.head_sha = snapshot.head;
@@ -668,7 +732,7 @@ export class Runs {
       r.additions += Number(a) || 0;
       r.deletions += Number(d) || 0;
     }
-    r = { ...this.get(id), pushed: true, head_sha: r.head_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    r = { ...this.get(id), pushed: true, head_sha: r.head_sha, ci_pending_sha: r.head_sha !== previous ? r.head_sha! : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
     this.save(r);
     this.append(id, {
       type: "run.diff",
@@ -676,6 +740,7 @@ export class Runs {
       additions: r.additions,
       deletions: r.deletions,
     });
+    return true;
   }
   async openPull(id: string, user: string) {
     const r = this.get(id, user);
@@ -725,6 +790,7 @@ export class Runs {
   }
   async stop(id: string, user: string) {
     const r = this.get(id, user);
+    this.ci.stop(id);
     r.pending = [];
     this.status(r, "stopped");
     const live = this.live.get(id);
@@ -735,6 +801,9 @@ export class Runs {
     const live = this.live.get(id);
     if (this.booting.has(id) || live?.busy || live?.closing || r.pending.length || ["queued", "working"].includes(r.status))
       throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
+    r.ci_cancelled_sha = r.head_sha ?? undefined;
+    this.save(r);
+    this.ci.stop(id);
     if (!live) return { closed: true };
     live.closing = true;
     try {
@@ -745,6 +814,7 @@ export class Runs {
   }
   async remove(id: string, user: string) {
     this.get(id, user);
+    this.ci.stop(id);
     await this.close(id);
     this.db
       .prepare("UPDATE runs SET deleted_at=? WHERE id=?")
@@ -770,6 +840,7 @@ export class Runs {
   }
   async shutdown() {
     this.shuttingDown = true;
+    this.ci.stopAll();
     this.subscriptions.close();
     await Promise.allSettled([...this.launches.values()]);
     await Promise.allSettled([...this.live.keys()].map((id) => this.close(id)));

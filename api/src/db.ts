@@ -36,6 +36,8 @@ export function openStore(data: string) {
   })();
   clearExternalProfileImages(db);
   retireCodingAgents(db);
+  // Additive and idempotent: automatic CI rounds survive restarts and follow-ups.
+  db.prepare("UPDATE runs SET data=json_set(data,'$.ci_round',0) WHERE json_extract(data,'$.backend')='builtin' AND json_type(data,'$.ci_round') IS NULL").run();
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
     db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
