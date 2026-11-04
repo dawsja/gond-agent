@@ -461,11 +461,10 @@ const key = 'fixture-only-provider-key';
       await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last());
       await agentHeaders();
       await capture('streamed-transcript-image');
-      await page.emulateMedia({ colorScheme: 'light' });
-      await resolvedTheme('light');
-      await greyAvatar(page.getByLabel('No profile photo', { exact: true }).filter({ visible: true }).last(), 'light');
-      await agentHeaders();
+      // verifyTheme leaves System saved. Device changes resolve the palette, not
+      // the account preference; use the helper that checks both independently.
       await captureThemes('streamed-transcript-image');
+      expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe('system');
       const inlineImage = await page.evaluate(() => {
         const canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
         const data = canvas.toDataURL('image/png');
@@ -1097,7 +1096,7 @@ const key = 'fixture-only-provider-key';
     console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, screenshots }));
   } catch (error) {
     await capture('failure').catch(() => {});
-    console.log(JSON.stringify({ error: error.message, screenshots }));
+    console.log(JSON.stringify({ error: error.stack || error.message, screenshots }));
   } finally {
     await browser.close(); await new Promise(resolve => provider.close(resolve));
   }
