@@ -174,7 +174,10 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 }
                 AgentInput::PermissionReply { request_id, decision, message } => s.resolve(&request_id, Reply::Permission(decision, message)),
                 AgentInput::QuestionReply { request_id, answer } => s.resolve(&request_id, Reply::Answer(answer)),
-                AgentInput::Interrupt => s.turn_cancel.lock().unwrap().cancel(),
+                AgentInput::Interrupt => {
+                    s.turn_cancel.lock().unwrap().cancel();
+                    for tool in &s.tools { tool.stop(); }
+                },
                 AgentInput::Effort { effort } => *s.effort.lock().unwrap() = effort,
                 AgentInput::Mode { mode } => *s.mode.lock().unwrap() = mode,
                 AgentInput::Model { model, context_window } => *s.model.lock().unwrap() = (model, context_window),

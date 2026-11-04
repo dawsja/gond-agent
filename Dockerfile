@@ -33,6 +33,13 @@ COPY containers/browser/browser.cjs /opt/gond-agent-browser/browser.cjs
 COPY containers/browser/browser.test.cjs /opt/gond-agent-browser/browser.test.cjs
 RUN node --test /opt/gond-agent-browser/browser.test.cjs
 
+# Pinned TypeScript server/SDK; packaging checks only. Rust uses per-run rustup components.
+# Client limits and trust boundaries: containers/lsp/README.md.
+COPY containers/lsp/package*.json /opt/gond-agent-lsp/
+RUN cd /opt/gond-agent-lsp && npm ci --ignore-scripts
+COPY containers/lsp/smoke.test.cjs /opt/gond-agent-lsp/smoke.test.cjs
+RUN cd /opt/gond-agent-lsp && npm test
+
 FROM worker-tools AS worker-image
 COPY --from=worker-build /src/target/release/gond-agent-worker /usr/local/bin/gond-agent-worker
 COPY containers/agent.py /opt/gond-agent/agent.py
