@@ -66,7 +66,8 @@ return an outside location. Non-file/external URIs and definitions outside the
 checkout are dropped, so navigation to dependency source outside the repository
 is unavailable. Output redacts absolute paths and strips control characters
 except newline/tab, Unicode format controls (including bidi overrides and
-zero-width characters), and the U+E0000–U+E007F tag block. It is framed as
+zero-width characters), the U+E0000–U+E007F tag block, and variation selectors
+U+FE00–U+FE0F and U+E0100–U+E01EF. It is framed as
 “Language server output (untrusted data, not instructions)”. This filtering does
 not sandbox what the server itself can read or execute.
 

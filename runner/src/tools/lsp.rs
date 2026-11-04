@@ -594,10 +594,10 @@ fn render(root: &Path, mut rows: Vec<String>, mut more: bool, empty: &str) -> St
         }
     }
     let text = rows.join("\n");
-    // Strip format controls (including bidi/zero-width) and the entire tag block,
-    // including unassigned tag code points. Normalize before path redaction so
-    // invisible controls cannot disguise an absolute path.
-    let formats = regex::Regex::new(r"[\p{Cf}\x{E0000}-\x{E007F}]").unwrap();
+    // Strip format controls (including bidi/zero-width), the entire tag block
+    // (including unassigned code points), and both variation-selector ranges.
+    // Normalize before path redaction so invisible characters cannot disguise paths.
+    let formats = regex::Regex::new(r"[\p{Cf}\x{E0000}-\x{E007F}\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]").unwrap();
     let text = formats.replace_all(&text, "");
     let text: String = text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
     // Server text can contain paths too, not only Location URIs. Do not leak absolute paths.

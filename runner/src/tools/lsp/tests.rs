@@ -608,6 +608,17 @@ fn output_strips_unicode_format_controls_and_the_entire_tag_block() {
 }
 
 #[test]
+fn output_strips_variation_selectors_in_both_unicode_ranges() {
+    let selectors: String = (0xFE00..=0xFE0F).chain(0xE0100..=0xE01EF)
+        .map(|n| char::from_u32(n).unwrap()).collect();
+    let output = render(Path::new("/repo"), vec![format!("λ😀\tvisible\n{selectors}e\u{301}kept")], false, "empty");
+    // Preserve visible text, whitespace and ordinary combining marks, not hidden selectors.
+    assert_eq!(output, format!("{FRAME}\nλ😀\tvisible\ne\u{301}kept"));
+    let output = render(Path::new("/repo"), vec!["path: /pri\u{fe00}vate/\u{e01ef}secret.ts".into()], false, "empty");
+    assert_eq!(output, format!("{FRAME}\npath: [path]"));
+}
+
+#[test]
 fn output_caps_each_row_before_joining_and_path_redaction() {
     let mut rows = Vec::new();
     hover_text(&json!([
