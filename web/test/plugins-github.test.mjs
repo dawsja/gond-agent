@@ -43,7 +43,7 @@ test('route registry sends all Settings paths through the redirect boundary and 
   }
   visit(file)
   for (const [path, element] of routes) if (path?.startsWith('/settings')) assert.equal(element, '{<SettingsRoute />}', path)
-  for (const path of ['/settings', '/settings/connections', '/settings/github']) assert.ok(routes.has(path), path)
+  assert.equal(routes.get('/settings/*'), '{<SettingsRoute />}', 'all canonical pages and legacy paths must share the redirect boundary')
   assert.equal(routes.get('/plugins/github'), '{<GithubPluginScreen />}')
   assert.match(source, /import\("@\/app\/settings-route"\)/)
   assert.match(source, /import\("@\/features\/plugins\/github-plugin"\)/)

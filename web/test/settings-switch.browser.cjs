@@ -5,7 +5,8 @@ const assert = require('node:assert/strict');
 const { mkdirSync } = require('node:fs');
 const { resolve, join } = require('node:path');
 const { chromium, expect } = require('@playwright/test');
-let server, browser, origin;
+let server, browser, origin, settingsRegistry;
+const settingsScreenshots = '/tmp/gond-settings-pages';
 const screenshots = process.env.SCREENSHOT_DIR || '/tmp/gond-settings-switches';
 const fallbackLabel = 'Use the shared GitHub connection for accounts without their own';
 const fixture = (view, theme = 'light', accent = 'blue') => `${origin}/agents/test/fixtures/settings-switch.html?view=${view}&theme=${theme}&accent=${accent}`;
@@ -18,11 +19,13 @@ before(async () => {
   origin = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ args: ['--no-sandbox'] });
   mkdirSync(screenshots, { recursive: true });
+  mkdirSync(settingsScreenshots, { recursive: true });
+  settingsRegistry = await import('../src/features/settings/registry.ts');
 });
 after(async () => { await browser?.close(); await server?.close(); });
 
 async function mockAPI(page, theme = 'light', { admin = true, connected = false } = {}) {
-  const state = { fallback: false, auto_pr: true, enabled: true, puts: [], personal: connected, shared: connected, login: { status: 'idle' }, sharedLogin: { status: 'idle' }, requests: [] };
+  const state = { accent: 'blue', theme, fallback: false, auto_pr: true, enabled: true, puts: [], personal: connected, shared: connected, login: { status: 'idle' }, sharedLogin: { status: 'idle' }, requests: [] };
   const user = { id: admin ? 'admin' : 'member', name: admin ? 'Test Administrator' : 'Test Member', email: admin ? 'admin@example.test' : 'member@example.test' };
   await page.route('**/api/**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -42,13 +45,15 @@ async function mockAPI(page, theme = 'light', { admin = true, connected = false 
       state.puts.push({ path, body });
       if (path === '/api/v1/settings/github') state.fallback = body.fallback;
       else if (path === '/api/v1/me/automations') state.auto_pr = body.auto_pr;
+      else if (path === '/api/v1/me/accent') { state.accent = body.accent; return route.fulfill({ json: { accent: state.accent } }); }
+      else if (path === '/api/v1/me/theme') state.theme = body.theme;
       else if (path.endsWith('/enabled')) state.enabled = body.enabled;
       else if (path !== '/api/v1/settings/oidc') throw new Error(`Unexpected mutation ${path}`);
       return route.fulfill({ json: { ok: true } });
     }
     const responses = {
       '/api/auth/get-session': { session: { id: 'fixture-session', userId: user.id, expiresAt: new Date(Date.now() + 86400000).toISOString() }, user },
-      '/api/v1/me': { theme, accent: 'blue', admin, user, setup_required: false, automations: { auto_pr: state.auto_pr } },
+      '/api/v1/me': { theme: state.theme, accent: state.accent, admin, user, setup_required: false, automations: { auto_pr: state.auto_pr } },
       '/api/v1/me/deletion': { last_account: true, has_password: true, blocked_reason: null },
       '/api/v1/runs': { runs: [] },
       '/api/v1/subscriptions': { accounts: [], pending: null, welcome: false },
@@ -262,7 +267,7 @@ test('legacy Settings GitHub hash, query and path bookmarks redirect before Sett
       assert.ok(!state.requests.some(request => /\/me\/(?:deletion|sign-in-methods)|\/sessions$|\/settings\//.test(request.path)), 'redirect must not mount Settings or administrator controls');
     }
     await page.goto(origin + '/agents/settings#chatgpt');
-    await expect(page).toHaveURL(origin + '/agents/settings#chatgpt');
+    await expect(page).toHaveURL(origin + '/agents/settings/models#chatgpt');
     await expect(page.getByRole('heading', { name: 'Models', exact: true })).toBeVisible();
   });
 });
@@ -353,13 +358,11 @@ for (const width of [1440, 390]) for (const theme of ['light', 'dark']) for (con
       await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
       await expect(page.getByRole('heading', { name: /Your connection|Shared connection/ })).toHaveCount(0);
       await expect(page.getByRole('button', { name: /Connect GitHub|Reconnect GitHub|Disconnect/ })).toHaveCount(0);
-      await expect(page.getByText('ChatGPT plan', { exact: true })).toBeVisible();
-      await expect(page.locator('#sign-in-methods')).toHaveCount(1);
-      await page.getByRole('heading', { name: 'Models', exact: true }).evaluate(el => {
-        const scroller = el.closest('main').lastElementChild;
-        scroller.scrollTop += el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-        window.scrollTo(0, 0);
-      });
+      await expect(page).toHaveURL(origin + '/agents/settings/account');
+      await expect(page.locator('#sign-in-methods')).toBeVisible();
+      await page.goto(origin + '/agents/settings/models');
+      await expect(page.getByRole('heading', { name: 'Models', exact: true })).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'ChatGPT plan', exact: true })).toBeVisible();
       await page.evaluate(() => document.fonts.ready);
       await page.screenshot({ path: join(screenshots, `settings-without-connections-${role}-${theme}-${width}.png`), animations: 'disabled' });
       assert.ok(!state.requests.some(request => /\/github(?:\/login)?$/.test(request.path)), 'Settings must not mount GitHub controls');
@@ -382,5 +385,269 @@ test('GitHub loading and error states stay readable and prevent changing an unkn
     } finally { hold.release(); }
     await expect(page.getByText("Couldn't check GitHub", { exact: true })).toBeVisible();
     await expect(page.getByRole('switch', { name: fallbackLabel })).toBeDisabled();
+  });
+});
+
+async function openSettingsPage(page, id, width) {
+  const topic = settingsRegistry.SETTINGS_PAGES.find(item => item.id === id);
+  if (width < 768) {
+    await page.getByRole('combobox', { name: 'Settings page', exact: true }).click();
+    await page.getByRole('option', { name: topic.title, exact: true }).click();
+  } else await page.getByRole('navigation', { name: 'Settings pages' }).getByRole('link', { name: topic.title, exact: true }).click();
+  await expect(page).toHaveURL(origin + '/agents' + topic.route);
+}
+
+for (const width of [1440, 390]) for (const theme of ['light', 'dark']) test(`Appearance saves Orange after topic navigation and overrides stale hints: ${theme}, ${width}px`, async () => {
+  await withPage({ viewport: { width, height: 900 }, colorScheme: theme }, async page => {
+    const state = await mockAPI(page, theme);
+    await page.goto(origin + '/agents/settings/account');
+    await expect(page.locator('#sign-in-methods')).toBeVisible();
+    await expect(page.locator('#sessions')).toBeVisible();
+    await openSettingsPage(page, 'models', width);
+    await expect(page.getByRole('heading', { name: 'ChatGPT plan', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Model providers', exact: true })).toBeVisible();
+    await openSettingsPage(page, 'appearance', width);
+    const control = page.locator('#appearance').getByRole('button', { name: 'Color', exact: true });
+    await expect(control).toBeEnabled();
+    await control.click();
+    const saving = page.waitForResponse(response => response.url() === origin + '/api/v1/me/accent' && response.request().method() === 'PUT');
+    await page.getByRole('menuitemradio', { name: 'Orange', exact: true }).click();
+    const response = await saving;
+    assert.equal(response.status(), 200);
+    assert.deepEqual(response.request().postDataJSON(), { accent: 'orange' });
+    assert.deepEqual(await response.json(), { accent: 'orange' });
+    await expect(page.locator('html')).toHaveAttribute('data-accent', 'orange');
+    await expect(control).toHaveText('Orange');
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText(theme === 'light' ? 'Light' : 'Dark');
+    await openSettingsPage(page, 'account', width);
+    await expect(control).toBeHidden();
+    await openSettingsPage(page, 'appearance', width);
+    await expect(control).toHaveText('Orange');
+    for (const hint of ['purple', 'not-an-accent']) {
+      await page.evaluate(value => localStorage.setItem('gond-agent-accent', value), hint);
+      await page.reload();
+      await expect(page.locator('html')).toHaveAttribute('data-accent', 'orange');
+      await expect(control).toHaveText('Orange');
+      assert.equal(await page.evaluate(() => localStorage.getItem('gond-agent-accent')), 'orange');
+    }
+    assert.deepEqual(state.puts, [{ path: '/api/v1/me/accent', body: { accent: 'orange' } }]);
+    await page.screenshot({ path: join(settingsScreenshots, `appearance-orange-${theme}-${width}.png`), animations: 'disabled' });
+  });
+});
+
+for (const width of [1440, 390]) for (const theme of ['light', 'dark']) for (const admin of [true, false]) {
+  const role = admin ? 'administrator' : 'member';
+  test(`Settings topic pages and old URL screenshots: ${role}, ${theme}, ${width}px`, async () => {
+    await withPage({ viewport: { width, height: 900 }, colorScheme: theme }, async page => {
+      const state = await mockAPI(page, theme, { admin });
+      await page.goto(origin + '/agents/settings');
+      await expect(page).toHaveURL(origin + '/agents/settings/account');
+      const available = settingsRegistry.settingsPages(admin);
+      if (width >= 768) {
+        const nav = page.getByRole('navigation', { name: 'Settings pages' });
+        await expect(nav.getByRole('link')).toHaveText(available.map(item => item.title));
+        await expect(page.getByRole('combobox', { name: 'Settings page' })).toBeHidden();
+      } else {
+        await expect(page.getByRole('navigation', { name: 'Settings pages' })).toBeHidden();
+        await page.getByRole('combobox', { name: 'Settings page' }).click();
+        await expect(page.getByRole('option')).toHaveText(available.map(item => item.title));
+        await page.keyboard.press('Escape');
+      }
+      for (const topic of available) {
+        await openSettingsPage(page, topic.id, width);
+        await expect(page.getByRole('heading', { name: topic.title, level: 2, exact: true })).toBeVisible();
+        if (width >= 768) await expect(page.getByRole('navigation', { name: 'Settings pages' }).locator('[aria-current="page"]')).toHaveText(topic.title);
+        else await expect(page.getByRole('combobox', { name: 'Settings page' })).toHaveText(topic.title);
+        await expect(page.locator('html')).toHaveClass(theme === 'dark' ? /dark/ : /^(?!.*dark)/);
+        const panel = page.locator(`[data-settings-page="${topic.id}"]`);
+        for (const section of topic.sections) {
+          if (admin || !section.adminOnly) {
+            await expect(panel.locator('#' + section.id)).toBeVisible();
+            // Settle async card contents before screenshots.
+            await expect(panel.getByText('Loading…', { exact: true })).toHaveCount(0);
+          } else await expect(panel.locator('#' + section.id)).toHaveCount(0);
+        }
+        await page.evaluate(() => document.fonts.ready);
+        const prefix = `${topic.id}-${role}-${theme}-${width}`;
+        await page.screenshot({ path: join(settingsScreenshots, prefix + '.png'), animations: 'disabled' });
+        // A full panel capture includes long topic pages below the first screen.
+        await panel.evaluate(el => { el.style.height = 'auto'; el.style.overflow = 'visible'; });
+        await panel.screenshot({ path: join(settingsScreenshots, prefix + '-content.png'), animations: 'disabled' });
+        await panel.evaluate(el => { el.style.height = ''; el.style.overflow = ''; });
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no horizontal viewport overflow');
+      }
+      // Each accessible topic also has a legacy bookmark capture after canonicalization.
+      for (const topic of available) {
+        const section = topic.sections.find(item => admin || !item.adminOnly);
+        await page.goto(origin + '/agents/settings#' + section.id);
+        await expect(page).toHaveURL(origin + '/agents' + settingsRegistry.settingsHref(section.id));
+        await expect(page.locator('#' + section.id)).toBeFocused();
+        await page.screenshot({ path: join(settingsScreenshots, `redirect-${topic.id}-${role}-${theme}-${width}.png`), animations: 'disabled' });
+      }
+      if (!admin) {
+        await page.goto(origin + '/agents/settings/sign-in-people');
+        await expect(page).toHaveURL(origin + '/agents/settings/account');
+        await expect(page.locator('#oidc, #people')).toHaveCount(0);
+        await page.screenshot({ path: join(settingsScreenshots, `sign-in-people-denied-${role}-${theme}-${width}.png`), animations: 'disabled' });
+        assert.ok(!state.requests.some(item => /\/settings\/(providers|oidc|people|web-search)$/.test(item.path)), 'member pages never mount admin forms');
+      }
+      assert.ok(!state.requests.some(item => /\/github(?:\/login)?$/.test(item.path)), 'no GitHub controls in any Settings page');
+    });
+  });
+}
+
+test('all legacy section aliases, queries and section paths resolve through the production router', async () => {
+  for (const topic of settingsRegistry.SETTINGS_PAGES) for (const section of topic.sections) for (const anchor of [section.id, ...section.anchors]) {
+    for (const suffix of ['#' + anchor, '?section=' + anchor, '?tab=' + anchor, '?anchor=' + anchor, '/' + anchor]) {
+      // Bound Chromium history/document retention in the 2 GiB CI container.
+      await withPage({}, async page => {
+        await mockAPI(page);
+        await page.goto(origin + '/agents/settings' + suffix);
+        const resolved = settingsRegistry.resolveSettingsLocation('/settings' + (suffix.startsWith('/') ? suffix : ''), suffix.startsWith('#') ? suffix : '', suffix.startsWith('?') ? suffix : '', true);
+        await expect(page).toHaveURL(origin + '/agents' + resolved.to);
+        await expect(page.getByRole('heading', { name: topic.title, level: 2, exact: true })).toBeVisible();
+      });
+    }
+  }
+});
+
+test('Settings links support arrows, Home/End, Enter, Tab order and aria-current without activating on focus', async () => {
+  await withPage({ viewport: { width: 1440, height: 900 } }, async page => {
+    await mockAPI(page);
+    await page.goto(origin + '/agents/settings/account');
+    const nav = page.getByRole('navigation', { name: 'Settings pages' });
+    const account = nav.getByRole('link', { name: 'Account', exact: true });
+    const appearance = nav.getByRole('link', { name: 'Appearance', exact: true });
+    await account.focus();
+    await page.keyboard.press('ArrowDown');
+    await expect(appearance).toBeFocused();
+    await expect(account).toHaveAttribute('aria-current', 'page');
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(origin + '/agents/settings/appearance');
+    await expect(appearance).toHaveAttribute('aria-current', 'page');
+    await page.keyboard.press('ArrowUp');
+    await expect(account).toBeFocused();
+    await page.keyboard.press('End');
+    await expect(nav.getByRole('link', { name: 'Danger zone' })).toBeFocused();
+    await page.keyboard.press('Home');
+    await expect(account).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(appearance).toBeFocused();
+    await nav.getByRole('link', { name: 'Danger zone' }).focus();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toBeFocused();
+  });
+});
+
+test('mobile Settings select supports keyboard navigation and selection', async () => {
+  await withPage({ viewport: { width: 390, height: 900 } }, async page => {
+    await mockAPI(page, 'light', { admin: false });
+    await page.goto(origin + '/agents/settings');
+    const select = page.getByRole('combobox', { name: 'Settings page' });
+    await select.focus();
+    await page.keyboard.press('Space');
+    await expect(page.getByRole('option', { name: 'Account', exact: true })).toBeFocused();
+    await page.keyboard.press('ArrowDown');
+    await expect(page.getByRole('option', { name: 'Appearance', exact: true })).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(origin + '/agents/settings/appearance');
+    // BrowserRouter updates the URL before its transition commits the new panel.
+    await expect(page.getByRole('heading', { name: 'Appearance', level: 2, exact: true })).toBeVisible();
+    await expect(select).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toBeFocused();
+  });
+});
+
+for (const width of [1440, 390]) test(`topic navigation retains unsaved provider/OIDC drafts, details and scroll at ${width}px`, async () => {
+  await withPage({ viewport: { width, height: 600 } }, async page => {
+    const state = await mockAPI(page);
+    await page.goto(origin + '/agents/settings/sign-in-people');
+    await page.getByLabel('Button label', { exact: true }).fill('Unsaved identity');
+    await page.getByLabel('Client secret', { exact: true }).fill('fixture-only-unsaved-secret');
+    await page.getByRole('switch', { name: 'Enable single sign-on' }).click();
+    const panel = page.locator('[data-settings-page="sign-in-people"]');
+    await panel.evaluate(el => { el.scrollTop = 170; });
+    const scroll = await panel.evaluate(el => el.scrollTop);
+    assert.ok(scroll > 0, 'fixture must exercise actual scrolling');
+    await openSettingsPage(page, 'models', width);
+    await page.getByRole('button', { name: '+ Add provider', exact: true }).click();
+    await page.getByLabel('API key', { exact: true }).fill('fixture-only-unsaved-key');
+    await page.getByText('Advanced settings', { exact: true }).click();
+    await page.getByLabel('Connection name', { exact: true }).fill('Unsaved provider');
+    await openSettingsPage(page, 'appearance', width);
+    await openSettingsPage(page, 'sign-in-people', width);
+    await expect(page.getByLabel('Button label', { exact: true })).toHaveValue('Unsaved identity');
+    await expect(page.getByLabel('Client secret', { exact: true })).toHaveValue('fixture-only-unsaved-secret');
+    await expect(page.getByRole('switch', { name: 'Enable single sign-on' })).toBeChecked();
+    assert.equal(await panel.evaluate(el => el.scrollTop), scroll);
+    await openSettingsPage(page, 'models', width);
+    await expect(page.getByLabel('API key', { exact: true })).toHaveValue('fixture-only-unsaved-key');
+    await expect(page.getByLabel('Connection name', { exact: true })).toHaveValue('Unsaved provider');
+    await page.goBack();
+    await expect(page.getByLabel('Button label', { exact: true })).toHaveValue('Unsaved identity');
+    assert.equal(state.puts.length, 0, 'navigation must not save drafts');
+    assert.equal(await page.evaluate(() => JSON.stringify(localStorage).includes('fixture-only-unsaved')), false, 'secrets are not cached');
+  });
+});
+
+for (const admin of [true, false]) test(`search uses registry routes/anchors, hides admin items, and never deletes (${admin ? 'admin' : 'member'})`, async () => {
+  await withPage({ viewport: { width: 1440, height: 900 } }, async page => {
+    const state = await mockAPI(page, 'light', { admin });
+    await page.goto(origin + '/agents/settings/account');
+    const open = async text => {
+      await page.getByRole('button', { name: 'Search', exact: true }).click();
+      await page.getByRole('textbox', { name: 'Search', exact: true }).fill(text);
+    };
+    for (const item of settingsRegistry.settingsSearchItems(admin)) {
+      await open(item.title);
+      await page.getByRole('option', { name: item.title, exact: true }).click();
+      await expect(page).toHaveURL(origin + '/agents' + item.to);
+      await expect(page.locator('#' + item.to.split('#')[1])).toBeFocused();
+    }
+    if (!admin) for (const title of ['Model providers', 'Single sign-on', 'People', 'Web search']) {
+      await open(title);
+      await expect(page.getByRole('option', { name: title, exact: true })).toHaveCount(0);
+      await page.keyboard.press('Escape');
+    }
+    await open('erase close');
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(origin + '/agents/settings/danger-zone#delete');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    assert.ok(!state.requests.some(item => item.method === 'DELETE'), 'search only navigates');
+  });
+});
+
+test('cold deep links follow delayed card layout, then preserve user scroll on Back', async () => {
+  await withPage({ viewport: { width: 1440, height: 600 } }, async page => {
+    await mockAPI(page);
+    const hold = deferred();
+    await page.route('**/api/v1/settings/oidc', async route => { await hold.promise; await route.fallback(); });
+    try {
+      await page.goto(origin + '/agents/settings/sign-in-people#people');
+      await expect(page.locator('#people')).toBeFocused();
+    } finally { hold.release(); }
+    await expect(page.getByLabel('Button label', { exact: true })).toHaveValue('Single sign-on');
+    const people = page.locator('#people');
+    await expect.poll(async () => {
+      const box = await people.boundingBox();
+      return box.y >= 130 && box.y < 570;
+    }).toBe(true);
+    // Explicit section navigation still aligns, even on an already visited page.
+    await page.goto(origin + '/agents/settings/models#providers');
+    await page.getByRole('button', { name: '+ Add provider', exact: true }).click();
+    await expect(page.getByLabel('API key', { exact: true })).toBeVisible();
+    const panel = page.locator('[data-settings-page="models"]');
+    await panel.hover();
+    const initialScroll = await panel.evaluate(el => el.scrollTop);
+    await page.mouse.wheel(0, 280);
+    await expect.poll(() => panel.evaluate(el => el.scrollTop)).toBeGreaterThan(initialScroll);
+    const before = await panel.evaluate(el => el.scrollTop);
+    assert.ok(before > 0);
+    await openSettingsPage(page, 'appearance', 1440);
+    await page.goBack();
+    await expect(page).toHaveURL(origin + '/agents/settings/models#providers');
+    await expect(page.getByLabel('API key', { exact: true })).toBeVisible();
+    await expect.poll(() => panel.evaluate(el => el.scrollTop)).toBe(before);
   });
 });

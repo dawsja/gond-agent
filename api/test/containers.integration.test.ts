@@ -165,6 +165,19 @@ describe.skipIf(!image)("real container workspaces", () => {
       for (const shot of result.screenshots ?? []) await writeFile(join(evidence, shot.name), Buffer.from(shot.data, "base64"));
       expect(result.error, JSON.stringify(result.diagnostics)).toBeUndefined();
       expect(result.passed).toBe(true);
+      // Both first-account and returning phases must visit every Settings topic
+      // and retain #42's administrator GitHub cards under Plugins, not Settings.
+      expect(result.navigation.settings).toEqual([
+        { path: "/agents/settings/account", heading: "Account" },
+        { path: "/agents/settings/appearance", heading: "Appearance" },
+        { path: "/agents/settings/models", heading: "Models" },
+        { path: "/agents/settings/agent-access", heading: "Agent access" },
+        { path: "/agents/settings/sign-in-people", heading: "Sign-in & people" },
+        { path: "/agents/settings/danger-zone", heading: "Danger zone" },
+      ]);
+      expect(result.navigation.github).toEqual({
+        path: "/agents/plugins/github", headings: ["Your connection", "Shared connection"],
+      });
     };
     let failure: unknown;
     try {

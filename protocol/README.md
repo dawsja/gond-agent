@@ -1,5 +1,11 @@
 # Gond Agent protocols
 
+## Settings navigation
+
+The web route registry is `web/src/features/settings/registry.ts`. `/agents/settings` canonicalizes to `/agents/settings/account`; topic routes are `account`, `appearance`, `models`, `agent-access`, `sign-in-people` (administrators only) and `danger-zone`. Sections and their old category/hash/query bookmarks resolve through this registry, including `#delete` → `/agents/settings/danger-zone#delete`. `section`, `tab` and `anchor` queries are consumed on redirect; unrelated queries such as OIDC callback errors remain intact. Old Connections/GitHub targets still redirect to `/agents/plugins/github` before Settings mounts. Search uses the same section destinations and permission visibility, and never performs mutations.
+
+These are browser routes only: no API payloads, permissions or save semantics change. Account owns sign-in methods/sessions; administrators manage provider connections under Models, Web search under Agent access, and OIDC/roles under Sign-in & people. Members cannot mount administrator-only forms through direct links. The UI retains visited Settings panels and their scroll offsets in memory to preserve unsaved drafts across topics and history navigation, without persisting secret fields to storage. Reloading or leaving Settings ends that session. The desktop navigation uses ordinary links with `aria-current="page"`; phones use the shared accessible Select.
+
 ## Theme preference
 
 `GET /api/v1/me` includes a top-level `theme`: `system`, `light` or `dark`. New accounts and missing or invalid stored preferences return `system`.

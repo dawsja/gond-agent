@@ -1,7 +1,7 @@
 // Search everything from the sidebar's search button: runs, pages and settings, in one dialog in the middle
 // of the screen. Styled like the composer's pickers and shared/menu.tsx: 4px corners, border-strong,
 // 32px rows, no motion. Arrows move, Enter opens, Esc closes.
-import { Settings2, KeyRound, type LucideIcon, Plug, Search, Trash2 } from "lucide-react"
+import { Settings2, type LucideIcon, Plug, Search } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router"
@@ -9,6 +9,8 @@ import type { Run } from "@/lib/api"
 import { repoName } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Dot } from "./parts"
+import { settingsSearchItems } from "../settings/registry"
+import { useMe } from "@/lib/queries"
 
 export type SearchPage = { label: string; icon: LucideIcon; to: string }
 
@@ -22,13 +24,6 @@ type Item = {
   /** An app path. */
   to: string
 }
-
-const SETTINGS: { title: string; to: string; icon: LucideIcon; keywords: string }[] = [
-  { title: "Settings", to: "/settings", icon: Settings2, keywords: "account profile preferences" },
-  { title: "Model providers", to: "/settings#providers", icon: Settings2, keywords: "api key url anthropic openai models setup" },
-  { title: "Sessions", to: "/settings#sessions", icon: KeyRound, keywords: "sign out revoke devices browsers" },
-  { title: "Delete account", to: "/settings#delete", icon: Trash2, keywords: "remove erase close" },
-]
 
 const GROUPS: Item["group"][] = ["Runs", "Pages", "Settings"]
 
@@ -44,6 +39,7 @@ export function SearchDialog({
   runs: Run[]
 }) {
   const navigate = useNavigate()
+  const { data: me } = useMe()
   const [query, setQuery] = useState("")
   const [active, setActive] = useState(0)
   const list = useRef<HTMLDivElement>(null)
@@ -61,7 +57,7 @@ export function SearchDialog({
       })),
       ...pages.map((p) => ({ id: `page:${p.to}`, group: "Pages" as const, title: p.label, icon: <p.icon className="size-3.5" />, to: p.to })),
       { id: "page:github", group: "Pages" as const, title: "GitHub", icon: <Plug className="size-3.5" />, keywords: "plugins connections repositories shared", to: "/plugins/github" },
-      ...SETTINGS.map((s) => ({
+      ...[{ title: "Settings", to: "/settings", icon: Settings2, keywords: "account profile preferences" }, ...settingsSearchItems(!!me?.admin)].map((s) => ({
         id: `setting:${s.to}`,
         group: "Settings" as const,
         title: s.title,
@@ -70,7 +66,7 @@ export function SearchDialog({
         to: s.to,
       })),
     ],
-    [pages, runs],
+    [pages, runs, me?.admin],
   )
 
   const shown = useMemo(() => {

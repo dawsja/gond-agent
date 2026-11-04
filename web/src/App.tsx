@@ -69,9 +69,7 @@ export function App() {
               <Route path="/plugins" element={<PluginsScreen />} />
               <Route path="/plugins/github" element={<GithubPluginScreen />} />
               <Route path="/automations" element={<AutomationsScreen />} />
-              <Route path="/settings" element={<SettingsRoute />} />
-              <Route path="/settings/connections" element={<SettingsRoute />} />
-              <Route path="/settings/github" element={<SettingsRoute />} />
+              <Route path="/settings/*" element={<SettingsRoute />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>

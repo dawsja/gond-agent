@@ -1,14 +1,19 @@
-import { Navigate, useLocation } from "react-router"
+import { useLayoutEffect } from "react"
+import { Navigate, useLocation, useNavigate } from "react-router"
 import { SettingsScreen } from "@/features/settings/settings-screen"
-
-// The retired Connections category only contained GitHub. Redirect before
-// mounting Settings so old bookmarks never mount connection controls there.
-const githubTargets = new Set(["connections", "connections-settings", "github", "shared-github"])
+import { resolveSettingsLocation } from "@/features/settings/registry"
+import { useMe } from "@/lib/queries"
 
 export function SettingsRoute() {
   const { pathname, hash, search } = useLocation()
-  const query = new URLSearchParams(search)
-  const targets = [hash.slice(1), pathname.split("/")[2], ...["section", "tab", "anchor"].map(key => query.get(key))]
-  if (targets.some(target => target && githubTargets.has(target.toLowerCase()))) return <Navigate to="/plugins/github" replace />
-  return <SettingsScreen />
+  const navigate = useNavigate(), { data: me } = useMe()
+  const resolved = resolveSettingsLocation(pathname, hash, search, !!me?.admin)
+  useLayoutEffect(() => {
+    if (me && !resolved.external && resolved.to !== pathname + search + hash) navigate(resolved.to, { replace: true })
+  }, [me, resolved.external, resolved.to, pathname, search, hash, navigate])
+  // GitHub bookmarks leave before any Settings forms mount. Local compatibility
+  // links retain the same screen instance, so redirects cannot discard drafts.
+  if (resolved.external) return <Navigate to={resolved.to} replace />
+  if (!me) return null
+  return <SettingsScreen page={resolved.page} />
 }
