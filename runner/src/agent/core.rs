@@ -242,6 +242,23 @@ const AUTO_COMPACT_PCT: u64 = 85;
 const MAX_COMPACTIONS: u32 = 5;
 const MAX_SUMMARY_REQUESTS: u32 = 16;
 const NOTHING_MORE_TO_COMPACT: &str = "Nothing more to compact without losing recent context. Choose a model with a larger context window.";
+const SUMMARY_REQUEST_LIMIT: &str = "Too much history to summarise in one pass. Choose a model with a larger context window.";
+
+#[derive(Debug)]
+struct NothingMoreToCompact;
+
+impl std::fmt::Display for NothingMoreToCompact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(NOTHING_MORE_TO_COMPACT) }
+}
+
+impl std::error::Error for NothingMoreToCompact {}
+
+#[derive(Default)]
+struct TurnCompactions {
+    count: u32,
+    // Between automatic checks, history only changes by appending or successful compaction.
+    skipped_history_len: Option<usize>,
+}
 
 fn summary_request(s: &Shared, text: &str, model: &str, window: u64) -> ResponsesRequest {
     ResponsesRequest {
@@ -270,7 +287,7 @@ fn summarize<'a>(s: &'a Arc<Shared>, text: String, model: &'a str, window: u64, 
             let older = summarize(s, text[..half].to_owned(), model, window, cancel, budget).await?;
             let newer = summarize(s, text[half..].to_owned(), model, window, cancel, budget).await?;
             let merged = format!("Quoted older notes:\n{older}\nQuoted newer notes:\n{newer}");
-            if merged.len() >= text.len() { return Err(anyhow!(NOTHING_MORE_TO_COMPACT)); }
+            if merged.len() >= text.len() { return Err(anyhow!(NothingMoreToCompact)); }
             if compaction::request_bound(&summary_request(s, &merged, model, window)) > window {
                 return Err(anyhow!("This model's context window is too small to merge conversation notes."));
             }
@@ -290,7 +307,7 @@ fn summarize<'a>(s: &'a Arc<Shared>, text: String, model: &'a str, window: u64, 
                     keep /= 2;
                     notes = compaction::clip(output.trim(), keep);
                 }
-                if notes.len() >= text.len() { return Err(anyhow!(NOTHING_MORE_TO_COMPACT)); }
+                if notes.len() >= text.len() { return Err(anyhow!(NothingMoreToCompact)); }
                 Ok(notes)
             }
             Streamed::Cancelled(_) => Err(anyhow!("Compaction was interrupted.")),
@@ -306,7 +323,7 @@ async fn compact(s: &Arc<Shared>, run: &Run, history: &mut Vec<Message>, reason:
     let before = compaction::estimate(history);
     let cut = compaction::tail_start(history);
     if history.len() <= compaction::KEEP_MESSAGES || cut == 0 {
-        return Err(anyhow!(NOTHING_MORE_TO_COMPACT));
+        return Err(anyhow!(NothingMoreToCompact));
     }
     let files = compaction::Files::from_history(history).section();
     let plan = serde_json::to_string(&*s.plan.lock().unwrap()).expect("plan serializes");
@@ -314,12 +331,12 @@ async fn compact(s: &Arc<Shared>, run: &Run, history: &mut Vec<Message>, reason:
     let mut next = vec![Message::user_text(&prefix)];
     next.extend_from_slice(&history[cut..]);
     // Even empty notes cannot help: don't spend a model call on protected recent data.
-    if compaction::estimate(&next) >= before { return Err(anyhow!(NOTHING_MORE_TO_COMPACT)); }
+    if compaction::estimate(&next) >= before { return Err(anyhow!(NothingMoreToCompact)); }
     let mut budget = Some(MAX_SUMMARY_REQUESTS);
     let notes = summarize(s, compaction::quoted_history(&history[..cut]), &model, window, cancel, &mut budget).await?;
     next[0] = Message::user_text(format!("{prefix}{notes}"));
     let after = compaction::estimate(&next);
-    if after >= before { return Err(anyhow!(NOTHING_MORE_TO_COMPACT)); }
+    if after >= before { return Err(anyhow!(NothingMoreToCompact)); }
     if window > 0 && after >= window {
         return Err(anyhow!("The recent conversation and saved work state are too large to compact without losing context. Choose a model with a larger context window."));
     }
@@ -359,6 +376,24 @@ async fn compact_in_turn(s: &Arc<Shared>, run: &Run, history: &mut Vec<Message>,
     compact(s, run, history, reason, cancel).await?;
     *count += 1;
     Ok(())
+}
+
+async fn compact_automatically(s: &Arc<Shared>, run: &Run, history: &mut Vec<Message>, reason: &str, state: &mut TurnCompactions, context_used: u64, cancel: &CancellationToken) -> Result<()> {
+    let window = s.model.lock().unwrap().1;
+    let used = context_used.max(compaction::estimate(history));
+    if window == 0 || used.saturating_mul(100) < window.saturating_mul(AUTO_COMPACT_PCT) || history.len() <= 2 {
+        return Ok(());
+    }
+    if used < window && state.skipped_history_len == Some(history.len()) { return Ok(()); }
+    match compact_in_turn(s, run, history, reason, &mut state.count, cancel).await {
+        Err(e) if e.is::<NothingMoreToCompact>() && used < window && !cancel.is_cancelled() => {
+            // The provider may still accept this history. Overflow recovery remains strict.
+            state.skipped_history_len = Some(history.len());
+            Ok(())
+        }
+        Ok(()) => { state.skipped_history_len = None; Ok(()) }
+        Err(e) => Err(e),
+    }
 }
 
 fn end_compaction_failure(s: &Shared, run: &Run, cancel: &CancellationToken, error: anyhow::Error) -> Result<String> {
@@ -440,17 +475,13 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
         let started = Instant::now();
         let mut tool_count = 0u32;
         let mut reminders = PlanReminders::default();
-        let mut compactions = 0;
+        let mut compactions = TurnCompactions::default();
         let mut context_used = if run.is_sub() { 0 } else { *s.main_context.lock().unwrap() };
         let mut first = true;
         loop {
-            let window = s.model.lock().unwrap().1;
-            let used = context_used.max(compaction::estimate(history));
-            if window > 0 && used.saturating_mul(100) >= window.saturating_mul(AUTO_COMPACT_PCT) && history.len() > 2 {
-                let reason = if first { "auto-turn" } else { "auto-round" };
-                if let Err(e) = compact_in_turn(s, run, history, reason, &mut compactions, cancel).await {
-                    return end_compaction_failure(s, run, cancel, e);
-                }
+            let reason = if first { "auto-turn" } else { "auto-round" };
+            if let Err(e) = compact_automatically(s, run, history, reason, &mut compactions, context_used, cancel).await {
+                return end_compaction_failure(s, run, cancel, e);
             }
             first = false;
             let (model, _) = s.model.lock().unwrap().clone();
@@ -485,7 +516,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 if let Streamed::Done(partial, _, _) = &streamed {
                     if let Some(partial) = sanitize_partial(partial.clone()) { history.push(partial); }
                 }
-                if let Err(e) = compact_in_turn(s, run, history, "overflow", &mut compactions, cancel).await {
+                if let Err(e) = compact_in_turn(s, run, history, "overflow", &mut compactions.count, cancel).await {
                     return end_compaction_failure(s, run, cancel, e);
                 }
                 req.messages = history.clone();
@@ -607,7 +638,7 @@ async fn stream_with_budget(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, 
     const ATTEMPTS: u32 = 4;
     'attempt: for attempt in 0..ATTEMPTS {
         if let Some(remaining) = budget {
-            if *remaining == 0 { return Streamed::Failed(anyhow!(NOTHING_MORE_TO_COMPACT)); }
+            if *remaining == 0 { return Streamed::Failed(anyhow!(SUMMARY_REQUEST_LIMIT)); }
             *remaining -= 1;
         }
         if attempt > 0 {
@@ -1802,6 +1833,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_no_progress_with_large_recent_tail_allows_model_request() {
+        for provider_overflow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = Arc::new(StdMutex::new(vec![]));
+            let url = mock(Arc::new(move |req| {
+                assert!(!is_summary(req), "the tiny older prefix cannot shrink");
+                if provider_overflow {
+                    return "event: error\ndata: {\"code\":\"context_exceeded\",\"message\":\"maximum context length\"}\n\n".into();
+                }
+                sse(&[json!({"type":"text", "text":"Finished despite the large tail"})], "end_turn")
+            }), seen.clone()).await;
+            let mut cfg = config(dir.path(), Mode::Allow);
+            cfg.context_window = 4096;
+            cfg.history = (0..3).map(|_| Message::user_text("tiny")).collect();
+            cfg.history.push(Message { role:Role::Assistant, content:vec![Block::ToolCall {
+                id:"c".into(), name:"read".into(), input:json!({"path":"a"}), opaque:None,
+            }] });
+            cfg.history.push(Message { role:Role::Tool, content:vec![result("c".into(), "read".into(), "big ".repeat(3600), false)] });
+            cfg.history.extend((0..2).map(|_| Message::user_text("recent")));
+            let mut expected = cfg.history.clone();
+            expected.push(Message::user_text("Continue"));
+            let used = compaction::estimate(&expected);
+            assert!(used * 100 >= cfg.context_window * AUTO_COMPACT_PCT && used < cfg.context_window);
+            let mut h = spawn(ApiClient::new(url, None), cfg);
+            h.input.send(AgentInput::User { text:"Continue".into(), images:vec![] }).unwrap();
+            let evs = until(&mut h, |e| if provider_overflow { matches!(e, AgentEvent::Error { .. }) } else { matches!(e, AgentEvent::TurnEnd { .. }) }).await;
+            assert!(!evs.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+            assert_eq!(seen.lock().unwrap().len(), 1, "overflow must fail plainly, not retry unchanged history");
+            assert_eq!(seen.lock().unwrap()[0]["messages"], serde_json::to_value(expected).unwrap());
+            if provider_overflow {
+                assert!(evs.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message == NOTHING_MORE_TO_COMPACT)));
+                assert!(evs.iter().any(|e| matches!(e, AgentEvent::TurnEnd { stop_reason, .. } if stop_reason == "error")));
+            } else {
+                assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta { text, .. } if text == "Finished despite the large tail")));
+                assert!(matches!(evs.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "end_turn"));
+                // Explicit manual requests remain hard failures on the same protected tail.
+                h.input.send(AgentInput::Compact).unwrap();
+                let evs = until(&mut h, |e| matches!(e, AgentEvent::Error { .. })).await;
+                assert!(evs.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message == NOTHING_MORE_TO_COMPACT)));
+                assert!(evs.iter().any(|e| matches!(e, AgentEvent::TurnEnd { stop_reason, .. } if stop_reason == "error")));
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                eprintln!("large-tail evidence: {used}/4096 estimated tokens; automatic compaction skipped; final answer delivered; manual compaction still fails");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_no_progress_is_not_retried_until_history_changes() {
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let url = mock(Arc::new(|req| {
+            assert!(is_summary(req));
+            sse(&[json!({"type":"text", "text":"verbose ".repeat(200)})], "end_turn")
+        }), seen.clone()).await;
+        let s = compaction_shared(ApiClient::new(url, None), 8192);
+        let run = Run { id:"main".into(), kind:None };
+        let cancel = CancellationToken::new();
+        let mut state = TurnCompactions::default();
+        let mut history = (0..8).map(|_| Message::user_text("tiny".repeat(100))).collect::<Vec<_>>();
+        history[2] = Message::user_text("tiny"); // Appending once still cannot make the older prefix shrink.
+        let original = history.clone();
+        for _ in 0..3 {
+            compact_automatically(&s, &run, &mut history, "auto-round", &mut state, 7200, &cancel).await.unwrap();
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "non-shrinking summary must not be requested again for unchanged history");
+        assert_eq!(history, original);
+        assert_eq!(state.count, 0);
+        history.push(Message::user_text("tiny".repeat(100)));
+        let changed = history.clone();
+        for _ in 0..2 {
+            compact_automatically(&s, &run, &mut history, "auto-round", &mut state, 7200, &cancel).await.unwrap();
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2, "appending history permits one new attempt");
+        assert_eq!(history, changed);
+        assert_eq!(state.count, 0);
+        // A skip marker must not mask failure once usage reaches the full window.
+        let error = compact_automatically(&s, &run, &mut history, "auto-round", &mut state, 8192, &cancel).await.unwrap_err();
+        assert!(error.is::<NothingMoreToCompact>());
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(history, changed);
+        assert_eq!(state.count, 0);
+    }
+
+    #[tokio::test]
     async fn short_or_zero_cut_history_does_not_summarize_or_spend_turn_count() {
         let seen = Arc::new(StdMutex::new(vec![]));
         let url = mock(Arc::new(|_| panic!("no summary should be sent")), seen.clone()).await;
@@ -1859,7 +1973,8 @@ mod tests {
             let original = history.clone();
             let mut count = 0;
             let error = compact_in_turn(&s, &Run { id:"main".into(), kind:None }, &mut history, "auto-turn", &mut count, &CancellationToken::new()).await.unwrap_err();
-            assert_eq!(error.to_string(), NOTHING_MORE_TO_COMPACT);
+            assert_eq!(error.to_string(), SUMMARY_REQUEST_LIMIT);
+            assert!(!error.is::<NothingMoreToCompact>());
             assert_eq!(seen.lock().unwrap().len(), MAX_SUMMARY_REQUESTS as usize);
             assert_summary_bounds(&seen.lock().unwrap(), 8192);
             assert_eq!(history, original);
