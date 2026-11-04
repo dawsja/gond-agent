@@ -280,12 +280,15 @@ it("quota cleanup evicts an expired claim while preserving a newer live restore"
 
 it("round-trips only supplied state, seals it with the auth secret, and stores opaque bundles with private permissions", () => {
   vi.stubEnv("CHECKPOINT_TEST_SECRET", "must-not-be-captured-from-the-api-environment");
-  const state = JSON.stringify({ messages: ["private conversation"], supplied_token: "caller-supplied-only" }) + "\n\0opaque runner state\n";
+  const evidenceKey = "07".repeat(32);
+  const state = JSON.stringify({ messages: ["private conversation"], supplied_token: "caller-supplied-only", evidence: { key: evidenceKey } }) + "\n\0opaque runner state\n";
   const bundle = Buffer.from([0, 255, 1, 2, 3]);
   const saved = store.save({ ...key(), tree, bundle, state });
   expect(fs.readFileSync(join(root(), saved.bundle_path))).toEqual(bundle);
   const sealed = fs.readFileSync(join(root(), saved.state_path), "utf8");
   expect(sealed).not.toContain("private conversation");
+  expect(sealed).not.toContain(evidenceKey);
+  expect(JSON.stringify(rows())).not.toContain(evidenceKey);
   const plaintext = unseal(secret, sealed), split = plaintext.indexOf("\n");
   const envelope = JSON.parse(plaintext.slice(0, split));
   expect(plaintext.slice(split + 1)).toBe(state);

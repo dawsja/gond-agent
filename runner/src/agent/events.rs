@@ -32,6 +32,8 @@ pub struct QuestionOption {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
+    #[serde(rename = "evidence.recorded")]
+    EvidenceRecorded { record: super::evidence::Record },
     #[serde(rename = "session.start")]
     SessionStart { session_id: String, model: String, cwd: String, mode: Mode },
     #[serde(rename = "turn.start")]
@@ -94,6 +96,8 @@ pub enum AgentEvent {
     StateExported { request_id: String, state: Box<super::checkpoint::Checkpoint> },
     #[serde(rename = "state.imported")]
     StateImported { request_id: String },
+    #[serde(rename = "state.evidence_initialized")]
+    EvidenceInitialized { request_id: String },
     #[serde(rename = "state.error")]
     StateError { request_id: String, operation: String, code: String },
     #[serde(rename = "error")]
@@ -119,7 +123,7 @@ pub struct ImageInput {
     pub id: Option<String>,
 }
 
-// Only checkpoint controls are closed schemas. Ordinary input frames may carry
+// Only private controls are closed schemas. Ordinary input frames may carry
 // API metadata (for example user.effort) that the runner does not consume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -154,9 +158,26 @@ pub struct ImportStateInput {
     pub state: Value,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InitEvidenceInput {
+    pub request_id: String,
+    pub run_id: String,
+    pub owner_id: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for InitEvidenceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitEvidenceInput").field("key", &"[redacted]").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentInput {
+    #[serde(rename = "init_evidence")]
+    InitEvidence(InitEvidenceInput),
     #[serde(rename = "checkpoint.release")]
     CheckpointRelease(CheckpointReleaseInput),
     #[serde(rename = "export_state")]

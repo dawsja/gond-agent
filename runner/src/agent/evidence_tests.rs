@@ -1,0 +1,1154 @@
+//! Fake-model integration tests. Included as a child module of core so these
+//! exercise the real loop/dispatcher without exposing private runner state.
+use super::*;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::time::Duration;
+
+const BEFORE: &str = "module.exports = 1;\n";
+const AFTER: &str = "module.exports = 1; // implementation changed\n";
+const GATE: &str = "Evidence gate (transparency, not enforcement). Evidence recorded by the worker is missing or stale.\n\
+Requirement CHECK: run one eligible exact command with run_checks; it must report more than zero tests and leave the tree unchanged.\n\
+A changed command definition or unknown test count does not satisfy CHECK; restore the base definition and re-run, or declare_unverified.\n\
+CHECK[1] command=\"npm test\" cwd=\".\"\n\
+Alternatively call declare_unverified with a plain reason; it will always appear under Not verified. Do not claim independent proof.";
+
+fn git(dir: &Path, args: &[&str]) {
+    // Fixture-only identity/configuration: never touch this checkout or global
+    // Git config, and never inherit relay credentials into fixture subprocesses.
+    let output = std::process::Command::new("/usr/bin/git")
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Evidence fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+        .env("GIT_COMMITTER_NAME", "Evidence fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "fixture git command failed");
+}
+
+fn repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet", "--template="]);
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"private":true,"scripts":{"test":"node --test"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("source.js"), BEFORE).unwrap();
+    std::fs::write(dir.path().join("source.test.js"),
+        "const test = require('node:test');\nconst assert = require('node:assert/strict');\ntest('source returns one', () => assert.equal(require('./source.js'), 1));\n").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "--quiet", "-m", "fixture base"]);
+    dir
+}
+
+fn config(dir: &Path) -> AgentConfig {
+    AgentConfig {
+        model: "m".into(),
+        context_window: 100_000,
+        mode: Mode::Allow,
+        rules: vec![],
+        cwd: dir.into(),
+        effort: "low".into(),
+        session_id: "evidence-test".into(),
+        history: vec![],
+        plan: vec![],
+        plan_reminder_every: 0,
+        plan_nudge_limit: 0,
+        interactive: false,
+        question_wait: Duration::ZERO,
+        tools: crate::tools::builtin(),
+        system: "sys".into(),
+        sub_system: "sub".into(),
+        skills: vec![],
+    }
+}
+
+// The relay's normalized SSE, not provider-specific OpenAI/Anthropic frames.
+fn sse(blocks: &[Value], stop: &str) -> String {
+    let mut body = String::from("event: response.start\ndata: {\"id\":\"r\",\"model\":\"m\"}\n\n");
+    for (index, block) in blocks.iter().enumerate() {
+        let kind = block["type"].as_str().unwrap();
+        body += &format!(
+            "event: block.start\ndata: {}\n\n",
+            json!({
+                "index":index, "type":kind, "id":block.get("id"), "name":block.get("name")
+            })
+        );
+        if kind == "text" {
+            body += &format!(
+                "event: block.delta\ndata: {}\n\n",
+                json!({"index":index,"text":block["text"]})
+            );
+            body += &format!("event: block.end\ndata: {}\n\n", json!({"index":index}));
+        } else {
+            body += &format!(
+                "event: block.end\ndata: {}\n\n",
+                json!({"index":index,"input":block["input"]})
+            );
+        }
+    }
+    body += &format!(
+        "event: response.end\ndata: {}\n\n",
+        json!({
+            "stop_reason":stop,
+            "usage":{"input_uncached":100,"output":20,"reasoning":0,"cache_read":0,"cache_write":0}
+        })
+    );
+    body
+}
+
+fn call(id: &str, name: &str, input: Value) -> String {
+    sse(
+        &[json!({"type":"tool_call","id":id,"name":name,"input":input})],
+        "tool_use",
+    )
+}
+
+fn finish() -> String {
+    sse(&[json!({"type":"text","text":"Finished."})], "end_turn")
+}
+
+fn editing_script() -> Vec<String> {
+    vec![
+        call("read-source", "read", json!({"path":"source.js"})),
+        call(
+            "edit-source",
+            "edit",
+            json!({"path":"source.js","old_string":BEFORE,"new_string":AFTER}),
+        ),
+        finish(),
+    ]
+}
+
+async fn mock(script: Vec<String>, seen: Arc<Mutex<Vec<Value>>>) -> String {
+    use crate::tools::testutil::http::{Res, serve};
+    let script = Mutex::new(VecDeque::from(script));
+    serve(move |request| {
+        seen.lock().unwrap().push(request.json());
+        let body = script.lock().unwrap().pop_front().unwrap_or_else(finish);
+        Res::new(200, "text/event-stream", body)
+    })
+    .await
+}
+
+async fn until(h: &mut AgentHandle, pred: impl Fn(&AgentEvent) -> bool) -> Vec<AgentEvent> {
+    let mut events = vec![];
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), h.events.recv())
+            .await
+            .expect("runner timed out")
+            .expect("runner event stream closed");
+        let done = pred(&event);
+        events.push(event);
+        if done {
+            return events;
+        }
+    }
+}
+
+async fn turn(h: &mut AgentHandle) -> Vec<AgentEvent> {
+    initialize(h, "07".repeat(32)).await;
+    h.input
+        .send(AgentInput::User {
+            text: "Implement the change.".into(),
+            images: vec![],
+        })
+        .unwrap();
+    let events = until(
+        h,
+        |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main"),
+    )
+    .await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(
+        matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "end_turn")
+    );
+    events
+}
+
+async fn initialize(h: &mut AgentHandle, key: String) {
+    let input = AgentInput::InitEvidence(InitEvidenceInput {
+        request_id: "key".into(),
+        run_id: "run".into(),
+        owner_id: "owner".into(),
+        key: key.clone(),
+    });
+    assert!(!format!("{input:?}").contains(&key));
+    h.input.send(input).unwrap();
+    let events = until(h, |e| {
+        matches!(
+            e,
+            AgentEvent::EvidenceInitialized { .. } | AgentEvent::StateError { .. }
+        )
+    })
+    .await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::EvidenceInitialized { .. })
+    ));
+}
+
+async fn exported(h: &mut AgentHandle) -> Checkpoint {
+    h.input
+        .send(AgentInput::ExportState(ExportStateInput {
+            request_id: "export".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            quiescent: None,
+            boundary_id: None,
+            hold: false,
+        }))
+        .unwrap();
+    let events = until(h, |e| {
+        matches!(
+            e,
+            AgentEvent::StateExported { .. } | AgentEvent::StateError { .. }
+        )
+    })
+    .await;
+    let AgentEvent::StateExported { state, .. } = events.into_iter().last().unwrap() else {
+        panic!("checkpoint export failed");
+    };
+    *state
+}
+
+fn gate_count(history: &[Message]) -> usize {
+    history
+        .iter()
+        .filter(|message| {
+            message.content.iter().any(|block| {
+        matches!(block, Block::Text { text, .. } if text.starts_with("Evidence gate ("))
+    })
+        })
+        .count()
+}
+
+fn assert_gate_request(request: &Value) {
+    let message = request["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        message["role"], "user",
+        "gate must not impersonate a system/tool message"
+    );
+    assert_eq!(message["content"][0]["text"], GATE);
+    assert!(!request["system"].as_str().unwrap().contains(GATE));
+}
+
+#[tokio::test]
+async fn unchanged_definition_with_unknown_count_requires_an_unverified_declaration() {
+    let dir = repository();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"private":true,"scripts":{"test":"node -e \"void 0\""}}"#,
+    )
+    .unwrap();
+    git(dir.path(), &["add", "package.json"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "base command without test summary",
+        ],
+    );
+    let mut script = editing_script();
+    script.push(call(
+        "unknown-check",
+        "run_checks",
+        json!({"command":"npm test"}),
+    ));
+    script.push(finish());
+    script.push(call(
+        "unverified",
+        "declare_unverified",
+        json!({"reason":"The base command reports no parsed test count."}),
+    ));
+    script.push(finish());
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    turn(&mut h).await;
+    let state = exported(&mut h).await;
+    let ledger = state.evidence.as_ref().unwrap();
+    assert_eq!(ledger.records.len(), 1);
+    let record = &ledger.records[0];
+    assert_eq!(record.exit_code, Some(0));
+    assert_eq!(record.tests_ran, None);
+    assert!(!record.command_definition_changed);
+    assert!(record.fresh(&evidence_tree::tree_hash(dir.path()).unwrap()));
+    assert!(!record.successful_check());
+    assert_eq!(ledger.gate_rounds, 2);
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("reports no parsed test count"))
+    );
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert_gate_request(&requests[3]);
+    assert_gate_request(&requests[5]);
+}
+
+#[tokio::test]
+async fn changed_tree_finish_gates_then_exact_npm_test_records_real_evidence() {
+    let dir = repository();
+    let before = evidence_tree::tree_hash(dir.path()).unwrap();
+    let mut script = editing_script();
+    script.push(call(
+        "checks",
+        "run_checks",
+        json!({"command":"npm test","timeout_ms":20_000}),
+    ));
+    script.push(finish());
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let events = turn(&mut h).await;
+    assert!(events.iter().any(
+        |e| matches!(e, AgentEvent::ToolEnd { call_id, ok:true, .. } if call_id == "edit-source")
+    ));
+    let records: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::EvidenceRecorded { record } => Some(record),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record = records[0];
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    assert_ne!(before, tree);
+    assert_eq!(record.command, "npm test");
+    assert_eq!(record.cwd, ".");
+    assert_eq!(record.exit_code, Some(0));
+    assert_eq!(
+        record.tests_ran,
+        Some(1),
+        "must parse an actual node:test summary"
+    );
+    assert!(record.env_clean && record.successful_check() && record.fresh(&tree));
+    let state = exported(&mut h).await;
+    let ledger = state.evidence.as_ref().unwrap();
+    assert_eq!(ledger.gate_rounds, 1);
+    assert!(ledger.unverified.is_empty());
+    assert_eq!(gate_count(&state.history), 1);
+    assert_eq!(ledger.records.len(), 1);
+    assert!(ledger.records[0] == *record);
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_gate_request(&requests[3]);
+    let evidence_index = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::EvidenceRecorded { .. }))
+        .unwrap();
+    let end_index = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main"))
+        .unwrap();
+    assert!(evidence_index < end_index);
+    // Safe, useful runtime evidence for --nocapture: no key, signature, token,
+    // full checkpoint or untrusted command output is printed.
+    println!(
+        "Evidence gate runtime: {}",
+        json!({
+            "gate_message":GATE,"command":record.command,"exit_code":record.exit_code,
+            "tests_ran":record.tests_ran,"fresh":record.fresh(&tree)
+        })
+    );
+}
+
+#[tokio::test]
+async fn changed_package_script_never_satisfies_gate_even_with_a_fresh_positive_count() {
+    for (script, count) in [
+        ("exit 0", None),
+        ("printf '# tests 1\\n# pass 1\\n# fail 0\\n'", Some(1)),
+    ] {
+        let dir = repository();
+        let requests = Arc::new(Mutex::new(vec![]));
+        let url = mock(
+            vec![
+                call("read-manifest", "read", json!({"path":"package.json"})),
+                call(
+                    "edit-manifest",
+                    "edit",
+                    json!({"path":"package.json","old_string":"node --test","new_string":script}),
+                ),
+                call("check", "run_checks", json!({"command":"npm test"})),
+                finish(),
+                finish(),
+                finish(),
+            ],
+            requests.clone(),
+        )
+        .await;
+        let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+        let events = turn(&mut h).await;
+        let record = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::EvidenceRecorded { record } => Some(record),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.tests_ran, count);
+        assert!(record.command_definition_changed);
+        assert!(record.fresh(&evidence_tree::tree_hash(dir.path()).unwrap()));
+        assert!(!record.successful_check());
+        let state = exported(&mut h).await;
+        assert_eq!(gate_count(&state.history), 2);
+        assert_eq!(state.evidence.as_ref().unwrap().turn_gate_rounds, 2);
+        assert!(
+            state
+                .evidence
+                .as_ref()
+                .unwrap()
+                .unverified
+                .iter()
+                .any(|note| note.contains("positive parsed test count"))
+        );
+        for request in requests.lock().unwrap().iter().skip(4) {
+            assert_gate_request(request);
+        }
+    }
+}
+
+#[tokio::test]
+async fn private_key_control_is_one_shot_bound_and_absent_from_model_history() {
+    let dir = repository();
+    let requests = Arc::new(Mutex::new(vec![]));
+    let url = mock(vec![finish()], requests.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let key = "07".repeat(32);
+    initialize(&mut h, key.clone()).await;
+    h.input
+        .send(AgentInput::InitEvidence(InitEvidenceInput {
+            request_id: "replace".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            key: "08".repeat(32),
+        }))
+        .unwrap();
+    let events = until(&mut h, |e| matches!(e, AgentEvent::StateError { .. })).await;
+    assert!(
+        matches!(events.last(), Some(AgentEvent::StateError { operation, code, .. })
+        if operation == "init_evidence" && code == "evidence_already_initialized_or_started")
+    );
+    let state = exported(&mut h).await;
+    assert!(state.evidence.as_ref().unwrap().key.as_ref() == Some(&key));
+    h.input
+        .send(AgentInput::User {
+            text: "Finish without changes".into(),
+            images: vec![],
+        })
+        .unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+    assert!(
+        !serde_json::to_string(&requests.lock().unwrap()[0])
+            .unwrap()
+            .contains(&key)
+    );
+    assert!(
+        exported(&mut h)
+            .await
+            .history
+            .iter()
+            .all(|m| !serde_json::to_string(m).unwrap().contains(&key))
+    );
+}
+
+#[tokio::test]
+async fn repeated_finish_is_bounded_at_two_gates_and_keeps_private_unverified_notes() {
+    let dir = repository();
+    let mut script = editing_script();
+    script.extend([finish(), finish()]);
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let events = turn(&mut h).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::EvidenceRecorded { .. }))
+    );
+    let state = exported(&mut h).await;
+    let ledger = state.evidence.as_ref().unwrap();
+    assert_eq!(ledger.turn_gate_rounds, 2);
+    assert_eq!(ledger.gate_rounds, 2);
+    assert_eq!(gate_count(&state.history), 2);
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("positive parsed test count"))
+    );
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("budget was exhausted"))
+    );
+    assert!(
+        !serde_json::to_string(&state.history)
+            .unwrap()
+            .contains("budget was exhausted")
+    );
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_gate_request(&requests[3]);
+    assert_gate_request(&requests[4]);
+}
+
+#[tokio::test]
+async fn declare_unverified_after_one_gate_finishes_and_preserves_the_reason() {
+    let dir = repository();
+    let mut script = editing_script();
+    script.push(call(
+        "declare",
+        "declare_unverified",
+        json!({"reason":"Cannot run dependencies offline."}),
+    ));
+    script.push(finish());
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let events = turn(&mut h).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::EvidenceRecorded { .. }))
+    );
+    let state = exported(&mut h).await;
+    let ledger = state.evidence.as_ref().unwrap();
+    assert!(ledger.declared);
+    assert_eq!(ledger.turn_gate_rounds, 1);
+    assert_eq!(gate_count(&state.history), 1);
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note == "Declared unverified: Cannot run dependencies offline.")
+    );
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_gate_request(&requests[3]);
+}
+
+#[tokio::test]
+async fn unchanged_turn_finishes_without_gate_or_evidence() {
+    let dir = repository();
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(vec![finish()], seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let events = turn(&mut h).await;
+    let state = exported(&mut h).await;
+    let ledger = state.evidence.as_ref().unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(gate_count(&state.history), 0);
+    assert_eq!(ledger.gate_rounds, 0);
+    assert!(ledger.records.is_empty() && ledger.unverified.is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::EvidenceRecorded { .. }))
+    );
+}
+
+fn shared(dir: &Path) -> Arc<Shared> {
+    Arc::new(Shared {
+        api: ApiClient::new("http://unused.invalid", None),
+        events: unbounded_channel().0,
+        pending: Mutex::default(),
+        mode: Mutex::new(Mode::Allow),
+        rules: Mutex::default(),
+        model: Mutex::new(("m".into(), 100_000)),
+        effort: Mutex::new("low".into()),
+        tools: vec![],
+        reads: ReadSet::default(),
+        shells: Shells::default(),
+        browser: BrowserSession::default(),
+        baseline: Baseline::default(),
+        plan: Mutex::default(),
+        plan_reminder_every: 0,
+        plan_nudge_limit: 0,
+        cwd: dir.into(),
+        session_id: "s".into(),
+        system: String::new(),
+        sub_system: String::new(),
+        locks: Mutex::default(),
+        turn_cancel: Mutex::new(CancellationToken::new()),
+        interactive: false,
+        question_wait: Duration::ZERO,
+        sub_counter: AtomicU32::new(0),
+        sub_slots: tokio::sync::Semaphore::new(subagents::MAX_CONCURRENT),
+        main_context: Mutex::new(0),
+        skills: Mutex::default(),
+        checkpoints: CheckpointControl::default(),
+        evidence: Mutex::new(evidence::Ledger::new(dir)),
+    })
+}
+
+#[tokio::test]
+async fn subagent_reserved_state_tools_are_hidden_and_direct_dispatch_is_forbidden() {
+    let dir = repository();
+    let shared = shared(dir.path());
+    let original = shared.evidence.lock().unwrap().clone();
+    let cancel = CancellationToken::new();
+    for kind in [
+        SubagentKind::Explore,
+        SubagentKind::Reviewer,
+        SubagentKind::TestWriter,
+    ] {
+        let run = Run {
+            id: format!("{}-1", kind.name()),
+            kind: Some(kind),
+            inherited_mode: Some(Mode::Allow),
+        };
+        for name in ["declare_unverified", "declare_task", "skip_repro"] {
+            assert!(!agent_tool_defs(true).iter().any(|tool| tool.name == name));
+            let block = run_call(
+                &shared,
+                Turn {
+                    run: &run,
+                    cancel: &cancel,
+                    started: Instant::now(),
+                    tool_count: 0,
+                },
+                format!("forbidden-{name}"),
+                name.into(),
+                json!({"reason":"skip checks"}),
+            )
+            .await;
+            let Block::ToolResult {
+                is_error, content, ..
+            } = block
+            else {
+                panic!("expected tool result")
+            };
+            assert!(is_error);
+            assert!(content.iter().any(|part| matches!(part, ResultPart::Text { text } if text.contains("depth/capability limit"))));
+        }
+    }
+    assert!(
+        agent_tool_defs(false)
+            .iter()
+            .any(|tool| tool.name == "declare_unverified")
+    );
+    assert!(
+        *shared.evidence.lock().unwrap() == original,
+        "forbidden calls must not mutate ledger"
+    );
+}
+
+fn checkpoint_fixture(dir: &Path) -> Checkpoint {
+    let mut ledger = evidence::Ledger::new(dir);
+    ledger.initialize("run", "07".repeat(32)).unwrap();
+    Checkpoint {
+        schema_version: checkpoint::SCHEMA_VERSION,
+        runner_state_version: checkpoint::RUNNER_STATE_VERSION.into(),
+        run_id: "run".into(),
+        owner_id: "owner".into(),
+        history: vec![Message::user_text("Saved task")],
+        plan: vec![],
+        counters: Counters::default(),
+        evidence: Some(ledger),
+    }
+}
+
+#[tokio::test]
+async fn subagent_clean_finish_never_spends_or_fires_the_parent_evidence_gate() {
+    let dir = repository();
+    let mut shared = shared(dir.path());
+    Arc::get_mut(&mut shared).unwrap().tools = crate::tools::builtin();
+    let base = evidence_tree::tree_hash(dir.path()).unwrap();
+    {
+        let mut ledger = shared.evidence.lock().unwrap();
+        ledger.initialize("run", "07".repeat(32)).unwrap();
+        ledger.begin_turn(Some(base), false);
+    }
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let original = shared.evidence.lock().unwrap().clone();
+    assert!(
+        original.clone().gate(dir.path(), Some(&tree)).is_some(),
+        "The same change must require a main-agent gate"
+    );
+    for kind in [
+        SubagentKind::Explore,
+        SubagentKind::Reviewer,
+        SubagentKind::TestWriter,
+    ] {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let url = mock(vec![finish()], seen.clone()).await;
+        Arc::get_mut(&mut shared).unwrap().api = ApiClient::new(url, None);
+        let run = Run {
+            id: format!("{}-1", kind.name()),
+            kind: Some(kind),
+            inherited_mode: Some(Mode::Allow),
+        };
+        let mut history = vec![Message::user_text("Finish the delegated work")];
+        run_loop(&shared, &run, &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(gate_count(&history), 0);
+        assert!(
+            *shared.evidence.lock().unwrap() == original,
+            "A child finish must not mutate the parent ledger"
+        );
+        let request = &seen.lock().unwrap()[0];
+        assert!(
+            !request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "declare_unverified")
+        );
+    }
+}
+
+#[tokio::test]
+async fn evidence_gate_continuation_is_checkpointed_before_the_next_model_request() {
+    use super::super::events::CheckpointReleaseInput;
+    let dir = repository();
+    let mut script = editing_script();
+    script.push(call("checks", "run_checks", json!({"command":"npm test"})));
+    script.push(finish());
+    let seen = Arc::new(Mutex::new(vec![]));
+    let url = mock(script, seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    initialize(&mut h, "07".repeat(32)).await;
+    h.input
+        .send(AgentInput::ExportState(ExportStateInput {
+            request_id: "enable".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            quiescent: Some(true),
+            boundary_id: None,
+            hold: false,
+        }))
+        .unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::StateExported { .. })).await;
+    h.input
+        .send(AgentInput::User {
+            text: "Implement the change".into(),
+            images: vec![],
+        })
+        .unwrap();
+    let mut gate_saved = false;
+    loop {
+        let events = until(&mut h, |e| {
+            matches!(
+                e,
+                AgentEvent::CheckpointReady { .. } | AgentEvent::TurnEnd { .. }
+            )
+        })
+        .await;
+        match events.last().unwrap() {
+            AgentEvent::CheckpointReady { boundary_id } => {
+                h.input
+                    .send(AgentInput::ExportState(ExportStateInput {
+                        request_id: "held".into(),
+                        run_id: "run".into(),
+                        owner_id: "owner".into(),
+                        quiescent: None,
+                        boundary_id: Some(boundary_id.clone()),
+                        hold: false,
+                    }))
+                    .unwrap();
+                let events = until(&mut h, |e| {
+                    matches!(
+                        e,
+                        AgentEvent::StateExported { .. } | AgentEvent::StateError { .. }
+                    )
+                })
+                .await;
+                let AgentEvent::StateExported { state, .. } = events.last().unwrap() else {
+                    panic!("held export failed")
+                };
+                if gate_count(&state.history) == 1 && !gate_saved {
+                    assert_eq!(
+                        seen.lock().unwrap().len(),
+                        3,
+                        "No request may pass the gate's held checkpoint boundary"
+                    );
+                    assert_eq!(state.evidence.as_ref().unwrap().gate_rounds, 1);
+                    gate_saved = true;
+                }
+                h.input
+                    .send(AgentInput::CheckpointRelease(CheckpointReleaseInput {
+                        request_id: "release".into(),
+                        boundary_id: boundary_id.clone(),
+                    }))
+                    .unwrap();
+            }
+            AgentEvent::TurnEnd { stop_reason, .. } => {
+                assert_eq!(stop_reason, "end_turn");
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert!(gate_saved);
+    assert_eq!(seen.lock().unwrap().len(), 5);
+}
+
+fn signed_record(ledger: &mut evidence::Ledger, tree: &str) -> evidence::Record {
+    ledger
+        .record(evidence::Record {
+            run_id: "run".into(),
+            command_definition_changed: false,
+            seq: 0,
+            id: String::new(),
+            command: "npm test".into(),
+            cwd: ".".into(),
+            exit_code: Some(0),
+            duration_ms: 10,
+            started_at: 1,
+            tree_hash_before: tree.into(),
+            tree_hash_after: tree.into(),
+            tests_ran: Some(1),
+            env_clean: true,
+            env_digest: evidence::environment_digest(),
+            output_tail: "# tests 1\n# pass 1\n# fail 0\n".into(),
+            kind: evidence::EvidenceKind::Check,
+            sig: String::new(),
+        })
+        .unwrap()
+}
+
+async fn restore(dir: &Path, value: Value) -> Checkpoint {
+    let mut h = spawn(ApiClient::new("http://unused.invalid", None), config(dir));
+    h.input
+        .send(AgentInput::ImportState(ImportStateInput {
+            request_id: "restore".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            state: value,
+        }))
+        .unwrap();
+    let events = until(&mut h, |e| {
+        matches!(
+            e,
+            AgentEvent::StateImported { .. } | AgentEvent::StateError { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(events.last(), Some(AgentEvent::StateImported { request_id }) if request_id == "restore")
+    );
+    assert!(events.iter().all(|e| matches!(
+        e,
+        AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. }
+    )));
+    exported(&mut h).await
+}
+
+#[tokio::test]
+async fn checkpoint_roundtrip_restores_ledger_and_marks_mismatched_trees_stale() {
+    let dir = repository();
+    let base_tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let mut state = checkpoint_fixture(dir.path());
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let ledger = state.evidence.as_mut().unwrap();
+    ledger.begin_turn(Some(base_tree), false);
+    ledger.gate_rounds = 1;
+    ledger.turn_gate_rounds = 1;
+    ledger.fix_rounds = 2;
+    ledger.reviews = 1;
+    let record = signed_record(ledger, &tree);
+    let value: Value = serde_json::from_slice(&checkpoint::json_bytes(&state).unwrap()).unwrap();
+    let decoded = Checkpoint::import(value.clone(), "run", "owner")
+        .await
+        .unwrap();
+    // Avoid assert_eq! on private checkpoint/ledger values: its debug output
+    // would expose the signing key on failure.
+    assert!(
+        decoded == state,
+        "checkpoint codec must preserve all ledger state"
+    );
+    let restored = restore(dir.path(), value.clone()).await;
+    assert!(restored.history == state.history);
+    let fresh = restored.evidence.as_ref().unwrap();
+    assert!(fresh.records == state.evidence.as_ref().unwrap().records);
+    assert!(fresh.key == state.evidence.as_ref().unwrap().key);
+    assert!(fresh.stale_ids.is_empty());
+    assert_eq!(fresh.resumes, 1);
+    assert_eq!(
+        (
+            fresh.gate_rounds,
+            fresh.turn_gate_rounds,
+            fresh.fix_rounds,
+            fresh.reviews
+        ),
+        (1, 1, 2, 1)
+    );
+    assert!(
+        fresh
+            .unverified
+            .iter()
+            .any(|note| note.contains("node_modules"))
+    );
+    let mut eligible = fresh.clone();
+    assert!(eligible.gate(dir.path(), Some(&tree)).is_none());
+
+    std::fs::write(dir.path().join("source.js"), "module.exports = 2;\n").unwrap();
+    let changed_tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let stale = restore(dir.path(), value).await;
+    let mut ledger = stale.evidence.unwrap();
+    assert_eq!(ledger.stale_ids, vec![record.id.clone()]);
+    assert_eq!(
+        ledger.records.len(),
+        1,
+        "retain historical evidence, do not delete or re-sign it"
+    );
+    assert!(ledger.records[0] == record);
+    assert!(ledger.gate(dir.path(), Some(&changed_tree)).is_some());
+    ledger.validate().unwrap();
+}
+
+#[tokio::test]
+async fn service_rekey_on_resume_preserves_counters_and_does_not_refresh_historical_evidence() {
+    let dir = repository();
+    let base = evidence_tree::tree_hash(dir.path()).unwrap();
+    let mut state = checkpoint_fixture(dir.path());
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let ledger = state.evidence.as_mut().unwrap();
+    ledger.begin_turn(Some(base), false);
+    ledger.gate_rounds = 5;
+    ledger.turn_gate_rounds = 1;
+    let previous = signed_record(ledger, &tree);
+    let requests = Arc::new(Mutex::new(vec![]));
+    let url = mock(vec![finish(), finish()], requests.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path()));
+    let new_key = "08".repeat(32);
+    initialize(&mut h, new_key.clone()).await;
+    h.input
+        .send(AgentInput::ImportState(ImportStateInput {
+            request_id: "restore".into(),
+            run_id: "run".into(),
+            owner_id: "owner".into(),
+            state: serde_json::to_value(state).unwrap(),
+        }))
+        .unwrap();
+    let events = until(&mut h, |e| {
+        matches!(
+            e,
+            AgentEvent::StateImported { .. } | AgentEvent::StateError { .. }
+        )
+    })
+    .await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::StateImported { .. })
+    ));
+    let restored = exported(&mut h).await;
+    let ledger = restored.evidence.as_ref().unwrap();
+    assert!(ledger.key.as_ref() == Some(&new_key));
+    assert_eq!(
+        (ledger.gate_rounds, ledger.turn_gate_rounds, ledger.resumes),
+        (5, 1, 1)
+    );
+    assert_eq!(ledger.historical_ids, vec![previous.id.clone()]);
+    assert!(
+        ledger.records[0] == previous,
+        "Do not re-sign earlier evidence"
+    );
+    h.input
+        .send(AgentInput::User {
+            text: "Continue".into(),
+            images: vec![],
+        })
+        .unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+    let final_state = exported(&mut h).await;
+    let ledger = final_state.evidence.as_ref().unwrap();
+    assert_eq!(
+        (ledger.gate_rounds, ledger.turn_gate_rounds, ledger.resumes),
+        (6, 2, 1)
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "Only one round remains after resume"
+    );
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("budget was exhausted"))
+    );
+}
+
+#[tokio::test]
+async fn old_checkpoint_without_ledger_and_missing_key_restore_without_trusting_history() {
+    let dir = repository();
+    let mut old = serde_json::to_value(checkpoint_fixture(dir.path())).unwrap();
+    old["runner_state_version"] = json!("gond-agent-checkpoint-2");
+    assert_eq!(
+        Checkpoint::import(old.clone(), "run", "owner")
+            .await
+            .unwrap_err(),
+        "incompatible_version",
+        "Only ledgerless epoch-2 state is compatible"
+    );
+    old.as_object_mut().unwrap().remove("evidence");
+    old["counters"]["sub_counter"] = json!(3);
+    old["counters"]["main_context"] = json!(12345);
+    old["counters"]["plan_calls"] = json!(7);
+    old["counters"]["plan_nudges"] = json!(2);
+    old["counters"]["turn_compactions"] = json!(1);
+    old["runner_state_version"] = json!("gond-agent-checkpoint-1");
+    assert!(
+        Checkpoint::import(old.clone(), "run", "owner")
+            .await
+            .is_err(),
+        "Epoch 1 must not replenish bounded delegation slots"
+    );
+    old["runner_state_version"] = json!("gond-agent-checkpoint-2");
+    let decoded = Checkpoint::import(old.clone(), "run", "owner")
+        .await
+        .unwrap();
+    assert!(decoded.evidence.is_none());
+    assert_eq!(
+        decoded.runner_state_version,
+        checkpoint::RUNNER_STATE_VERSION
+    );
+    let restored = restore(dir.path(), old).await;
+    assert_eq!(restored.counters, decoded.counters);
+    assert_eq!(
+        restored.counters.sub_counter, 3,
+        "Migration must preserve consumed delegation allowance"
+    );
+    assert_eq!(restored.history, decoded.history);
+    let ledger = restored.evidence.as_ref().unwrap();
+    assert!(ledger.records.is_empty());
+    assert_eq!(ledger.resumes, 1);
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("predates the evidence ledger"))
+    );
+
+    let mut state = checkpoint_fixture(dir.path());
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let ledger = state.evidence.as_mut().unwrap();
+    let record = signed_record(ledger, &tree);
+    ledger.key = None;
+    let restored = restore(dir.path(), serde_json::to_value(state).unwrap()).await;
+    let ledger = restored.evidence.unwrap();
+    assert!(
+        ledger.key.is_none(),
+        "The worker must not mint a replacement signing key"
+    );
+    assert_eq!(ledger.stale_ids, vec![record.id.clone()]);
+    assert!(ledger.records[0] == record);
+    assert!(
+        ledger
+            .unverified
+            .iter()
+            .any(|note| note.contains("before restart cannot satisfy"))
+    );
+    ledger.validate().unwrap();
+}
+
+#[tokio::test]
+async fn older_checkpoint_cannot_roll_back_service_replay_and_gate_reservations() {
+    let dir = repository();
+    let base = evidence_tree::tree_hash(dir.path()).unwrap();
+    let mut state = checkpoint_fixture(dir.path());
+    std::fs::write(dir.path().join("source.js"), AFTER).unwrap();
+    let tree = evidence_tree::tree_hash(dir.path()).unwrap();
+    let ledger = state.evidence.as_mut().unwrap();
+    ledger.begin_turn(Some(base.clone()), false);
+    ledger.gate_rounds = 1;
+    ledger.turn_gate_rounds = 1;
+    let old = signed_record(ledger, &tree);
+    let mut service = evidence::Ledger::new(dir.path());
+    service.initialize("run", "08".repeat(32)).unwrap();
+    service.seq = 100;
+    service.gate_rounds = 6;
+    service.resumes = 7;
+    let decoded = Checkpoint::import(serde_json::to_value(state).unwrap(), "run", "owner")
+        .await
+        .unwrap();
+    let mut restored = decoded.evidence.unwrap();
+    restored
+        .restore_with_service(Some(&tree), &service)
+        .unwrap();
+    assert_eq!(
+        (
+            restored.seq,
+            restored.gate_rounds,
+            restored.resumes,
+            restored.turn_gate_rounds
+        ),
+        (100, 6, 7, 1)
+    );
+    assert_eq!(restored.turn_tree, Some(base));
+    assert!(restored.records[0] == old);
+    assert_eq!(restored.historical_ids, vec![old.id]);
+    assert!(restored.gate(dir.path(), Some(&tree)).is_none());
+    assert!(
+        restored
+            .unverified
+            .iter()
+            .any(|note| note.contains("budget was exhausted"))
+    );
+    let next = signed_record(&mut restored, &tree);
+    assert_eq!(next.seq, 101);
+    assert!(next.authentic(&[8; 32]));
+    restored.validate().unwrap();
+}
+
+#[test]
+fn input_frames_keep_metadata_compatibility_but_checkpoint_controls_remain_exact() {
+    let user = r#"{"type":"user","text":"Continue","effort":"high","metadata":{"source":"api"}}"#;
+    assert_eq!(
+        serde_json::from_str::<AgentInput>(user).unwrap(),
+        AgentInput::User {
+            text: "Continue".into(),
+            images: vec![]
+        }
+    );
+    assert_eq!(
+        serde_json::from_str::<AgentInput>(r#"{"type":"interrupt","future_field":true}"#).unwrap(),
+        AgentInput::Interrupt
+    );
+    let export = r#"{"type":"export_state","request_id":"r","run_id":"run","owner_id":"owner","hold":false}"#;
+    let input: AgentInput = serde_json::from_str(export).unwrap();
+    assert_eq!(serde_json::to_string(&input).unwrap(), export);
+    let import =
+        r#"{"type":"import_state","request_id":"r","run_id":"run","owner_id":"owner","state":{}}"#;
+    let input: AgentInput = serde_json::from_str(import).unwrap();
+    assert_eq!(serde_json::to_string(&input).unwrap(), import);
+    let init = json!({"type":"init_evidence","request_id":"r","run_id":"run","owner_id":"owner","key":"07".repeat(32)});
+    let input: AgentInput = serde_json::from_value(init.clone()).unwrap();
+    assert!(serde_json::to_value(&input).unwrap() == init);
+    assert!(!format!("{input:?}").contains(&"07".repeat(32)));
+    for frame in [export.to_owned(), import.to_owned(), init.to_string()] {
+        let mut value: Value = serde_json::from_str(&frame).unwrap();
+        value["future_field"] = json!(true);
+        assert!(serde_json::from_value::<AgentInput>(value).is_err());
+    }
+    assert!(
+        serde_json::from_str::<AgentInput>(r#"{"type":"evidence.recorded","record":{}}"#).is_err()
+    );
+}

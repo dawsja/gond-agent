@@ -48,7 +48,7 @@ describe("retired automation stays removed", () => {
       auto_resume_pending: false, resume_from_checkpoint: false };
     const legacy = { ...normal, ci_active: true, ci_turn: true, ci_publication_pending: true, ci_round: 2,
       ci_state: "pending", ci_sha: "c".repeat(40), ci_previous_sha: "d".repeat(40), ci_pending_sha: "e".repeat(40),
-      ci_cancelled_sha: "f".repeat(40), ci_failing: ["test"], ci_reason: "old reason" };
+      ci_cancelled_sha: "f".repeat(40), ci_failing: ["test"], ci_reason: "old reason", ci_future_field: { ignored: true } };
     const stored = JSON.stringify(legacy);
     const parsed = parseRun(stored);
     expect(parsed).toEqual(parseRun(JSON.stringify(normal)));
