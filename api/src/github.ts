@@ -212,12 +212,20 @@ export async function checkout(
   }
   return { cwd, archive };
 }
+export interface PushOptions {
+  /** #23's caller must set this for an explicit new branch until publication is confirmed; never infer it from a name. */
+  lease?: "create-only";
+  /** #22's CI-config guard belongs here, not just before the initial import/push. */
+  beforePush?: (context: { cwd: string; branch: string; head: string }) => Promise<void>;
+}
+
 export async function importBundle(
   cwd: string,
   bundle: Buffer,
   branch: string,
   env: NodeJS.ProcessEnv = process.env,
   retryOptions?: RetryOptions,
+  pushOptions: PushOptions = {},
 ) {
   if (!validBranch(branch)) throw new Error("Invalid branch");
   const path = join(cwd, ".git", "gond-agent.bundle");
@@ -228,14 +236,39 @@ export async function importBundle(
       await git(cwd, "fetch", "--no-tags", path, "HEAD");
       await git(cwd, "reset", "--hard", "FETCH_HEAD");
     }, { maxAttempts: 1 });
-    await pushBranch(cwd, branch, env, retryOptions);
+    await pushBranch(cwd, branch, env, retryOptions, pushOptions);
   } finally {
     await withRetry("import", () => rm(path, { force: true }), { maxAttempts: 1 });
   }
 }
 
 /** Retry publication of an already imported commit without needing the worker bundle again. */
-export async function pushBranch(cwd: string, branch: string, env: NodeJS.ProcessEnv = process.env, retryOptions?: RetryOptions) {
+export async function pushBranch(cwd: string, branch: string, env: NodeJS.ProcessEnv = process.env, retryOptions?: RetryOptions, options: PushOptions = {}) {
   if (!validBranch(branch)) throw new Error("Invalid branch");
-  await withRetry("push", () => authenticatedGit(env, cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]), retryOptions);
+  const { lease, beforePush } = options;
+  // Pin guarded/create-only publication so reconciliation compares the exact commit sent.
+  const head = lease || beforePush ? (await git(cwd, "rev-parse", "HEAD")).toString().trim() : "HEAD";
+  if (head !== "HEAD" && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error("Invalid publication commit");
+  const ref = `refs/heads/${branch}`;
+  await withRetry("push", async () => {
+    try {
+      await authenticatedGit(env, cwd, ["push", ...(lease === "create-only" ? [`--force-with-lease=${ref}:`] : []), "origin", `${head}:${ref}`]);
+    } catch (error) {
+      if (lease === "create-only" && classifyRetryFailure(error).staleLease) {
+        // The first create may have succeeded before its response was lost. Never
+        // weaken the lease: reconcile with one owner-credential-scoped read instead.
+        try {
+          const remote = (await authenticatedGit(env, cwd, ["ls-remote", "--refs", "origin", ref])).toString().trim();
+          if (remote === `${head}\t${ref}`) return;
+        } catch { /* Unverifiable state remains the original non-retryable rejection. */ }
+      }
+      throw error;
+    }
+  }, {
+    ...retryOptions,
+    beforeAttempt: beforePush ? async () => {
+      if (retryOptions?.beforeAttempt) await retryOptions.beforeAttempt();
+      await beforePush({ cwd, branch, head });
+    } : retryOptions?.beforeAttempt,
+  });
 }

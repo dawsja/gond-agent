@@ -6,6 +6,8 @@ export interface RetryFailure {
   retryAfterMs?: number;
   /** Positive evidence that an API mutation can be replayed without an ambiguous outcome. */
   safeToReplay?: boolean;
+  /** Git rejected a stale force-with-lease expectation, not a transport failure. */
+  staleLease?: boolean;
 }
 export interface RetryOptions {
   /** Total attempts, including the first; never more than five. */
@@ -15,6 +17,8 @@ export interface RetryOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   random?: () => number;
+  /** Runs before every attempt, outside classification/retry; guard failures propagate unchanged. */
+  beforeAttempt?: () => Promise<void>;
 }
 
 /** Safe classified command failure, before an operation's retry budget is applied. */
@@ -24,6 +28,7 @@ export class ClassifiedRetryFailure extends Error implements RetryFailure {
   readonly reason: string;
   readonly retryAfterMs?: number;
   readonly safeToReplay?: boolean;
+  readonly staleLease?: boolean;
   constructor(failure: RetryFailure) {
     super(failure.reason);
     this.name = "ClassifiedRetryFailure";
@@ -32,6 +37,7 @@ export class ClassifiedRetryFailure extends Error implements RetryFailure {
     this.reason = failure.reason;
     this.retryAfterMs = failure.retryAfterMs;
     this.safeToReplay = failure.safeToReplay;
+    this.staleLease = failure.staleLease;
   }
 }
 
@@ -73,6 +79,7 @@ export function classifyRetryFailure(error: unknown, now = Date.now()): RetryFai
     class: error.class, retryable: error.retryable, reason: error.reason,
     ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
     ...(error.safeToReplay === undefined ? {} : { safeToReplay: error.safeToReplay }),
+    ...(error.staleLease === undefined ? {} : { staleLease: error.staleLease }),
   };
   const e = record(error), response = record(e.response);
   const detail = [text(e.message), text(e.stderr)].join("\n").slice(-64 * 1024);
@@ -85,6 +92,8 @@ export function classifyRetryFailure(error: unknown, now = Date.now()): RetryFai
   // Permanent outcomes win even if accompanying diagnostics also mention a connection failure.
   if (status === 401 || status === 403 || /authentication failed|bad credentials|could not read (?:username|password)|permission denied|repository not found|terminal prompts disabled|invalid (?:username|password|token)|access denied/i.test(detail))
     return failure("auth", false, status === 401 || status === 403 ? `GitHub request failed (HTTP ${status}). Check your GitHub connection.` : "GitHub access was refused. Check your GitHub connection.");
+  if (/\bstale info\b/i.test(detail))
+    return { ...failure("rejected", false, "The remote rejected the branch lease. Check the branch before trying again."), staleLease: true };
   if (/non-fast-forward|\[rejected\]|\[remote rejected\]|fetch first|protected branch|pre-receive hook declined/i.test(detail))
     return failure("rejected", false, "The remote rejected the branch update. Check the branch before trying again.");
   if (status === 429 || status === 503) {
@@ -137,6 +146,8 @@ export async function withRetry<T>(step: string, fn: (attempt: number, remaining
   const deadline = options.totalTimeoutMs === undefined ? Infinity : now() + Math.max(1, options.totalTimeoutMs);
   let lastFailure: RetryFailure | undefined;
   for (let attempt = 1; ; attempt++) {
+    if (deadline - now() <= 0) throw new RetryError(step, lastFailure ?? classifyRetryFailure({ timedOut: true }), attempt - 1);
+    if (options.beforeAttempt) await options.beforeAttempt();
     const remainingMs = deadline - now();
     if (remainingMs <= 0) throw new RetryError(step, lastFailure ?? classifyRetryFailure({ timedOut: true }), attempt - 1);
     try { return await fn(attempt, remainingMs); }
