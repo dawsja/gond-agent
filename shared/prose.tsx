@@ -16,7 +16,11 @@ export function Code({ children }: { children: ReactNode }) {
 function isSameOriginImage(src: string): boolean {
   if (typeof window === "undefined") return false
   try {
-    return new URL(src).origin === window.location.origin
+    const url = new URL(src)
+    // Check the normalized path, but reject encoded paths and backslashes before
+    // they can disguise traversal. Neither allowed route needs a query/fragment.
+    if (url.origin !== window.location.origin || url.username || url.password || /[\\%?#]/.test(src)) return false
+    return url.pathname.startsWith("/agents/") || /^\/api\/v1\/runs\/[A-Za-z0-9_-]+\/images\/[A-Za-z0-9_-]+$/.test(url.pathname)
   } catch {
     return false
   }
@@ -31,7 +35,7 @@ export function Prose({ text, small, className }: { text: string; small?: boolea
         urlTransform={(url, key, node) => node.tagName === "img" && key === "src" ? url : defaultUrlTransform(url)}
         components={{
           img: ({ src, alt, title }) => {
-            // Only absolute same-origin HTTP(S) URLs render, not worker paths.
+            // Only allow-listed absolute same-origin HTTP(S) images render, not worker paths.
             // Remote URLs stay links; inline data/blob previews remain compatible.
             if (typeof src === "string" && /^https?:\/\//i.test(src)) return isSameOriginImage(src) ? (
               <img src={src} alt={alt} title={title} />

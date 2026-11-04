@@ -52,7 +52,7 @@ test('real Markdown renders absolute same-origin images without allowing lookali
   const previousWindow = globalThis.window
   globalThis.window = { location: new URL('https://workspace.example.test/agents/') }
   try {
-    for (const path of ['/agents/favicon-32.png', '/api/v1/runs/run_fixture/images/img_fixture']) {
+    for (const path of ['/agents/favicon-32.png', '/agents/nested/../favicon-32.png', '/api/v1/runs/run_fixture/images/img_fixture']) {
       const src = `https://workspace.example.test${path}`
       const html = renderToStaticMarkup(createElement(Prose, { text: `![Local diagram](${src})` }))
       assert.ok(html.includes(`<img src="${src}" alt="Local diagram"`), html)
@@ -61,6 +61,40 @@ test('real Markdown renders absolute same-origin images without allowing lookali
       const html = renderToStaticMarkup(createElement(Prose, { text: `![Remote](${src})` }))
       assert.match(html, /<a href=/)
       assert.doesNotMatch(html, /<img/)
+    }
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
+})
+
+test('real Markdown never loads same-origin API routes or ambiguous image paths', () => {
+  const { Prose } = load(new URL('../../shared/prose.tsx', import.meta.url))
+  const previousWindow = globalThis.window
+  globalThis.window = { location: new URL('https://workspace.example.test/agents/') }
+  try {
+    const paths = [
+      '/api/v1/runs', '/api/v1/me', '/api/auth/get-session', '/api/auth/sign-out',
+      '/other/screen.png', '/agents-other/screen.png',
+      '/agents/../api/v1/runs', '/agents/%2e%2e/api/v1/me',
+      '/agents/nested/%2E%2E/favicon-32.png', '/agents/%252e%252e%252fapi/v1/me',
+      '/agents/nested%2f..%2f..%2fapi/v1/me', '/agents/%5c..%5capi/v1/me',
+      '/agents/..\\api/v1/me',
+      '/agents/favicon-32.png?refresh=1', '/agents/favicon-32.png#preview',
+      '/agents/favicon-32.png?', '/agents/favicon-32.png#',
+      '/api/v1/runs/run_fixture/images/img_fixture?refresh=1',
+      '/api/v1/runs/run_fixture/images/img_fixture#preview',
+      '/api/v1/runs/run_fixture/images/img_fixture?',
+      '/api/v1/runs/run_fixture/images/img_fixture#',
+      '/api/v1/runs/run.fixture/images/img_fixture',
+      '/api/v1/runs/run_fixture/images/img_fixture/extra',
+      '/api/v1/runs/run_fixture/images/',
+    ]
+    for (const path of paths) {
+      const src = `https://workspace.example.test${path}`
+      const html = renderToStaticMarkup(createElement(Prose, { text: `![Blocked](<${src}>)` }))
+      assert.doesNotMatch(html, /<img/, `${src}: ${html}`)
+      assert.ok(html.includes('<a href=') || html.includes('image not available'), html)
     }
   } finally {
     if (previousWindow === undefined) delete globalThis.window
