@@ -12,8 +12,13 @@ export function errorParts(body: unknown): { code?: string; message: string } {
 /** A plain message for an API connection's failure. Provider bodies stay in server logs. */
 export function providerFailure(status: number, body: unknown): ApiError {
   const { code, message } = errorParts(body);
-  if (["context_exceeded", "context_length_exceeded", "prompt_too_long", "max_context_length_exceeded"].includes(code ?? "")
-    || /prompt is too long|maximum context|context length|context window|prompt length exceeds|too many tokens|maximum number of tokens/i.test(message))
+  const rateLimit = status === 429 || /rate_?limit/i.test(code ?? "");
+  const outputLimit = /max_(tokens|output_tokens|completion_tokens)/i.test(`${code ?? ""} ${message}`);
+  // Preserve rate/output errors before the relay can relabel them as context overflow.
+  // SSE errors have no HTTP status and need an explicit context code.
+  if (!rateLimit && !outputLimit && !/quota/i.test(code ?? "")
+    && (["context_exceeded", "context_length_exceeded", "model_context_window_exceeded", "prompt_too_long", "max_context_length_exceeded"].includes((code ?? "").toLowerCase())
+      || (status === 400 && /prompt is too long|maximum context|context length|context window|prompt length exceeds/i.test(message))))
     return new ApiError(400, "context_exceeded", "The conversation is too long for this model.");
   if (code === "insufficient_quota" || code === "billing_error")
     return new ApiError(402, "provider_quota", "The provider account has no remaining credit or quota. Check billing with the provider.");
@@ -23,7 +28,7 @@ export function providerFailure(status: number, body: unknown): ApiError {
     return new ApiError(403, "provider_forbidden", "This API key doesn't have access to the model.");
   if (status === 404 || code === "not_found_error" || code === "model_not_found")
     return new ApiError(404, "provider_model", "The provider doesn't recognize this model. Refresh the model list or choose another model.");
-  if (status === 429 || code === "rate_limit_error" || code === "rate_limit_exceeded")
+  if (rateLimit)
     return new ApiError(429, "provider_rate_limit", "The provider is limiting requests right now. Gond Agent will retry shortly.", true);
   if (status === 529 || status >= 500 || code === "overloaded_error" || code === "server_error" || code === "api_error")
     return new ApiError(503, "provider_unavailable", "The model provider is unavailable right now. Gond Agent will retry shortly.", true);

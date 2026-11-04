@@ -116,5 +116,6 @@ pub(super) fn request_bound(req: &crate::api::wire::ResponsesRequest) -> u64 {
 }
 
 pub(super) fn estimate(history: &[Message]) -> u64 {
-    (serde_json::to_vec(history).expect("messages serialize").len() as u64).div_ceil(4)
+    // Match the request serializer's newest-eight image policy; never decode images here.
+    (serde_json::to_vec(&crate::images::for_request(history)).expect("messages serialize").len() as u64).div_ceil(4)
 }

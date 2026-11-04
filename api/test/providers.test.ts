@@ -73,6 +73,16 @@ describe("provider settings and request routing", () => {
     expect(providerSettings(reopened).connections).toEqual([]);
     reopened.close();
   });
+  it("rejects unresolved upload IDs rather than hydrating unprocessed model images", async () => {
+    saveProviderSettings(db, secret, settings());
+    const request = new Request("http://worker/v1/responses", { method: "POST", body: JSON.stringify({
+      model: "auto", messages: [{ role: "user", content: [{ type: "image", id: "img_upload", media_type: "image/png", data: "" }] }],
+    }) });
+    const response = await modelResponse(db, secret, "user", "run", request);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe("invalid_image");
+    expect(seen).toHaveLength(0);
+  });
   it("starts empty, encrypts keys, persists settings and preserves a blank update", () => {
     expect(publicModels(db).models).toEqual([]);
     expect(() => modelFor(db, "auto")).toThrow(/No models are available/);

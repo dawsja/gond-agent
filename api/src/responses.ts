@@ -46,17 +46,10 @@ async function relay(db: Store, secret: string, access: ModelAccess, userId: str
     abort = new AbortController();
   if (body.reasoning && model.capabilities.reasoning !== "none") validateEffort(model, body.reasoning.effort);
   req.signal.addEventListener("abort", () => abort.abort(), { once: true });
-  // Resolve only images belonging to this run and user.
   for (const message of body.messages)
-    for (const block of message.content) {
-      if (block.type === "image" && "id" in block && block.id) {
-        const image = db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND user_id=? AND run_id=?")
-          .get(block.id, userId, runId) as { media_type: string; bytes: Buffer } | undefined;
-        if (!image) throw new ApiError(404, "image_not_found", "That image isn't available.");
-        Object.assign(block, { media_type: image.media_type, data: image.bytes.toString("base64") });
-        delete (block as { id?: string }).id;
-      }
-    }
+    for (const block of message.content)
+      if (block.type === "image" && block.id)
+        throw new ApiError(400, "invalid_image", "Image bytes must be processed by the worker before a model request.");
   const up = adapter.build(body, model);
   const plan = model.access;
   let upstream: Response;
