@@ -266,6 +266,46 @@ async fn status_filters_never_execute_repository_code() {
     assert!(map.worktree.is_empty(), "unsafe status must bypass caching");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_or_incompatible_ctags_errors_without_caching() {
+    const FIXTURE: &str = "REPO_MAP_CTAGS_DEPENDENCY_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = PathBuf::from(root);
+        let (c, _rx) = ctx(&root);
+        let output = RepoMap.run(&c, json!({})).await;
+        assert!(!output.ok, "unavailable symbol extraction must be a tool error, not an empty successful map");
+        let message = text(&output);
+        assert!(message.contains("Universal Ctags") && message.contains("JSON") && message.contains("unavailable"), "unclear dependency error: {message}");
+        assert!(!root.join(".git/gond-agent/repo-map.json").exists(), "unavailable extraction must never populate the cache");
+        return;
+    }
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let executable = std::env::current_exe().unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap()).map(|p| p.join("git")).find(|p| p.is_file()).expect("git is required for fixtures");
+    for (mode, script) in [
+        ("missing", None),
+        ("not-universal", Some("#!/bin/sh\nprintf 'Exuberant Ctags 5.8\\n'\n")),
+        ("no-json", Some("#!/bin/sh\ncase \"$2\" in --version) printf 'Universal Ctags 5.9.0\\n';; *) printf 'regex supports regex\\n';; esac\n")),
+        ("json-rejected", Some("#!/bin/sh\ncase \"$2\" in --version) printf 'Universal Ctags 5.9.0\\n';; --list-features) printf 'json supports json output\\n';; *) exit 1;; esac\n")),
+        ("invalid-json", Some("#!/bin/sh\ncase \"$2\" in --version) printf 'Universal Ctags 5.9.0\\n';; --list-features) printf 'json supports json output\\n';; *) printf 'not JSON tags\\n';; esac\n")),
+    ] {
+        let d = repo();
+        put(d.path(), "a.ts", b"export function actual_symbol() {}\n");
+        // Match the executable test filesystem, not /tmp (which may be mounted noexec).
+        let bin = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        symlink(&git, bin.path().join("git")).unwrap();
+        if let Some(script) = script {
+            put(bin.path(), "ctags", script.as_bytes());
+            fs::set_permissions(bin.path().join("ctags"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let result = std::process::Command::new(&executable)
+            .args(["--exact", "tools::repo_map::tests::unavailable_or_incompatible_ctags_errors_without_caching", "--nocapture", "--test-threads=1"])
+            .env(FIXTURE, d.path()).env("PATH", bin.path()).output().unwrap();
+        assert!(result.status.success(), "{mode}: child regression failed:\n{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    }
+}
+
 // Offline benchmark bridge: invokes the shipped implementation, not a Python reimplementation.
 #[tokio::test]
 #[ignore = "invoked only by scripts/repo-map-benchmark.py with private fixture paths"]
