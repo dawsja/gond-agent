@@ -5,6 +5,7 @@ import { api, type GithubLogin } from "@/lib/api"
 import { useMe } from "@/lib/queries"
 import { Button } from "@shared/ui/button"
 import { Input } from "@shared/ui/input"
+import { Switch } from "@shared/ui/switch"
 import { Field, FieldLabel } from "@shared/ui/field"
 import { Shell } from "../studio/shell"
 import { Section, Row } from "../studio/section"
@@ -14,16 +15,28 @@ export function PluginsScreen() {
   return <Shell active="Plugins" crumbs={<span>Connections</span>} contentClassName="overflow-y-auto"><div className="mx-auto flex max-w-[760px] flex-col gap-5 px-5 py-10"><h1 className="text-3xl font-semibold">Connections</h1><GithubConnection />{me?.admin && <GithubConnection shared />}</div></Shell>
 }
 
+interface GithubConnectionStatus { configured: boolean; login: string | null; managed: boolean; fallback?: boolean }
+
 export function GithubConnection({ shared = false }: { shared?: boolean }) {
   const qc = useQueryClient(), path = shared ? "/v1/settings/github" : "/v1/github", key = shared ? "shared-github" : "github"
-  const github = useQuery({ queryKey: [key], queryFn: () => api<{ configured: boolean; login: string | null; managed: boolean; fallback?: boolean }>(path) })
+  const github = useQuery({ queryKey: [key], queryFn: () => api<GithubConnectionStatus>(path) })
   const login = useQuery({ queryKey: [key, "login"], queryFn: () => api<GithubLogin>(`${path}/login`),
     refetchInterval: q => ["starting", "pending", "busy"].includes(q.state.data?.status ?? "") ? 1500 : false })
   const update = (state: GithubLogin) => qc.setQueryData([key, "login"], state)
   const start = useMutation({ mutationFn: () => api<GithubLogin>(`${path}/login`, { method: "POST" }), onSuccess: update })
   const cancel = useMutation({ mutationFn: () => api<GithubLogin>(`${path}/login`, { method: "DELETE", body: { id: login.data?.id } }), onSuccess: update })
   const disconnect = useMutation({ mutationFn: () => api(path, { method: "DELETE" }), onSuccess: () => { update({ status: "idle" }); for (const k of [key, "github", "repos", "branches"]) void qc.invalidateQueries({ queryKey: [k] }) } })
-  const fallback = useMutation({ mutationFn: (value: boolean) => api(path, { method: "PUT", body: { fallback: value } }), onSuccess: () => { void qc.invalidateQueries({ queryKey: [key] }); void qc.invalidateQueries({ queryKey: ["github"] }) } })
+  const fallback = useMutation({
+    mutationFn: (value: boolean) => api(path, { method: "PUT", body: { fallback: value } }),
+    onMutate: async value => {
+      await qc.cancelQueries({ queryKey: [key] })
+      const before = qc.getQueryData<GithubConnectionStatus>([key])
+      qc.setQueryData<GithubConnectionStatus>([key], old => old && { ...old, fallback: value })
+      return before
+    },
+    onError: (_error, _value, before) => { if (before) qc.setQueryData([key], before) },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: [key] }), qc.invalidateQueries({ queryKey: ["github"] })]),
+  })
   const status = login.data?.status
   const pending = start.isPending || status === "starting" || status === "pending"
   useEffect(() => {
@@ -34,7 +47,7 @@ export function GithubConnection({ shared = false }: { shared?: boolean }) {
       <Row label="Status">{github.isPending ? "Checking…" : github.isError ? "Couldn't check GitHub" : github.data?.configured ? `Signed in as ${github.data.login}` : "Not connected"}</Row>
       <div className="flex flex-col gap-4 border-t border-border px-5 py-4 max-md:px-4">
         <>
-          {shared && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={!!github.data?.fallback} disabled={fallback.isPending} onChange={e => fallback.mutate(e.target.checked)} />Use the shared GitHub connection for accounts without their own</label>}
+          {shared && <div className="flex items-center justify-between gap-4 text-sm"><label htmlFor="shared-github-fallback">Use the shared GitHub connection for accounts without their own</label><Switch id="shared-github-fallback" checked={!!github.data?.fallback} disabled={!github.data || github.isError} pending={fallback.isPending} onCheckedChange={value => fallback.mutate(value)} /></div>}
           {!shared && github.data?.configured && !github.data.managed && <p className="text-sm text-muted-foreground">Using shared or service credentials. Connect your own account to override them.</p>}
           <p className="text-sm text-muted-foreground">GitHub CLI is already installed. Sign in here, then approve the one-time code on GitHub. No terminal or download is needed.</p>
           {pending && <p role="status" className="text-sm">{status === "pending" ? "Waiting for approval on GitHub…" : "Requesting a sign-in code…"}</p>}

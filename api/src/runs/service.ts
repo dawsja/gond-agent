@@ -1,5 +1,6 @@
 import { Checkpoints } from "../checkpoints";
 import { listRunPage, type RunListOptions } from "./list";
+import { runDiff, preferPullDiff, type PullDiff } from "./diff";
 import { assertRunTransition, type RunStatus } from "../../../shared/run-state";
 import { searchConfigured, searchResponse } from "../search";
 import { randomBytes } from "node:crypto";
@@ -108,7 +109,14 @@ export interface Run {
   resume_from_checkpoint?: boolean;
   auto_resume_pending?: boolean;
   auto_resumes?: number;
+  /** Immutable task/evidence anchor; not the PR comparison revision. */
   base_sha: string | null;
+  /** Last known base branch head, independent of the original task anchor. */
+  diff_base_head?: string;
+  /** Comparison candidate; may differ from the confirmed head after a failed push. */
+  diff_head?: string;
+  /** Last authoritative GitHub totals, tied to the published commit. */
+  pr_diff?: PullDiff;
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; recovery?: boolean }
@@ -332,13 +340,20 @@ export class Runs {
   async refreshPulls(user: string, id?: string, options: RunListOptions = {}) {
     this.assertAccount(user);
     const rows = id ? [this.get(id, user)] : this.list(user, options);
-    const states = await this.pullRequests.states(rows, user);
+    const metadata = await this.pullRequests.metadata(rows, user);
     this.assertAccount(user);
     for (const original of rows) {
       let run: Run;
       try { run = this.get(original.id, user); } catch { continue; }
       if (run.repo !== original.repo || run.pr_number !== original.pr_number) continue;
-      const state = run.pr_state === "merged" ? "merged" : states.get(`${run.repo}#${run.pr_number}`);
+      const pull = metadata.get(`${run.repo}#${run.pr_number}`);
+      const before = JSON.stringify([run.files, run.additions, run.deletions, run.pr_diff]);
+      preferPullDiff(run, pull?.files !== undefined ? pull : undefined);
+      if (before !== JSON.stringify([run.files, run.additions, run.deletions, run.pr_diff])) {
+        this.save(run);
+        this.append(run.id, { type: "run.diff", files: run.files, additions: run.additions, deletions: run.deletions });
+      }
+      const state = run.pr_state === "merged" ? "merged" : pull?.state;
       if (!state) continue;
       if (run.pr_state !== state) {
         run.pr_state = state;
@@ -1579,32 +1594,33 @@ export class Runs {
     return true;
   }
   private async recordDiff(id: string, live: Live, head: string, pushed: boolean) {
-    let r = this.get(id);
-    r.pushed ||= pushed;
-    // A retained candidate is not the confirmed remote head. Its SHA already
-    // lives in publishPending/kept_commit for publication recovery.
-    if (pushed) r.head_sha = head;
-    r.diff = (
-      await git(live.cwd, "diff", "--no-ext-diff", r.base_sha!, "HEAD", "--")
-    )
-      .toString()
-      .slice(0, 2_000_000);
-    const counts = (
-      await git(live.cwd, "diff", "--numstat", r.base_sha!, "HEAD", "--")
-    )
-      .toString()
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-    r.files = counts.length;
-    r.additions = 0;
-    r.deletions = 0;
-    for (const line of counts) {
-      const [a, d] = line.split("\t");
-      r.additions += Number(a) || 0;
-      r.deletions += Number(d) || 0;
+    const original = this.get(id);
+    let comparison: Awaited<ReturnType<typeof runDiff>> | undefined;
+    let reported: PullDiff | undefined;
+    // Comparison metadata is best effort and must never turn a successful push
+    // into failed publication. Missing shallow ancestry preserves the prior diff.
+    try {
+      comparison = await runDiff(live.cwd, original.base_branch, head, githubEnvFor(this.db, this.cfg.secret, original.user_id), original.diff_base_head, pushed ? head : original.head_sha ?? undefined);
+    } catch { console.error("Couldn't refresh run comparison", id); }
+    if (pushed && original.pr_number) {
+      try {
+        const metadata = await this.pullRequests.metadata([original], original.user_id, true);
+        const pull = metadata.get(`${original.repo}#${original.pr_number}`);
+        if (pull?.files !== undefined) reported = pull;
+      } catch { console.error("Couldn't refresh published pull request counts", id); }
     }
-    r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    // Async comparison/metadata reads cannot roll back concurrent lifecycle or transcript updates.
+    const r = this.get(id);
+    r.pushed ||= pushed;
+    // A retained candidate is not the confirmed remote head.
+    if (pushed) { r.head_sha = head; r.diff_head = head; }
+    if (comparison) r.diff_base_head = comparison.baseHead;
+    if (comparison?.result) {
+      const { diff, perFile, files, additions, deletions } = comparison.result;
+      Object.assign(r, { diff, files, additions, deletions, diff_head: head });
+      r.summary = { ...r.summary, files: perFile };
+    }
+    if (pushed) preferPullDiff(r, reported);
     // Also surface weakening for legacy workers, which have no signed records.
     if (r.evidence) r.evidence.weakened = [...new Set([...(r.evidence.weakened ?? []), ...weakenedEvidence(r.diff)])].sort().slice(0, 32);
     this.save(r);
@@ -1647,6 +1663,16 @@ export class Runs {
       this.save(r);
       this.append(id, { type: "run.pr", number: pr.number, url: pr.html_url });
     }
+    // Creating/reusing a PR may precede GitHub's diff calculation. Keep local
+    // counts until valid metadata for this head is available; later reads retry.
+    try {
+      const metadata = await this.pullRequests.metadata([r], r.user_id, true);
+      const current = this.get(id);
+      const pull = metadata.get(`${current.repo}#${current.pr_number}`);
+      preferPullDiff(current, pull?.files !== undefined ? pull : undefined);
+      this.save(current);
+      this.append(id, { type: "run.diff", files: current.files, additions: current.additions, deletions: current.deletions });
+    } catch { console.error("Couldn't refresh published pull request counts", id); }
     return { ok: true };
   }
   async merge(id: string, user: string) {

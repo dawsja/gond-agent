@@ -31,6 +31,25 @@ exports.verifyPagination = async ({ page, expect, origin, capture }) => {
   const previous = page.getByRole('button', { name: 'Previous page', exact: true });
   const shot = async name => {
     await page.getByRole('navigation', { name: 'Runs pagination' }).scrollIntoViewIfNeeded();
+    const cards = list.locator(':scope > li');
+    const counts = cards.locator('[data-diff-counts]').filter({ visible: true });
+    await expect(counts).toHaveCount(await cards.count());
+    for (const count of await counts.all()) {
+      await expect(count).toHaveText('+11.4k−99.9k');
+      await expect(count).toHaveAttribute('title', '+11456 −99999');
+    }
+    // Text and squares must stay inside the tile (desktop) or row (mobile),
+    // not merely inside the document's scroll width.
+    expect(await cards.evaluateAll(cards => cards.every(card => {
+      const tile = card.querySelector('[data-diff-tile]');
+      const box = tile && tile.getBoundingClientRect().width ? tile : card;
+      const bounds = box.getBoundingClientRect();
+      return [...box.querySelectorAll('[data-diff-counts], [data-diff-counts] > span, [data-diff-squares], [data-diff-squares] > span')].every(el => {
+        const r = el.getBoundingClientRect();
+        return !r.width || r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom;
+      }) && card.scrollWidth <= card.clientWidth;
+    }))).toBe(true);
+    if (page.viewportSize().width >= 768) await expect(cards.locator('[data-diff-squares] > span')).toHaveCount(await cards.count() * 5);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await capture('pagination-' + name);
   };

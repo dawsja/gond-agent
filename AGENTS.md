@@ -103,6 +103,8 @@ Model names must use live provider metadata; do not maintain alias-to-version ta
 
 Settings use larger foreground-colored category headings for Personal settings, Models, Security, Agent access and Account management, with more space between categories than between related cards. Keep category headings at level 2 and nested card headings at level 3; retain existing hash targets and subscription/API adjacency.
 
+Boolean settings use the Radix-backed `shared/ui/switch.tsx`, with labels on the left and switches on the right. Pass `pending` for in-flight saves: it disables the control, sets `aria-busy` and announces Saving. Immediate saves show the new value optimistically and restore it on failure; form drafts such as OIDC still require Save. Do not add local switch implementations. Only choose-several list checkboxes may use a nearby `settings-multiselect: <reason>` comment to pass `web/test/settings-switch.test.mjs`. Browser coverage: `cd web && npm exec --call 'node --test test/settings-switch.browser.cjs'` (requires Playwright/Chromium); it runs the real components with mocked API responses and writes screenshots to `/tmp/gond-settings-switches`, never the checkout.
+
 - `cd api && npm ci && npm run typecheck && npm test`
 - `cd web && npm ci && npm run lint && npm run build`
 - `cd runner && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
@@ -116,6 +118,8 @@ Settings use larger foreground-colored category headings for Personal settings, 
 - Onboarding's bootstrap and returning phases share saved application data, but the test-only member-seeding boundary clears Better Auth's persisted request budgets. Never clear those budgets in production startup or relax production rate limits for browser tests. Keep the re-sign-in session-response assertion and the separate rate-limit persistence regression guard.
 
 Update this guide, README and protocol when behavior changes.
+
+Run diffs use one service-side merge-base comparison for saved text, numstat totals and per-file summary, refreshing the current base with owner credentials within a bounded network/deepening budget. Keep immutable `base_sha` for task/evidence anchoring; additive `diff_base_head` holds the last known base head. Offline comparisons must never substitute the original base; preserve the prior diff if ancestry is unavailable, without failing publication. Prefer valid GitHub PR totals for the published head, persisted as additive `pr_diff`; never apply a different head's counts or override an unpublished `diff_head` comparison with older published totals. Shallow ancestry repair must fetch an upstream-reachable published commit, not require an unpublished candidate to exist remotely. Refresh on publish and authenticated reads, not a scheduler. Compact list counts must fit their tile and retain exact tooltips; run details keep exact integers.
 
 Linked PR metadata is refreshed on authenticated workspace run-list/detail reads, in bounded GraphQL batches with a 30-second cache. This read-only state synchronization is separate from retired background issue/check/PR automation polling; the scheduler never polls GitHub. Preserve last known state on lookup failure, distinguish closed from merged, use the purple `--status-merged` token (`#bc8cff` in dark, light-safe ink in light) across wide/phone views, and finalize externally merged idle runs without interrupting active or queued work.
 

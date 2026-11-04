@@ -8,6 +8,7 @@ import type { Run, RunStatus } from "@/lib/api"
 import { Badge } from "@shared/ui/badge"
 import { RUN_UI } from "@/lib/run-state"
 import { STATUS, mono } from "./theme"
+import { compactCount } from "@/lib/format"
 
 const statusColor: Record<RunStatus, string> = STATUS
 
@@ -83,7 +84,7 @@ export function DiffSquares({ add, del, className }: { add: number; del: number;
   const r = del === 0 ? 0 : Math.max(1, Math.round((del / total) * lit))
   const g = add === 0 ? 0 : Math.max(1, lit - r)
   return (
-    <span className={cn("inline-flex gap-[3px]", className)} aria-hidden="true">
+    <span data-diff-squares className={cn("inline-flex shrink-0 gap-[3px]", className)} aria-hidden="true">
       {Array.from({ length: 5 }, (_, i) => (
         <span
           key={i}
@@ -95,11 +96,11 @@ export function DiffSquares({ add, del, className }: { add: number; del: number;
   )
 }
 
-export function DiffCounts({ add, del, className }: { add: number; del: number; className?: string }) {
+export function DiffCounts({ add, del, compact = false, className }: { add: number; del: number; compact?: boolean; className?: string }) {
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-[12px] tabular-nums", className)} style={mono}>
-      <span className="text-diff-add">+{add}</span>
-      <span className="text-diff-del">−{del}</span>
+    <span data-diff-counts title={`+${add} −${del}`} className={cn("inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[12px] tabular-nums", className)} style={mono}>
+      <span className="text-diff-add">+{compact ? compactCount(add) : add}</span>
+      <span className="text-diff-del">−{compact ? compactCount(del) : del}</span>
     </span>
   )
 }
@@ -107,14 +108,14 @@ export function DiffCounts({ add, del, className }: { add: number; del: number; 
 /** The square card from Cursor's list, reimagined: file count, counts, and the five-square bar. */
 export function DiffTile({ files, add, del, status }: { files: number; add: number; del: number; status: RunStatus }) {
   return (
-    <div className="relative flex h-[66px] w-[84px] shrink-0 flex-col justify-between rounded-[4px] border border-border bg-background px-2.5 pt-2 pb-2.5">
+    <div data-diff-tile className="relative flex h-[66px] w-[112px] shrink-0 flex-col justify-between rounded-[4px] border border-border bg-background px-2.5 pt-2 pb-2.5">
       <div className="flex items-center justify-between">
         <span className="text-[11px] text-muted-foreground">
-          <span className="font-medium text-foreground">{files || "—"}</span> {files === 1 ? "file" : "files"}
+          <span className="font-medium text-foreground" title={String(files)}>{files ? compactCount(files) : "—"}</span> {files === 1 ? "file" : "files"}
         </span>
         {status === "working" && <Dot status="working" size={5} />}
       </div>
-      {files ? <DiffCounts add={add} del={del} className="text-[11px]" /> : <span className="text-[11px] text-subtle">waiting</span>}
+      {files ? <DiffCounts add={add} del={del} compact className="text-[11px]" /> : <span className="text-[11px] text-subtle">waiting</span>}
       <DiffSquares add={add} del={del} />
     </div>
   )

@@ -63,6 +63,16 @@ it("paginates stable newest-first ties, reports full tab totals, and preserves q
     console.log(JSON.stringify({ request: "/api/v1/runs?" + query, limit: body.limit, offset: body.offset, total: body.total, rows: body.runs.length, counts: body.counts, first: body.runs[0].id, last: body.runs.at(-1)!.id }));
 });
 
+it("retains comparison heads and authoritative PR diff totals on paged reads", async () => {
+  const snapshot = { ...fixture[0], base_sha: "original-task-base", head_sha: "published-head",
+    diff_base_head: "current-main-head", diff_head: "published-head",
+    pr_diff: { head_sha: "published-head", files: 77, additions: 11456, deletions: 99999 } };
+  db.prepare("UPDATE runs SET data=? WHERE id=?").run(JSON.stringify(snapshot), snapshot.id);
+  const page = await get("?limit=10&offset=0");
+  expect(page.runs).toHaveLength(10);
+  expect(page.runs[0]).toMatchObject(snapshot);
+});
+
 it("combines repository and tab before paging, excludes deleted/foreign rows, clamps empty and last pages", async () => {
   for (const tab of ["all", "working", "ready", "merged"]) {
     const eligible = fixture.filter(r => r.repo === "acme/app");

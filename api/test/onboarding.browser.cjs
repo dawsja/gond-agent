@@ -356,13 +356,13 @@ const key = 'fixture-only-provider-key';
     ];
     const catalogURL = origin + '/api/v1/models';
     const fixtureRunURL = origin + '/api/v1/runs/composer-fixture';
-    let current = models[0], retiredBackend, sent, imageRequests = 0, activePreview = false, prState = null, queuePosition;
+    let current = models[0], retiredBackend, sent, imageRequests = 0, activePreview = false, prState = null, queuePosition, largeDiff = false;
     const sockets = [];
-    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: 'Composer preview', prompt: 'Review the settings', status: queuePosition ? 'queued' : activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', queue_position: queuePosition, queue_length: queuePosition ? 3 : undefined, pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: 0, additions: 0, deletions: 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
+    const run = () => ({ id: 'composer-fixture', user_id: 'fixture', repo: 'acme/app', base_branch: 'main', branch: 'fixture', model_id: current.id, backend: current.backend, retired_backend: retiredBackend, effort: 'medium', title: largeDiff ? 'Failing test first for bug fixes' : 'Composer preview', prompt: 'Review the settings', status: queuePosition ? 'queued' : activePreview ? 'working' : prState === 'merged' ? 'merged' : 'ready', queue_position: queuePosition, queue_length: queuePosition ? 3 : undefined, pr_state: prState, pr_number: prState ? 42 : null, pr_url: prState ? 'https://github.com/acme/app/pull/42' : null, files: largeDiff ? 77 : 0, additions: largeDiff ? 11456 : 0, deletions: largeDiff ? 99999 : 0, created_at: Date.now(), updated_at: Date.now(), live: { phase: 'idle' } });
     const modelRoute = route => route.fulfill({ json: { models, connections } });
     const runRoute = route => route.fulfill({ json: run() });
     const listRoute = route => {
-      const rows = prState || queuePosition ? [run()] : [];
+      const rows = prState || queuePosition || largeDiff ? [run()] : [];
       return route.fulfill({ json: { runs: rows, total: rows.length, limit: 100, offset: 0, repositories: ['acme/app'], counts: { all: rows.length, working: rows.filter(r => ['working', 'queued'].includes(r.status)).length, active: rows.filter(r => r.status === 'working').length, queued: queuePosition ? 1 : 0, ready: rows.filter(r => r.status === 'ready').length, merged: rows.filter(r => r.status === 'merged').length } } });
     };
     const stopRoute = route => { queuePosition = undefined; return route.fulfill({ json: { ok: true } }); };
@@ -391,6 +391,27 @@ const key = 'fixture-only-provider-key';
       expect(thinking.x + thinking.width).toBeLessThanOrEqual(width);
     };
     try {
+      largeDiff = true;
+      await page.goto(origin + '/agents/');
+      const card = page.locator('li').filter({ hasText: 'Failing test first for bug fixes' });
+      await expect(card).toBeVisible();
+      const counts = card.locator('[data-diff-counts]').filter({ visible: true });
+      await expect(counts).toHaveText('+11.4k−99.9k');
+      await expect(counts).toHaveAttribute('title', '+11456 −99999');
+      // Check descendants, not just scrollWidth or the flex wrapper: text can
+      // paint outside an otherwise correctly sized flex item.
+      expect(await card.evaluate(card => {
+        const tile = card.querySelector('[data-diff-tile]');
+        const box = tile && tile.getBoundingClientRect().width ? tile : card;
+        const bounds = box.getBoundingClientRect();
+        return [...box.querySelectorAll('[data-diff-counts], [data-diff-counts] > span, [data-diff-squares], [data-diff-squares] > span')].every(el => {
+          const r = el.getBoundingClientRect();
+          return !r.width || r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom;
+        }) && card.scrollWidth <= card.clientWidth;
+      })).toBe(true);
+      if (width >= 768) await expect(card.locator('[data-diff-squares] > span')).toHaveCount(5);
+      await captureThemes('runs-large-diff');
+      largeDiff = false;
       await page.goto(origin + '/agents/');
       await page.getByRole('button', { name: 'Choose model', exact: true }).click();
       for (const model of models) {
@@ -1123,7 +1144,8 @@ const key = 'fixture-only-provider-key';
     await page.goto(origin + '/agents/automations');
     await expect(page.getByRole('heading', { name: 'Automations', exact: true })).toBeVisible();
     await expect(page.getByText('GitHub polling', { exact: true })).toHaveCount(0);
-    await expect(page.getByRole('switch', { name: 'Automatic pull requests', exact: true })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Open pull requests automatically', exact: true })).toBeVisible();
+    await captureThemes('automations-switches');
     await capture('automations');
     await page.goto(origin + '/agents/plugins');
     await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
@@ -1152,10 +1174,26 @@ const key = 'fixture-only-provider-key';
     expect(JSON.stringify(github) + JSON.stringify(repos)).not.toContain('fixture-only-github-token');
     await capture(returning ? 'github-after-restart' : 'github-connected');
     await page.goto(origin + '/agents/settings#connections');
-    await expect(page.getByLabel('Use the shared GitHub connection for accounts without their own', { exact: true })).not.toBeChecked();
+    const sharedFallback = page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true });
+    await expect(sharedFallback).not.toBeChecked();
+    await expect(sharedFallback).toBeEnabled();
+    for (const checked of [true, false]) {
+      const saved = page.waitForResponse(response => response.url() === origin + '/api/v1/settings/github' && response.request().method() === 'PUT');
+      await sharedFallback.press('Space');
+      const response = await saved;
+      expect(response.status()).toBe(200);
+      expect(response.request().postDataJSON()).toEqual({ fallback: checked });
+      await expect(sharedFallback).toBeEnabled();
+      await expect(sharedFallback).toHaveAttribute('aria-checked', String(checked));
+    }
     await expect(page.getByText('Shared connection (used by accounts without their own). The fallback also permits service credentials from the server environment. New accounts need their own connection unless it is on.', { exact: true })).toBeVisible();
     await page.getByRole('heading', { name: 'Shared connection', exact: true }).scrollIntoViewIfNeeded();
-    await capture('github-admin-shared');
+    await captureThemes('github-admin-shared-switch');
+    const singleSignOn = page.getByRole('switch', { name: 'Enable single sign-on', exact: true });
+    await singleSignOn.scrollIntoViewIfNeeded();
+    await expect(singleSignOn).toBeEnabled();
+    await expect(singleSignOn).not.toBeChecked();
+    await captureThemes('oidc-switch');
     await page.goto(origin + '/agents/settings#people-settings');
     await page.getByRole('heading', { name: 'People', level: 3, exact: true }).scrollIntoViewIfNeeded();
     await capture('people-role-actions');
