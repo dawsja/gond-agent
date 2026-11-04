@@ -25,7 +25,7 @@ before(async () => {
 after(async () => { await browser?.close(); await server?.close(); });
 
 async function mockAPI(page, theme = 'light', { admin = true, connected = false } = {}) {
-  const state = { fallback: false, auto_pr: true, enabled: true, puts: [], personal: connected, shared: connected, login: { status: 'idle' }, sharedLogin: { status: 'idle' }, requests: [] };
+  const state = { accent: 'blue', theme, fallback: false, auto_pr: true, enabled: true, puts: [], personal: connected, shared: connected, login: { status: 'idle' }, sharedLogin: { status: 'idle' }, requests: [] };
   const user = { id: admin ? 'admin' : 'member', name: admin ? 'Test Administrator' : 'Test Member', email: admin ? 'admin@example.test' : 'member@example.test' };
   await page.route('**/api/**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -45,13 +45,15 @@ async function mockAPI(page, theme = 'light', { admin = true, connected = false 
       state.puts.push({ path, body });
       if (path === '/api/v1/settings/github') state.fallback = body.fallback;
       else if (path === '/api/v1/me/automations') state.auto_pr = body.auto_pr;
+      else if (path === '/api/v1/me/accent') { state.accent = body.accent; return route.fulfill({ json: { accent: state.accent } }); }
+      else if (path === '/api/v1/me/theme') state.theme = body.theme;
       else if (path.endsWith('/enabled')) state.enabled = body.enabled;
       else if (path !== '/api/v1/settings/oidc') throw new Error(`Unexpected mutation ${path}`);
       return route.fulfill({ json: { ok: true } });
     }
     const responses = {
       '/api/auth/get-session': { session: { id: 'fixture-session', userId: user.id, expiresAt: new Date(Date.now() + 86400000).toISOString() }, user },
-      '/api/v1/me': { theme, accent: 'blue', admin, user, setup_required: false, automations: { auto_pr: state.auto_pr } },
+      '/api/v1/me': { theme: state.theme, accent: state.accent, admin, user, setup_required: false, automations: { auto_pr: state.auto_pr } },
       '/api/v1/me/deletion': { last_account: true, has_password: true, blocked_reason: null },
       '/api/v1/runs': { runs: [] },
       '/api/v1/subscriptions': { accounts: [], pending: null, welcome: false },
@@ -394,6 +396,44 @@ async function openSettingsPage(page, id, width) {
   } else await page.getByRole('navigation', { name: 'Settings pages' }).getByRole('link', { name: topic.title, exact: true }).click();
   await expect(page).toHaveURL(origin + '/agents' + topic.route);
 }
+
+for (const width of [1440, 390]) for (const theme of ['light', 'dark']) test(`Appearance saves Orange after topic navigation and overrides stale hints: ${theme}, ${width}px`, async () => {
+  await withPage({ viewport: { width, height: 900 }, colorScheme: theme }, async page => {
+    const state = await mockAPI(page, theme);
+    await page.goto(origin + '/agents/settings/account');
+    await expect(page.locator('#sign-in-methods')).toBeVisible();
+    await expect(page.locator('#sessions')).toBeVisible();
+    await openSettingsPage(page, 'models', width);
+    await expect(page.getByRole('heading', { name: 'ChatGPT plan', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Model providers', exact: true })).toBeVisible();
+    await openSettingsPage(page, 'appearance', width);
+    const control = page.locator('#appearance').getByRole('button', { name: 'Color', exact: true });
+    await expect(control).toBeEnabled();
+    await control.click();
+    const saving = page.waitForResponse(response => response.url() === origin + '/api/v1/me/accent' && response.request().method() === 'PUT');
+    await page.getByRole('menuitemradio', { name: 'Orange', exact: true }).click();
+    const response = await saving;
+    assert.equal(response.status(), 200);
+    assert.deepEqual(response.request().postDataJSON(), { accent: 'orange' });
+    assert.deepEqual(await response.json(), { accent: 'orange' });
+    await expect(page.locator('html')).toHaveAttribute('data-accent', 'orange');
+    await expect(control).toHaveText('Orange');
+    await expect(page.getByRole('combobox', { name: 'Theme', exact: true })).toHaveText(theme === 'light' ? 'Light' : 'Dark');
+    await openSettingsPage(page, 'account', width);
+    await expect(control).toBeHidden();
+    await openSettingsPage(page, 'appearance', width);
+    await expect(control).toHaveText('Orange');
+    for (const hint of ['purple', 'not-an-accent']) {
+      await page.evaluate(value => localStorage.setItem('gond-agent-accent', value), hint);
+      await page.reload();
+      await expect(page.locator('html')).toHaveAttribute('data-accent', 'orange');
+      await expect(control).toHaveText('Orange');
+      assert.equal(await page.evaluate(() => localStorage.getItem('gond-agent-accent')), 'orange');
+    }
+    assert.deepEqual(state.puts, [{ path: '/api/v1/me/accent', body: { accent: 'orange' } }]);
+    await page.screenshot({ path: join(settingsScreenshots, `appearance-orange-${theme}-${width}.png`), animations: 'disabled' });
+  });
+});
 
 for (const width of [1440, 390]) for (const theme of ['light', 'dark']) for (const admin of [true, false]) {
   const role = admin ? 'administrator' : 'member';

@@ -31,12 +31,15 @@ const key = 'fixture-only-provider-key';
   const errors = [];
   const externalRequests = [];
   const authResponses = [];
-  page.on('response', response => {
+  // Include secondary contexts: an auth failure there otherwise looks like a
+  // stale theme/accent on the main page's failure screenshot.
+  const observeAuth = target => target.on('response', response => {
     const url = new URL(response.url());
     if (url.origin !== origin || !url.pathname.startsWith('/api/auth/')) return;
-    authResponses.push({ path: url.pathname, method: response.request().method(), status: response.status(), retryAfter: response.headers()['x-retry-after'] });
+    authResponses.push({ path: url.pathname, method: response.request().method(), status: response.status(), retryAfter: response.headers()['x-retry-after'], context: target === page ? 'main' : 'secondary' });
     if (authResponses.length > 30) authResponses.shift();
   });
+  observeAuth(page);
   page.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
   const greyAvatar = async (locator, theme = 'dark') => {
     await expect(locator).toBeVisible();
@@ -85,8 +88,24 @@ const key = 'fixture-only-provider-key';
     expect((await (await page.request.get(origin + '/api/v1/me')).json()).theme).toBe(theme.toLowerCase());
     await expect.poll(() => page.evaluate(() => localStorage.getItem('gond-agent-theme'))).toBe(theme.toLowerCase());
   };
+  const openHome = async () => {
+    if (width < 768) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
+    await page.getByRole('link', { name: 'Home', exact: true }).filter({ visible: true }).click();
+    await expect(page).toHaveURL(url => url.origin === origin && /^\/agents\/?$/.test(url.pathname));
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  };
+  const openSettingsPage = async (id, name) => {
+    // Use topic navigation, not a new document/session lookup for every panel.
+    // Keep explicit reloads below for persistence and first-paint checks.
+    if (width < 768) {
+      await page.getByRole('combobox', { name: 'Settings page', exact: true }).click();
+      await page.getByRole('option', { name, exact: true }).click();
+    } else await page.getByRole('navigation', { name: 'Settings pages' }).getByRole('link', { name, exact: true }).click();
+    await expect(page).toHaveURL(origin + '/agents/settings/' + id);
+    await expect(page.getByRole('heading', { name, level: 2, exact: true })).toBeVisible();
+  };
   const verifyTheme = async () => {
-    await page.goto(origin + '/agents/settings/appearance');
+    await openSettingsPage('appearance', 'Appearance');
     await expect(page.getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
     await chooseTheme('Light');
     await resolvedTheme('light');
@@ -121,6 +140,7 @@ const key = 'fixture-only-provider-key';
     const state = await page.context().storageState();
     const freshContext = await browser.newContext({ storageState: { ...state, origins: [] }, viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
     const fresh = await freshContext.newPage();
+    observeAuth(fresh);
     fresh.on('pageerror', error => errors.push(error.message));
     fresh.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
     try {
@@ -220,6 +240,9 @@ const key = 'fixture-only-provider-key';
     };
     const state = async (target, name, color) => {
       const accent = name.toLowerCase();
+      // Establish the authenticated panel before interpreting a boot-cache value
+      // as an accent failure (a rejected session lookup renders Sign in instead).
+      await expect(control(target)).toBeVisible();
       await expect(target.locator('html')).toHaveAttribute('data-accent', accent);
       await expect.poll(() => primary(target)).toBe(color);
       await expect(control(target)).toHaveText(name);
@@ -249,15 +272,17 @@ const key = 'fixture-only-provider-key';
       else await page.getByRole('menuitemradio', { name, exact: true }).click();
       const response = await saving;
       expect(response.status()).toBe(200);
+      expect(response.request().postDataJSON()).toEqual({ accent: name.toLowerCase() });
       expect(await response.json()).toEqual({ accent: name.toLowerCase() });
     };
-    await page.goto(origin + '/agents/settings/appearance#appearance');
+    await openSettingsPage('appearance', 'Appearance');
     await expect(page.locator('#appearance').getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
     await state(page, 'Blue', '#2b61b9');
     let previous = await primary(page);
     // No copied cookies or storage: the same account retrieves its color from the server.
     const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' });
     const other = await context.newPage();
+    observeAuth(other);
     other.on('pageerror', error => errors.push(error.message));
     other.on('request', request => { if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin) externalRequests.push(request.url()); });
     try {
@@ -269,6 +294,7 @@ const key = 'fixture-only-provider-key';
       await other.getByLabel('Password', { exact: true }).fill('test-password-only-123456');
       await other.getByRole('button', { name: 'Sign in', exact: true }).click();
       await expect(other.getByRole('heading', { level: 1 })).toContainText(', Test');
+      await other.goto(origin + '/agents/settings/appearance#appearance');
       // Representative choices, not a second copy of the supported-color catalog.
       for (const [name, color] of [['Purple', '#6747ba'], ['Green', '#17853e'], ['Orange', '#c1450b']]) {
         await choose(name, name === 'Purple');
@@ -279,7 +305,8 @@ const key = 'fixture-only-provider-key';
         await state(page, name, color);
         await page.getByRole('region', { name: 'Appearance', exact: true }).scrollIntoViewIfNeeded();
         await selected(page, name, 'accent-' + name.toLowerCase());
-        await other.goto(origin + '/agents/settings/appearance#appearance');
+        // Reload the existing Appearance document once per saved choice. A
+        // repeated goto to this same hash URL may only navigate within the page.
         await other.reload();
         await state(other, name, color);
         await selected(other, name);
@@ -342,7 +369,7 @@ const key = 'fixture-only-provider-key';
     await page.reload();
     await state(page, 'Blue', '#2b61b9');
     await selected(page, 'Blue');
-    await page.goto(origin + '/agents/settings');
+    await openSettingsPage('account', 'Account');
   };
   // UI fixtures exercise API and subscription choices without a paid model call.
   // Registration, provider setup, storage and the rest of onboarding use the real service.
@@ -397,7 +424,7 @@ const key = 'fixture-only-provider-key';
     };
     try {
       largeDiff = true;
-      await page.goto(origin + '/agents/');
+      await openHome();
       const card = page.locator('li').filter({ hasText: 'Failing test first for bug fixes' });
       await expect(card).toBeVisible();
       const counts = card.locator('[data-diff-counts]').filter({ visible: true });
@@ -417,7 +444,7 @@ const key = 'fixture-only-provider-key';
       if (width >= 768) await expect(card.locator('[data-diff-squares] > span')).toHaveCount(5);
       await captureThemes('runs-large-diff');
       largeDiff = false;
-      await page.goto(origin + '/agents/');
+      await openHome();
       await page.getByRole('button', { name: 'Choose model', exact: true }).click();
       for (const model of models) {
         await expect(page.getByRole('button', { name: model.display_name, exact: true }).locator('[data-model-provider]')).toHaveAttribute('data-model-provider', model.provider);
@@ -762,7 +789,7 @@ const key = 'fixture-only-provider-key';
       await page.getByRole('tab', { name: 'Pull request #42', exact: true }).click();
       await expect(page.getByText('Merged', { exact: true }).filter({ visible: true }).first()).toBeVisible();
       await capture('pr-merged-details');
-      await page.goto(origin + '/agents/');
+      await openHome();
       const mergedChip = page.getByLabel('Merged pull request #42', { exact: true }).filter({ visible: true });
       await expect(mergedChip.locator('.lucide-git-merge')).toHaveCSS('color', 'rgb(188, 140, 255)');
       await capture('pr-merged-home');
@@ -832,7 +859,7 @@ const key = 'fixture-only-provider-key';
         await expect(providers.locator('fieldset')).toHaveCount(0);
         await providers.scrollIntoViewIfNeeded();
         await capture('subscription-empty-api-settings');
-        await page.goto(origin + '/agents/');
+        await openHome();
         await expect(page.getByRole('button', { name: 'Choose model', exact: true })).toContainText('GPT-5.4 mini');
         await expect(page.getByText(/API connection unavailable/)).toHaveCount(0);
       } finally {
@@ -969,12 +996,18 @@ const key = 'fixture-only-provider-key';
     await verifyTheme();
     const topics = [['account', 'Account'], ['appearance', 'Appearance'], ['models', 'Models'], ['agent-access', 'Agent access'], ['sign-in-people', 'Sign-in & people'], ['danger-zone', 'Danger zone']];
     for (const [id, name] of topics) {
-      await page.goto(origin + '/agents/settings/' + id);
+      await openSettingsPage(id, name);
       await expect(page).toHaveURL(origin + '/agents/settings/' + id);
       await expect(page.getByRole('heading', { level: 2 })).toHaveText([name]);
       await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
       await expect(page.getByRole('button', { name: /Connect GitHub|Reconnect GitHub|Disconnect/ })).toHaveCount(0);
       navigation.settings.push({ path: new URL(page.url()).pathname, heading: name });
+      if (id === 'account') {
+        await expect(page.locator('#sign-in-methods').getByRole('heading', { name: 'Sign-in methods', level: 3, exact: true })).toBeVisible();
+        await expect(page.locator('#sign-in-methods').getByText('Password', { exact: true })).toBeVisible();
+        await expect(page.locator('#sessions').getByRole('heading', { name: 'Sessions', level: 3, exact: true })).toBeVisible();
+        await expect(page.locator('#sessions').getByText('Current session', { exact: true })).toBeVisible();
+      }
       const heading = page.getByRole('heading', { name, exact: true, level: 2 });
       await heading.scrollIntoViewIfNeeded();
       const category = page.getByRole('region', { name, exact: true });
@@ -987,9 +1020,9 @@ const key = 'fixture-only-provider-key';
       expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
       if (!returning) await captureThemes('settings-page-' + id);
     }
-    await page.goto(origin + '/agents/settings/models');
+    await openSettingsPage('models', 'Models');
     await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['ChatGPT plan', 'Model providers']);
-    await page.goto(origin + '/agents/settings/agent-access#mcp');
+    await openSettingsPage('agent-access', 'Agent access');
     const mcp = page.locator('#mcp');
     await mcp.scrollIntoViewIfNeeded();
     if (!returning) {
@@ -1018,7 +1051,7 @@ const key = 'fixture-only-provider-key';
       await expect(mcp.getByText(/Revoked/)).toBeVisible();
       await expect(mcp.getByLabel('New MCP token', { exact: true })).toHaveCount(0);
     }
-    await page.goto(origin + '/agents/');
+    await openHome();
     if (width !== 1440) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
     await page.getByRole('button', { name: 'Search', exact: true }).filter({ visible: true }).click();
     await expect(page.getByRole('option', { name: 'Settings', exact: true })).toBeVisible();
@@ -1088,7 +1121,7 @@ const key = 'fixture-only-provider-key';
       await manual.getByRole('button', { name: 'Add manual model', exact: true }).click();
       await manual.getByLabel('Model ID', { exact: true }).fill('manual-model');
       expect((await save('Save changes')).status()).toBe(200);
-      await page.goto(origin + '/agents/');
+      await openHome();
       await page.getByRole('button', { name: 'Choose model', exact: true }).click();
       await expect(page.getByRole('button', { name: 'manual-model · Manual provider', exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: 'Fixture coder · Second provider', exact: true })).toBeVisible();
@@ -1118,7 +1151,7 @@ const key = 'fixture-only-provider-key';
       await capture('account-grey-default');
       await verifyAccents();
     }
-    await page.goto(origin + '/agents/settings/account');
+    await openSettingsPage('account', 'Account');
     const beforePhoto = await (await page.request.get(origin + '/api/v1/me')).json();
     if (returning) {
       expect(beforePhoto.user.has_photo).toBe(true);
@@ -1223,6 +1256,7 @@ const key = 'fixture-only-provider-key';
     if (returning) {
       const memberContext = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
       const member = await memberContext.newPage();
+      observeAuth(member);
       try {
         const signed = await member.request.post(origin + '/api/auth/sign-in/email', { headers: { Origin: origin }, data: { email: 'member@example.test', password: 'test-password-only-123456' } });
         expect(signed.status()).toBe(200);
