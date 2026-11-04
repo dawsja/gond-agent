@@ -173,6 +173,8 @@ interface Live {
   releaseForWaiting?: boolean;
   /** Fence late saves after a failed-release capture times out. Never reuse this worker. */
   checkpointDisabled?: boolean;
+  /** Final failure capture is one-shot, including in-flight calls and teardown retries. */
+  failedCheckpointAttempted?: boolean;
   /** Active user delivery has not been acknowledged; a failure capture must not consume it. */
   pendingDeliveryId?: string;
   keepTimer?: ReturnType<typeof setTimeout>;
@@ -1852,7 +1854,9 @@ export class Runs {
    * Capture only at release: an in-window follow-up keeps the original live-workspace semantics.
    * The closing reservation excludes new delivery until the paired capture has settled. */
   private async checkpointFailedWorkspace(id: string, live: Live | undefined) {
-    if (!live || !this.workerAlive(live) || this.get(id).status !== "failed") return;
+    if (!live || live.closed || live.destruction || live.checkpointDisabled || live.failedCheckpointAttempted ||
+        !this.workerAlive(live) || this.get(id).status !== "failed") return;
+    live.failedCheckpointAttempted = true;
     live.closing = true;
     try {
       await evidenceRequest(async () => {

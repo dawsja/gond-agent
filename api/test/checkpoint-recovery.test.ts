@@ -379,6 +379,64 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     } finally { gate.resolve(); vi.useRealTimers(); }
   });
 
+  it("attempts a timed-out final capture only once across destruction retries", async () => {
+    const { run, worker } = await failLive("model");
+    const gate = deferred();
+    worker.captureGate = gate.promise;
+    for (let attempt = 0; attempt < 4; attempt++)
+      worker.destroy.mockRejectedValueOnce(new Error("Destroy unavailable"));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const closing = expect(runs.close(run.id)).rejects.toThrow("Destroy unavailable");
+    try {
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(worker.finalCaptures).toBe(1);
+      expect(worker.destroy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+      expect(worker.destroy).toHaveBeenCalledTimes(1);
+      expect(rows(run.id)).toHaveLength(0); // Timeout discards the older valid pair too.
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        await vi.advanceTimersByTimeAsync(1000 * 2 ** (attempt - 1));
+        expect(worker.finalCaptures).toBe(1);
+        expect(worker.destroy).toHaveBeenCalledTimes(attempt + 1);
+      }
+      // All five destroys finish after one 10-second deadline plus 15 seconds of retry backoff.
+      expect(worker.destroyed).toBe(true);
+      expect(runs.get(run.id)).toMatchObject({ work_kept: false, resume_from_checkpoint: false });
+      expect(runs.get(run.id).error).toContain("within 10 seconds");
+      expect(runs.history(run.id, 0).filter(event => event.type === "run.checkpoint_unavailable"))
+        .toEqual([expect.objectContaining({ reason: "timeout" })]);
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rows(run.id)).toHaveLength(0); // Late capture cannot resurrect a discarded pair.
+    } finally {
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+      await closing;
+    }
+  });
+
+  it("fences a repeated failure capture before the first attempt settles", async () => {
+    const { run, worker } = await failLive("model");
+    type FailureLive = Parameters<Runs["checkpointFailedWorkspace"]>[1];
+    const service = runs as unknown as {
+      live: Map<string, FailureLive>;
+      checkpointFailedWorkspace(id: string, live: FailureLive): Promise<unknown>;
+    };
+    const live = service.live.get(run.id)!;
+    const gate = deferred();
+    worker.captureGate = gate.promise;
+    const first = service.checkpointFailedWorkspace(run.id, live);
+    const repeated = service.checkpointFailedWorkspace(run.id, live);
+    try {
+      expect(worker.finalCaptures).toBe(1);
+    } finally {
+      gate.resolve();
+      await Promise.all([first, repeated]);
+    }
+  });
+
   it("reports a fixed state_too_large reason when full stored history exceeds the API state cap", async () => {
     const { run, worker } = await checkpointed();
     const previous = rows(run.id).at(-1)!;
