@@ -142,8 +142,16 @@ const gitEnv = (env: NodeJS.ProcessEnv, cwd: string, args: string[], timeout = 1
     },
   );
 export const git = (cwd: string, ...args: string[]) => gitEnv(process.env, cwd, args);
-const authenticatedGit = (env: NodeJS.ProcessEnv, cwd: string, args: string[], onStderr?: (text: string) => void) => gitEnv(env, cwd,
-  ["-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", ...args], args[0] === "clone" ? 600_000 : 120_000, onStderr);
+const authenticatedGit = (env: NodeJS.ProcessEnv, cwd: string, args: string[], onStderr?: (text: string) => void, timeout = args[0] === "clone" ? 600_000 : 120_000) => gitEnv(env, cwd,
+  ["-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", ...args], timeout, onStderr);
+
+/** Refresh only the comparison refs in the service clone, never the worker or upstream history. */
+export async function fetchDiffBase(cwd: string, base: string, head: string, depth: number, env: NodeJS.ProcessEnv, timeout: number, includeHead = false) {
+  if (!validBranch(base) || !/^[a-f0-9]{40}$/.test(head)) throw new Error("Invalid comparison revision");
+  await withRetry("fetch", (_attempt, remaining) => authenticatedGit(env, cwd,
+    ["fetch", "--no-tags", "--depth", String(depth), "origin", `+refs/heads/${base}:refs/remotes/origin/${base}`, ...(includeHead ? [head] : [])],
+    undefined, remaining), { maxAttempts: 2, totalTimeoutMs: timeout });
+}
 
 /** Owner-scoped publication reconciliation; an absent branch returns null. */
 export async function branchHead(repo: string, branch: string, env: NodeJS.ProcessEnv): Promise<string | null> {

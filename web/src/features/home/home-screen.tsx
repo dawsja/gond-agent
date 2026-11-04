@@ -150,7 +150,7 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
           {run.files > 0 && (
             <span className="inline-flex items-center gap-2 md:hidden">
               <Sep />
-              <DiffCounts add={run.additions} del={run.deletions} className="text-[12px]" />
+              <DiffCounts add={run.additions} del={run.deletions} compact className="text-[12px]" />
             </span>
           )}
           {run.pr_number && (

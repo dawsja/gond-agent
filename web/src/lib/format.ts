@@ -1,3 +1,12 @@
+/** Bounded compact counts for list cards. Detail views keep the exact integer. */
+export function compactCount(n: number): string {
+  if (n < 1000) return String(n)
+  const units = [[1e15, "q"], [1e12, "t"], [1e9, "b"], [1e6, "m"], [1e3, "k"]] as const
+  const [divisor, suffix] = units.find(([divisor]) => n >= divisor)!
+  const scaled = n / divisor
+  return `${scaled >= 100 ? Math.floor(scaled) : Math.floor(scaled * 10) / 10}${suffix}`
+}
+
 /** A percentage: "0%", "<0.1%", "3.4%", "37%".  */
 export function pct(n: number): string {
   if (n <= 0) return "0%"
