@@ -1,0 +1,149 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { test } from 'node:test'
+import ts from 'typescript'
+const require = createRequire(import.meta.url)
+const cache = new Map()
+function load(path) {
+  if (cache.has(path.href)) return cache.get(path.href)
+  const exports = {}; cache.set(path.href, exports)
+  const source = readFileSync(path, 'utf8')
+  const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText
+  new Function('require', 'exports', code)(name => name.startsWith('.') ? load(new URL(name + '.ts', path)) : require(name), exports)
+  return exports
+}
+const { groupTranscriptItems } = load(new URL('../src/features/run/group-transcript.ts', import.meta.url))
+const { createTranscript } = load(new URL('../src/features/run/transcript.ts', import.meta.url))
+const { activityLabel, presentTool } = load(new URL('../src/features/run/tool-presentation.ts', import.meta.url))
+const call = (id, name = 'bash', status = 'done', input = { command: 'npm test' }) => ({ callId: id, ...presentTool(name, '', input), status, output: '', summary: '', start: 1 })
+const item = tool => ({ kind: 'tool', key: tool.callId, tool })
+const group = tools => groupTranscriptItems(tools.map(item))
+
+test('empty and single completed activity, without mutating frozen inputs', () => {
+  assert.deepEqual(groupTranscriptItems([]), [])
+  const tool = call('first'); Object.freeze(tool.paths); Object.freeze(tool)
+  const input = Object.freeze([Object.freeze(item(tool))])
+  const [row] = groupTranscriptItems(input)
+  assert.equal(row.label, 'Ran 1 command')
+  assert.equal(row.detail, 'npm test')
+  assert.equal(row.tools[0], tool)
+})
+
+test('only consecutive kinds collapse, preserving chronological steps and check separators', () => {
+  const rows = group([call('a'), call('b'), call('c', 'edit', 'done', { path: 'api/src/runs/service.ts' }), call('d'), call('e', 'run_checks'), call('f')])
+  assert.deepEqual(rows.map(row => row.kind === 'activity-group' ? row.activity : row.tool.name), ['commands', 'edits', 'commands', 'run_checks', 'commands'])
+  assert.equal(rows[0].label, 'Ran 2 commands')
+  assert.equal(rows[1].label, 'Edited 1 file')
+  assert.equal(rows[1].detail, 'api/src/runs/service.ts')
+  assert.deepEqual(rows[0].tools.map(t => t.callId), ['a', 'b'])
+})
+
+test('failed member is exposed in the collapsed group model with its output intact', () => {
+  const failed = { ...call('bad', 'bash', 'failed'), output: 'Permission denied' }
+  const [row] = group([call('a'), failed, call('b')])
+  assert.equal(row.failed, 1)
+  assert.equal(row.tools[1].output, 'Permission denied')
+})
+
+test('stable first-call ID retains keyed expansion as terminal steps append', () => {
+  const [before] = group([call('a')])
+  const expanded = new Map([[before.key, true]])
+  const [after] = group([call('a'), call('b'), call('c', 'bash', 'failed')])
+  assert.equal(after.key, before.key)
+  assert.equal(expanded.get(after.key), true)
+  assert.equal(after.tools.length, 3)
+  assert.equal(after.failed, 1)
+})
+
+test('live commands are standalone until done, then join the preceding group', () => {
+  const live = item(call('live', 'bash', 'running'))
+  const before = groupTranscriptItems([item(call('a')), live])
+  assert.equal(before.length, 2)
+  assert.equal(before[1].tool, live.tool)
+  assert.equal(before[1].expansionKey, 'activity:commands:live')
+  const after = group([call('a'), call('live')])
+  assert.equal(after.length, 1)
+  assert.equal(after[0].key, before[0].key)
+  assert.ok(after[0].expansionKeys.includes(before[1].expansionKey), 'an open live row transfers its disclosure state')
+})
+
+test('flattens old folded explore/edit batches, separates live members, deduplicates file counts', () => {
+  const read = call('r', 'Read', 'done', { file_path: 'a.ts' })
+  const review = call('review', 'batch', 'done', {})
+  const live = call('live', 'read', 'running', { path: 'b.ts' })
+  const [soloLive] = groupTranscriptItems([{ kind: 'explore', key: 'x1', tools: [live] }])
+  const [appendedLive] = groupTranscriptItems([{ kind: 'explore', key: 'x1', tools: [live, call('next', 'read', 'running')] }])
+  assert.equal(soloLive.key, appendedLive.key)
+  const rows = groupTranscriptItems([{ kind: 'explore', key: 'x1', tools: [read, review, live] }])
+  assert.equal(rows[0].label, 'Explored 1 file')
+  assert.deepEqual(rows[0].tools, [read, review])
+  assert.equal(rows[1].kind, 'tool')
+  assert.equal(rows[1].tool, live)
+  const [edits] = group([call('e1', 'Edit', 'done', { path: 'a.ts' }), call('e2', 'write', 'done', { path: 'a.ts' }), call('e3', 'fileChange', 'done', { changes: [{ path: 'b.ts' }] })])
+  assert.equal(edits.label, 'Edited 2 files')
+  assert.equal(group([review])[0].label, 'Explored context · 1 step')
+})
+
+test('out-of-order parallel completion retains all stable disclosure membership keys', () => {
+  const a = call('a', 'read', 'running', { path: 'a.ts' })
+  const b = call('b', 'read', 'done', { path: 'b.ts' })
+  const before = groupTranscriptItems([{ kind: 'explore', key: 'x1', tools: [a, b] }])
+  const expanded = new Set([before[1].key])
+  const [after] = groupTranscriptItems([{ kind: 'explore', key: 'x1', tools: [{ ...a, status: 'done' }, b] }])
+  assert.ok(after.expansionKeys.some(key => expanded.has(key)))
+  assert.deepEqual(after.tools.map(t => t.callId), ['a', 'b'])
+  assert.equal(after.label, 'Explored 2 files')
+})
+
+test('legacy missing metadata, unknown/external tools, and other items pass through as separators', () => {
+  const unknown = item(call('unknown', 'future_tool'))
+  const legacy = item({ ...call('old'), title: '', paths: [] })
+  const external = item(call('ext', 'mcp__remote__bash'))
+  const text = { kind: 'text', key: 't', text: 'A message' }
+  const future = { kind: 'future', key: 'future' }
+  const rows = groupTranscriptItems([item(call('a')), unknown, legacy, external, text, future, item(call('b'))])
+  assert.deepEqual(rows.slice(1, -1), [unknown, legacy, external, text, future])
+  assert.equal(rows[0].tools.length, 1)
+  assert.equal(rows.at(-1).tools.length, 1)
+})
+
+test('grouping streamed snapshots matches replay, including legacy aliases and live explores', () => {
+  const events = [
+    { type: 'tool.start', call_id: 'a', name: 'commandExecution', input: { command: 'pwd' } },
+    { type: 'tool.end', call_id: 'a', ok: true },
+    { type: 'tool.start', call_id: 'b', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool.end', call_id: 'b', ok: true },
+    { type: 'tool.start', call_id: 'c', name: 'read', input: { path: 'a.ts' } },
+    { type: 'tool.end', call_id: 'c', ok: true },
+    { type: 'tool.start', call_id: 'd', name: 'read', input: { path: 'b.ts' } },
+  ].map((event, index) => ({ ...event, seq: index + 1, ts: index + 1 }))
+  const fold = createTranscript()
+  for (const event of events) fold([event])
+  assert.deepEqual(groupTranscriptItems(fold([]).items), groupTranscriptItems(createTranscript()(events).items))
+  const rows = groupTranscriptItems(fold([]).items)
+  assert.equal(rows[0].tools.length, 2)
+  assert.equal(rows[1].label, 'Explored 1 file')
+  assert.equal(rows[2].tool.status, 'running')
+})
+
+test('check names remain detailed and only terminal shell success implies pass', () => {
+  const check = call('check', 'run_checks')
+  assert.equal(check.title, 'npm test')
+  assert.equal(activityLabel(check), 'Checks finished')
+  assert.equal(activityLabel({ ...check, summary: '1.2s', output: 'No type errors.' }), 'Checks finished · Passed')
+  assert.equal(activityLabel({ ...check, summary: 'background · bg-1' }), 'Checks finished')
+  assert.equal(activityLabel({ ...check, output: '{"exit_code":0}' }), 'Checks finished')
+  assert.equal(activityLabel({ ...check, status: 'failed' }), 'Checks failed · Failed')
+  assert.equal(activityLabel({ ...check, status: 'running' }), 'Running checks')
+  assert.equal(group([call('a'), check, call('b')]).length, 3)
+})
+
+test('transcript view renders activity exclusively through the pure grouping boundary', () => {
+  const source = readFileSync(new URL('../src/features/run/transcript-view.tsx', import.meta.url), 'utf8')
+  assert.match(source, /import \{ groupTranscriptItems,.*from "\.\/group-transcript"/)
+  assert.match(source, /const timeline = useMemo\(\(\) => groupTranscriptItems\(t.items\), \[t.items\]\)/)
+  assert.match(source, /\{timeline.map\(render\)\}/)
+  assert.doesNotMatch(source, /t.items.map\(render\)/)
+  assert.match(source, /case "activity-group":[\s\S]*?activity=\{it\}/)
+})

@@ -1,6 +1,6 @@
 // A run's transcript on its page: messages, tools, plans and subagents (TUI language, softened).
 import { Check, CircleAlert, CirclePause, GitPullRequestArrow, LoaderCircle } from "lucide-react"
-import { type ReactNode, useMemo } from "react"
+import { type ReactNode, useMemo, useState } from "react"
 import { Activity } from "@/components/workspace/activity"
 import { ProfileAvatar } from "@/components/profile-avatar"
 import type { Run, RunStatus } from "@/lib/api"
@@ -11,12 +11,13 @@ import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
 import { DiffCounts, Dot, PrChip, StatusPill } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
-import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
+import { type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceLine, TraceTitle } from "@shared/ui/trace"
 import { AgentLabel } from "./agent-label"
 import { activityLabel, groupLabel } from "./tool-presentation"
 import { SharedImage } from "./shared-image"
+import { groupTranscriptItems, type ActivityGroup, type TimelineItem } from "./group-transcript"
 
 /* ───────────── transcript pieces (TUI language, softened) ───────────── */
 
@@ -114,7 +115,7 @@ function ToolDetails({ tool, runId }: { tool: ToolCall; runId: string }) {
   }, [tool.output])
   return <div className="flex min-w-0 flex-col gap-2 text-xs text-muted-foreground">
     <div className="flex min-w-0 items-start gap-2">
-      <span className="shrink-0">{tool.label}</span>
+      <span className={cn("shrink-0", tool.status === "failed" && "text-failed")}>{tool.label}{tool.status === "failed" ? " · Failed" : ""}</span>
       {tool.title && <code className="min-w-0 break-all text-foreground">{tool.title}</code>}
       {took(tool) && <span className="ml-auto shrink-0 text-subtle">{took(tool)}</span>}
     </div>
@@ -127,23 +128,27 @@ function ToolDetails({ tool, runId }: { tool: ToolCall; runId: string }) {
   </div>
 }
 
-function ToolActivity({ tools, runId, live, group }: { tools: ToolCall[]; runId: string; live: boolean; group?: "explore" | "edits" }) {
+function ToolActivity({ tools, runId, live, group, activity, open, onOpenChange }: { tools: ToolCall[]; runId: string; live: boolean; group?: "explore" | "edits"; activity?: ActivityGroup; open?: boolean; onOpenChange?: (open: boolean) => void }) {
   const failed = tools.some(tool => tool.status === "failed")
   const running = tools.some(tool => tool.status === "running")
   const interrupted = running && !live && !failed
-  const label = interrupted ? "Activity interrupted" : group ? groupLabel(tools, group === "edits") : activityLabel(tools[0])
+  const label = activity ? activity.label : interrupted ? "Activity interrupted" : group ? groupLabel(tools, group === "edits") : activityLabel(tools[0])
   const files = useMemo(() => tools.flatMap(tool => tool.diff ? parseUnifiedDiff(tool.diff) : []), [tools])
   const status = failed ? "error" : interrupted ? "pending" : running ? "running" : undefined
-  const indicator = failed ? <CircleAlert /> : interrupted ? <CirclePause /> : running ? <LoaderCircle className="animate-spin text-warning motion-reduce:animate-none" /> : !group ? <Check className="text-ready" /> : undefined
+  const indicator = failed ? <CircleAlert /> : interrupted ? <CirclePause /> : running ? <LoaderCircle className="animate-spin text-warning motion-reduce:animate-none" /> : !group && !activity ? <Check className="text-ready" /> : undefined
   return <Trace aria-label="Agent activity">
-    <TraceCollapsible className={cn("min-w-0", failed && "rounded border border-failed/30 bg-failed/5 px-3 py-1")}>
+    <TraceCollapsible open={open} onOpenChange={onOpenChange} className={cn("min-w-0", tools[0].name === "run_checks" && "rounded border border-border bg-surface px-3 py-1", failed && "rounded border border-failed/30 bg-failed/5 px-3 py-1")}>
       <TraceCollapsibleTrigger indicator={indicator}>
         <TraceLine status={status} className="flex-1">
-          <TraceTitle>{label}</TraceTitle>
+          <TraceTitle className="break-all">
+            {label}
+            {activity?.failed ? <span className="font-medium"> · {activity.failed} failed</span> : null}
+            {(activity?.detail || (!group && tools[0].name === "run_checks" && tools[0].title)) && <> <code className="ml-2 text-muted-foreground">{activity?.detail || tools[0].title}</code></>}
+          </TraceTitle>
           {files.length > 0 && <TraceDescription><DiffCounts add={files.reduce((n, f) => n + f.add, 0)} del={files.reduce((n, f) => n + f.del, 0)} /></TraceDescription>}
         </TraceLine>
       </TraceCollapsibleTrigger>
-      {failed && <p role="status" className="pb-1 pl-5 text-xs text-failed">{group ? "An action failed. Open details to see what happened." : "Open details to see what happened."}</p>}
+      {failed && <p role="status" className="pb-1 pl-5 text-xs text-failed">{group || activity ? "An action failed. Open details to see what happened." : "Open details to see what happened."}</p>}
       <TraceCollapsibleContent><div className="flex min-w-0 flex-col gap-4">{tools.map(tool => <ToolDetails key={tool.callId} tool={tool} runId={runId} />)}</div></TraceCollapsibleContent>
     </TraceCollapsible>
   </Trace>
@@ -273,7 +278,16 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
     return keys
   }, [t.items])
   const firstUser = t.items.find((i) => i.kind === "user")?.key
-  const render = (it: Item) => {
+  const timeline = useMemo(() => groupTranscriptItems(t.items), [t.items])
+  // Membership keys preserve open details when parallel completions merge groups.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  const setActivityOpen = (keys: string[], open: boolean) => setExpanded(previous => {
+    const next = new Set(previous)
+    for (const key of keys) next.delete(key)
+    if (open) next.add(keys[0])
+    return next
+  })
+  const render = (it: TimelineItem) => {
     switch (it.kind) {
       case "user":
         return (
@@ -299,11 +313,15 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
           <Prose text={it.text} />
         </section>
       }
+      case "activity-group":
+        return <ToolActivity key={it.key} tools={it.tools} activity={it} runId={run.id} live={live} open={it.expansionKeys.some(key => expanded.has(key))} onOpenChange={open => setActivityOpen(it.expansionKeys, open)} />
       case "explore":
       case "edits":
         return <ToolActivity key={it.key} tools={it.tools} group={it.kind} runId={run.id} live={live} />
-      case "tool":
-        return <ToolActivity key={it.key} tools={[it.tool]} runId={run.id} live={live} />
+      case "tool": {
+        const expansionKey = it.expansionKey
+        return <ToolActivity key={it.key} tools={[it.tool]} runId={run.id} live={live} open={expansionKey ? expanded.has(expansionKey) : undefined} onOpenChange={expansionKey ? open => setActivityOpen([expansionKey], open) : undefined} />
+      }
       case "plan":
         return <PlanCard key={it.key} steps={it.steps} />
       case "agents":
@@ -328,7 +346,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
   return (
     <div className="mx-auto flex w-full max-w-[720px] flex-col gap-5 px-8 pt-6 pb-8 max-md:px-4 max-md:pt-4">
       {t.items.length === 0 && <UserMessage text={run.prompt} ts={run.created_at} runId={run.id} author={author} authorId={run.user_id} base={run.base_branch} first />}
-      {t.items.map(render)}
+      {timeline.map(render)}
       {live && run.status !== "queued" && !busyTool && (
         <Activity label={t.step ?? run.step ?? "Working"} />
       )}
