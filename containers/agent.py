@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import hmac
+import hashlib
 import http.server
 import io
 import json
@@ -155,7 +156,7 @@ def checkpoint_message(base, head):
     return f"Gond Agent checkpoint\n\nbase_sha: {base}\nhead_sha: {head}\n"
 
 
-def checkpoint_tree(req):
+def checkpoint_tree(req, state_digest=None):
     """Export the working tree, not the staging area; never publish this commit."""
     base = checkpoint_sha(req.get("base_sha"))
     identity = req.get("identity", {})
@@ -184,6 +185,9 @@ def checkpoint_tree(req):
         git("read-tree", head)
         git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
         tree = git("write-tree").decode().strip()
+        fingerprint = hashlib.sha256(f"{base}:{parent}:{tree}:{state_digest}".encode()).hexdigest() if state_digest else None
+        if fingerprint and fingerprint == req.get("previous_fingerprint"):
+            return {"unchanged": True}
         env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER")
                     for key, field in (("NAME", "name"), ("EMAIL", "email"))})
         # Stable internal metadata; publication still uses the normal snapshot path.
@@ -196,7 +200,7 @@ def checkpoint_tree(req):
         git("bundle", "create", "--version=2", str(bundle), CHECKPOINT_REF, "^" + parent)
         if bundle.stat().st_size > MAX_CHECKPOINT_BUNDLE:
             raise RuntimeError("The checkpoint bundle is too large.")
-        return {"bundle": base64.b64encode(bundle.read_bytes()).decode(),
+        return {**({"fingerprint": fingerprint} if fingerprint else {}), "bundle": base64.b64encode(bundle.read_bytes()).decode(),
                 "base_sha": base, "head_sha": parent, "checkpoint_sha": commit}
 
 
@@ -432,7 +436,8 @@ def checkpoint_rpc(req):
             return state_rpc({"method": "checkpoint.release", "boundary_id": held[2]}, expected_worker=held[0])
         state = state_rpc({"method": "export_state", "run_id": req.get("run_id"),
                            "owner_id": req.get("owner_id"), "boundary_id": held[2]}, expected_worker=held[0])
-        tree = checkpoint_tree(req)
+        state_digest = hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        tree = checkpoint_tree(req, state_digest)
         with worker_lock:
             if held_boundary != held or worker is not held[0] or worker.poll() is not None:
                 raise RuntimeError("The checkpoint boundary is no longer available.")

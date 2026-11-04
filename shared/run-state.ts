@@ -2,8 +2,8 @@
 export const RUN_STATES = ["queued", "working", "ready", "failed", "stopped", "merged", "interrupted"] as const
 export type RunStatus = typeof RUN_STATES[number]
 
-/** Same-state updates are allowed for progress/idempotency, except interrupted:
- * recovery must explicitly re-enter the queue before doing any work.
+/** Same-state updates are allowed for metadata/idempotency. Interrupted runs may
+ * fail or stop, but must explicitly re-enter the queue before doing any work.
  */
 export const RUN_TRANSITIONS = {
   queued: ["queued", "working", "failed", "stopped", "merged"],
@@ -12,7 +12,7 @@ export const RUN_TRANSITIONS = {
   failed: ["failed", "queued", "working", "ready", "stopped", "merged"],
   stopped: ["stopped", "queued", "working", "failed", "merged"],
   merged: ["merged"],
-  interrupted: ["queued", "stopped", "merged"],
+  interrupted: ["interrupted", "queued", "failed", "stopped", "merged"],
 } as const satisfies Record<RunStatus, readonly RunStatus[]>
 
 export function isRunStatus(value: unknown): value is RunStatus {

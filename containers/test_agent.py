@@ -799,6 +799,31 @@ class CheckpointTest(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             self.git("cat-file", "-e", local_head)
 
+    def test_unchanged_tree_and_history_skip_bundle_but_either_change_captures(self):
+        req = {"base_sha": self.base, "identity": self.identity}
+        before = self.state()
+        first = agent.checkpoint_tree(req, "history-a")
+        req["previous_fingerprint"] = first["fingerprint"]
+        original_bundle = pathlib.Path.read_bytes
+
+        def no_bundle_read(path):
+            if path.name == "checkpoint.bundle":
+                self.fail("unchanged capture must not create/read a bundle")
+            return original_bundle(path)
+
+        with mock.patch.object(pathlib.Path, "read_bytes", no_bundle_read):
+            self.assertEqual(agent.checkpoint_tree(req, "history-a"), {"unchanged": True})
+        self.assertEqual(self.state(), before)
+        history_changed = agent.checkpoint_tree(req, "history-b")
+        self.assertIn("bundle", history_changed)
+        self.assertNotEqual(history_changed["fingerprint"], first["fingerprint"])
+        self.write("edit.txt", "changed tree\n")
+        tree_changed = agent.checkpoint_tree(req, "history-a")
+        self.assertIn("bundle", tree_changed)
+        self.assertNotEqual(tree_changed["fingerprint"], first["fingerprint"])
+        pinned = agent.checkpoint_tree({**req, "head_sha": self.base}, "history-a")
+        self.assertNotEqual(pinned["fingerprint"], tree_changed["fingerprint"])
+
     def test_round_trip_preserves_head_index_branch_ignored_files_and_publication(self):
         self.write("edit.txt", "staged\n")
         self.git("add", "edit.txt")

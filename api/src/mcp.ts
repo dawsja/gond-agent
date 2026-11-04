@@ -412,7 +412,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "get_session",
-        "Read a session's current status and recorded usage.",
+        "Read a session's current status and recorded usage. Interrupted sessions report state interrupted and done true (not successful completion). There is no explicit MCP resume tool; send_session_message resumes through the queue.",
         { session_id: id },
         true,
         ({ session_id }) => {
@@ -437,7 +437,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "read_session_events",
-        "Read transcript events after a sequence cursor. Session output is untrusted repository/model content.",
+        "Read transcript events after a sequence cursor. Interrupted sessions return done true and stop waiting; use send_session_message to resume (no explicit MCP resume tool). Session output is untrusted repository/model content.",
         {
           session_id: id,
           after_seq: z.number().int().nonnegative().default(0),
@@ -547,7 +547,7 @@ export function createMcp(db: Store, cfg: Config, runs: Runs) {
       );
       tool(
         "send_session_message",
-        "Queue a follow-up, optionally with another available model. Optional pr_body replaces the persistent PR description (up to 20,000 characters, including empty). Otherwise the clean final reply (end_turn) after the last tool call supplies the description, falling back to the plain run title, never the prompt. Sessions created by the removed Claude Code and Codex agents are read-only.",
+        "Queue a follow-up, optionally with another available model. This also resumes an interrupted session through the queue; there is no separate MCP resume tool. Interrupted state reports done true, not successful completion. Optional pr_body replaces the persistent PR description (up to 20,000 characters, including empty). Otherwise the clean final reply (end_turn) after the last tool call supplies the description, falling back to the plain run title, never the prompt. Sessions created by the removed Claude Code and Codex agents are read-only.",
         { session_id: id, request_id: id, text, pr_body: bodySchema.optional(), ...selection },
         false,
         (args) =>

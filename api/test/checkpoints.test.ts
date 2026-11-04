@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seal, unseal } from "../src/auth";
-import { CHECKPOINT_BUNDLE_MAX, CHECKPOINT_STATE_MAX, Checkpoints, checkpointSettings, type Checkpoint, type CheckpointKey, type CheckpointTree } from "../src/checkpoints";
+import { CHECKPOINT_BUNDLE_MAX, CHECKPOINT_STATE_MAX, CHECKPOINT_CLAIM_LEASE_MS, Checkpoints, checkpointSettings, type Checkpoint, type CheckpointKey, type CheckpointTree } from "../src/checkpoints";
 import { openStore, type Store } from "../src/db";
 
 const secret = "checkpoint-test-auth-secret-at-least-32-characters";
@@ -81,6 +81,31 @@ it("adds nullable claim metadata to existing checkpoints without rewriting them"
   expect(rows()).toEqual([{ ...saved, claimed_by: null }]);
 });
 
+it("adds lease and quarantine columns without rewriting legacy claims, consumed rows or files", () => {
+  const saved = save(), consumed = save(2), first = store.claim(key())!;
+  store.consume(key(2), consumed.seq);
+  const before = rows().map(({ claimed_at: _time, invalid_reason: _reason, ...row }) => row);
+  const runsBefore = db.prepare("SELECT * FROM runs ORDER BY id").all();
+  const stateBefore = fs.readFileSync(join(root(), saved.state_path));
+  db.exec("ALTER TABLE run_checkpoints DROP COLUMN claimed_at; ALTER TABLE run_checkpoints DROP COLUMN invalid_reason");
+  db.close();
+  db = openStore(dir);
+  const migrated = before.map(row => ({ ...row, claimed_at: null, invalid_reason: null }));
+  expect(rows()).toEqual(migrated);
+  expect(db.prepare("SELECT * FROM runs ORDER BY id").all()).toEqual(runsBefore);
+  db.close();
+  db = openStore(dir);
+  expect(rows()).toEqual(migrated);
+  expect(fs.readFileSync(join(root(), saved.state_path))).toEqual(stateBefore);
+  store = new Checkpoints(db, dir, secret, { now: () => now });
+  const replacement = store.claim(key())!; // Legacy claims without a timestamp cannot pin storage forever.
+  expect(replacement.checkpoint.seq).toBe(saved.seq);
+  expect(replacement.claimToken).not.toBe(first.claimToken);
+  expect(() => store.consumeClaim(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+  expect(store.claim(key(2))).toBeNull();
+  expect(rows()[1].consumed_at).toBe(now);
+});
+
 it("exclusively claims the latest checkpoint across connections without falling back to an older one", () => {
   expect(store.claim(key())).toBeNull();
   const older = save(), latest = save();
@@ -88,7 +113,7 @@ it("exclusively claims the latest checkpoint across connections without falling 
   try {
     const other = new Checkpoints(otherDb, dir, secret, { now: () => now });
     const claimed = store.claim(key());
-    expect(claimed).toMatchObject({ checkpoint: { ...latest, claimed_by: claimed?.claimToken },
+    expect(claimed).toMatchObject({ checkpoint: { ...latest, claimed_by: claimed?.claimToken, claimed_at: now },
       bundle: Buffer.from("opaque-not-a-git-bundle"), state: "supplied-state", tree });
     expect(claimed?.claimToken).toMatch(/^[a-f0-9]{64}$/);
     expect(other.claim(key())).toBeNull();
@@ -145,16 +170,112 @@ it("preserves claims across startup until explicit recovery reset, without reviv
   expect(rows()[1].consumed_at).toBe(now);
 });
 
-it("validates checkpoint usability before claiming and leaves failed claims unclaimed", () => {
+it.each(["corrupt bundle", "expired", "wrong worker version"])("quarantines a %s before claiming, without retrying it or falling back", failure => {
+  const older = save(), latest = save();
+  expect(() => store.claim(key(1, "bob"))).toThrow("unavailable");
+  expect(rows()).toEqual([older, latest]); // Authorization failures must not poison another owner's data.
+  if (failure === "corrupt bundle") fs.writeFileSync(join(root(), latest.bundle_path), Buffer.alloc(latest.bundle_size, 42));
+  if (failure === "expired") now = latest.created_at + 7 * DAY;
+  const attemptKey = failure === "wrong worker version" ? { ...key(), runnerVersion: "worker-v2" } : key();
+  expect(store.claim(attemptKey)).toBeNull();
+  expect(rows()).toEqual([older, { ...latest, consumed_at: now, claimed_by: null, claimed_at: null, invalid_reason: "restore_failed" }]);
+  // Even repairing the bytes/time/version cannot make a known-bad restore retryable.
+  fs.writeFileSync(join(root(), latest.bundle_path), Buffer.from("opaque-not-a-git-bundle"));
+  now = latest.created_at;
+  store.resetClaims();
+  expect(store.claim(key())).toBeNull();
+  expect(() => store.load(key(), latest.seq)).toThrow("unavailable");
+});
+
+it("replaces a claim at exactly ten minutes across connections and fences out its stale token", () => {
+  expect(CHECKPOINT_CLAIM_LEASE_MS).toBe(10 * 60_000);
+  const saved = save(), first = store.claim(key())!;
+  const claimedAt = now;
+  expect(rows()[0]).toMatchObject({ claimed_by: first.claimToken, claimed_at: claimedAt });
+  const otherDb = openStore(dir);
+  try {
+    const other = new Checkpoints(otherDb, dir, secret, { now: () => now });
+    now = claimedAt + CHECKPOINT_CLAIM_LEASE_MS - 1;
+    expect(other.claim(key())).toBeNull();
+    expect(rows()[0]).toMatchObject({ claimed_by: first.claimToken, claimed_at: claimedAt });
+    now++;
+    const replacement = other.claim(key())!;
+    expect(replacement.checkpoint.seq).toBe(saved.seq);
+    expect(replacement.claimToken).not.toBe(first.claimToken);
+    const replacementRow = rows()[0];
+    expect(replacementRow).toMatchObject({ claimed_by: replacement.claimToken, claimed_at: now, consumed_at: null });
+    expect(() => store.release(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+    expect(() => store.consumeClaim(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+    store.quarantine(key(), saved.seq, first.claimToken);
+    expect(rows()).toEqual([replacementRow]);
+    other.consumeClaim(key(), saved.seq, replacement.claimToken);
+    const consumedAt = now;
+    now++;
+    expect(() => store.consumeClaim(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+    other.consumeClaim(key(), saved.seq, replacement.claimToken);
+    expect(rows()[0].consumed_at).toBe(consumedAt);
+    expect(store.claim(key())).toBeNull();
+  } finally { otherDb.close(); }
+});
+
+it("quarantines only the current claim and keeps it unavailable after restart and claim reset", () => {
+  const older = save(), latest = save(), claimed = store.claim(key())!;
+  const before = rows();
+  store.quarantine(key(), latest.seq); // An unclaimed caller cannot invalidate an active restore.
+  expect(rows()).toEqual(before);
+  store.quarantine(key(), latest.seq, claimed.claimToken);
+  const quarantined = rows()[1];
+  expect(rows()).toEqual([older, { ...latest, consumed_at: now, claimed_by: null, claimed_at: null, invalid_reason: "restore_failed" }]);
+  now += CHECKPOINT_CLAIM_LEASE_MS;
+  store.quarantine(key(), latest.seq, claimed.claimToken);
+  expect(rows()[1]).toEqual(quarantined);
+  expect(() => store.release(key(), latest.seq, claimed.claimToken)).toThrow("unavailable");
+  expect(() => store.consumeClaim(key(), latest.seq, claimed.claimToken)).toThrow("unavailable");
+  db.close();
+  db = openStore(dir);
+  store = new Checkpoints(db, dir, secret, { now: () => now });
+  store.resetClaims();
+  expect(store.claim(key())).toBeNull();
+  expect(rows()).toEqual([older, quarantined]);
+});
+
+it("protects a live claim from retention but deletes its pair as soon as the lease expires", () => {
+  const retentionMs = 2 * CHECKPOINT_CLAIM_LEASE_MS;
+  store = new Checkpoints(db, dir, secret, { now: () => now, retentionMs });
   const saved = save();
-  for (const bad of [key(1, "bob"), { ...key(), runnerVersion: "worker-v2" }])
-    expect(() => store.claim(bad)).toThrow("unavailable");
-  now = saved.created_at + 7 * DAY;
-  expect(() => store.claim(key())).toThrow("unavailable");
-  now = saved.created_at;
-  fs.writeFileSync(join(root(), saved.bundle_path), Buffer.alloc(saved.bundle_size, 42));
-  expect(() => store.claim(key())).toThrow("could not be read");
-  expect(rows()).toEqual([saved]);
+  now = saved.created_at + retentionMs - 1;
+  const claim = store.claim(key())!;
+  const claimedAt = now;
+  now++;
+  store.cleanup();
+  expect(rows()[0]).toMatchObject({ seq: saved.seq, claimed_by: claim.claimToken });
+  now = claimedAt + CHECKPOINT_CLAIM_LEASE_MS - 1;
+  store.cleanup();
+  expect(exists(saved.bundle_path)).toBe(true);
+  expect(exists(saved.state_path)).toBe(true);
+  now++;
+  store.cleanup();
+  expect(rows()).toEqual([]);
+  expect(exists(saved.bundle_path)).toBe(false);
+  expect(exists(saved.state_path)).toBe(false);
+});
+
+it("quota cleanup evicts an expired claim while preserving a newer live restore", () => {
+  const first = save();
+  store.claim(key());
+  now += CHECKPOINT_CLAIM_LEASE_MS - 1;
+  const second = save(2), secondClaim = store.claim(key(2))!;
+  store = new Checkpoints(db, dir, secret, { now: () => now, maxBytes: bytes(first) });
+  expect(rows()).toHaveLength(2); // Both active leases may temporarily exceed a reduced quota.
+  now++;
+  store.cleanup();
+  expect(rows()).toHaveLength(1);
+  expect(rows()[0]).toMatchObject({ seq: second.seq, claimed_by: secondClaim.claimToken, consumed_at: null });
+  expect(exists(first.bundle_path)).toBe(false);
+  expect(exists(first.state_path)).toBe(false);
+  expect(exists(second.bundle_path)).toBe(true);
+  expect(exists(second.state_path)).toBe(true);
+  expect(rows().reduce((total, row) => total + bytes(row), 0)).toBeLessThanOrEqual(bytes(first));
 });
 
 it("round-trips only supplied state, seals it with the auth secret, and stores opaque bundles with private permissions", () => {

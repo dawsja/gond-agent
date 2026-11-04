@@ -56,8 +56,10 @@ No next model request, compaction, queued user work or tool dispatch starts whil
 held. Export with `"boundary_id":"1"` to require that exact held history; stale
 IDs fail with `boundary_mismatch`. Live tracked background shells make this
 capture fail with `background_shells_active`, rather than claim an atomic tree.
-This is agent-dispatch quiescence, not an OS/filesystem snapshot of arbitrary
-unmanaged processes or external side effects.
+This is agent-dispatch quiescence, not an OS/filesystem snapshot. Background
+shells, dev servers and watchers may keep writing while the runner is held.
+Tracked live shells reject capture, but untracked/detached processes are not
+frozen. External side effects are not quiesced either.
 
 Capture the tree while still held, persist both artifacts together, then send:
 
@@ -78,7 +80,9 @@ emits `{"checkpoint":{"boundary_id":"<token>"}}` over its attached transport.
 Dedicated RPC `checkpoint` accepts that token plus `run_id`, `owner_id`,
 `base_sha`, `identity: {name,email}` and optional `head_sha`. It validates the hold, exports history,
 then captures the tree, returning `{boundary_id,state,bundle,base_sha,head_sha,
-checkpoint_sha}`. It never releases. Dedicated RPC `checkpoint.release` accepts
+checkpoint_sha,fingerprint}`. Optional `previous_fingerprint` compares tree,
+state and revision pins, returning `unchanged:true` before bundle creation when
+all match. It never releases. Dedicated RPC `checkpoint.release` accepts
 the controller token and releases the runner. Captures/releases reject overlap
 rather than build a queue. Raw `checkpoint_tree` is only available without a
 live runner; publication `snapshot` cannot overlap capture or run during a hold.
@@ -90,8 +94,10 @@ save callback receives the paired RPC result and must finish persistence before
 returning. Only one callback runs at a time; at most one subsequent held boundary
 can wait while the previous release acknowledgement is delivered. Capture/save
 failure reports through optional `onError` and releases in `finally`, preserving
-the prior saved checkpoint. Failed release discards the workspace. No service
-integration or automatic resume is enabled by this interface alone.
+the prior saved checkpoint. Ordinary attempts are at least 30 seconds apart;
+intervening boundaries release immediately. Unchanged pairs skip persistence.
+Explicit post-publication capture bypasses the interval. Failed release discards
+the workspace. No service integration is enabled by this interface alone.
 
 `Workspace.flushCheckpoints?(): Promise<void>` waits for in-flight capture,
 persistence **and release acknowledgement**, including a subsequent boundary
@@ -100,7 +106,8 @@ for save failures), or disconnection. The most recent failed save remains visibl
 until a later successful save; flushing does not start a capture.
 
 `Workspace.captureCheckpoint?(options?: {head_sha:string}): Promise<void>` requires enableCheckpoints and
-an idle worker (after turn.end). It flushes prior work, requests the explicit idle
+an idle worker (after turn.end). It settles prior work (a previous save error
+must not prevent a fresh attempt), requests the explicit idle
 hold above, then waits for the ready consumer's single save and release. It
 rejects overlapping explicit captures and propagates capture/save/release errors.
 The ready consumer waits for the hold-request acknowledgement before issuing its
@@ -125,8 +132,10 @@ Service ordering: await `flushCheckpoints?.()` **before**
 publication `snapshot`; publish/push; await `captureCheckpoint?.({head_sha:publishedSHA})` **after**
 publication and **before** auto-close/CI watching. Awaiting the final turn.end
 alone does not imply that its release acknowledgement has reached the API. The
-postpublication capture is necessary because snapshot can create a new commit,
-and recovery must pin the pushed HEAD, not its prepublication parent.
+postpublication capture pins the pushed HEAD, not its prepublication parent.
+RunService catches save/flush/capture failures and emits
+`run.checkpoint_unavailable`: checkpoint availability must never block publishing
+completed work. Recovery may instead use an older pair or fail after restart.
 The optional capture argument updates the saved handler options inside the
 serialized explicit capture, after prior captures flush and before requesting the
 idle export/hold. It applies to that capture and all later captures; overlapping
@@ -213,10 +222,18 @@ RunService exclusively claims the latest usable checkpoint, restores the paired
 tree/history into a fresh worker and sends explicit continuation framing. A failed
 prerequisite checkout, tree restore or history import falls back to a fresh checkout
 of the last pushed branch and records `run.checkpoint_fallback`. The predecessor
-claim is consumed only when a replacement pair is durable. Answer replay remains
+claim is consumed only when a replacement pair is durable, released on worker
+loss/closure, and expires after ten minutes as a retention/quota backstop. Bad
+validation/restore pairs are quarantined with a fixed reason, never retried.
+Answer replay remains
 in a durable service ledger until that same publication transaction acknowledges
 its captured history; a second restart before replacement rebuilds, rather than
-stacks, synthetic continuation inputs. Pending live request IDs are never reused.
+stacks, synthetic continuation inputs. Only model-authored questions are quoted
+as data; human answers are ordinary user text. Delivery framing never mutates
+stored human/CI messages. Finishing-phase recovery verifies publication and
+finishes instead of replaying the original task. Pending live request IDs are
+never reused. MCP has no explicit resume tool: `send_session_message` resumes;
+`state:interrupted,done:true` is not successful completion.
 
 At startup, eligible interactive runs resume through the ordinary queue one at a
 time, at most twice while their checkpoint is under 24 hours old. Scheduled,

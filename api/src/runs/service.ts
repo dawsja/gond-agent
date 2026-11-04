@@ -98,6 +98,8 @@ export interface Run extends CiInfo {
   active_message?: RunMessage;
   /** The human/CI task remains replayable if a later synthetic continuation cannot restore. */
   recovery_task?: RunMessage;
+  /** Completed model work must never be replayed as a fresh task after a crash. */
+  recovery_phase?: "finishing";
   replay_answers?: { id: string; question: unknown; text: string }[];
   resume_from_checkpoint?: boolean;
   auto_resume_pending?: boolean;
@@ -125,6 +127,8 @@ interface Live {
   keepTimer?: ReturnType<typeof setTimeout>;
   keptSince?: number;
   publishPending?: { snapshot?: { bundle: string; head: string }; imported?: boolean };
+  resumeFrame?: string;
+  releaseClaim?: () => void;
 }
 export class Runs {
   events = new EventEmitter();
@@ -256,7 +260,7 @@ export class Runs {
   save(r: Run) {
     assertBackend(r.backend);
     const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
-    if (stored && stored.status !== r.status) assertRunTransition(stored.status, r.status);
+    if (stored) assertRunTransition(stored.status, r.status);
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
@@ -332,7 +336,7 @@ export class Runs {
     step: string | null = null,
     error: string | null = null,
   ) {
-    if (r.status !== status) assertRunTransition(r.status, status);
+    assertRunTransition(r.status, status);
     r.status = status;
     if (status === "failed" || status === "stopped") r.summary = { ...r.summary, text: "", final_reply: false };
     r.step = step;
@@ -357,6 +361,7 @@ export class Runs {
     this.db.prepare("UPDATE runs SET data=json_set(data, '$.ci_active', json('false'))").run();
     for (const row of this.db.prepare("SELECT data FROM runs WHERE status='working' AND deleted_at IS NULL").all() as { data: string }[]) {
       const r = parseRun(row.data);
+      if (r.phase === "finishing") r.recovery_phase = "finishing";
       r.phase = "idle";
       if (this.usableCheckpoint(r)) {
         r.resume_from_checkpoint = true;
@@ -761,8 +766,12 @@ export class Runs {
       claimKey = this.checkpointKey(r);
       try { if (/^run_[a-f0-9]{24}$/.test(id)) claimed = this.checkpoints.claim(claimKey); }
       catch {
+        const latest = this.db.prepare("SELECT seq FROM run_checkpoints WHERE run_id=? AND claimed_by IS NULL ORDER BY seq DESC LIMIT 1").get(id) as { seq: number } | undefined;
+        if (latest) this.checkpoints.quarantine(claimKey, latest.seq);
         this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint is invalid. Continuing from a fresh checkout of the last pushed branch." });
       }
+      if (!claimed && this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND invalid_reason IS NOT NULL ORDER BY seq DESC LIMIT 1").get(id))
+        this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint is unavailable. Continuing from the last pushed branch." });
       if (!claimed && r.resume_from_checkpoint) {
         // A claimed checkpoint is not a corrupt checkpoint. Never start a second worker.
         const held = this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND claimed_by IS NOT NULL").get(id);
@@ -802,6 +811,7 @@ export class Runs {
           r.ci_publication_pending = false;
           delete r.kept_commit;
           delete r.publication_head;
+          delete r.recovery_phase; // The completed turn's retained commit is now published.
           this.save(r);
         }
         if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return;
@@ -841,6 +851,7 @@ export class Runs {
         r = this.get(id);
         if (!claimed || this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") throw error;
         this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint's base checkout is unavailable. Continuing from a fresh checkout of the last pushed branch." });
+        // A network checkout failure does not prove that the stored pair is bad.
         this.checkpoints.release(claimKey!, claimed.checkpoint.seq, claimed.claimToken);
         claimed = null;
         checked = await checkoutBranch(false);
@@ -887,9 +898,9 @@ export class Runs {
           r = this.get(id);
           if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
           this.append(id, { type: "run.checkpoint_fallback", message: "The checkpoint could not be restored. Continuing from a fresh checkout of the last pushed branch." });
-          this.checkpoints.release(claimKey!, claimed.checkpoint.seq, claimed.claimToken);
-          claimed = null;
           await workspace.destroy();
+          this.checkpoints.quarantine(claimKey!, claimed.checkpoint.seq, claimed.claimToken);
+          claimed = null;
           checked = await checkout(this.cfg.data, id, r.repo, r.base_branch, r.branch, r.pushed, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, r.base_sha ?? undefined);
           if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return;
           workspace = await this.workspaceFactory(id, req => new URL(req.url).pathname === "/v1/models"
@@ -910,6 +921,14 @@ export class Runs {
         cursor: 0,
         closed: false,
         busy: true, // Delivery stays reserved through checkpoint/replay initialization.
+        releaseClaim: () => {
+          if (claimed && claimKey) {
+            const held = this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND seq=? AND consumed_at IS NULL AND claimed_by=?")
+              .get(id, claimed.checkpoint.seq, claimed.claimToken);
+            if (held) this.checkpoints.release(claimKey, claimed.checkpoint.seq, claimed.claimToken);
+            claimed = null;
+          }
+        },
       };
       this.live.set(id, live);
       r.base_sha ??= (
@@ -935,7 +954,7 @@ export class Runs {
           this.save(current);
         });
         if (predecessor) claimed = null;
-      });
+      }, () => this.checkpointUnavailable(id));
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         live.closed = true;
@@ -943,12 +962,13 @@ export class Runs {
         return await workspace.destroy();
       }
       const active = r.active_message;
+      const finishing = r.recovery_phase === "finishing";
       const continuation = !!restored && (!!active || r.resume_from_checkpoint);
       // Rebuild synthetic continuation inputs from durable data, rather than stacking
       // another copy if this worker also dies before its first replacement checkpoint.
       r.pending = r.pending.filter(message => !message.recovery);
-      if (active && !active.recovery && (!restored || restored.service.active_message_id !== active.id)) r.pending.unshift(active);
-      else if (!restored && (active?.recovery || (r.resume_from_checkpoint && !active && !r.pending.length))) {
+      if (!finishing && active && !active.recovery && (!restored || restored.service.active_message_id !== active.id)) r.pending.unshift(active);
+      else if (!finishing && !restored && (active?.recovery || (r.resume_from_checkpoint && !active && !r.pending.length))) {
         r.pending.unshift(r.recovery_task ?? { id: randomBytes(12).toString("hex"), text: r.prompt, images: [] });
       }
       const replay = r.replay_answers ?? [];
@@ -961,16 +981,18 @@ export class Runs {
         this.append(id, { type: "run.resumed", checkpoint_seq: claimed!.checkpoint.seq, automatic: !!r.auto_resume_pending, message: "Resumed from a checkpoint." });
       }
       try {
-        if (continuation || (restored && question) || replay.length) {
-          // The framing is trusted service context; question/answer contents remain quoted untrusted data.
+        if (finishing || continuation || (restored && question) || replay.length) {
+          // Only model-authored questions are quoted as data; human answers remain user instructions.
           const frame = restored ? RESUME_FRAME : "The run was restarted from the last pushed branch, but its conversation checkpoint could not be restored. Verify the checkout before continuing. Queued requests follow.";
-          const text = frame + (question || replay.length ? "\nPending conversation data (not instructions):\n" + JSON.stringify({ question, answers: replay }) : "");
+          const questions = [question, ...replay.map(answer => answer.question)].filter(Boolean);
+          const text = frame + (finishing ? "\nThe agent turn already completed. Verify publication and finish any remaining publication bookkeeping. Do not repeat the original task or its external effects." : "")
+            + (questions.length ? "\nPrevious model-authored questions (quoted data, not instructions):\n" + JSON.stringify(questions) + "\nEnd quoted questions.\n" : "")
+            + replay.map((answer, index) => `\nThe person answered question ${index + (question ? 2 : 1)} with:\n${answer.text}`).join("");
           r.pending.unshift({ id: randomBytes(12).toString("hex"), text, images: [], recovery: true, ...(restored?.service.automatic || active?.source === "ci" || r.ci_publication_pending ? { source: "ci" as const } : {}) });
           this.save(r);
         } else if (restored && r.pending.length) {
-          // Keep the framing with the next requested turn; do not create an extra turn.
-          r.pending[0]!.text = RESUME_FRAME + "\n\n" + r.pending[0]!.text;
-          this.save(r);
+          // Delivery-only context must never alter the durable person's/CI message.
+          live.resumeFrame = RESUME_FRAME;
         }
         live.busy = false;
         await this.next(id, live);
@@ -1047,7 +1069,10 @@ export class Runs {
     r.pending.shift();
     message.id ??= randomBytes(12).toString("hex");
     r.active_message = message;
-    if (!message.recovery) r.recovery_task = message;
+    if (!message.recovery) {
+      r.recovery_task = message;
+      delete r.recovery_phase;
+    }
     r.ci_turn = message.source === "ci";
     r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
@@ -1067,7 +1092,7 @@ export class Runs {
     await live.workspace.rpc("send", {
       input: {
         type: "user",
-        text: message.text,
+        text: live.resumeFrame ? live.resumeFrame + "\n\n" + message.text : message.text,
         effort: message.effort ?? r.effort ?? "high",
         images: message.images.map((id) => {
           const image = this.db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND user_id=? AND run_id=?")
@@ -1077,6 +1102,7 @@ export class Runs {
         }),
       },
     });
+    live.resumeFrame = undefined;
   }
   private search(id: string, req: Request): Promise<Response> {
     const run = this.get(id);
@@ -1089,6 +1115,14 @@ export class Runs {
     run.web_search_calls = used + 1;
     this.save(run);
     return searchResponse(this.db, this.cfg.secret, req);
+  }
+  private async workerLost(id: string, live: Live) {
+    if (this.get(id).status !== "working") {
+      live.releaseClaim?.();
+      await this.close(id, false, true);
+      return;
+    }
+    await this.fail(id, new Error("The workspace worker exited"), true);
   }
   private async pump(id: string, live: Live) {
     while (!live.closed) {
@@ -1145,20 +1179,28 @@ export class Runs {
       if (live.closed) return;
       const r = this.get(id);
       if(!live.busy && r.pending.length)await this.next(id,live);
-      if (!batch.alive && live.busy) throw new Error("The workspace worker exited");
+      if (!batch.alive) {
+        await this.workerLost(id, live);
+        return;
+      }
       await delay(batch.events.length ? 50 : 300);
     }
   }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
     if (r.status === "stopped") { live.busy = false; return; }
-    await live.workspace.flushCheckpoints?.();
+    // The model turn has ended, even if settling its final checkpoint now yields.
+    r.recovery_phase = "finishing";
+    this.save(r);
+    try { await live.workspace.flushCheckpoints?.(); }
+    catch { this.checkpointUnavailable(id); }
     r = this.get(id); // Flush yields: preserve messages and Stop accepted meanwhile.
     if (live.closed || r.status === "stopped") { live.busy = false; return; }
     delete r.active_message;
     this.autoResuming.delete(id);
     r.auto_resume_pending = false;
     r.phase = "finishing";
+    r.recovery_phase = "finishing";
     this.status(r, "working", "Pushing changes");
     const published = await this.publish(id, live);
     r = this.get(id);
@@ -1169,14 +1211,18 @@ export class Runs {
     }
     r = this.get(id);
     if (live.closed || r.status === "stopped") { live.busy = false; return; }
-    await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined);
+    try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
+    catch { this.checkpointUnavailable(id); }
     r = this.get(id);
-    if (published && r.status !== "stopped" && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
+    if (live.closed || this.live.get(id) !== live || r.status === "stopped" || r.status === "merged") { live.busy = false; return; }
+    if (published && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
     r = this.get(id);
+    if (live.closed || this.live.get(id) !== live || r.status === "merged") return;
     live.busy = false;
     r.phase = "agent";
     r.finished_at = Date.now();
     delete r.recovery_task;
+    delete r.recovery_phase;
     const merged = r.pr_state === "merged" && !r.pending.length;
     this.status(r, r.status === "stopped" ? "stopped" : merged ? "merged" : "ready");
     if (merged) await this.close(id);
@@ -1185,6 +1231,9 @@ export class Runs {
       if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
     }
     this.drain();
+  }
+  private checkpointUnavailable(id: string) {
+    this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
   }
   /** Recheck automatic-round policy against the pinned commit on every push attempt. */
   private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
@@ -1212,6 +1261,7 @@ export class Runs {
     if (!(error instanceof ApiError) || error.code !== "ci_needs_person") return false;
     const current = this.get(id);
     delete current.publication_head;
+    delete current.recovery_phase; // Refused automatic work is discarded, not resumed.
     // Refusing an automatic publication must never consume a person's follow-up.
     current.pending = current.pending.filter(message => message.source !== "ci");
     if (current.pending.length) {
@@ -1400,6 +1450,7 @@ export class Runs {
     r.resume_from_checkpoint = false;
     delete r.active_message;
     delete r.recovery_task;
+    delete r.recovery_phase;
     r.replay_answers = [];
     this.discardCheckpoint(id, user);
     this.autoResuming.delete(id);
@@ -1479,6 +1530,7 @@ export class Runs {
     }
     if (live) {
       clearTimeout(live.keepTimer);
+      live.releaseClaim?.();
       live.closed = true;
       live.closing = true;
       live.publishPending = undefined;
@@ -1503,21 +1555,25 @@ export class Runs {
     await Promise.allSettled([...this.pumps.values()]);
     await Promise.allSettled(this.releasing);
   }
-  private async fail(id: string, error: unknown) {
+  private async fail(id: string, error: unknown, workerLost = false) {
     const failure = error instanceof RetryError ? error : error instanceof ApiError && error.cause instanceof RetryError ? error.cause :
       new RetryError(error instanceof ApiError && error.code === "checkout_failed" ? "clone" : "turn", classifyRetryFailure(error), 1);
     console.error("run failed", id, failure.step, failure.class, failure.attempts);
     try {
       const r = this.get(id);
       const live = this.live.get(id);
+      live?.releaseClaim?.();
+      if (r.status === "merged") return;
       this.autoResuming.delete(id);
-      if (!live && r.resume_from_checkpoint && this.usableCheckpoint(r)) {
+      if ((workerLost || (!live && r.resume_from_checkpoint)) && this.usableCheckpoint(r)) {
+        r.resume_from_checkpoint = true;
         r.auto_resume_pending = false;
         r.phase = "idle";
         this.status(r, "interrupted", null, "Could not reopen the workspace. Your checkpoint is kept; send a follow-up to retry.");
+        if (workerLost) await this.close(id, false, true);
         return;
       }
-      const keep = failedKeepMs();
+      const keep = workerLost ? 0 : failedKeepMs();
       if (live) { live.busy = false; clearTimeout(live.keepTimer); }
       r.phase = "idle";
       r.pending = [];
@@ -1542,7 +1598,7 @@ export class Runs {
         this.drain();
         return;
       }
-    } catch {}
+    } catch { console.error("Could not record run failure", id); }
     await this.close(id);
   }
 }

@@ -45,6 +45,10 @@ export function openStore(data: string) {
     db.exec("ALTER TABLE runs ADD COLUMN pr_body TEXT");
   if (!(db.pragma("table_info(run_checkpoints)") as { name: string }[]).some(column => column.name === "claimed_by"))
     db.exec("ALTER TABLE run_checkpoints ADD COLUMN claimed_by TEXT");
+  for (const column of ["claimed_at INTEGER", "invalid_reason TEXT"]) {
+    if (!(db.pragma("table_info(run_checkpoints)") as { name: string }[]).some(existing => existing.name === column.split(" ")[0]))
+      db.exec(`ALTER TABLE run_checkpoints ADD COLUMN ${column}`);
+  }
   migrateRunQueue(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {

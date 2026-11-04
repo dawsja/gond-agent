@@ -15,6 +15,7 @@ export interface WorkspaceCheckpointOptions {
 }
 export interface WorkspaceCheckpoint {
   boundary_id: string;
+  fingerprint?: string;
   bundle: string; // base64; opaque bytes, never unpack on the API host
   base_sha: string;
   head_sha: string;
@@ -39,6 +40,7 @@ export interface Workspace {
 export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>) => Promise<Workspace>;
 const MANAGED = "io.gond-agent.managed=true";
 const MAX_FRAME = 256 * 1024 * 1024;
+export const CHECKPOINT_MIN_INTERVAL_MS = 30_000;
 
 /** No host paths, credentials, devices, published ports or Docker socket enter a workspace. */
 export function containerArguments(cfg: Config, name: string, instance: string, run: string) {
@@ -149,6 +151,8 @@ export class ContainerPool {
     let checkpointGate: Promise<void> | undefined;
     let capturePending = false;
     let checkpointSequence = 0;
+    let checkpointAttemptAt = -Infinity;
+    let checkpointFingerprint: string | undefined;
     const checkpointReady = (boundary: unknown) => {
       if (typeof boundary !== "string" || !/^[a-f0-9]{32}$/.test(boundary) || checkpointBoundary) {
         fail(new Error("Invalid checkpoint boundary"));
@@ -170,11 +174,15 @@ export class ContainerPool {
           const boundary_id = checkpointBoundary;
           checkpointBoundary = undefined;
           try {
-            if (checkpointHandler) {
-              const capture = await rpc<WorkspaceCheckpoint>("checkpoint", {
-                ...checkpointHandler.options, run_id: id, boundary_id,
+            if (checkpointHandler && (capturePending || Date.now() - checkpointAttemptAt >= CHECKPOINT_MIN_INTERVAL_MS)) {
+              checkpointAttemptAt = Date.now();
+              const capture = await rpc<WorkspaceCheckpoint | { unchanged: true }>("checkpoint", {
+                ...checkpointHandler.options, run_id: id, boundary_id, previous_fingerprint: checkpointFingerprint,
               });
-              await checkpointHandler.save(capture);
+              if (!("unchanged" in capture)) {
+                await checkpointHandler.save(capture);
+                checkpointFingerprint = capture.fingerprint;
+              }
               checkpointError = undefined;
             }
           } catch (error) {
@@ -205,7 +213,10 @@ export class ContainerPool {
       if (capturePending) throw new Error("Workspace checkpoint capture is already pending");
       capturePending = true;
       try {
-        await flushCheckpoints();
+        // A prior failed save must not prevent trying a new post-publication capture.
+        try { await flushCheckpoints(); }
+        catch { if (destroyed || disconnected) throw new Error("Workspace disconnected"); }
+        checkpointError = undefined;
         if (options) checkpointHandler.options.head_sha = options.head_sha;
         const before = checkpointSequence;
         let unblock!: () => void;

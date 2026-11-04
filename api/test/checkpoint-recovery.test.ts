@@ -58,6 +58,7 @@ class FakeWorkspace implements Workspace {
   save?: (value: WorkspaceCheckpoint) => void | Promise<void>;
   onError?: (error: unknown) => void;
   captureErrors: unknown[] = [];
+  checkpointError?: unknown;
   captureGate?: Promise<void>;
   checkpointBundle = Buffer.from("opaque-checkpoint-bundle");
   boundary = 0;
@@ -85,15 +86,17 @@ class FakeWorkspace implements Workspace {
       await this.captureGate;
       await this.save({ boundary_id: `boundary-${++this.boundary}`, bundle: bundle.toString("base64"),
         state, base_sha: this.options.base_sha, head_sha: HEAD, checkpoint_sha: TREE });
+      this.checkpointError = undefined;
     } catch (error) {
       // Like the real Workspace, release after a failed save and retain the previous checkpoint.
       this.captureErrors.push(error);
+      this.checkpointError = error;
       this.onError?.(error);
     }
   }
 
-  async captureCheckpoint() { await this.capture(); }
-  async flushCheckpoints() {}
+  async captureCheckpoint() { await this.capture(); await this.flushCheckpoints(); }
+  async flushCheckpoints() { if (this.checkpointError) throw this.checkpointError; }
 
   async rpc<T = any>(method: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push(structuredClone({ method, args }));
@@ -196,6 +199,102 @@ afterEach(async () => {
 });
 
 describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", () => {
+  it("publishes a finished turn despite failed flush and post-publication capture", async () => {
+    vi.stubEnv("GOND_AGENT_CHECKPOINT_MAX_MB", "1");
+    await restart();
+    const { run, worker } = await checkpointed();
+    const previous = rows(run.id);
+    worker.checkpointBundle = Buffer.alloc(1024 * 1024, 1);
+    await worker.capture();
+    expect(worker.captureErrors).toHaveLength(1);
+    worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    expect(importBundle).toHaveBeenCalledTimes(1);
+    expect(runs.get(run.id)).toMatchObject({ pushed: true, head_sha: HEAD });
+    expect(rows(run.id)).toEqual(previous);
+    expect(runs.history(run.id, 0)).toContainEqual(expect.objectContaining({ type: "run.checkpoint_unavailable" }));
+    expect(runs.history(run.id, 0)).not.toContainEqual(expect.objectContaining({ type: "run.error" }));
+  });
+
+  it("releases a restored worker's claim when it dies before the first replacement checkpoint", async () => {
+    const { run } = await checkpointed();
+    const predecessor = rows(run.id).at(-1)!;
+    await restart();
+    vi.spyOn(FakeWorkspace.prototype, "capture").mockImplementationOnce(async () => {});
+    await runs.recover();
+    await vi.waitFor(() => { expect(workers).toHaveLength(2); expect(workers.at(-1)!.users()).toHaveLength(1); });
+    expect(rows(run.id).at(-1)).toMatchObject({ seq: predecessor.seq, claimed_by: expect.any(String), consumed_at: null });
+    await workers.at(-1)!.destroy();
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("interrupted"));
+    expect(rows(run.id).at(-1)).toMatchObject({ seq: predecessor.seq, claimed_by: null, claimed_at: null, consumed_at: null });
+  });
+
+  it("keeps delivery-only resume framing out of durable messages over two restores", async () => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
+    disableCiNetwork();
+    finishUsers = true;
+    const { run, worker } = await checkpointed();
+    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1));
+    finishUsers = false;
+    const followUp = "Handle the next parser edge case.";
+    vi.spyOn(FakeWorkspace.prototype, "capture").mockImplementation(async () => {});
+    await runs.validateFollowUp(run.id, "u");
+    runs.enqueue(run.id, "u", followUp);
+    await vi.waitFor(() => { expect(workers.at(-1)).not.toBe(worker); expect(workers.at(-1)!.users()).toHaveLength(1); });
+    expect(workers.at(-1)!.users()[0]!.split("The run was restarted.")).toHaveLength(2);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const active = runs.get(run.id).active_message!;
+      if (!active.recovery) expect(active.text).toBe(followUp);
+      else expect(active.text.split("The run was restarted.")).toHaveLength(2);
+      expect(runs.get(run.id).recovery_task?.text).toBe(followUp);
+      const count = workers.length;
+      await restart();
+      await runs.recover();
+      await vi.waitFor(() => { expect(workers.length).toBeGreaterThan(count); expect(workers.at(-1)!.users().length).toBeGreaterThan(0); });
+      const delivered = workers.at(-1)!.users().join("\n");
+      expect(delivered.split("The run was restarted.")).toHaveLength(2);
+      // The old completed checkpoint has no follow-up: it must remain ordinary pending work.
+      expect(runs.get(run.id).pending.map(message => message.text)).toContain(followUp);
+      expect(runs.get(run.id).recovery_task?.text).toBe(followUp);
+    }
+  });
+
+  it.each([false, true])("quarantines a failed restore without replaying a finished task (queued follow-up: %s)", async queuedFollowUp => {
+    const { run, worker } = await checkpointed();
+    const predecessor = rows(run.id).at(-1)!;
+    const capture = deferred();
+    const capturing = vi.spyOn(worker, "captureCheckpoint").mockImplementation(() => capture.promise);
+    if (queuedFollowUp) runs.enqueue(run.id, "u", "Do the next task afterwards.");
+    worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await vi.waitFor(() => expect(capturing).toHaveBeenCalledTimes(1));
+    expect(importBundle).toHaveBeenCalledTimes(1);
+    expect(runs.get(run.id)).toMatchObject({ phase: "finishing", recovery_phase: "finishing", pushed: true });
+    const shutdown = runs.shutdown();
+    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1));
+    capture.resolve();
+    await shutdown;
+    await restart();
+    const rpc = FakeWorkspace.prototype.rpc;
+    let restoreAttempts = 0;
+    vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
+      if (method === "restore_checkpoint") { restoreAttempts++; throw new Error("invalid tree"); }
+      return rpc.call(this, method, args);
+    });
+    vi.spyOn(FakeWorkspace.prototype, "capture").mockImplementation(async () => {});
+    await runs.recover();
+    await vi.waitFor(() => { expect(workers).toHaveLength(3); expect(workers.at(-1)!.users()).toHaveLength(1); });
+    const fallback = workers.at(-1)!;
+    expect(fallback.imported).toBeUndefined();
+    expect(fallback.users()[0]).toContain("Verify publication and finish");
+    expect(fallback.users().join("\n")).not.toContain(PROMPT);
+    expect(runs.get(run.id).pending.map(message => message.text)).toEqual(queuedFollowUp ? ["Do the next task afterwards."] : []);
+    expect(rows(run.id).find(row => row.seq === predecessor.seq)).toMatchObject({ consumed_at: expect.any(Number), invalid_reason: "restore_failed", claimed_by: null });
+    expect(restoreAttempts).toBe(1);
+    await restart();
+    await runs.recover();
+    expect(runs.get(run.id).status).toBe("failed"); // No usable pair; never retry the quarantined checkpoint.
+    expect(restoreAttempts).toBe(1);
+  });
   it("runs unref'ed checkpoint cleanup periodically and stops it on shutdown", async () => {
     await runs.shutdown();
     vi.useFakeTimers();
@@ -270,6 +369,8 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     await vi.waitFor(() => expect(workers.at(-1)!.users()).toHaveLength(1));
     await vi.waitFor(() => expect((runs as unknown as { booting: Set<string> }).booting.size).toBe(0));
     expect(workers.at(-1)!.users()[0]).toContain(answer);
+    expect(workers.at(-1)!.users()[0]).toMatch(/The person answered question \d+ with:\nYes, preserve empty fields\./);
+    expect(workers.at(-1)!.users()[0]).not.toContain("Pending conversation data (not instructions)");
     expect(runs.get(run.id).replay_answers).toHaveLength(1);
     await restart();
     await runs.recover();
