@@ -7,8 +7,10 @@ pub mod browser;
 pub mod checks;
 pub mod fs;
 pub mod git;
+pub mod lsp;
 pub mod output;
 pub mod patch;
+pub mod persistent_browser;
 pub(crate) mod process;
 pub mod search;
 pub mod symbols;
@@ -45,6 +47,7 @@ pub struct ToolCtx {
     pub events: UnboundedSender<AgentEvent>,
     pub reads: ReadSet,
     pub shells: Shells,
+    pub browser: persistent_browser::BrowserSession,
     pub baseline: Baseline,
     pub cancel: tokio_util::sync::CancellationToken,
 }
@@ -109,6 +112,8 @@ pub trait Tool: Send + Sync {
         str_arg(input, "path").map(|p| vec![p.to_owned()]).unwrap_or_default()
     }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput>;
+    /// Stop long-lived services even when no tool call is currently active.
+    fn stop(&self) {}
 
     fn def(&self) -> ToolDef {
         ToolDef { name: self.name().into(), description: self.description().into(), input_schema: self.schema() }
@@ -124,6 +129,7 @@ impl Tool for Bounded {
     fn title(&self, input: &Value) -> String { self.0.title(input) }
     fn target(&self, input: &Value) -> String { self.0.target(input) }
     fn paths(&self, input: &Value) -> Vec<String> { self.0.paths(input) }
+    fn stop(&self) { self.0.stop(); }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
@@ -140,14 +146,15 @@ impl Tool for Bounded {
 pub fn bounded(tool: Arc<dyn Tool>) -> Arc<dyn Tool> { Arc::new(Bounded(tool)) }
 
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
-    let tools: Vec<Arc<dyn Tool>> = vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs::Read), Arc::new(git::Git), Arc::new(checks::RunChecks),
         Arc::new(fs::Write), Arc::new(fs::Edit), Arc::new(fs::MultiEdit),
         Arc::new(patch::ApplyPatch), Arc::new(search::ListDir), Arc::new(search::Glob),
-        Arc::new(search::Grep), Arc::new(symbols::Symbols), Arc::new(batch::Batch),
+        Arc::new(search::Grep), Arc::new(symbols::Symbols), Arc::new(lsp::Lsp::default()), Arc::new(batch::Batch),
         Arc::new(browser::Browser), Arc::new(bash::Bash), Arc::new(bash::BashOutput),
         Arc::new(bash::BashList), Arc::new(bash::KillShell), Arc::new(web::WebFetch),
     ];
+    tools.extend(persistent_browser::tools());
     tools.into_iter().map(bounded).collect()
 }
 
@@ -307,6 +314,7 @@ pub mod testutil {
                 events: tx,
                 reads: Default::default(),
                 shells: Default::default(),
+                browser: Default::default(),
                 baseline: Default::default(),
                 cancel: Default::default(),
             },

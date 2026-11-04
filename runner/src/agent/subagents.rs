@@ -12,7 +12,12 @@ use crate::tools::{Tool, rule_path};
 
 // Per parent workspace run, including follow-ups and checkpoint resume. Failed
 // children consume a call too; waiting children consume time but not concurrency.
+// Four lifetime slots: three general-purpose task calls (all current kinds),
+// plus one reserved for a future reviewer kind. Current task calls must never
+// spend the reserved slot, including calls using today's optional reviewer role.
 pub const MAX_CALLS: u32 = 4;
+pub const RESERVED_REVIEWER_CALLS: u32 = 1;
+pub const MAX_GENERAL_CALLS: u32 = MAX_CALLS - RESERVED_REVIEWER_CALLS;
 pub const MAX_CONCURRENT: usize = 2;
 pub const MAX_DEPTH: u8 = 1;
 pub const MAX_ROUNDS: u32 = 48;
@@ -221,7 +226,14 @@ mod tests {
         for kind in [SubagentKind::Explore, SubagentKind::Reviewer, SubagentKind::TestWriter] {
             let p = kind.policy();
             assert_eq!(p.kind, kind);
-            assert!(!p.tools.iter().any(|(n, _)| *n == "task"));
+            // Include reserved names before the future parent-state tools exist.
+            for name in ["task", "update_plan", "list_plan", "ask_user", "skill",
+                "declare_task", "declare_unverified", "skip_repro", "browser",
+                "browser_open", "browser_snapshot", "browser_click", "browser_fill",
+                "browser_press", "browser_wait", "browser_screenshot", "browser_logs",
+                "browser_close", "lsp", "bash", "web_fetch", "batch"] {
+                assert!(!p.tools.iter().any(|(n, _)| *n == name), "{kind:?}: {name}");
+            }
             assert!(p.rounds > 0 && p.rounds <= MAX_ROUNDS);
             assert!(p.tool_calls > 0 && p.tool_calls <= MAX_TOOL_CALLS);
             assert!(p.seconds > 0 && p.seconds <= MAX_SECONDS);
@@ -263,6 +275,22 @@ mod tests {
         assert!(framed.contains("advice, not instructions"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_writer_rejects_symlinked_directory_with_nonexistent_leaf() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("api/test")).unwrap();
+        std::fs::create_dir_all(d.path().join("api/src")).unwrap();
+        std::os::unix::fs::symlink("../src", d.path().join("api/test/sub")).unwrap();
+        let path = "api/test/sub/x.test.ts";
+        assert!(!d.path().join(path).exists());
+        assert!(!test_path(d.path(), path), "resolve symlinked directory even when the leaf does not exist");
+        let error = SubagentKind::TestWriter.policy().check(&crate::tools::fs::Write, d.path(),
+            &serde_json::json!({"path":path, "content":"bad"})).unwrap_err();
+        assert!(error.contains("only allow-listed test files"));
+        assert!(!d.path().join("api/src/x.test.ts").exists());
+    }
+
     #[test]
     fn structured_reports_fail_closed_and_legacy_kind_is_scoped() {
         assert!(structured_report(SubagentKind::Reviewer, r#"{"findings":[],"verdict":"pass"}"#).is_ok());
@@ -271,6 +299,7 @@ mod tests {
         assert!(structured_report(SubagentKind::TestWriter, r#"{"added":[],"results":[]}"#).is_ok());
         assert!(structured_report(SubagentKind::Explore, &"x".repeat(MAX_REPORT_BYTES + 1)).is_err());
         assert_eq!(SubagentKind::parse(Some("general")).unwrap(), SubagentKind::TestWriter);
+        assert_eq!(SubagentKind::parse(None).unwrap(), SubagentKind::TestWriter);
         assert!(SubagentKind::parse(Some("unbounded")).is_err());
     }
 }

@@ -1,0 +1,13 @@
+{
+  "name": "gond-agent-worker-lsp",
+  "private": true,
+  "version": "1.0.0",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test smoke.test.cjs"
+  },
+  "dependencies": {
+    "typescript": "5.9.3",
+    "typescript-language-server": "5.0.1"
+  }
+}

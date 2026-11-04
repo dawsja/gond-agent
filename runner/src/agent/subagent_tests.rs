@@ -8,7 +8,7 @@ fn delegate(kind: &str, id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn bounded_reviewer_seeded_diff_and_fifth_call_runtime() {
+async fn bounded_reviewer_seeded_diff_and_reserved_call_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(dir.path()).output().unwrap();
     assert!(git(&["init"]).status.success());
@@ -33,14 +33,18 @@ async fn bounded_reviewer_seeded_diff_and_fifth_call_runtime() {
             (true, false) => {
                 let results = sub_results(req);
                 assert_eq!(results.len(), 5);
-                for block in &results[..4] {
+                for block in &results[..3] {
                     assert!(!block["is_error"].as_bool().unwrap_or(false));
                     assert!(sub_text(block).contains("calculate.py"));
                     assert!(sub_text(block).contains("changes_required"));
                 }
-                assert_eq!(results[4]["is_error"], true);
-                assert!(sub_text(&results[4]).contains("call limit"));
+                for block in &results[3..] {
+                    assert_eq!(block["is_error"], true);
+                    assert!(sub_text(block).contains("call limit"));
+                    assert!(sub_text(block).contains("1 reserved"));
+                }
                 println!("Reviewer runtime: {}", sub_text(&results[0]));
+                println!("Reserved fourth call runtime: {}", sub_text(&results[3]));
                 println!("Fifth call runtime: {}", sub_text(&results[4]));
                 sse(&[json!({"type":"text","text":"Review received"})], "end_turn")
             }
@@ -64,7 +68,7 @@ async fn bounded_reviewer_seeded_diff_and_fifth_call_runtime() {
     let mut h = spawn(ApiClient::new(url, None), cfg);
     h.input.send(AgentInput::User { text:"Review the division change".into(), images:vec![] }).unwrap();
     let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd {agent_id,..} if agent_id == "main")).await;
-    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::AgentSpawn {..})).count(), 4);
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::AgentSpawn {..})).count(), 3);
     let mut active = 0;
     for e in &events {
         match e { AgentEvent::AgentSpawn {..} => { active += 1; assert!(active <= subagents::MAX_CONCURRENT); }, AgentEvent::AgentEnd {..} => active -= 1, _ => {} }
@@ -74,6 +78,47 @@ async fn bounded_reviewer_seeded_diff_and_fifth_call_runtime() {
     h.input.send(AgentInput::User {text:"Follow up".into(), images:vec![]}).unwrap();
     let followup = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd {agent_id,..} if agent_id == "main")).await;
     assert!(!followup.iter().any(|e| matches!(e, AgentEvent::AgentSpawn {..})));
+}
+
+#[tokio::test]
+async fn reserved_fourth_slot_is_unavailable_to_every_current_task_kind() {
+    assert_eq!(subagents::MAX_CALLS, 4);
+    assert_eq!(subagents::MAX_GENERAL_CALLS, 3);
+    assert_eq!(subagents::RESERVED_REVIEWER_CALLS, 1);
+    let s = compaction_shared(ApiClient::new("http://127.0.0.1:1/v1", None), 200_000);
+    // This is also the counter restored from checkpoints; no kind, alias or
+    // follow-up may spend the last slot through today's public task tool.
+    s.sub_counter.store(subagents::MAX_GENERAL_CALLS, Ordering::SeqCst);
+    let main = Run { id:"main".into(), kind:None, inherited_mode:None };
+    let cancel = CancellationToken::new();
+    for kind in [Some("explore"), Some("reviewer"), Some("test_writer"), Some("general"), None] {
+        let mut input = json!({"description":"Fourth call", "prompt":"Must not spawn"});
+        if let Some(kind) = kind { input["kind"] = kind.into(); }
+        let block = task(&s, &main, "fourth".into(), "task".into(), &input, &cancel).await;
+        let Block::ToolResult { is_error, content, .. } = block else { panic!("not a tool result") };
+        assert!(is_error, "{kind:?} must not use the reserved slot");
+        assert!(matches!(&content[0], ResultPart::Text { text } if text.contains("call limit") && text.contains("1 reserved")));
+        assert_eq!(s.sub_counter.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[tokio::test]
+async fn reserved_parent_state_tools_are_rejected_before_dispatch() {
+    let s = compaction_shared(ApiClient::new("http://127.0.0.1:1/v1", None), 200_000);
+    let cancel = CancellationToken::new();
+    for kind in [SubagentKind::Explore, SubagentKind::Reviewer, SubagentKind::TestWriter] {
+        let run = Run { id:kind.name().into(), kind:Some(kind), inherited_mode:Some(Mode::Allow) };
+        for name in ["task", "update_plan", "list_plan", "ask_user", "skill",
+            "declare_task", "declare_unverified", "skip_repro"] {
+            let block = run_call(&s, Turn { run:&run, cancel:&cancel, started:Instant::now(), tool_count:0 },
+                "forged".into(), name.into(), json!({})).await;
+            let Block::ToolResult { is_error, content, .. } = block else { panic!("not a tool result") };
+            assert!(is_error);
+            assert!(matches!(&content[0], ResultPart::Text { text } if text.contains("depth/capability limit")), "{kind:?}: {name}");
+        }
+    }
+    assert_eq!(s.sub_counter.load(Ordering::SeqCst), 0);
+    assert!(s.plan.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
