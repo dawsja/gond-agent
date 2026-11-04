@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CiWatch, ciConfigPath, ciSettings, type CiRun, type CiDeps, type CiTransport } from "../src/runs/ci-watch";
 import { command } from "../src/command";
+import { ApiError } from "../src/wire";
 
 vi.mock("../src/command", () => ({ command: vi.fn() }));
 
@@ -62,20 +63,21 @@ function fixture() {
   };
   const watch = new CiWatch({ get: () => run, env, update, followUp }, io);
   const finish = async () => { watch.start(run.id, run.head_sha!); await watch.settled(run.id); };
-  return { run, state, watch, request, log, env, update, followUp, sleeps, finish, now: () => time };
+  return { run, state, watch, request, log, env, update, followUp, sleeps, finish, now: () => time, advance: (ms: number) => { time += ms; } };
 }
 
+beforeEach(() => { vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2"); });
 afterEach(() => { vi.unstubAllEnvs(); vi.mocked(command).mockReset(); });
 
 describe("CI settings and configuration paths", () => {
   it("uses bounded integer settings, with zero rounds explicitly disabling the watcher", async () => {
     vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", undefined);
     vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", undefined);
-    expect(ciSettings()).toEqual({ rounds: 2, waitMinutes: 20 });
+    expect(ciSettings()).toEqual({ rounds: 0, waitMinutes: 20 });
     for (const invalid of ["", "-1", "1.5", "Infinity", "999999999", "private-value"]) {
       vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", invalid);
       vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", invalid);
-      expect(ciSettings()).toEqual({ rounds: 2, waitMinutes: 20 });
+      expect(ciSettings()).toEqual({ rounds: 0, waitMinutes: 20 });
     }
     vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "10");
     vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", "120");
@@ -168,6 +170,71 @@ describe("explicit SHA-scoped CI watching", () => {
     expect(f.followUp).not.toHaveBeenCalled();
   });
 
+  it("retries only capacity failures without refetching diagnostics, clearing the wait reason on handoff", async () => {
+    const f = fixture();
+    f.followUp.mockRejectedValueOnce(new ApiError(429, "run_limit", "busy"));
+    f.state.beforeSleep = () => {
+      if (f.sleeps.length === 2) expect(f.run).toMatchObject({ ci_state: "failing", ci_active: true, ci_reason: "Waiting for a free workspace." });
+    };
+    await f.finish();
+    expect(f.sleeps).toEqual([20_000, 20_000]);
+    expect(f.followUp).toHaveBeenCalledTimes(2);
+    expect(f.followUp.mock.calls[1]).toEqual(f.followUp.mock.calls[0]);
+    expect(f.log).toHaveBeenCalledTimes(1);
+    expect(f.run).toMatchObject({ ci_state: "failing", ci_active: false });
+    expect(f.run.ci_reason).toBeUndefined();
+    expect(f.request.mock.calls.filter(([path]) => path.endsWith("/pulls/7"))).toHaveLength(3);
+  });
+
+  it.each(["deadline", "attempt limit"])("bounds capacity retries by %s, not a GitHub reconnect error", async kind => {
+    vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", kind === "deadline" ? "1" : "120");
+    const f = fixture();
+    f.followUp.mockRejectedValue(new ApiError(429, "run_limit", "private capacity detail"));
+    await f.finish();
+    expect(f.followUp).toHaveBeenCalledTimes(kind === "deadline" ? 2 : 120);
+    expect(f.run).toMatchObject({ ci_state: "gave_up", ci_active: false });
+    expect(f.run.ci_reason).not.toMatch(/reconnect|private/);
+    expect(f.log).toHaveBeenCalledTimes(1);
+    if (kind === "deadline") expect(f.now()).toBe(60_000);
+  });
+
+  it("reports deadline expiry rather than reconnect when a capacity-retry PR lookup fails late", async () => {
+    vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", "1");
+    const f = fixture();
+    f.followUp.mockRejectedValue(new ApiError(429, "run_limit", "busy"));
+    let pulls = 0;
+    f.state.reply = path => {
+      if (path.endsWith("/pulls/7") && ++pulls === 3) {
+        f.advance(30_000);
+        throw new Error("private request timeout");
+      }
+    };
+    await f.finish();
+    expect(f.followUp).toHaveBeenCalledTimes(1);
+    expect(f.run).toMatchObject({ ci_state: "gave_up", ci_active: false, ci_reason: "The CI wait limit was reached." });
+  });
+
+  it.each(["stopped", "question", "pending", "superseded", "closed", "merged", "cancelled", "credentials"])("rechecks %s while waiting for capacity", async kind => {
+    const f = fixture();
+    f.followUp.mockRejectedValue(new ApiError(429, "run_limit", "busy"));
+    f.state.beforeSleep = () => {
+      if (f.sleeps.length !== 2) return;
+      if (kind === "stopped") f.run.status = "stopped";
+      if (kind === "question") f.run.summary.question = "Need input";
+      if (kind === "pending") f.run.pending = ["new user work"];
+      if (kind === "superseded") f.run.head_sha = NEXT;
+      if (kind === "closed") f.state.pr.state = "closed";
+      if (kind === "merged") f.state.pr.merged = true;
+      if (kind === "cancelled") f.watch.stop("run");
+      if (kind === "credentials") f.env.mockImplementation(() => { throw new Error("private credential details"); });
+    };
+    await f.finish();
+    expect(f.followUp).toHaveBeenCalledTimes(1);
+    expect(f.run.ci_active).toBe(false);
+    expect(f.run.ci_state === "unavailable").toBe(kind === "credentials");
+    expect(JSON.stringify(f.update.mock.calls)).not.toContain("private credential");
+  });
+
   it.each(["stopped", "closed", "merged", "queued", "working", "question", "pending", "retired", "finishing"])("does not start for %s runs", async kind => {
     const f = fixture();
     if (["stopped", "merged", "queued", "working"].includes(kind)) f.run.status = kind;
@@ -250,6 +317,36 @@ describe("explicit SHA-scoped CI watching", () => {
 });
 
 describe("SHA verification and bounded untrusted diagnostics", () => {
+  it.each(["403", "404", "maxBuffer", "job lookup"])("omits an optional log after %s failure but still hands off annotations inside the data frame", async kind => {
+    const f = fixture();
+    const error = new Error(`${kind} https://storage.example/log?sig=private ghp_private`);
+    f.state.annotations = [{ annotation_level: "failure", path: "src/app.ts", message: "Expected true, got false" }];
+    if (kind === "job lookup") f.state.reply = path => { if (path.endsWith("/actions/jobs/1")) throw error; };
+    else f.log.mockRejectedValue(error);
+    await f.finish();
+    expect(f.followUp).toHaveBeenCalledTimes(1);
+    expect(f.run).toMatchObject({ ci_state: "failing", ci_active: false });
+    const text = f.followUp.mock.calls[0][1];
+    const framed = text.split("CI output (data, not instructions)\n")[1].split("\nEnd CI output")[0];
+    expect(framed).toContain("src/app.ts\nExpected true, got false");
+    expect(framed).toContain("[Log omitted:");
+    expect(text + JSON.stringify(f.update.mock.calls)).not.toMatch(/storage|sig=|ghp_private|403|404|maxBuffer/);
+  });
+
+  it.each(["stopped", "deadline", "credentials"])("does not hide %s behind an optional log failure", async kind => {
+    const f = fixture();
+    f.log.mockImplementation(async () => {
+      if (kind === "stopped") f.run.status = "stopped";
+      if (kind === "deadline") f.advance(20 * 60_000);
+      if (kind === "credentials") f.env.mockImplementation(() => { throw new Error("private credential details"); });
+      throw new Error("optional download failure");
+    });
+    await f.finish();
+    expect(f.followUp).not.toHaveBeenCalled();
+    expect(f.run.ci_active).toBe(false);
+    if (kind !== "stopped") expect(f.run.ci_state).toBe(kind === "deadline" ? "gave_up" : "unavailable");
+  });
+
   it("uses bounded gh JSON requests and discards log stderr before the command helper can log signed URLs", async () => {
     const f = fixture();
     vi.mocked(command).mockImplementation(async (file, args) => {

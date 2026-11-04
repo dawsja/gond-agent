@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+#[cfg(test)]
+use base64::Engine;
 use futures::{FutureExt, StreamExt};
 use futures::future::{BoxFuture, join_all};
 use serde_json::{Value, json};
@@ -346,6 +348,16 @@ fn tool_visible(t: &dyn Tool, run: &Run) -> bool {
 fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>, cancel: &'a CancellationToken) -> BoxFuture<'a, Result<String>> {
     Box::pin(async move {
         s.emit(AgentEvent::TurnStart { agent_id: run.id.clone() });
+        if let Some(message) = history.last_mut() {
+            for block in &mut message.content {
+                if let Block::Image { data, id, .. } = block {
+                    *block = match crate::images::normalise_base64(std::mem::take(data)).await {
+                        Ok((media_type, data)) => Block::Image { media_type, data, id: id.take() },
+                        Err(text) => Block::Text { text, opaque: None },
+                    };
+                }
+            }
+        }
         let started = Instant::now();
         let mut tool_count = 0u32;
         let mut reminders = PlanReminders::default();
@@ -1197,8 +1209,10 @@ mod tests {
         let handler: Handler = Arc::new(|_: &Value| sse(&[json!({"type":"text","text":"A cat."})], "end_turn"));
         let url = mock(handler, seen.clone()).await;
         let mut h = spawn(ApiClient::new(url, Some("t".into())), config(dir.path(), Mode::Ask));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(32, 24).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
         let images = vec![
-            ImageInput { media_type: "image/png".into(), data: "iVBORw0K".into(), id: None },
+            ImageInput { media_type: "image/png".into(), data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()), id: None },
             ImageInput { media_type: "image/jpeg".into(), id: Some("img_cloud".into()), ..Default::default() },
         ];
         h.input.send(AgentInput::User { text: "what is [Image #1]?".into(), images }).unwrap();
@@ -1206,8 +1220,12 @@ mod tests {
         let reqs = seen.lock().unwrap();
         let content = &reqs[0]["messages"][0]["content"];
         assert_eq!(content[0], json!({"type": "text", "text": "what is [Image #1]?"}));
-        assert_eq!(content[1], json!({"type": "image", "media_type": "image/png", "data": "iVBORw0K"}));
-        assert_eq!(content[2], json!({"type": "image", "media_type": "image/jpeg", "id": "img_cloud"}), "uploaded images go by id");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["media_type"], "image/jpeg");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(content[1]["data"].as_str().unwrap()).unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (32, 24));
+        assert_eq!(content[2]["type"], "text", "unresolved uploads cannot bypass worker processing");
     }
 
     #[tokio::test]

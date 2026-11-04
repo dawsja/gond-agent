@@ -265,6 +265,8 @@ export class Runs {
     this.append(r.id, { type: "run.status", status, step, error });
   }
   async recover() {
+    // Watches are process-local and never resume after a restart, including on ready runs.
+    this.db.prepare("UPDATE runs SET data=json_set(data, '$.ci_active', json('false'))").run();
     for (const row of this.db
       .prepare("SELECT data FROM runs WHERE status IN ('queued','working')")
       .all() as { data: string }[]) {
@@ -428,11 +430,11 @@ export class Runs {
     source?: "ci",
   ) {
     this.assertAccount(user);
-    const r = this.get(id, user);
+    let r = this.get(id, user);
     assertActive(r);
     if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
       throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
-    if (!source) this.ci.stop(id);
+    if (!source) { this.ci.stop(id); r = this.get(id, user); }
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
       throw new ApiError(409, "merged", "Start a new run after merging.");
@@ -593,7 +595,12 @@ export class Runs {
         type: "user",
         text: message.text,
         effort: message.effort ?? r.effort ?? "high",
-        images: message.images.map((id) => ({ id })),
+        images: message.images.map((id) => {
+          const image = this.db.prepare("SELECT media_type,bytes FROM images WHERE id=? AND user_id=? AND run_id=?")
+            .get(id, r.user_id, r.id) as { media_type: string; bytes: Buffer } | undefined;
+          if (!image) throw new ApiError(404, "image_not_found", "That image isn't available.");
+          return { media_type: image.media_type, data: image.bytes.toString("base64") };
+        }),
       },
     });
   }
@@ -789,8 +796,9 @@ export class Runs {
     await this.close(id);
   }
   async stop(id: string, user: string) {
-    const r = this.get(id, user);
+    this.get(id, user);
     this.ci.stop(id);
+    const r = this.get(id, user);
     r.pending = [];
     this.status(r, "stopped");
     const live = this.live.get(id);

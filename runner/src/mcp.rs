@@ -369,14 +369,14 @@ pub async fn connect_all(cwd: &Path, trusted: bool) -> (Vec<Arc<dyn Tool>>, Vec<
                 status.push(Status { name: name.clone(), detail: cfg.describe(), tools: list.len(), ok: true });
                 for t in list {
                     let Some(tool_name) = t["name"].as_str() else { continue };
-                    tools.push(Arc::new(McpTool {
+                    tools.push(crate::tools::bounded(Arc::new(McpTool {
                         full_name: leak(format!("mcp__{}__{}", sanitize(&name), sanitize(tool_name))),
                         tool: tool_name.to_owned(),
                         description: leak(t["description"].as_str().unwrap_or("").chars().take(1024).collect()),
                         schema: t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"})),
                         read_only: t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false),
                         client: client.clone(),
-                    }));
+                    })));
                 }
             }
             Err(e) => status.push(Status { name, detail: e.to_string(), tools: 0, ok: false }),

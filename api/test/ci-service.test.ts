@@ -100,6 +100,75 @@ afterEach(async () => {
 });
 
 describe("run service automatic CI hooks", () => {
+  it("defaults OFF: a pushed turn keeps its workspace and does not watch CI", async () => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", undefined);
+    seed();
+    const { live, destroy } = workspace();
+    const start = vi.spyOn(watcher(), "start");
+    const request = vi.fn();
+    service().ci.io.request = request;
+    await service().finish("run", live);
+    expect(pushed).toHaveBeenCalledTimes(1);
+    expect(start).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(service().live.get("run")).toBe(live);
+    expect(live.busy).toBe(false);
+    expect(runs.get("run")).toMatchObject({ status: "ready", phase: "agent", head_sha: NEXT, ci_round: 0, pending: [] });
+    expect(runs.get("run").ci_state).toBeUndefined();
+    watcher().start("run", NEXT); // The watcher itself also honors the default.
+    await watcher().settled("run");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("clears stale ci_active on every run at startup without resuming watches or losing CI history", async () => {
+    for (const status of ["ready", "queued", "working", "stopped", "failed", "merged"] as const) {
+      seed({ id: status, status, ci_active: true, ci_state: "pending", ci_round: 1, ci_sha: SHA });
+    }
+    const start = vi.spyOn(watcher(), "start");
+    await runs.recover();
+    for (const status of ["ready", "queued", "working", "stopped", "failed", "merged"] as const) {
+      expect(runs.get(status)).toMatchObject({ ci_active: false, ci_state: "pending", ci_round: 1, ci_sha: SHA });
+    }
+    expect(runs.get("ready").status).toBe("ready");
+    for (const status of ["queued", "working"]) expect(runs.get(status)).toMatchObject({ status: "failed", phase: "idle", pending: [] });
+    await runs.recover(); // Idempotent, including persisted JSON boolean values.
+    const rows = db.prepare("SELECT data FROM runs").all() as { data: string }[];
+    expect(rows.every(row => JSON.parse(row.data).ci_active === false)).toBe(true);
+    expect(start).not.toHaveBeenCalled();
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the CI round and queue on capacity failure, then enqueues exactly once after capacity frees", async () => {
+    seed();
+    service().booting.add("other-run");
+    await expect(ciDeps().followUp("run", "Fix CI", SHA)).rejects.toMatchObject({ code: "run_limit" });
+    expect(runs.get("run")).toMatchObject({ ci_round: 0, pending: [] });
+    expect(runs.history("run", 0)).toEqual([]);
+    service().booting.delete("other-run");
+    vi.spyOn(service(), "boot").mockResolvedValue(undefined);
+    expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(true);
+    expect(runs.get("run")).toMatchObject({ ci_round: 1, pending: [{ text: "Fix CI", source: "ci" }] });
+    expect(runs.history("run", 0).filter(event => event.type === "ci")).toHaveLength(1);
+  });
+
+  it.each(["stop", "user follow-up"])("does not restore a stale ci_active snapshot after %s", async action => {
+    seed();
+    vi.spyOn(service(), "boot").mockResolvedValue(undefined);
+    const request = vi.fn();
+    service().ci.io = {
+      request, now: () => 0,
+      sleep: async (_ms: number, signal: AbortSignal) => new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })),
+    };
+    watcher().start("run", SHA);
+    expect(runs.get("run").ci_active).toBe(true);
+    if (action === "stop") await runs.stop("run", "u");
+    else runs.enqueue("run", "u", "Take a different approach");
+    await watcher().settled("run");
+    expect(runs.get("run").ci_active).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("destroys the workspace and releases maxRuns=1 capacity before watching and enqueuing CI, not a user message", async () => {
     seed();
     const { live, destroy } = workspace();

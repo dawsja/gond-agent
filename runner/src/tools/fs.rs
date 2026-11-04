@@ -4,9 +4,11 @@ use base64::Engine;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
+use tokio::io::AsyncReadExt;
 
 use super::{Tool, ToolCtx, ToolOutput, schema, str_arg};
 use crate::api::wire::ResultPart;
+use crate::images::MAX_IMAGE_INPUT;
 use crate::permissions::Access;
 
 const MAX_LINES: usize = 2000;
@@ -57,29 +59,6 @@ pub(crate) fn remember(ctx: &ToolCtx, path: &Path) {
     ctx.reads.lock().unwrap().insert(path.to_path_buf(), mtime(path));
 }
 
-const MAX_IMAGE_INPUT: u64 = 20 * 1024 * 1024;
-const MAX_IMAGE_OUTPUT: usize = 3 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION: u32 = 2048;
-
-fn resize_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_| "Cannot identify image")?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    limits.max_image_width = Some(16384);
-    limits.max_image_height = Some(16384);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|_| "Cannot decode image within memory and dimension limits")?;
-    let mut resized = decoded.thumbnail(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION);
-    loop {
-        let mut encoded = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85).encode_image(&resized.to_rgb8()).map_err(|_| "Cannot encode image")?;
-        if encoded.len() <= MAX_IMAGE_OUTPUT { return Ok(encoded); }
-        let dimension = resized.width().max(resized.height()) / 2;
-        if dimension == 0 { return Err("Image cannot fit the output limit".into()); }
-        resized = resized.thumbnail(dimension, dimension);
-    }
-}
-
 pub struct Read;
 
 impl Tool for Read {
@@ -113,19 +92,19 @@ impl Tool for Read {
                 if tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() > MAX_IMAGE_INPUT) {
                     return ToolOutput::err("Image exceeds the 20 MiB input limit; resize it before reading");
                 }
-                return match tokio::fs::read(&path).await {
+                let bytes = async {
+                    let mut bytes = Vec::new();
+                    tokio::fs::File::open(&path).await?.take(MAX_IMAGE_INPUT + 1).read_to_end(&mut bytes).await?;
+                    Ok::<_, std::io::Error>(bytes)
+                }.await;
+                return match bytes {
                     Ok(bytes) => {
-                        let bytes = match tokio::task::spawn_blocking(move || resize_image(&bytes)).await {
-                            Ok(Ok(b)) => b,
-                            Ok(Err(e)) => return ToolOutput::err(e),
-                            Err(_) => return ToolOutput::err("Image processing failed"),
-                        };
                         if ctx.cancel.is_cancelled() { return ToolOutput::err("interrupted"); }
                         remember(ctx, &path);
                         let kb = bytes.len() / 1024;
                         ToolOutput {
                             ok: true,
-                            content: vec![ResultPart::Image { media_type: "image/jpeg".into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) }],
+                            content: vec![ResultPart::Image { media_type: image_type(&path).unwrap_or("application/octet-stream").into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) }],
                             summary: format!("image · {kb} KB"),
                             display: String::new(),
                             diff: None,
@@ -371,15 +350,15 @@ mod tests {
     use super::*;
     use crate::tools::testutil::{ctx, text};
 
-    #[test]
-    fn images_are_resized_and_below_service_payload_limit() {
+    #[tokio::test]
+    async fn images_are_resized_and_below_service_payload_limit() {
         let image = image::DynamicImage::new_rgb8(3000, 2200);
         let mut input = std::io::Cursor::new(Vec::new());
         image.write_to(&mut input, image::ImageFormat::Png).unwrap();
-        let output = resize_image(input.get_ref()).unwrap();
+        let (_, output) = crate::images::normalise(input.into_inner()).await.unwrap();
         let resized = image::load_from_memory(&output).unwrap();
-        assert!(resized.width() <= MAX_IMAGE_DIMENSION && resized.height() <= MAX_IMAGE_DIMENSION);
-        assert!(output.len() <= MAX_IMAGE_OUTPUT);
+        assert!(resized.width() <= crate::images::MAX_IMAGE_DIMENSION && resized.height() <= crate::images::MAX_IMAGE_DIMENSION);
+        assert!(output.len() <= crate::images::MAX_IMAGE_OUTPUT);
         assert!(base64::engine::general_purpose::STANDARD.encode(output).len() < 5 * 1024 * 1024);
     }
 

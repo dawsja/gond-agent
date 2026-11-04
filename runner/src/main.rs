@@ -4,6 +4,7 @@ mod agent;
 mod api;
 mod config;
 mod http;
+mod images;
 mod mcp;
 mod permissions;
 mod prompt;
