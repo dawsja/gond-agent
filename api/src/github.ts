@@ -32,7 +32,7 @@ export const validRepo = (repo: string) =>
   !repo.endsWith("/.") &&
   !repo.endsWith("/..");
 export const validBranch = (b: string) =>
-  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(b) &&
+  /^[A-Za-z0-9][A-Za-z0-9._/-]{0,334}$/.test(b) &&
   !b.includes("..") &&
   !b.includes("@{") &&
   !b.endsWith("/") &&
@@ -213,9 +213,9 @@ export async function checkout(
   return { cwd, archive };
 }
 export interface PushOptions {
-  /** Set for an explicit new branch until publication is confirmed; never infer it from a name. */
+  /** #23's caller must set this for an explicit new branch until publication is confirmed; never infer it from a name. */
   lease?: "create-only";
-  /** Policy guard for every push attempt, outside retry classification. */
+  /** #22's CI-config guard belongs here, not just before the initial import/push. */
   beforePush?: (context: { cwd: string; branch: string; head: string }) => Promise<void>;
 }
 

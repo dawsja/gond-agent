@@ -31,6 +31,9 @@ vi.mock("../src/github", async original => ({
 
 const branch = "feat/explicit-ci-fix", ref = `refs/heads/${branch}`;
 const token = "owner-only-fixture-token";
+const availabilityEndpoint = `repos/acme/app/git/matching-refs/heads/${branch}`;
+const prEndpoint = "repos/acme/app/pulls/7";
+const githubRequests = () => vi.mocked(gh).mock.calls.map(([endpoint]) => endpoint);
 type Event = { kind: "guard" | "push" | "ls-remote"; args: string[] };
 let dir: string, db: ReturnType<typeof openStore>, runs: Runs;
 const service = () => runs as any;
@@ -52,10 +55,11 @@ beforeEach(async () => {
     .run("u", seal(cfg.secret, token), Date.now());
   runs = new Runs(db, cfg, factory);
   vi.mocked(gh).mockImplementation(async (endpoint, method, body, env) => {
-    expect(endpoint).toBe("repos/acme/app/pulls/7");
     expect(method).toBe("GET");
     expect(body).toBeUndefined();
     expect(env?.GH_TOKEN).toBe(token);
+    if (endpoint === availabilityEndpoint) return [] as never;
+    expect(endpoint).toBe(prEndpoint);
     return { state: "open", merged: false } as never;
   });
 });
@@ -200,7 +204,8 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
     expect(await f.remoteHead()).toBe("");
     expect(f.rpc).toHaveBeenCalledTimes(path === "first import" ? 1 : 0);
-    expect(gh).not.toHaveBeenCalled();
+    // Fresh snapshots preflight the branch; neither refusal reaches the PR policy read.
+    expect(githubRequests()).toEqual(path === "first import" ? [availabilityEndpoint] : []);
   });
 
   it("rechecks the pinned diff after a transient first import push failure and refuses CI changes before a second push", async () => {
@@ -213,6 +218,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(await f.remoteHead()).toBe("");
     expect(f.rpc).toHaveBeenCalledTimes(1);
     expect(f.destroy).toHaveBeenCalledTimes(1);
+    expect(githubRequests()).toEqual([availabilityEndpoint, prEndpoint]);
     await expect(readFile(join(f.cwd, ".git", "gond-agent.bundle"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 20_000);
 
@@ -224,7 +230,8 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(await f.remoteHead()).toBe(f.head);
     expect(runs.get("run")).toMatchObject({ pushed: true, head_sha: f.head, ci_round: 1 });
     expect(runs.get("run").ci_state).not.toBe("gave_up");
-    expect(gh).toHaveBeenCalledTimes(2);
+    // Retry/reconciliation must not repeat availability checks after the ref was created.
+    expect(githubRequests()).toEqual([availabilityEndpoint, prEndpoint, prEndpoint]);
     expect(f.rpc).toHaveBeenCalledTimes(1);
     expect(f.start).toHaveBeenCalledExactlyOnceWith("run", f.head);
   }, 20_000);
@@ -236,6 +243,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(await f.git(f.cwd, "rev-parse", "HEAD")).toBe(f.head);
     expect(runs.get("run")).toMatchObject({ pushed: false, head_sha: f.base });
     expect(await f.remoteHead()).toBe("");
+    expect(githubRequests()).toEqual([availabilityEndpoint, ...Array(5).fill(prEndpoint)]);
     const previous = f.events.length;
     // The same kept commit is no longer safe to publish, even though its diff is safe.
     vi.mocked(gh).mockResolvedValueOnce({ state: "closed", merged: false });
@@ -246,6 +254,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(runs.get("run").head_sha).toBe(f.base);
     expect(await f.remoteHead()).toBe("");
     expect(f.rpc).toHaveBeenCalledTimes(1); // No new snapshot/import from the retained worker.
+    expect(githubRequests()).toEqual([availabilityEndpoint, ...Array(6).fill(prEndpoint)]);
   }, 20_000);
 
   it("watches the kept commit after a retained publication succeeds without another snapshot or import", async () => {
@@ -259,6 +268,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(await f.remoteHead()).toBe(f.head);
     expect(runs.get("run")).toMatchObject({ pushed: true, head_sha: f.head, ci_pending_sha: f.head });
     expect(f.rpc).toHaveBeenCalledTimes(1);
+    expect(githubRequests()).toEqual([availabilityEndpoint, ...Array(6).fill(prEndpoint)]);
     expect(f.start).toHaveBeenCalledExactlyOnceWith("run", f.head);
   }, 20_000);
 

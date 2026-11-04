@@ -148,10 +148,12 @@ describe("run service automatic CI hooks", () => {
 
   it("queues one durable CI round without a worker when capacity is full, then starts it once", async () => {
     seed();
+    const prBody = "Keep this user-authored PR description";
+    db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(prBody, "run");
     const boot = vi.spyOn(service(), "boot").mockResolvedValue(undefined);
     service().booting.add("other-run");
     expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(true);
-    expect(runs.get("run")).toMatchObject({ status: "queued", ci_round: 1, pending: [{ text: "Fix CI", source: "ci" }] });
+    expect(runs.get("run")).toMatchObject({ status: "queued", ci_round: 1, pr_body: prBody, pending: [{ text: "Fix CI", source: "ci" }] });
     expect(service().queue.has("run")).toBe(true);
     expect(await ciDeps().followUp("run", "Duplicate fix", SHA)).toBe(false);
     expect(boot).not.toHaveBeenCalled();
@@ -301,7 +303,7 @@ describe("run service automatic CI hooks", () => {
     for (const busy of [false, true]) {
       live.busy = busy;
       expect(await ciDeps().followUp("run", "Fix CI", SHA)).toBe(false);
-      expect(() => runs.enqueue("run", "u", "Fix CI", [], undefined, undefined, undefined, "ci"))
+      expect(() => runs.enqueue("run", "u", "Fix CI", [], undefined, undefined, undefined, undefined, "ci"))
         .toThrow(/idle run with no pending question/);
       expect(runs.get("run")).toMatchObject({ ci_round: 0, pending: [], summary: { question } });
     }
@@ -377,7 +379,7 @@ describe("run service automatic CI hooks", () => {
     expect(await ciDeps().followUp("run", "Second fix", SHA)).toBe(true);
     expect(runs.get("run").ci_round).toBe(2);
     expect(await ciDeps().followUp("run", "Third fix", SHA)).toBe(false);
-    expect(enqueue).toHaveBeenCalledExactlyOnceWith("run", "u", "Second fix", [], undefined, undefined, undefined, "ci");
+    expect(enqueue).toHaveBeenCalledExactlyOnceWith("run", "u", "Second fix", [], undefined, undefined, undefined, undefined, "ci");
     expect(factory).not.toHaveBeenCalled();
   });
 

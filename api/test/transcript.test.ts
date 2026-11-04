@@ -89,7 +89,8 @@ it("rolls back partial text across compaction and a queued follow-up without mut
   expect(createTranscript()(all)).toEqual(frozenAfter);
   expect(before).toEqual(frozenBefore);
   expect(after).toEqual(frozenAfter);
-  expect(all.reduce(fold, emptySummary()).text).toBe("Completed earlier response. Final reply");
+  // Compaction is a publication boundary, not a transcript deletion.
+  expect(all.reduce(fold, emptySummary()).text).toBe("Final reply");
 });
 
 it("groups API, Claude and Codex activity without exposing transport names or merging external tools", () => {
@@ -232,7 +233,9 @@ it("discards aborted attempts and shows the successful reply once in transcript 
     { kind: "text", key: "t3", text: "Completed earlier response. " },
     { kind: "text", key: "t13", text: "Final reply" },
   ]);
-  expect(summary.text).toBe("Completed earlier response. Final reply");
+  // The transcript above keeps pre-tool commentary; the publication summary does not.
+  expect(summary.text).toBe("Final reply");
+  expect(summary.final_reply).toBe(true);
   expect(after.items.find(item => item.kind === "explore")).toMatchObject({ tools: [{ status: "done", output: "kept output" }] });
   expect(after.items.find(item => item.kind === "plan")).toMatchObject({ steps: [{ text: "Fix", status: "done" }] });
   const all = [...start, reset, ...retry];

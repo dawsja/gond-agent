@@ -38,8 +38,8 @@ import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
+import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
-import { publicationPushOptions } from "./publication";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
@@ -49,7 +49,6 @@ export interface Run extends CiInfo {
   repo: string;
   base_branch: string;
   branch: string;
-  /** Explicit caller-selected branch; never infer this from the branch name. */
   explicit_branch?: boolean;
   model_id: string;
   effort?: string;
@@ -58,6 +57,7 @@ export interface Run extends CiInfo {
   retired_backend?: string;
   title: string;
   prompt: string;
+  pr_body?: string | null;
   status: string;
   queue_position?: number;
   queue_length?: number;
@@ -145,7 +145,7 @@ export class Runs {
           r.ci_round = (r.ci_round ?? 0) + 1;
           r.ci_previous_sha = sha;
           this.save(r);
-          this.enqueue(id, r.user_id, text, [], undefined, undefined, undefined, "ci");
+          this.enqueue(id, r.user_id, text, [], undefined, undefined, undefined, undefined, "ci");
         })();
         return true;
       },
@@ -182,7 +182,7 @@ export class Runs {
   get(id: string, user?: string): Run {
     const r = this.db
       .prepare(
-        "SELECT data FROM runs WHERE id=? AND deleted_at IS NULL" +
+        "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE id=? AND deleted_at IS NULL" +
           (user ? " AND user_id=?" : ""),
       )
       .get(...(user ? [id, user] : [id])) as { data: string } | undefined;
@@ -194,7 +194,7 @@ export class Runs {
     return (
       this.db
         .prepare(
-          "SELECT data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
+          "SELECT json_set(data,'$.pr_body',pr_body) AS data FROM runs WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
         )
         .all(user) as { data: string }[]
     ).map((r) => {
@@ -222,11 +222,12 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null} | undefined;
+    const stored = this.db.prepare("SELECT json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
-    // Other lifecycle work may still hold a snapshot from before a search request.
+    // Lifecycle snapshots must not reset newer description overrides or search/CI counts.
+    if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
     r.updated_at = Date.now();
@@ -298,6 +299,7 @@ export class Runs {
     error: string | null = null,
   ) {
     r.status = status;
+    if (status === "failed" || status === "stopped") r.summary = { ...r.summary, text: "", final_reply: false };
     r.step = step;
     r.error = error;
     this.save(r);
@@ -410,6 +412,9 @@ export class Runs {
       model: string;
       effort?: string;
       prompt: string;
+      title?: string;
+      branch?: string;
+      pr_body?: string;
       images?: string[];
       source?: string;
       backend?: unknown;
@@ -422,6 +427,7 @@ export class Runs {
       return this.get(attribution.id, user);
     }
     const backend = assertBackend(input.backend);
+    const fields = publicationFields(input);
     if (
       !validRepo(input.repo) ||
       !input.prompt?.trim() ||
@@ -443,8 +449,9 @@ export class Runs {
         "That branch name isn't valid.",
       );
     const id = attribution?.id ?? `run_${randomBytes(12).toString("hex")}`,
-      title = titleFrom(input.prompt),
+      title = fields.title ?? titleFrom(input.prompt),
       now = Date.now();
+    if (fields.branch) await assertBranchAvailable(input.repo, fields.branch, githubEnvFor(this.db, this.cfg.secret, user));
     this.assertAccount(user);
     const profile = this.profile(user);
     const r: Run = {
@@ -452,12 +459,14 @@ export class Runs {
       user_id: user,
       repo: input.repo,
       base_branch: base,
-      branch: `gond-agent/${slug(title)}-${id.slice(-6)}`,
+      branch: fields.branch ?? `gond-agent/${slug(title)}-${id.slice(-6)}`,
+      ...(fields.branch ? { explicit_branch: true } : {}),
       model_id: selectedModel.id,
       backend,
       effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
+      pr_body: fields.pr_body ?? null,
       status: "queued",
       step: null,
       created_at: now,
@@ -493,9 +502,9 @@ export class Runs {
       if (attribution && this.db.prepare("SELECT 1 FROM runs WHERE id=? AND user_id=? AND json_extract(data,'$.mcp_token_id')=?").get(id, user, attribution.tokenId)) return;
       this.db
         .prepare(
-          "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)",
+          "INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data,pr_body) VALUES(?,?,?,?,?,?,?,?)",
         )
-        .run(id, user, r.repo, r.status, now, now, JSON.stringify(r));
+        .run(id, user, r.repo, r.status, now, now, JSON.stringify(r), r.pr_body);
       this.enqueue(
         id,
         user,
@@ -555,15 +564,17 @@ export class Runs {
     effort?:string,
     model?:string,
     requestId?: string,
+    pr_body?: unknown,
     source?: "ci",
   ) {
-    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, source))();
+    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body, source))();
     if (accepted === false) return;
     this.drain();
   }
-  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, source?: "ci") {
+  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown, source?: "ci") {
     this.assertAccount(user);
     let r = this.get(id, user);
+    const fields = publicationFields({ pr_body });
     assertActive(r);
     if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
       throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
@@ -583,6 +594,10 @@ export class Runs {
     const answering = this.live.get(id);
     if (question && answering?.busy) {
       r.summary.question = null;
+      if (fields.pr_body !== undefined) {
+        this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
+        r.pr_body = fields.pr_body;
+      }
       this.save(r);
       this.append(id, { type: "user", text, images: [] });
       if (requestId) this.db.prepare("INSERT INTO run_message_requests(run_id,request_id) VALUES(?,?)").run(id, requestId);
@@ -609,6 +624,10 @@ export class Runs {
           .run(id, image, user);
     }
     if (waiting) { r.status = "queued"; r.error = null; r.step = null; r.summary.question = null; }
+    if (fields.pr_body !== undefined) {
+      this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
+      r.pr_body = fields.pr_body;
+    }
     r.pending.push({ text, images, effort, model, ...(source ? { source } : {}), ...(requestId ? { request_id: requestId } : {}) });
     this.save(r);
     this.append(id, {
@@ -900,6 +919,7 @@ export class Runs {
   }
   /** Recheck automatic-round policy against the pinned commit on every push attempt. */
   private ciBeforePush(run: Run): PushOptions["beforePush"] {
+    if (!run.ci_turn) return undefined;
     return async ({ cwd, branch, head }) => {
       const current = this.get(run.id);
       if (!current.ci_turn) return;
@@ -931,6 +951,10 @@ export class Runs {
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
     const pending = live.publishPending ??= {};
+    // Only preflight a fresh snapshot. An imported retry may already exist remotely
+    // after a lost response; the create-only lease reconciles that exact commit.
+    if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
+    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       options.backgroundPublication
@@ -938,10 +962,10 @@ export class Runs {
         : { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     ), { maxAttempts: 1 });
     try {
-      if (pending.imported) await pushBranch(live.cwd, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r)));
+      if (pending.imported) await pushBranch(live.cwd, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, pushOptions);
       else await importBundle(
         live.cwd, Buffer.from(snapshot.bundle, "base64"), r.branch,
-        githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r)),
+        githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, pushOptions,
       );
       pending.imported = true;
     } catch (error) {
@@ -1010,7 +1034,7 @@ export class Runs {
         "not_pushed",
         "Wait until the changes have been pushed.",
       );
-    const body = r.summary.text || r.prompt;
+    const body = descriptionFor(r);
     if (r.pr_number)
       await gh(`repos/${r.repo}/pulls/${r.pr_number}`, "PATCH", { body }, githubEnvFor(this.db, this.cfg.secret, r.user_id), options);
     else {

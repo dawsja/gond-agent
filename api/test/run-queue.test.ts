@@ -497,6 +497,30 @@ describe("persistent workspace queue", () => {
     expect(runs.history(a.id, 0).filter(e => e.type === "user")).toHaveLength(2);
   });
 
+  it("persists queued publication overrides atomically with request receipts without replaying stale bodies", async () => {
+    await create(); // Occupy the only slot so publication metadata waits with the queued run.
+    const queued = await runs.create("b", {...input(),title:"Queued publication",pr_body:"Initial description"});
+    const order = membership(queued.id);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "");
+    expect(runs.get(queued.id)).toMatchObject({status:"queued",queue_position:1,title:"Queued publication",pr_body:""});
+    expect(membership(queued.id)).toEqual(order);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "Stale retry body");
+    expect(runs.get(queued.id).pr_body).toBe("");
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    expect(() => runs.enqueue(queued.id, "b", "Invalid description", [], undefined, undefined, "invalid-body", "bad\0body"))
+      .toThrow(expect.objectContaining({code:"invalid_publication"}));
+    expect(db.prepare("SELECT request_id FROM run_message_requests WHERE run_id=?").all(queued.id))
+      .toEqual([{request_id:"body-update"}]);
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    await runs.shutdown();
+    runs = new Runs(db, cfg, factory);
+    runs.enqueue(queued.id, "b", "Update the description", [], undefined, undefined, "body-update", "Stale restart body");
+    expect(runs.get(queued.id)).toMatchObject({status:"queued",queue_position:1,title:"Queued publication",pr_body:""});
+    expect(runs.get(queued.id).pending).toHaveLength(2);
+    expect(membership(queued.id)).toEqual(order);
+    expect(runs.history(queued.id, 0).filter(e => e.type === "user")).toHaveLength(2);
+  });
+
   it("recovers waiting membership, messages and order while failing interrupted active work", async () => {
     const interrupted = await create(), first = await create("b", "First"), second = await create("b", "Second");
     runs.enqueue(first.id, "b", "Pending follow-up");
