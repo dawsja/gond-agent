@@ -70,7 +70,7 @@ afterEach(async () => {
 });
 
 async function fixture(options: {
-  failPushes?: number; loseResponse?: boolean; configOnRetry?: boolean; removeBaselineOnFailure?: boolean;
+  failPushes?: number; loseResponse?: boolean; configOnRetry?: boolean; removeBaselineOnFailure?: boolean; configChange?: boolean;
 } = {}) {
   const actual = await vi.importActual<typeof import("../src/command")>("../src/command");
   const remote = join(dir, "remote.git"), cwd = join(dir, "checkouts", "run"), worker = join(dir, "worker");
@@ -89,7 +89,12 @@ async function fixture(options: {
   await git(cwd, "clone", "--no-tags", remote, ".");
   await git(worker, "checkout", "-b", branch);
   await writeFile(join(worker, "work.txt"), "fixed\n");
-  await git(worker, "commit", "-am", "automatic fix");
+  if (options.configChange) {
+    await mkdir(join(worker, ".github", "workflows"), { recursive: true });
+    await writeFile(join(worker, ".github", "workflows", "test.yml"), "name: changed CI\n");
+  }
+  await git(worker, "add", ".");
+  await git(worker, "commit", "-m", "automatic fix");
   const head = await git(worker, "rev-parse", "HEAD");
   const bundlePath = join(worker, ".git", "fixture.bundle");
   await git(worker, "bundle", "create", bundlePath, "HEAD");
@@ -121,6 +126,7 @@ async function fixture(options: {
     if (file === "git") {
       if (args.includes("diff") && args.includes("--name-only") && args.includes("--no-renames")) {
         events.push({ kind: "guard", args: [...args] });
+        expect(runs.get("run").pushed).toBe(false);
         if (++guards > 1 && options.configOnRetry) return Buffer.from(".github/workflows/test.yml\0");
       }
       if (args.includes("ls-remote")) {
@@ -130,6 +136,7 @@ async function fixture(options: {
       if (args.includes("push")) {
         events.push({ kind: "push", args: [...args] });
         expect(commandOptions?.env?.GH_TOKEN).toBe(token);
+        expect(runs.get("run").pushed).toBe(false);
         pushes++;
         if (pushes <= (options.failPushes ?? 0)) {
           if (options.removeBaselineOnFailure) {
@@ -235,6 +242,30 @@ describe("automatic CI publication with explicit-branch leases", () => {
     expect(runs.get("run")).toMatchObject({ pushed: true, head_sha: f.head, ci_pending_sha: f.head });
     expect(f.rpc).toHaveBeenCalledTimes(1);
     expect(f.start).toHaveBeenCalledExactlyOnceWith("run", f.head);
+  }, 20_000);
+
+  it("refuses a real .github change in an automatic kept commit during boot before pushing or cloning", async () => {
+    const f = await fixture({ configChange: true });
+    await f.git(f.cwd, "fetch", "--no-tags", f.bundlePath, "HEAD");
+    await f.git(f.cwd, "reset", "--hard", "FETCH_HEAD");
+    service().live.delete("run");
+    const current = runs.get("run");
+    current.kept_commit = f.head;
+    runs.save(current);
+
+    await service().boot("run");
+
+    expect(f.events.map(event => event.kind)).toEqual(["guard"]);
+    expect(f.events[0].args.slice(-3)).toEqual([f.base, f.head, "--"]);
+    f.expectGaveUp();
+    expect(runs.get("run")).toMatchObject({
+      pushed: false, head_sha: f.base, kept_commit: f.head, phase: "idle",
+      ci_reason: "needs a person: automatic fixes cannot push changes to CI configuration.",
+    });
+    expect(await f.remoteHead()).toBe("");
+    expect(f.rpc).not.toHaveBeenCalled();
+    expect(gh).not.toHaveBeenCalled();
+    expect(service().booting.has("run")).toBe(false);
   }, 20_000);
 
   it("rechecks current CI policy on a capacity-reclaimed kept_commit retry and gives up without cloning or a second push", async () => {
