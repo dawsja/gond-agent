@@ -11,6 +11,8 @@ import { Runs } from "../src/runs/service";
 import type { Config } from "../src/config";
 import { gh, checkout, importBundle, pushBranch } from "../src/github";
 import { RetryError } from "../src/retry";
+import { command } from "../src/command";
+import * as publication from "../src/runs/publication";
 import { createMcp, createToken, sessionState } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 vi.mock("../src/github", async (original) => {
@@ -514,6 +516,72 @@ describe("persistent local run lifecycle", () => {
     } finally {
       release?.();
       vi.mocked(gh).mockImplementation(original);
+      captured.mockRestore();
+    }
+  });
+  it("keeps boot publication create-only and pushed false when someone else creates the explicit branch", async () => {
+    const captured = vi.spyOn(console, "error").mockImplementation(() => {});
+    const optionsFor = publication.publicationPushOptions;
+    let optionsSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      vi.mocked(importBundle).mockRejectedValueOnce(new RetryError("push", {class:"network",retryable:true,reason:"Connection reset"}, 5));
+      const branch = "fix/kept-commit-race", ref = `refs/heads/${branch}`;
+      const r = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Keep my unpublished work",branch});
+      await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+      await runs.close(r.id, true); // Reclaim the worker, retaining its imported commit for boot().
+      expect(runs.get(r.id)).toMatchObject({explicit_branch:true,pushed:false,kept_commit:"b".repeat(40),work_kept:false});
+
+      // Replace the mocked imported commit with a real API clone and local bare remote.
+      const cwd = join(dir, "checkouts", r.id), remote = join(dir, "remote.git");
+      mkdirSync(cwd, {recursive:true});
+      mkdirSync(remote);
+      const git = async (folder: string, ...args: string[]) => (await command("git", args, {cwd:folder})).toString().trim();
+      await git(remote, "init", "--bare", "-b", "main");
+      await git(cwd, "init", "-b", branch);
+      await git(cwd, "config", "user.name", "Fixture");
+      await git(cwd, "config", "user.email", "fixture@example.test");
+      writeFileSync(join(cwd, "work.txt"), "base\n");
+      await git(cwd, "add", ".");
+      await git(cwd, "commit", "-m", "base");
+      const base = await git(cwd, "rev-parse", "HEAD");
+      await git(cwd, "remote", "add", "origin", remote);
+      await git(cwd, "push", "origin", "HEAD:refs/heads/main");
+      writeFileSync(join(cwd, "work.txt"), "kept work\n");
+      await git(cwd, "commit", "-am", "kept work");
+      const head = await git(cwd, "rev-parse", "HEAD");
+      runs.save({...runs.get(r.id),kept_commit:head,head_sha:head});
+      // Someone else creates an ancestor ref after reclamation; a plain push would fast-forward it.
+      await git(remote, "update-ref", ref, base);
+      await git(cwd, "merge-base", "--is-ancestor", base, head);
+
+      const guard = vi.fn(async (context: {cwd:string;branch:string;head:string}) => {
+        expect(context).toEqual({cwd,branch,head});
+        expect(runs.get(r.id).pushed).toBe(false);
+      });
+      optionsSpy = vi.spyOn(publication, "publicationPushOptions").mockImplementation(run => optionsFor(run, guard));
+      const actual = await vi.importActual<typeof import("../src/github")>("../src/github");
+      const clones = vi.mocked(checkout).mock.calls.length, activity = log.length;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        vi.mocked(pushBranch).mockImplementationOnce(async (...args) => {
+          expect(args).toEqual([cwd,branch,expect.objectContaining({GH_TOKEN:"test-managed-github-token"}),undefined,{lease:"create-only",beforePush:guard}]);
+          expect(runs.get(r.id)).toMatchObject({pushed:false,kept_commit:head});
+          await actual.pushBranch(...args); // Real Git must reject instead of fast-forwarding the competing ref.
+        });
+        runs.enqueue(r.id, "u", "Retry the kept publication");
+        await vi.waitFor(() => expect(pushBranch).toHaveBeenCalledTimes(attempt));
+        await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+        expect(runs.get(r.id)).toMatchObject({pushed:false,kept_commit:head,work_kept:false,last_error:{step:"push",class:"rejected",attempts:1}});
+        const stored = JSON.parse((db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as {data:string}).data);
+        expect(stored).toMatchObject({pushed:false,kept_commit:head});
+        expect(await git(remote, "rev-parse", ref)).toBe(base);
+        expect(await git(cwd, "rev-parse", "HEAD")).toBe(head);
+      }
+      expect(guard).toHaveBeenCalledTimes(2);
+      expect(optionsSpy).toHaveBeenCalledTimes(2);
+      expect(checkout).toHaveBeenCalledTimes(clones);
+      expect(log).toHaveLength(activity); // No replacement worker or follow-up work starts after rejection.
+    } finally {
+      optionsSpy?.mockRestore();
       captured.mockRestore();
     }
   });
