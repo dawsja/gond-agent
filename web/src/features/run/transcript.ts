@@ -49,6 +49,7 @@ export type Item =
   | { kind: "tool"; key: string; tool: ToolCall }
   | { kind: "plan"; key: string; steps: PlanStep[] }
   | { kind: "agents"; key: string; agents: SubAgent[] }
+  | { kind: "compacted"; key: string; reason?: string; before?: number; after?: number }
   | { kind: "pr"; key: string; number: number; url: string; ts: number; state?: "open" | "closed" | "merged" }
   | { kind: "end"; key: string; status: RunStatus; error?: string; ts: number }
 
@@ -111,6 +112,16 @@ export function createTranscript() {
           else items.push({ kind: "text", key: `t${ev.seq}`, text: ev.text })
           break
         }
+        case "compacted":
+          if (!main) break
+          items.push({
+            kind: "compacted",
+            key: `compact${ev.seq}`,
+            reason: typeof ev.reason === "string" ? ev.reason : undefined,
+            before: typeof ev.before === "number" && Number.isFinite(ev.before) && ev.before >= 0 ? ev.before : undefined,
+            after: typeof ev.after === "number" && Number.isFinite(ev.after) && ev.after >= 0 ? ev.after : undefined,
+          })
+          break
         case "tool.start": {
           if (!main) break
           const call: ToolCall = { callId: ev.call_id, ...presentTool(ev.name, ev.title ?? "", ev.input), status: "running", summary: "", output: "", start: ev.ts }

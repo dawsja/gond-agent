@@ -1,3 +1,4 @@
+mod compaction;
 pub mod core;
 pub mod events;
 

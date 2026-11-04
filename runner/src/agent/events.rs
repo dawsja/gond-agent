@@ -74,9 +74,9 @@ pub enum AgentEvent {
     Usage { input: u64, output: u64, cache_read: u64, context_used: u64, context_window: u64 },
     #[serde(rename = "turn.end")]
     TurnEnd { agent_id: String, stop_reason: String },
-    /// The history was replaced by a summary; token counts before and (estimated) after.
+    /// Older history was summarized; estimated history token sizes before and after.
     #[serde(rename = "compacted")]
-    Compacted { before: u64, after: u64 },
+    Compacted { agent_id: String, reason: String, before: u64, after: u64 },
     #[serde(rename = "error")]
     Error { agent_id: String, message: String, retryable: bool },
 }
