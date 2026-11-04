@@ -754,7 +754,7 @@ pub fn tests_ran(text: &str) -> Option<u64> {
     None
 }
 
-/// Same secret patterns as the service's CI-log scrubber, applied BEFORE byte
+/// Known secret patterns are scrubbed BEFORE byte
 /// truncation. Text is untrusted even after scrubbing; this is not a secrets scan.
 pub fn scrub(text: &str, limit: usize) -> String {
     let mut text = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]")

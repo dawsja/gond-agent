@@ -32,8 +32,6 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
   const unsafe: [string, (c: ReleaseCandidate) => void][] = [
     ["pending message", c => { c.run.pending.push({ text: "Continue", images: [] }); }],
     ["question", c => { c.run.summary.question = { request_id: "q", question: "Which?" }; }],
-    ["CI watch", c => { c.run.ci_active = true; }],
-    ["CI publication", c => { c.run.ci_publication_pending = true; }],
     ["kept work", c => { c.run.work_kept = true; }],
     ["kept commit", c => { c.run.kept_commit = "b".repeat(40); }],
     ["unpublished branch", c => { c.run.pushed = false; }],

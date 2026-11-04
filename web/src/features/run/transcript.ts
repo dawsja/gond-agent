@@ -36,7 +36,6 @@ export interface SubAgent {
 }
 
 export type PlanStep = { text: string; status: "pending" | "in_progress" | "done" }
-export type CiState = "pending" | "passing" | "failing" | "none" | "gave_up" | "unavailable"
 
 export type Item =
   | {
@@ -48,8 +47,6 @@ export type Item =
     }
   | { kind: "text"; key: string; text: string }
   | { kind: "run-message"; key: string; text: string }
-  | { kind: "ci"; key: string; text: string }
-  | { kind: "ci-status"; key: string; state: CiState; round: number; sha: string; failing: string[]; reason?: string }
   | { kind: "explore"; key: string; tools: ToolCall[] }
   | { kind: "edits"; key: string; tools: ToolCall[] }
   | { kind: "tool"; key: string; tool: ToolCall }
@@ -115,16 +112,6 @@ export function createTranscript() {
             images: Array.isArray(ev.images) ? ev.images : [],
           })
           break
-        case "ci":
-          items.push({ kind: "ci", key: `ci${ev.seq}`, text: ev.text })
-          break
-        case "run.ci": {
-          const fields = { state: ev.state, round: ev.round, sha: ev.sha, failing: Array.isArray(ev.failing) ? [...ev.failing] : [], reason: ev.reason }
-          const l = last()
-          if (l?.kind === "ci-status" && l.sha === ev.sha && l.round === ev.round) { mark(l); Object.assign(l, fields) }
-          else items.push({ kind: "ci-status", key: `cs${ev.seq}`, ...fields })
-          break
-        }
         case "text.delta": {
           if (!main) break
           const l = last()
