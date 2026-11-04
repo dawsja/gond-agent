@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -17,14 +17,16 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use super::checkpoint::{self, Checkpoint, Counters};
 use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
-use super::events::{AgentEvent, AgentInput, Decision, ImageInput, QuestionOption, TodoItem};
+use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
 use crate::api::client::SUMMARY_REQUEST_LIMIT;
 use crate::permissions::{self, Access, Mode, Rule, Verdict};
 use crate::skills::{self, Skill};
 use crate::tools::{Baseline, ReadSet, Shells, Tool, ToolCtx, schema, str_arg};
+use crate::tools::persistent_browser::BrowserSession;
 
 pub struct AgentConfig {
     pub model: String,
@@ -52,6 +54,14 @@ pub struct AgentConfig {
 pub struct AgentHandle {
     pub input: UnboundedSender<AgentInput>,
     pub events: UnboundedReceiver<AgentEvent>,
+    pub browser: BrowserSession,
+}
+
+impl Drop for AgentHandle {
+    fn drop(&mut self) {
+        let _ = self.input.send(AgentInput::Interrupt);
+        self.browser.terminate();
+    }
 }
 
 enum Reply {
@@ -70,6 +80,7 @@ struct Shared {
     tools: Vec<Arc<dyn Tool>>,
     reads: ReadSet,
     shells: Shells,
+    browser: BrowserSession,
     baseline: Baseline,
     plan: Mutex<Vec<TodoItem>>,
     plan_reminder_every: u32,
@@ -85,11 +96,81 @@ struct Shared {
     sub_counter: AtomicU32,
     main_context: Mutex<u64>,
     skills: Mutex<Vec<Skill>>,
+    checkpoints: CheckpointControl,
+}
+
+#[derive(Default)]
+struct CheckpointControl {
+    exports: Mutex<Vec<StateRequest>>,
+    wake: tokio::sync::Notify,
+    binding: Mutex<Option<(String, String)>>,
+    counters: Mutex<Counters>,
+    resume_counters: AtomicBool,
+}
+
+struct StateRequest {
+    request_id: String,
+    run_id: String,
+    owner_id: String,
+}
+
+impl StateRequest {
+    fn error(&self, s: &Shared, operation: &str, code: &str) {
+        s.emit(AgentEvent::StateError { request_id: self.request_id.clone(), operation: operation.into(), code: code.into() });
+    }
+
+    fn valid(&self) -> bool {
+        !self.request_id.is_empty() && self.request_id.len() <= 256 && !self.request_id.chars().any(char::is_control)
+            && checkpoint::valid_binding(&self.run_id, &self.owner_id)
+    }
+}
+
+impl CheckpointControl {
+    fn bind(&self, req: &StateRequest) -> Result<(), &'static str> {
+        let mut binding = self.binding.lock().unwrap();
+        match binding.as_ref() {
+            Some((run, owner)) if run != &req.run_id || owner != &req.owner_id => Err("binding_mismatch"),
+            Some(_) => Ok(()),
+            None => { *binding = Some((req.run_id.clone(), req.owner_id.clone())); Ok(()) }
+        }
+    }
+}
+
+// Called only with the local, paired main history, never from the input task.
+fn export_boundary(s: &Shared, history: &[Message]) {
+    let requests = std::mem::take(&mut *s.checkpoints.exports.lock().unwrap());
+    for req in requests {
+        let result = s.checkpoints.bind(&req).and_then(|()| {
+            // Fail before cloning a potentially image-heavy stored transcript.
+            checkpoint::json_bytes(&history)?;
+            let mut counters = s.checkpoints.counters.lock().unwrap().clone();
+            counters.sub_counter = s.sub_counter.load(Ordering::Relaxed);
+            counters.main_context = *s.main_context.lock().unwrap();
+            let state = Checkpoint {
+                schema_version: checkpoint::SCHEMA_VERSION,
+                runner_state_version: checkpoint::RUNNER_STATE_VERSION.into(),
+                run_id: req.run_id.clone(), owner_id: req.owner_id.clone(),
+                history: history.to_vec(), plan: s.plan.lock().unwrap().clone(), counters,
+            };
+            state.validate(&req.run_id, &req.owner_id)?;
+            checkpoint::json_bytes(&state)?;
+            Ok(state)
+        });
+        match result {
+            Ok(state) => s.emit(AgentEvent::StateExported { request_id: req.request_id, state: Box::new(state) }),
+            Err(code) => req.error(s, "export_state", code),
+        }
+    }
 }
 
 impl Shared {
     fn emit(&self, e: AgentEvent) {
         let _ = self.events.send(e);
+    }
+
+    async fn end_turn(&self, agent_id: &str, stop_reason: impl Into<String>) {
+        if agent_id == "main" { self.browser.close().await; }
+        self.emit(AgentEvent::TurnEnd { agent_id: agent_id.into(), stop_reason: stop_reason.into() });
     }
 
     fn resolve(&self, id: &str, r: Reply) {
@@ -142,6 +223,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         tools: cfg.tools,
         reads: ReadSet::default(),
         shells: Shells::default(),
+        browser: BrowserSession::default(),
         baseline: Baseline::default(),
         plan: Mutex::new(cfg.plan),
         plan_reminder_every: cfg.plan_reminder_every,
@@ -157,6 +239,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         sub_counter: AtomicU32::new(0),
         main_context: Mutex::new(0),
         skills: Mutex::new(cfg.skills),
+        checkpoints: CheckpointControl::default(),
     });
     shared.emit(AgentEvent::SessionStart {
         session_id: cfg.session_id,
@@ -166,10 +249,32 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
     });
 
     let s = shared.clone();
+    let mut fresh = cfg.history.is_empty();
     tokio::spawn(async move {
         while let Some(input) = in_rx.recv().await {
             match input {
+                AgentInput::ExportState(ExportStateInput { request_id, run_id, owner_id }) => {
+                    let req = StateRequest { request_id, run_id, owner_id };
+                    if !req.valid() { req.error(&s, "export_state", "invalid_command"); continue; }
+                    let mut pending = s.checkpoints.exports.lock().unwrap();
+                    if pending.len() >= 4 {
+                        req.error(&s, "export_state", "export_queue_full");
+                    } else {
+                        pending.push(req);
+                        s.checkpoints.wake.notify_one();
+                    }
+                }
+                AgentInput::ImportState(ImportStateInput { request_id, run_id, owner_id, state }) => {
+                    let req = StateRequest { request_id, run_id, owner_id };
+                    if !req.valid() { req.error(&s, "import_state", "invalid_command"); continue; }
+                    if !fresh { req.error(&s, "import_state", "runner_not_fresh"); continue; }
+                    if let Err(code) = checkpoint::json_bytes(&state) { req.error(&s, "import_state", code); continue; }
+                    // Reserve at ingress: never queue an import behind ongoing/queued work.
+                    fresh = false;
+                    let _ = user_tx.send(Work::Import(req, state));
+                }
                 AgentInput::User { text, images } => {
+                    fresh = false;
                     let _ = user_tx.send(Work::User(text, images));
                 }
                 AgentInput::PermissionReply { request_id, decision, message } => s.resolve(&request_id, Reply::Permission(decision, message)),
@@ -182,6 +287,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 AgentInput::Mode { mode } => *s.mode.lock().unwrap() = mode,
                 AgentInput::Model { model, context_window } => *s.model.lock().unwrap() = (model, context_window),
                 AgentInput::Compact => {
+                    fresh = false;
                     let _ = user_tx.send(Work::Compact);
                 }
                 AgentInput::Skill { name, enabled } => {
@@ -193,10 +299,34 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         }
     });
 
+    let browser = shared.browser.clone();
     let s = shared;
     let mut history = cfg.history;
     tokio::spawn(async move {
-        while let Some(work) = user_rx.recv().await {
+        loop {
+            let work = tokio::select! {
+                biased;
+                _ = s.checkpoints.wake.notified() => { export_boundary(&s, &history); continue; }
+                work = user_rx.recv() => match work { Some(work) => work, None => break },
+            };
+            if let Work::Import(req, state) = work {
+                match Checkpoint::import(state, &req.run_id, &req.owner_id).await {
+                    Ok(state) => match s.checkpoints.bind(&req) {
+                        Ok(()) => {
+                            history = state.history;
+                            *s.plan.lock().unwrap() = state.plan;
+                            s.sub_counter.store(state.counters.sub_counter, Ordering::Relaxed);
+                            *s.main_context.lock().unwrap() = state.counters.main_context;
+                            *s.checkpoints.counters.lock().unwrap() = state.counters;
+                            s.checkpoints.resume_counters.store(true, Ordering::Relaxed);
+                            s.emit(AgentEvent::StateImported { request_id: req.request_id });
+                        }
+                        Err(code) => req.error(&s, "import_state", code),
+                    },
+                    Err(code) => req.error(&s, "import_state", code),
+                }
+                continue;
+            }
             let cancel = CancellationToken::new();
             *s.turn_cancel.lock().unwrap() = cancel.clone();
             let (text, images) = match work {
@@ -205,15 +335,18 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     s.emit(AgentEvent::TurnStart { agent_id: main.id.clone() });
                     let result = compact(&s, &main, &mut history, "manual", &cancel).await;
                     let stop = if cancel.is_cancelled() { "interrupted" } else if result.is_err() { "error" } else { "compacted" };
-                    s.emit(AgentEvent::TurnEnd { agent_id: main.id.clone(), stop_reason: stop.into() });
+                    s.end_turn(&main.id, stop).await;
                     if let Err(e) = result {
                         if !cancel.is_cancelled() {
                             s.emit(AgentEvent::Error { agent_id: main.id, message: s.api.describe(&e), retryable: false });
                         }
                     }
+                    s.checkpoints.counters.lock().unwrap().skipped_history_len = None;
+                    export_boundary(&s, &history);
                     continue;
                 }
                 Work::User(text, images) => (text, images),
+                Work::Import(..) => unreachable!(),
             };
             let start = history.len();
             history.push(Message::user(text, images));
@@ -226,6 +359,9 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     Err(anyhow!("Something went wrong in Gond Agent during this turn. Try again."))
                 }
             };
+            // Also covers a panic caught outside run_loop, before any error event.
+            s.browser.close().await;
+            export_boundary(&s, &history);
             if let Err(e) = result {
                 let retryable = e.downcast_ref::<ApiError>().is_some_and(|a| a.retryable);
                 s.emit(AgentEvent::Error { agent_id: "main".into(), message: s.api.describe(&e), retryable });
@@ -233,12 +369,13 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         }
     });
 
-    AgentHandle { input: in_tx, events: ev_rx }
+    AgentHandle { input: in_tx, events: ev_rx, browser }
 }
 
 enum Work {
     User(String, Vec<ImageInput>),
     Compact,
+    Import(StateRequest, Value),
 }
 
 const AUTO_COMPACT_PCT: u64 = 85;
@@ -390,9 +527,9 @@ async fn compact_automatically(s: &Arc<Shared>, run: &Run, history: &mut Vec<Mes
     }
 }
 
-fn end_compaction_failure(s: &Shared, run: &Run, cancel: &CancellationToken, error: anyhow::Error) -> Result<String> {
+async fn end_compaction_failure(s: &Shared, run: &Run, cancel: &CancellationToken, error: anyhow::Error) -> Result<String> {
     let interrupted = cancel.is_cancelled();
-    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: if interrupted { "interrupted" } else { "error" }.into() });
+    s.end_turn(&run.id, if interrupted { "interrupted" } else { "error" }).await;
     if interrupted { Ok(String::new()) } else { Err(error) }
 }
 
@@ -468,15 +605,21 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
         }
         let started = Instant::now();
         let mut tool_count = 0u32;
-        let mut reminders = PlanReminders::default();
-        let mut compactions = TurnCompactions::default();
+        let saved = if !run.is_sub() && s.checkpoints.resume_counters.swap(false, Ordering::Relaxed) {
+            s.checkpoints.counters.lock().unwrap().clone()
+        } else { Counters::default() };
+        let mut reminders = PlanReminders { calls: saved.plan_calls, last: saved.plan_last, nudges: saved.plan_nudges };
+        let mut compactions = TurnCompactions { count: saved.turn_compactions, skipped_history_len: saved.skipped_history_len };
         let mut context_used = if run.is_sub() { 0 } else { *s.main_context.lock().unwrap() };
         let mut first = true;
         loop {
+            round_boundary(s, run, history, &reminders, &compactions, context_used);
             let reason = if first { "auto-turn" } else { "auto-round" };
             if let Err(e) = compact_automatically(s, run, history, reason, &mut compactions, context_used, cancel).await {
-                return end_compaction_failure(s, run, cancel, e);
+                round_boundary(s, run, history, &reminders, &compactions, context_used);
+                return end_compaction_failure(s, run, cancel, e).await;
             }
+            if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
             first = false;
             let (model, _) = s.model.lock().unwrap().clone();
             let mut tools: Vec<ToolDef> = s.tools.iter().filter(|t| tool_visible(t.as_ref(), run)).map(|t| t.def()).collect();
@@ -511,8 +654,12 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                     if let Some(partial) = sanitize_partial(partial.clone()) { history.push(partial); }
                 }
                 if let Err(e) = compact_in_turn(s, run, history, "overflow", &mut compactions.count, cancel).await {
-                    return end_compaction_failure(s, run, cancel, e);
+                    if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
+                    round_boundary(s, run, history, &reminders, &compactions, context_used);
+                    return end_compaction_failure(s, run, cancel, e).await;
                 }
+                compactions.skipped_history_len = None;
+                if !run.is_sub() { context_used = *s.main_context.lock().unwrap(); }
                 req.messages = history.clone();
                 streamed = stream_once(s, run, &req, cancel).await;
                 if overflow_response(&streamed) {
@@ -528,11 +675,13 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                     if let Some(m) = sanitize_partial(partial) {
                         history.push(m);
                     }
-                    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "interrupted".into() });
+                    round_boundary(s, run, history, &reminders, &compactions, context_used);
+                    s.end_turn(&run.id, "interrupted").await;
                     return Ok(String::new());
                 }
                 Streamed::Failed(e) => {
-                    s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "error".into() });
+                    round_boundary(s, run, history, &reminders, &compactions, context_used);
+                    s.end_turn(&run.id, "error").await;
                     return Err(e);
                 }
             };
@@ -550,7 +699,8 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                         continue;
                     }
                 }
-                s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: stop });
+                round_boundary(s, run, history, &reminders, &compactions, context_used);
+                s.end_turn(&run.id, stop).await;
                 return Ok(text);
             }
 
@@ -569,12 +719,24 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
             let results = Message { role: Role::Tool, content: results };
             context_used = context_used.saturating_add(compaction::estimate(std::slice::from_ref(&results)));
             history.push(results);
+            round_boundary(s, run, history, &reminders, &compactions, context_used);
             if cancel.is_cancelled() {
-                s.emit(AgentEvent::TurnEnd { agent_id: run.id.clone(), stop_reason: "interrupted".into() });
+                s.end_turn(&run.id, "interrupted").await;
                 return Ok(text);
             }
         }
     })
+}
+
+fn round_boundary(s: &Shared, run: &Run, history: &[Message], reminders: &PlanReminders, compactions: &TurnCompactions, context_used: u64) {
+    if run.is_sub() { return; }
+    *s.main_context.lock().unwrap() = context_used;
+    *s.checkpoints.counters.lock().unwrap() = Counters {
+        sub_counter: s.sub_counter.load(Ordering::Relaxed), main_context: context_used,
+        plan_calls: reminders.calls, plan_last: reminders.last.clone(), plan_nudges: reminders.nudges,
+        turn_compactions: compactions.count, skipped_history_len: compactions.skipped_history_len,
+    };
+    export_boundary(s, history);
 }
 
 #[derive(Default)]
@@ -865,7 +1027,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
 }
 
 fn tool_context(s: &Shared, run: &Run, id: &str, cancel: &CancellationToken) -> ToolCtx {
-    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
+    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
 }
 
 fn permission_detail(name: &str, input: &Value) -> String {
@@ -989,6 +1151,7 @@ mod tests {
     use std::time::Duration;
 
     include!("stream_retry_tests.rs");
+    include!("checkpoint_tests.rs");
     #[cfg(unix)]
     include!("relay_security_tests.rs");
 
@@ -1880,15 +2043,70 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_shared_with_subagent_is_cleaned_before_main_turn_done() {
+        struct BrowserFixture;
+        impl Tool for BrowserFixture {
+            fn name(&self) -> &'static str { "browser_fixture" }
+            fn description(&self) -> &'static str { "Start a fake browser daemon" }
+            fn schema(&self) -> Value { schema(json!({}), &[]) }
+            fn access(&self) -> Access { Access::Exec }
+            fn title(&self, _: &Value) -> String { "browser fixture".into() }
+            fn run<'a>(&'a self, ctx: &'a ToolCtx, _: Value) -> BoxFuture<'a, crate::tools::ToolOutput> {
+                Box::pin(async move {
+                    let mut command = tokio::process::Command::new("sh");
+                    command.args(["-c", r#"
+                        printf '%s\n%s\n' "$$" "$1" > browser-probe
+                        while IFS= read -r line; do printf '{"ok":true,"text":"shared page"}\n'; done
+                    "#, "browser-fixture"]);
+                    ctx.browser.start_for_test(command, &ctx.cwd, &ctx.cwd, ctx.cancel.clone());
+                    let snapshot = crate::tools::persistent_browser::tools().into_iter().find(|tool| tool.name() == "browser_snapshot").unwrap();
+                    snapshot.run(ctx, json!({})).await
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let url = mock(Arc::new(|req| {
+            let main = req["metadata"]["agent_id"] == "main";
+            let count = req["messages"].as_array().unwrap().len();
+            let blocks = match (main, count) {
+                (true, 1) => vec![json!({"type":"tool_call","id":"delegate","name":"task","input":{
+                    "description":"Start shared page","prompt":"Start the fixture","kind":"general"
+                }})],
+                (false, 1) => vec![json!({"type":"tool_call","id":"fixture","name":"browser_fixture","input":{}})],
+                (true, 3) => vec![json!({"type":"tool_call","id":"snapshot","name":"browser_snapshot","input":{}})],
+                _ => vec![json!({"type":"text","text":"Done"})],
+            };
+            sse(&blocks, if blocks[0]["type"] == "tool_call" { "tool_use" } else { "end_turn" })
+        }), seen).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.context_window = 200_000;
+        cfg.tools.push(Arc::new(BrowserFixture));
+        let mut h = spawn(ApiClient::new(url, None), cfg);
+        h.input.send(AgentInput::User { text: "Work".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { agent_id, call_id, ok: true, output, .. }
+            if agent_id == "main" && call_id == "snapshot" && output == "shared page")));
+        let probe = std::fs::read_to_string(dir.path().join("browser-probe")).unwrap();
+        let mut lines = probe.lines();
+        let pid: libc::pid_t = lines.next().unwrap().parse().unwrap();
+        assert!(!std::path::Path::new(lines.next().unwrap()).exists());
+        // SAFETY: signal 0 only tests existence; stop() has already reaped this child.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
     fn compaction_shared(api: ApiClient, window: u64) -> Arc<Shared> {
         Arc::new(Shared {
             api, events: unbounded_channel().0, pending: Mutex::default(), mode: Mutex::new(Mode::Allow),
             rules: Mutex::default(), model: Mutex::new(("m".into(), window)), effort: Mutex::new("default".into()),
-            tools: vec![], reads: ReadSet::default(), shells: Shells::default(), baseline: Baseline::default(),
+            tools: vec![], reads: ReadSet::default(), shells: Shells::default(), browser: BrowserSession::default(), baseline: Baseline::default(),
             plan: Mutex::default(), plan_reminder_every: 0, plan_nudge_limit: 0, cwd: PathBuf::from("/tmp"),
             session_id: "s".into(), system: String::new(), sub_system: String::new(), locks: Mutex::default(),
             turn_cancel: Mutex::new(CancellationToken::new()), interactive: false, question_wait: Duration::ZERO,
             sub_counter: AtomicU32::new(0), main_context: Mutex::new(0), skills: Mutex::default(),
+            checkpoints: CheckpointControl::default(),
         })
     }
 
