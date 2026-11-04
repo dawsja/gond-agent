@@ -1,4 +1,6 @@
 // Presentation only: stored events and the worker's tool identities stay unchanged.
+// For compact labels only; expanded details keep the original text.
+export const displayText = (value: string) => value.replace(/[\p{Cc}\p{Cf}]|[\u{E0000}-\u{E007F}]|[\uFE00-\uFE0F]|[\u{E0100}-\u{E01EF}]/gu, "");
 const aliases: Record<string, string> = {
   Read: "read", Write: "write", Edit: "edit", MultiEdit: "multi_edit",
   Bash: "bash", Grep: "grep", Glob: "glob", WebSearch: "web_search", WebFetch: "web_fetch",
@@ -10,7 +12,7 @@ const labels: Record<string, string> = {
   bash: "Command", kill_shell: "Stop command", bash_output: "Command output",
   glob: "Find files", grep: "Search", list_directory: "List files", symbols: "Find symbols",
   batch: "Review files", list_plan: "Read plan", web_search: "Search the web", web_fetch: "Read page",
-  browser: "Browser check", skill: "Read instructions",
+  browser: "Browser check", run_checks: "Run checks", skill: "Read instructions",
   update_plan: "Plan update", task: "Delegate work",
 };
 export const EDIT_TOOLS = new Set(["write", "edit", "multi_edit", "apply_patch"]);
@@ -47,12 +49,27 @@ export function presentTool(rawName: string, rawTitle: string, rawInput: unknown
   return { name: local ? name : "external", label, title, paths: [...new Set(paths)], source: local ? undefined : words(source!) };
 }
 
-interface Activity { name: string; label: string; title: string; status: "running" | "done" | "failed"; paths: string[] }
+interface Activity { name: string; label: string; title: string; status: "running" | "done" | "failed"; paths: string[]; summary?: string }
+
+// run_checks emits raw stdout, not its model-facing JSON result. The shell's
+// terminal summary is a duration only for exit 0 (runner/src/tools/bash.rs).
+// Report process status, never a verification verdict (even `true` exits 0).
+// Background launches and legacy completions without this signal stay Finished.
+function checkResult(tool: Activity): string | undefined {
+  const summary = tool.summary ?? ""
+  if (tool.status === "done" && /^\d+\.\d+s$/.test(summary)) return "exit 0"
+  const exit = /^exit (-?\d+) · \d+\.\d+s$/.exec(summary)
+  return tool.status === "failed" && exit && exit[1] !== "0" ? `exit ${exit[1]}` : undefined
+}
 export function activityLabel(tool: Activity) {
   const running = tool.status === "running", failed = tool.status === "failed";
   if (tool.name === "bash") {
     const kind = /\btypecheck\b|\btsc\b/.test(tool.title) ? "Typecheck" : /\b(?:test|vitest|pytest)\b/.test(tool.title) ? "Tests" : /\bbuild\b/.test(tool.title) ? "Build" : "Command";
     return running ? `Running ${kind.toLowerCase()}` : `${kind} ${failed ? "failed" : "finished"}`;
+  }
+  if (tool.name === "run_checks") {
+    const result = checkResult(tool)
+    return running ? "Running checks" : `${failed ? "Checks failed" : "Checks finished"}${result ? ` · ${result}` : ""}`
   }
   if (tool.name === "browser") return running ? "Checking browser layouts" : `Browser checks ${failed ? "failed" : "finished"}`;
   if (tool.name === "update_plan") return running ? "Updating plan" : failed ? "Plan update failed" : "Updated plan";

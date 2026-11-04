@@ -604,21 +604,24 @@ const key = 'fixture-only-provider-key';
         activity('tool.start', { call_id: `search-${index}`, name: 'mcpToolCall', title: 'grep', input: { server: 'gond', tool: 'grep', arguments: { pattern: 'returnUrl' } } });
         activity('tool.end', { call_id: `search-${index}`, ok: true });
       }
-      const explored = page.getByRole('button', { name: 'Viewed 4 files and ran 2 searches', exact: true });
+      const explored = page.getByRole('button', { name: 'Explored 4 files api/src/auth.ts', exact: true });
       await expect(explored).toHaveAttribute('aria-expanded', 'false');
       await explored.focus(); await page.keyboard.press('Enter');
       await expect(explored).toHaveAttribute('aria-expanded', 'true');
-      await expect(page.getByText('api/src/auth.ts', { exact: true })).toBeVisible();
+      const exploredDetails = page.locator(`[id="${await explored.getAttribute('aria-controls')}"]`);
+      await expect(exploredDetails.getByText('api/src/auth.ts', { exact: true })).toBeVisible();
       await page.keyboard.press('Enter');
+      await expect(explored).toHaveAttribute('aria-expanded', 'false');
+      await expect(exploredDetails).toBeHidden();
       activity('text.delta', { text: "The mobile flow drops the return URL. I've updated the redirect and added a regression check." });
       for (const [index, file] of ['api/src/auth.ts', 'api/test/auth.test.ts'].entries()) {
         activity('tool.start', { call_id: `edit-${index}`, name: 'mcp__gond__edit', title: 'mcp__gond__edit', input: { path: file } });
         activity('tool.end', { call_id: `edit-${index}`, ok: true });
       }
-      await expect(page.getByRole('button', { name: 'Updated 2 files', exact: true })).toHaveAttribute('aria-expanded', 'false');
+      await expect(page.getByRole('button', { name: 'Edited 2 files api/src/auth.ts', exact: true })).toHaveAttribute('aria-expanded', 'false');
       activity('tool.start', { call_id: 'check', name: 'commandExecution', title: 'npm run typecheck', input: { command: 'npm run typecheck' } });
       activity('tool.end', { call_id: 'check', ok: true, output: JSON.stringify([{ type: 'text', text: 'No type errors.' }]) });
-      const typecheck = page.getByRole('button', { name: 'Typecheck finished', exact: true });
+      const typecheck = page.getByRole('button', { name: 'Ran 1 command npm run typecheck', exact: true });
       await typecheck.click();
       await expect(page.getByText('No type errors.', { exact: true })).toBeVisible();
       await typecheck.click();
