@@ -177,7 +177,20 @@ print(output)
         self.assertEqual(env["GOND_AGENT_MODEL"], "chatgpt.acct:gpt-5.5")
         self.assertEqual(env["GOND_AGENT_RELAY_TOKEN"], agent.relay_token)
         added = set(env) - set(os.environ)
-        self.assertEqual(added, {"GOND_AGENT_RELAY_TOKEN", "GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES"} - set(os.environ))
+        self.assertEqual(added, {"GOND_AGENT_RELAY_TOKEN", "GOND_AGENT_API_URL", "GOND_AGENT_MODEL", "GOND_AGENT_EFFORT", "GOND_AGENT_HOME", "GOND_AGENT_INITIAL_PLAN", "GOND_AGENT_PLAN_REMINDER_EVERY", "GOND_AGENT_PLAN_NUDGE_LIMIT", "GOND_AGENT_INTERACTIVE", "GOND_AGENT_QUESTION_WAIT_MINUTES",
+                                "GOND_AGENT_TASK_KIND", "GOND_AGENT_EVIDENCE_BASE_SHA", "GOND_AGENT_EVIDENCE", "GOND_AGENT_EVIDENCE_REPO_POLICY",
+                                "GOND_AGENT_EVIDENCE_SEQ", "GOND_AGENT_EVIDENCE_GATE_ROUNDS", "GOND_AGENT_EVIDENCE_RESUMES"} - set(os.environ))
+        self.assertEqual(env["GOND_AGENT_EVIDENCE"], "on")
+        self.assertEqual(env["GOND_AGENT_EVIDENCE_GATE_ROUNDS"], "0")
+        configured = agent.worker_env({"model": "fixture", "evidence_base_sha": "a" * 40,
+                                       "evidence_mode": "off", "evidence_repo_policy": "allow-weaken",
+                                       "evidence_seq": 7, "evidence_gate_rounds": 4, "evidence_resumes": 2})
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_BASE_SHA"], "a" * 40)
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE"], "off")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_REPO_POLICY"], "allow-weaken")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_SEQ"], "7")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_GATE_ROUNDS"], "4")
+        self.assertEqual(configured["GOND_AGENT_EVIDENCE_RESUMES"], "2")
 
     def test_each_dispatch_start_passes_a_fresh_token_only_in_worker_environment(self):
         output, errors, log = io.StringIO(), io.StringIO(), io.BytesIO()
@@ -610,9 +623,29 @@ class StateControlTest(unittest.TestCase):
                 source.wait(timeout=3)
                 thread.join(3)
 
+    def test_evidence_key_uses_only_the_private_correlated_control_path(self):
+        key = "07" * 32
+        environment = dict(os.environ)
+        frame, results = self.begin("init_evidence", key=key, request_id="caller-controlled")
+        self.assertEqual(set(frame), {"type", "request_id", "run_id", "owner_id", "key"})
+        self.assertEqual(frame["type"], "init_evidence")
+        self.assertTrue(frame["key"] == key)
+        self.assertNotEqual(frame["request_id"], "caller-controlled")
+        # Wrong-operation and unsolicited key-shaped replies never become events.
+        self.old.reply({"type": "state.imported", "request_id": frame["request_id"], "key": key})
+        self.assertTrue(results.empty())
+        self.old.reply({"type": "state.evidence_initialized", "request_id": frame["request_id"]})
+        self.assertIs(results.get(timeout=3), True)
+        self.assertEqual(agent.dispatch({"method": "events"})["events"], [])
+        self.assertEqual(os.environ, environment)
+        for invalid in (None, "x" * 64, key + "00", "PRIVATE-EVIDENCE-KEY"):
+            with self.assertRaisesRegex(RuntimeError, "Invalid evidence initialization"):
+                agent.dispatch({"method": "init_evidence", "run_id": "run", "owner_id": "owner", "key": invalid})
+        self.assertTrue(self.old.requests.empty())
+
     def test_unsolicited_stale_wrong_operation_and_late_frames_are_dropped(self):
         secret = {"private": "must never enter events"}
-        for kind in ("state.exported", "state.imported", "state.error", "state.future"):
+        for kind in ("state.exported", "state.imported", "state.evidence_initialized", "state.error", "state.future"):
             event = {"type": kind, "request_id": "unsolicited", "state": secret}
             self.old.reply(event)
             agent.drain(io.StringIO(json.dumps(event) + "\n"))
@@ -664,7 +697,7 @@ class StateControlTest(unittest.TestCase):
         self.assertEqual(agent.events, [])
 
     def test_send_cannot_bypass_state_controls(self):
-        for kind in ("export_state", "import_state", "state.exported", "state.imported", "state.error", "checkpoint.release", "checkpoint.ready", "checkpoint.future"):
+        for kind in ("export_state", "import_state", "init_evidence", "state.evidence_initialized", "state.exported", "state.imported", "state.error", "checkpoint.release", "checkpoint.ready", "checkpoint.future"):
             with self.subTest(kind=kind), self.assertRaisesRegex(RuntimeError, "dedicated"):
                 agent.dispatch({"method": "send", "input": {"type": kind, "state": {"secret": True}}})
         self.assertTrue(self.old.requests.empty())
@@ -873,7 +906,9 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD^").decode().strip(), self.head)
         self.assertNotEqual(published["head"], data["checkpoint_sha"])
         self.assertNotIn(b"ignored-secret", self.git("ls-tree", "-r", "--name-only", "HEAD"))
-        self.assertFalse((fresh / "local-exclude").exists())
+        # Clone-local excludes cannot hide executable files from canonical capture.
+        self.assertEqual((fresh / "local-exclude").read_text(), "also do not export\n")
+        self.assertIn(b"local-exclude", self.git("ls-tree", "-r", "--name-only", "HEAD"))
         # Without a journal-authenticated published HEAD, recovery from the
         # pushed branch rejects the old HEAD pin but accepts the new one.
         final = self.export()
@@ -954,6 +989,10 @@ class CheckpointTest(unittest.TestCase):
         before = self.state()
         with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
             self.export()
+        with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
+            agent.tree_hash()
+        with self.assertRaisesRegex(RuntimeError, "Newly staged ignored files"):
+            agent.dispatch({"method": "snapshot", "identity": self.identity})
         self.assertEqual(self.state(), before)
         self.assertEqual((self.root / "ignored-tracked").read_text(), "private work\n")
 

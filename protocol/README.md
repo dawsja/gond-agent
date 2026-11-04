@@ -35,7 +35,7 @@ Event pages contain at most 128,000 JSON characters; oversized individual events
 
 `start_session.title` is optional plain text without newlines, at most 120 characters, used for the run, commit and PR titles. Optional `branch` must match `^(gond-agent|feat|fix|chore|docs)/[a-z0-9][a-z0-9._-]{0,80}(/[a-z0-9._-]{1,80}){0,3}$`; `..`, trailing slash, `.lock` suffixes and protected names `main`, `master`, `HEAD`, `release*` and `v*` are forbidden. An existing remote branch is refused unless it belongs to this run. Explicit branches are rechecked before first publication, and a create-only Git lease prevents overwriting a branch created after that check.
 
-Optional `pr_body` on `start_session` and `send_session_message` is plain text up to 20,000 characters; follow-up overrides persist. PR body precedence is explicit `pr_body` (including an empty string), otherwise clean main-agent final text after the last tool call, otherwise the plain run title, never the prompt. Only `end_turn` (the runner's normalized clean stop) qualifies; truncated, refusal/filter, unknown, compacted, interrupted and error stops do not. Failed/stopped runs and successful turns with no final text use the title. Commentary and subagent text never supply the fallback. This publication selection leaves the live event transcript unchanged. MCP session reads and workspace run reads expose both the nullable `pr_body` override and the chosen `description`; the workspace PR panel renders that description.
+Optional `pr_body` on `start_session` and `send_session_message` is plain text up to 20,000 characters; follow-up overrides persist. Prose selection is explicit `pr_body` (including an empty string), otherwise clean main-agent final text after the last tool call, otherwise the plain run title, never the prompt. The sole `descriptionFor` body policy neutralizes caller/model Verification headings/markers and always appends a service-generated Verification block, even for empty explicit prose, gate-off/docs-only work or no records. Only `end_turn` (the runner's normalized clean stop) qualifies; truncated, refusal/filter, unknown, compacted, interrupted and error stops do not. Failed/stopped runs and successful turns with no final text use the title. Commentary and subagent text never supply the fallback. This publication selection leaves the live event transcript unchanged. MCP session reads and workspace run reads expose both the nullable `pr_body` override and the chosen `description`; the workspace PR panel renders that description.
 
 Start and follow-up `request_id` values are 1–100 characters, token-scoped and persisted across restart. Retry with identical arguments; changed arguments conflict. Start reserves a stable run ID before asynchronous work; run insertion and initial queueing are atomic. A start retry returns the existing owned run's current state and queue position, never another run. Follow-up enqueue and result persistence are atomic. Sessions retain `source: "mcp"` and token ID attribution. No billing fallback, direct shell/file access, merges, account deletion or image input tools are added.
 
@@ -69,6 +69,7 @@ The Docker controller accepts these separate RPC methods:
 | `checkpoint.release` | Held `boundary_id` → release acknowledgement after persistence. |
 | `checkpoint_tree` | Without a live runner: `base_sha`, connected-owner `identity:{name,email}` → base64 `bundle`, `base_sha`, `head_sha`, `checkpoint_sha`. |
 | `restore_checkpoint` | The above bundle and **trusted persisted** revision pins → validated pins after tree-only application; worker must not be running. |
+| `init_evidence` | `run_id`, `owner_id`, service-generated `key` → acknowledgement after private runner initialization. |
 | `export_state` | `run_id`, `owner_id` → `{state:…}` at a safe runner round boundary. |
 | `import_state` | `run_id`, `owner_id`, `state` → `true` after strict validation in a fresh idle runner. |
 
@@ -80,17 +81,105 @@ Runner JSONL uses `export_state {request_id,run_id,owner_id}` and `import_state 
 
 The controller's 120-second state RPC deadline covers pipe backpressure and the reply wait. Reply waiting releases the worker lock so interruption remains possible. A failed pipe write may leave an incomplete JSONL frame: the controller kills that worker's process group, revokes its relay credential and requires a fresh worker rather than reusing the stream. A reply timeout alone does not kill the worker; late control frames are filtered out.
 
-State schema version 1 / runner compatibility epoch `gond-agent-checkpoint-2` contains run/owner binding, stored `history`, `plan` and counters (subagent ID/consumed delegation allowance, context estimate, plan cadence/nudges and turn-compaction budget). The summary is preserved in stored user-role history. This is not a `ResponsesRequest`: old images are not removed. Only user/assistant/tool roles are allowed, nested schema fields are strict, tool rounds must pair fully and images are normalized on import. Import itself does not run a model. External effects, processes/shells, tool runtime state, installed tools/the tools volume, live subagent histories and pending questions are not restored. A pending question uses the preceding paired-round replay point, not an unpaired tool call or old live request ID. Held capture prevents model/tool/compaction/subagent work until paired history/tree persistence finishes and release is acknowledged; independently exporting history then snapshotting a changing tree is insufficient. Checkpoints do not guarantee exactly-once external execution.
+State schema version 1 / runner compatibility epoch `gond-agent-checkpoint-4` contains run/owner binding, stored `history`, `plan`, optional version-2 `evidence` and counters (subagent ID/consumed delegation allowance, context estimate, plan cadence/nudges and turn-compaction budget). The summary is preserved in stored user-role history. This is not a `ResponsesRequest`: old images are not removed. Only user/assistant/tool roles are allowed, nested schema fields are strict, tool rounds must pair fully and images are normalized on import. Import itself does not run a model. External effects, processes/shells, tool runtime state, installed tools/the tools volume, live subagent histories and pending questions are not restored. A pending question uses the preceding paired-round replay point, not an unpaired tool call or old live request ID. Held capture prevents model/tool/compaction/subagent work until paired history/tree persistence finishes and release is acknowledged; independently exporting history then snapshotting a changing tree is insufficient. Checkpoints do not guarantee exactly-once external execution.
 
 The API storage module stores opaque bundles and auth-secret-sealed state in private, atomically published files with SQLite metadata. The bundle is **not encrypted**; the API data volume is its trust boundary. Save requires base/HEAD/checkpoint SHA pins; load verifies those sealed pins, owner/run/version, creation time and bundle digest, but bundle structural validation belongs in the worker. Production RunService owns this store. Defaults are seven-day retention (`GOND_AGENT_CHECKPOINT_RETENTION_DAYS=7`), 1 GiB total (`GOND_AGENT_CHECKPOINT_MAX_MB=1024`), two snapshots per run, 64 MiB per bundle and 4 MiB stored state **including the service wrapper**. Eviction prefers consumed/ordinary snapshots over unconsumed interrupted work. Startup and hourly cleanup remove files and crash orphans; the hourly timer is unref'd and cleared on shutdown. Application hooks delete checkpoints before explicit close/stop, merge, run/account deletion and retention; SQL cascades cannot unlink files. Storage overrides require explicit Compose environment overrides.
+
+Evidence is a strict typed ledger with up to 40 records, a private signing key, frozen policy, sequence, gate/resume/fix/review counters, stale IDs, limitations/declaration and the turn's initial tree. Gate counters (two per turn, six per run, no further rounds at ten resumes) survive import, not just conversation compaction. Resume installs a fresh service-issued key, marks old records historical/stale without re-signing them, and preserves sequence and budget counters. Mismatched restored trees also make records stale; an imported/exported key never becomes signing authority. Ignored dependencies such as `node_modules` may be absent after restore.
+
+Publication snapshots, checkpoint export and evidence capture use the same isolated Git configuration and worktree `.gitignore`; ignored code is outside tree identity.
 
 CI handoff captures after push and before automatic close, which retains the checkpoint for follow-ups/CI fixes to restore earlier conversation and tree. `GOND_AGENT_CI_FIX_ROUNDS` remains 0 (off) through the API's single default constant; positive values explicitly opt in.
 
 ## Agent events
 
-Worker stdin accepts newline-delimited JSON: `user` with text and inline base64 image bytes (the service resolves owner/run-scoped upload IDs before sending), `interrupt`, `compact`, and model/mode/skill controls. Output is newline-delimited JSON: session.start, turn.start/end, text.delta, reasoning.delta, stream.reset, tool.call/start/output/images/end, todos, agent.spawn/status/end, usage, compacted and error. Main-agent events use `agent_id: main`. The container worker runs autonomously with all tools allowed inside its workspace. Agent schemas live in `runner/src/agent/events.rs`. Additive `tool.call {agent_id,call_id,name}` marks every dispatched tool call, including internal, invalid and cancelled calls, before dispatch. It clears the main reply candidate without adding visible transcript activity or requiring `tool.end`; historical `tool.start` events remain reply boundaries too. Only a main `turn.end` with `stop_reason: "end_turn"` and no main-agent error marks the collected text as a publishable final reply. The runner receives clean provider stops normalized to `end_turn`; no other stop reason qualifies. Older unmarked summaries fall back to the plain run title, never the prompt.
+Worker stdin accepts newline-delimited JSON: `user` with text and inline base64 image bytes (the service resolves owner/run-scoped upload IDs before sending), `interrupt`, `compact`, and model/mode/skill controls. Output is newline-delimited JSON: session.start, turn.start/end, text.delta, reasoning.delta, stream.reset, tool.call/start/output/images/end, todos, agent.spawn/status/end, usage, compacted, evidence.recorded and error. Main-agent events use `agent_id: main`. The container worker runs autonomously with all tools allowed inside its workspace. Agent schemas live in `runner/src/agent/events.rs`. Additive `tool.call {agent_id,call_id,name}` marks every dispatched tool call, including internal, invalid and cancelled calls, before dispatch. It clears the main reply candidate without adding visible transcript activity or requiring `tool.end`; historical `tool.start` events remain reply boundaries too. Only a main `turn.end` with `stop_reason: "end_turn"` and no main-agent error marks the collected text as a publishable final reply. The runner receives clean provider stops normalized to `end_turn`; no other stop reason qualifies. Older unmarked summaries fall back to the plain run title, never the prompt.
 
-`stream.reset {agent_id,text_length,reasoning_length}` rolls back deltas from a failed model-request attempt before retrying. Lengths count UTF-16 code units (JavaScript string lengths), separately for text and reasoning, across all blocks in that attempt. Consumers remove those suffixes only for that agent; completed earlier responses, tool activity and other agents remain intact. The runner emits one reset per discarded attempt with nonempty text or reasoning output, before any retry deltas, and none for retries before output, terminal failures or interruption. Resets are persisted/replayed in order with deltas; the workspace transcript and run summary discard partial text so the successful reply appears once. Partial tool calls never execute or enter model history.
+`stream.reset {agent_id,text_length,reasoning_length}` rolls back deltas from a failed model-request attempt before retrying, or removes a deferred final reply when the advisory evidence gate continues. Gate rollback removes only that reply's text, keeps model history intact, and prevents an earlier finish attempt from becoming publication prose. Lengths count UTF-16 code units (JavaScript string lengths), separately for text and reasoning, across all blocks in that attempt. Consumers remove those suffixes only for that agent; completed earlier responses, tool activity and other agents remain intact. The runner emits one reset per discarded attempt with nonempty text or reasoning output, before any retry deltas, and none for retries before output, terminal failures or interruption. Resets are persisted/replayed in order with deltas; the workspace transcript and run summary discard partial text so the successful reply appears once. Partial tool calls never execute or enter model history.
+
+### Execution evidence and publication
+
+This is an **advisory evidence transparency gate**, not enforcement or independent review. The ledger is **evidence recorded by the worker**. Only a separate-container rerun could supply independent proof; that is out of scope. HMAC signatures authenticate records to the API, not correctness: same-UID executed code can inspect runner process memory. The container remains the trust boundary.
+
+#### Event schema and admission
+
+`evidence.recorded` has exactly `type` and `record`; it is an ordinary persisted event only after API admission. The API service generates a fresh random 32-byte signing key per worker, sends it before the first task in private `init_evidence {request_id,run_id,owner_id,key}`, and waits for `state.evidence_initialized {request_id}`. It retains the key in live memory and sealed checkpoint state. Keys never enter environments, this event, ordinary run rows, transcripts or logs. The worker does not generate signing authority; the service never adopts an exported key or a later finish key as authority. No provider API key is involved in this ledger.
+
+```ts
+interface EvidenceRecorded {
+  type: "evidence.recorded";
+  record: {
+    run_id: string;            // must match the service-bound run
+    seq: number;               // positive, monotonically increasing
+    id: string;               // UUID
+    command: string;           // exact eligible command, or browser tool name
+    cwd: string;               // normalized repository-relative directory; root "."
+    exit_code: number | null;
+    duration_ms: number;
+    started_at: number;        // Unix epoch milliseconds, not seconds
+    tree_hash_before: string;  // Git tree OID
+    tree_hash_after: string;
+    command_definition_changed: boolean; // BASE definitions differ before/after check
+    tests_ran: number | null;  // parsed count; null means unknown, not pass
+    env_clean: boolean;        // environment allow-list applied, not secret-free
+    env_digest: string;        // SHA-256 hex digest of allow-list values
+    output_tail: string;       // scrubbed, bounded untrusted excerpt
+    kind: { type: "check" }
+        | { type: "ui_attempt"; url: string; title: string }
+        | { type: "repro_red" | "repro_green"; test_id: string; test_files: string[]; cases: string[] };
+    sig: string;               // HMAC-SHA256 hex; no signing key
+  };
+}
+```
+
+`duration_ms` and `started_at` are milliseconds; numeric counts/times are nonnegative integers. HMAC-SHA256 covers compact JSON `{domain:"gond-agent:evidence:v1",run_id,record}`, with object keys sorted recursively (arrays retain order). `record` contains **all fields except `sig`**, including its run_id, seq, both tree hashes and `command_definition_changed`; the envelope and record run IDs must match the service-bound run. The API uses strict typed schemas, rejects unknown fields/invalid signatures, duplicate IDs, replay and sequences at or below the last accepted sequence. It retains up to 40 public records (the active red/green pair is pinned; ordinary records use FIFO eviction) and up to 4,096 accepted IDs per run; further records are not admitted after the ID cap. The worker/checkpoint ledger uses the same bound and pinning rule. Worker emission caps command at 4,096 bytes, cwd at 1,024, output at 4,096, UI URL at 2,048 and title at 300; API schema bounds are sometimes looser for compatibility, not permission for the worker to exceed its own limits.
+
+Only foreground **`run_checks`** whose `command` and `cwd` exactly match a frozen policy entry records checks. The new `cwd` tool argument defaults to `.` and must be repository-relative/confined to the checkout. `cd … && …`, added flags, `bash`, background checks and other command variants are not equivalent evidence. The launcher clears inherited environment and installs an allow-list of shell/user/locale, scratch/cache and toolchain variables. `env_clean` and `env_digest` describe that allow-list and its digest, not proof of no secrets: HOME/`.npmrc`, repository code and same-UID processes may still expose configuration/credentials.
+
+A successful check needs `exit_code === 0`, `env_clean === true`, `tests_ran > 0`, `command_definition_changed === false`, and both tree hashes equal to the final tree. Command definitions/configuration are compared against pinned BASE before and after execution. A changed definition is signed as `command_definition_changed`, excludes the record from both gate and publication success, and produces an **Evidence weakened** warning. Node, Cargo, pytest and Vitest/Jest-style summary parsers observe counts (Cargo per-binary counts are summed); unsupported, truncated or unrecognized output yields an unknown count, not a pass. Zero tests at exit 0 does not satisfy the gate. Failure-name parsers for other tools do not imply test-count support. Eligible lint/typecheck commands usually cannot satisfy the positive-count requirement alone.
+
+`browser`/`browser_open` with bounded HTTP(S) URLs record UI **attempts**, including unsuccessful attempts when tree capture succeeds. `kind.url` and `kind.title` are metadata only. Titles are parsed from actual browser output when available, otherwise empty; URL credentials, query and fragment are removed. Page text, DOM, screenshots and assertions are not imported as independent proof or instructions. UI output tails are empty and `env_clean` is false; the check environment flag is not a UI-success condition. An attempt with unchanged matching tree hashes satisfies the attempt requirement, not visual correctness.
+
+#### Frozen policy and gate behavior
+
+The run's pinned original base supplies manifests and regular `.gond-agent/evidence.toml`; discovery happens once at worker spawn. Commands/policy stay frozen for that worker/turn. Defaults are enabled, one fresh successful check for changed work and a fresh UI attempt for changes under `web/` or to any `.tsx`/`.css` file. Only regular root `*.md` and `docs/**/*.md` (including `docs/*.md`) changes waive the check requirement; symlinks and Markdown elsewhere do not. There are no repository-overridable docs/test globs.
+
+Strict TOML, at most 16 KiB, accepts only this optional schema:
+
+```toml
+# enabled?: boolean; ui?: "attempt" | "none"
+enabled = true
+ui = "attempt"
+# checks?: array, at most 32 entries; both command and cwd required per entry
+checks = [{ command = "npm test", cwd = "api" }]
+```
+
+Unknown fields (including nested ones), oversized/malformed files or invalid entries reject the policy and retain defaults, with a note. Additional checks are additive exact command/cwd pairs, not mandatory execution of every discovered command. Manifest discovery recognizes npm test/lint/typecheck scripts, Cargo test/clippy and pytest manifests. Additional commands use a fixed allow-list grammar, not an arbitrary executable allow/deny list: at most 200 bytes, single ASCII spaces, and only ASCII letters/digits and `_-./:=` within tokens. No arbitrary executables (including absolute paths), URLs, shell operators, quoting, expansion, redirection, globs or wrappers.
+
+Allowed forms are:
+
+- `npm test`, or `npm`/`pnpm`/`bun run <script>` with no extra arguments. The `test` or named script must be nonempty in pinned BASE's `package.json` at the exact cwd. A run-script name starts with an ASCII letter/digit and otherwise contains only letters/digits or `_-.:`.
+- `cargo test` with mandatory `--locked`; other permitted Cargo flags are `--workspace`, `--all-targets`, `--all-features`, `--release`, `--offline`, `--frozen`, `--no-fail-fast`, `-q`, `--quiet`, `-v`, `--verbose`. The only optional harness suffix is `-- --test-threads=1`. Clippy's only form is `cargo clippy --all-targets --locked -- -D warnings`.
+- `pytest` with only `-q`, `-qq`, `--quiet`, `-v`, `-vv`, `--verbose`, `-x`, `--exitfirst`, `--strict-markers`, `--strict-config`, `--disable-warnings`, `--tb=short`, `--tb=long`, `--tb=auto`.
+- `python3 -m unittest` with only verbosity/quiet/failfast flags (`-v`, `--verbose`, `-q`, `--quiet`, `-f`, `--failfast`), or `python3 -m unittest discover` with those flags and normalized relative directories via `-s`/`--start-directory` and `-t`/`--top-level-directory`, or a literal `.py` filename via `-p`/`--pattern`. No quoted/glob pattern is accepted; omit the pattern to use unittest's default discovery pattern.
+
+Cwd must be `.` or a normalized repository-relative path without empty/`.`/`..` components, backslashes, colons or controls.
+
+Only deployment **`GOND_AGENT_EVIDENCE=off`** disables the advisory gate. Repository `enabled=false` or `ui="none"` require deployment **`GOND_AGENT_EVIDENCE_REPO_POLICY=allow-weaken`**, otherwise weakening is refused and noted; additions still apply. `allow-weaken` never bypasses command grammar or BASE-script validation. The API forwards these deployment choices to worker startup. Default Compose forwards both settings from `.env`, defaulting `GOND_AGENT_EVIDENCE` to `on`; `.env.example` includes that default and documents the optional repository-policy opt-in. Editing policy/manifests during work cannot change frozen checks; policy edits apply only on a later run whose pinned base includes them and produce weakening warnings.
+
+Only a clean main-agent `end_turn` without interruption/error enters the gate. Subagent, interrupted, error and compacted stops do not; no-change follow-ups consume no rounds. At most two continuations per turn, six per run and no further gate rounds at ten resumes are allowed. Actual runner counters survive sealed checkpoint restore. Separately, RunService durably reserves up to two rounds in `gate_budget` at `next`, before each task is delivered, capped at six. Before worker startup it seeds gate rounds from `max(gate_rounds, gate_budget)`, alongside persisted sequence/resume counters. A crash may spend unused allowance but cannot replenish it. `declare_unverified {reason}` records an explicit limitation and ends the advisory prompting, not the ability to publish. Declarations and exhaustion limitations always appear under **Not verified**. This is never an enforced pass/fail completion condition. Checkpoint-backed lifecycle recovery also preserves these sealed budgets.
+
+Tree identity uses `evidence_tree.rs` and the controller's shared isolated Git helper for `capture_tree`, publication snapshots and checkpoints: isolated Git config, hooks/fsmonitor disabled, temporary index/object store, HEAD-tracked plus worktree non-ignored files. Clone-local/system excludes cannot hide files, but worktree `.gitignore` still applies. **Ignored paths are NOT covered**, even if executed during a check; do not trust hidden ignored code on the strength of a tree match. Newly staged ignored files reject capture. Ignored dependencies (for example `node_modules`) may be absent on restore. Resume rekeys and marks old records historical/stale while preserving counters; tree mismatch also makes evidence stale, never newly authenticated execution.
+
+#### Sole description policy and limits
+
+`descriptionFor` is the sole publication-body policy shared by PR create/update and workspace/MCP reads. It selects explicit `pr_body` (even empty), otherwise eligible final main reply, otherwise title; then neutralizes untrusted Verification words/headings/markers, escapes HTML and closes unmatched fences before appending the service-owned block. It does not edit live transcripts or create a PR-prose file. Every description includes the generated **Verification** block, even with gate off, docs-only work, legacy workers or no evidence.
+
+Before **every push attempt**, including bundle import/retry and retained/capacity-reclaimed commits, service-side inspection derives `publication_tree` from the exact pinned `head^{tree}` and inspects the pinned base-to-head diff. It also classifies actual diff paths into `ui_required` (under `web/` or any `.tsx`/`.css`) and `docs_only` (only regular root/`docs/` Markdown files, excluding symlink changes). Freshness requires both record trees equal that tree; incomplete service inspection makes no freshness claim. The existing CI refusal guard remains independent enforcement, not part of this advisory evidence gate.
+
+The block reports latest check per exact cwd/command, fresh successful counts, failures/inconclusive checks, stale records, zero/unknown counts, gate status/counters, frozen policy, **Not verified** limitations, and **Evidence weakened** warnings. Heuristics flag deleted/changed tests, added skips/todos/only/narrowing, changed test/check scripts, test/CI configuration and policy edits. At most 32 weakening warnings are retained; diff inspection is capped at 2,000,000 characters and discloses truncation/unavailability. Absence of warnings is not proof of coverage. Missing-UI warnings follow the actual diff-path classification and `ui="attempt"` policy; regular-Markdown docs-only changes waive the check requirement.
+
+The block summarizes all retained records (up to 40) with sequence, command/cwd, exit, freshness, test count and duration. Details prioritize failed/inconclusive checks, then UI attempts, then successful checks, newest first within priority: at most eight detailed records, command preview 1,024 characters, URL/title previews 512 each, output excerpt 1,200, and a 23,000-character aggregate detail threshold. Policy/limitations text is capped at 4,096 characters each and weakening text at 2,048; omitted records/earlier history/truncation are disclosed. Selected prose is bounded to 20,000 characters. Scrubbing removes known secret patterns/URLs and invisible controls before output-tail truncation; all excerpts remain untrusted, not a comprehensive secrets scan. Environment limitations are always stated. Even a fresh successful check or a UI attempt establishes neither independent correctness nor visual correctness.
 
 ### Context compaction
 
@@ -324,7 +413,7 @@ The worker's loopback relay accepts POST `/v1/search` alongside model requests, 
 
 Built-in text results pass through one shared output wrapper (30,000-byte previews). Large results include an ephemeral path under `/tmp/gond-agent-output/` and read offset/limit or grep instructions. Shell producers spill before dropping their head/tail buffers. Files are capped at 32 MiB, total storage at 128 MiB including active reservations; oldest inactive outputs are cleaned first. A cap/busy-store failure is reported as incomplete, with narrowing/paging guidance. Paths include a sanitized call ID and unique suffix to avoid concurrent or batched collisions.
 
-`grep` supports `context_before`/`context_after`/`context`, files/content/count modes and zero-based result-line `offset`/`head_limit` paging; context lines are page rows too. Ordinary reads are streamed, at most 1 MiB per line; optional multiline searches require files no larger than 8 MiB. `bash_output` adds `wait_seconds` (0–120) and `until` (regex over unread buffered output); `bash_list` lists shells. Read-only `git` offers status/diff/log/show/blame. Optional `run_checks` reports exit_code (null for timeout/interruption), duration_seconds, summary, detected failures and an output tail; background calls return bash shell IDs. None changes completion behavior. All images use the shared worker image limits described above; `web_fetch` remains text-only and rejects raster responses.
+`grep` supports `context_before`/`context_after`/`context`, files/content/count modes and zero-based result-line `offset`/`head_limit` paging; context lines are page rows too. Ordinary reads are streamed, at most 1 MiB per line; optional multiline searches require files no larger than 8 MiB. `bash_output` adds `wait_seconds` (0–120) and `until` (regex over unread buffered output); `bash_list` lists shells. Read-only `git` offers status/diff/log/show/blame. `run_checks {command,cwd?,timeout_ms?,run_in_background?}` reports exit_code (null for timeout/interruption), duration_seconds, summary, detected failures, output_tail and tests_ran (null when unknown); cwd defaults to repository root `.`. Foreground exact eligible pairs record evidence for the bounded advisory transparency gate; background calls return bash shell IDs without recording checks. `bash` does not record checks. See [execution evidence](#execution-evidence-and-publication); this is not enforcement. All images use the shared worker image limits described above; `web_fetch` remains text-only and rejects raster responses.
 
 ## Bounded delegation
 
@@ -338,9 +427,9 @@ The existing worker `task` accepts `{description,prompt,kind?}`. `description` i
 | `test_writer` | Same reads; `write`, `edit`, `multi_edit`, `apply_patch` only for test paths; `run_checks` only for exact foreground test commands | `{added:["path and behavior"],results:["command, exit status and result"]}` |
 | `explore` | Same reads as reviewer | Concise text |
 
-The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. The parent-state dispatch denylist also reserves `declare_task`, `declare_unverified`, and `skip_repro` for a future evidence gate, even before those tools exist. Optional tools (including browser and language-server execution) are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
+The reviewer gets no write, exec, network, batch, MCP or parent-state capability. No role receives `task`; dispatch also rejects nested delegation at runtime (depth one), including fabricated calls. The parent-state dispatch denylist also reserves `declare_task`, `declare_unverified`, and `skip_repro` for the parent-only evidence workflow. Optional tools (including browser and language-server execution) are not automatically forwarded. Parent permission mode is inherited and can only become stricter; Plan blocks writes/execution, Ask retains permission prompts/rules (non-interactive Ask denies unapproved work). Permissions never override the path or command scope.
 
-The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Both lexical and resolved paths must qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
+The explicit test-path patterns are `api/test/**/*.test.ts`, `web/src/**/*.test.ts`, `web/src/**/*.test.tsx`, `web/src/**/*.spec.ts`, `web/src/**/*.spec.tsx`, `runner/tests/**/*.rs`, `runner/src/**/*_tests.rs`, and `containers/test_*.py`, plus fixed cross-repository defaults `**/*.test.ts`, `**/*.test.tsx`, `**/*.test.js`, `**/*.test.mjs`, `**/*.spec.ts`, `**/test_*.py`, `**/*_test.go`, `tests/**/*.rs` and `**/tests/**/*.rs`. Wildcards do not cross path separators except `**`. Production Rust files containing inline tests are deliberately excluded. Lexical and resolved paths must be identical and qualify; traversal, protected/outside paths, and existing hard links are rejected. Every patch source/destination must qualify before any change, with another check after permission waits.
 
 Exact test command allow-list (no added shell syntax/arguments or background execution):
 
@@ -377,7 +466,7 @@ Example JSON inside MCP text content:
 
 The API folds plan snapshots into durable run summaries and reconstructs older summaries from the latest stored main `todos` event. The restore result, including an empty plan when there are no Todos events, is saved once without changing run timestamps; subsequent reads skip the event lookup. Follow-ups preserve them. Controller `start` accepts optional `plan` plus `plan_reminder_every` and `plan_nudge_limit`, forwarded as `GOND_AGENT_INITIAL_PLAN`, `GOND_AGENT_PLAN_REMINDER_EVERY` and `GOND_AGENT_PLAN_NUDGE_LIMIT` to the runner. Reopened containers receive the stored plan, including after service recovery. This plan-only fallback is separate from checkpoint import, which restores saved tree/history when a usable checkpoint exists.
 
-Reminders are main-loop request context, not transcript events or provider-specific behavior. The interval counts main model rounds, resets per user turn, defaults to 6, and 0 disables reminders including change-triggered ones. With reminders enabled the first request and the request immediately after a plan change include current statuses. Pending/in-progress steps may trigger at most two continuation nudges per user turn (configurable down to 0). The counter never resets on plan edits or tool calls. Exhausting nudges ends normally on the next final response, without checking plan completion. Interrupted/error paths do not trigger nudges. No review/completion gate exists.
+Reminders are main-loop request context, not transcript events or provider-specific behavior. The interval counts main model rounds, resets per user turn, defaults to 6, and 0 disables reminders including change-triggered ones. With reminders enabled the first request and the request immediately after a plan change include current statuses. Pending/in-progress steps may trigger at most two continuation nudges per user turn (configurable down to 0). The counter never resets on plan edits or tool calls. Exhausting plan nudges permits the next final response without checking plan completion. Interrupted/error paths do not trigger nudges. Plan guidance is separate from the bounded advisory evidence transparency gate; neither is an enforcement or independent-review gate.
 
 Invalid initial-plan JSON is ignored with a warning and an empty plan, never a startup error. Service plan controls accept only nonnegative decimal integers through the u32 range; invalid settings warn without echoing values and use defaults. Compose forwards both controls from `.env`. Nudge wording is singular for one step ("1 plan step is still pending") and plural otherwise ("N plan steps are still pending").
 
@@ -386,3 +475,70 @@ Worker `start` accepts `interactive: boolean`. The service sets it true only for
 `GOND_AGENT_WEB_SEARCH_LIMIT` caps service-side web search attempts per run (default 30, 0 unlimited). It accepts only unsigned decimal integers through u32; invalid values warn without echoing the value and use 30. Compose exposes the setting in `.env.example`. Attempts, including errors/cancellations, are counted and saved in SQLite before provider work; the count is shared across concurrent calls, follow-ups, worker reopen and service restart. A limit response says "web search limit for this run reached" as a tool error, never a failed run. Settings connection tests are not run calls and do not consume a run's allowance.
 
 Interactive browser/MCP questions wait at most `GOND_AGENT_QUESTION_WAIT_MINUTES` (default 240 minutes / 4 hours; 0 waits indefinitely). This is only a wait-for-a-human/bot timeout, **not a run time budget**: expiry returns "No one answered; decide yourself and continue" and the same run continues. Answers before expiry still resume normally. The service validates unsigned decimal u32 integers (invalid values warn without echoing them and use 240), reads the setting and passes `question_wait_minutes` at worker start; Compose and `.env.example` expose it. A matching `question.resolved {request_id,agent_id}` event clears pending input on answer or timeout, returning MCP state from `waiting_for_input` to `working` before the turn ends. Scheduled runs remain non-interactive and never wait at all.
+
+## Failing regression first
+
+`start_session` and HTTP run creation accept optional `kind`:
+`bug|feature|refactor|other`. Omission is unspecified; prose is never classified
+silently. Parent-only `declare_task {kind,repro_plan}` pins the explicit kind and
+plan (2000 bytes). A run considered a bug fix must call it first, before edits.
+`skip_repro {reason}` accepts only `no_cheap_test_path`,
+`needs_external_service`, `ui_only`, or `cannot_reproduce_locally`; skips are
+limitations, never successful verification. Neither declaration is advertised or
+callable by any subagent kind.
+
+For repro execution, `run_checks` uses a separate closed grammar:
+`{repro:"red"|"green", test_files:["changed/test/path"], cwd:"."}`.
+No command, flags, shell strings, background execution or timeout argument is
+accepted. Paths must be safe literal, newly added/changed regular test files in
+the diff against pinned BASE and pass the same fixed test-path allowlist as
+`test_writer`; repositories cannot widen it. The runner comes only from pinned
+manifests, with a hard 120-second execution/acceptance limit:
+
+| Discovered runner | Generated invocation |
+| --- | --- |
+| `vitest` / `vitest run` npm test script | `npm test -- --reporter=json <files>` |
+| `jest` / `jest --runInBand` npm test script | `npm test -- --json --runInBand --runTestsByPath <files>` |
+| pytest manifests | `pytest --junitxml=<private temporary report> <files>` |
+| Cargo manifest | `cargo test --locked --test <target> -- --nocapture` (one `tests/<target>.rs`) |
+| `go.mod` | `go test -json <packages containing changed files>` |
+
+Jest's built-in JSON mode is `--json`, not Vitest's `--reporter=json`.
+Unsupported scripts/runners (including node:test in this version), unsupported
+Cargo inline-test paths, truncated/unrecognized output and tests over the cheap
+limit require an honest enumerated skip. Pytest JUnit failure assertions,
+Vitest/Jest assertion results, Cargo assertion panics after tests start, and Go
+JSON failures with an assertion-style `_test.go:line` location are recognized.
+Go additionally requires a matching test declaration in a requested changed
+file; arbitrary runtime panics are inconclusive. Exit-before-tests, compile,
+import, syntax errors and exits 124/126/127/137 never count as red.
+
+At red time, an isolated Git snapshot compares all non-test entries to pinned
+BASE. Bash edits, redirects, formatters and code generation cannot bypass this
+comparison. The execution tree must remain unchanged. Green requires exit 0,
+identical test-content SHA-256 identity and all the same reporter test ids passing
+on the final tree. Repro records never satisfy the ordinary exact-command check
+requirement. A bug without red/green or an explicit skip consumes at most the
+existing two gate continuations and reports a fixed Not verified limitation.
+
+After admitted red, private service `stage_repro` reconstructs the exact signed
+red tree and creates a local tests-only commit titled
+`Add failing test for: <single-line sanitized title>`, using the resolved platform
+identity, without trailers or a push. The fix is the last commit and keeps the
+normal title. Busy boundaries or tree-only restore can defer identical
+reconstruction until snapshot publication. If unavailable, the PR says
+`single commit` and keeps ledger ordering. The shared pre-push guard derives
+ancestry from the pinned candidate on initial import, retry and kept-commit
+publication, without changing the create-only lease.
+
+The deterministic Verification section includes kind, red command, test id,
+scrubbed/capped/fenced assertion tail, green command/passing tail, or skip reason.
+Ledger version is 2; runner/service compatibility epoch is
+`gond-agent-checkpoint-4`. Older epochs are rejected, not migrated. Gate counters,
+frozen runners and the active pair survive sealed checkpoint import. This is
+worker-recorded transparency, not independent proof.
+
+Runtime fixture: build the debug worker, `cd api && npm ci`, then
+`python3 containers/smoke-repro.py` with Cargo on PATH. It sequentially exercises
+real Vitest and Cargo through a local fake model, authenticated API admission,
+tests-only ancestry and the resulting PR section; no GitHub or Docker is used.

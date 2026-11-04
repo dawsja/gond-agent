@@ -2,6 +2,7 @@ import { z } from "zod";
 import { gh, type PushOptions } from "../github";
 import { ApiError } from "../wire";
 import type { Run } from "./service";
+import { neutralizeVerification, verificationBlock } from "./evidence";
 
 const controls = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 export const titleSchema = z.string().min(1).max(120).refine(
@@ -26,8 +27,10 @@ export function publicationPushOptions(run: Pick<Run, "explicit_branch" | "pushe
 }
 
 /** The sole publication-body policy, shared by GitHub, MCP and workspace reads. */
-export function descriptionFor(run: Pick<Run, "pr_body" | "summary" | "title" | "status">): string {
-  return run.pr_body ?? (!["failed", "stopped"].includes(run.status) && run.summary?.final_reply && run.summary.text ? run.summary.text : run.title);
+export function descriptionFor(run: Pick<Run, "pr_body" | "summary" | "title" | "status" | "evidence">): string {
+  const selected = run.pr_body ?? (!["failed", "stopped"].includes(run.status) && run.summary?.final_reply && run.summary.text ? run.summary.text : run.title);
+  const body = neutralizeVerification(selected);
+  return `${body ? `${body}\n\n` : ""}${verificationBlock(run.evidence)}`;
 }
 
 export async function remoteBranchExists(repo: string, branch: string, env: NodeJS.ProcessEnv): Promise<boolean> {

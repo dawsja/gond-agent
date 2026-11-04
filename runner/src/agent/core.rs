@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::checkpoint::{self, Checkpoint, Counters};
 use super::subagents::{self, SubagentKind};
+use super::{evidence, evidence_tree};
 use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
-use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, QuestionOption, TodoItem};
+use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, InitEvidenceInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
 use crate::api::client::SUMMARY_REQUEST_LIMIT;
@@ -28,6 +29,10 @@ use crate::permissions::{self, Access, Mode, Rule, Verdict};
 use crate::skills::{self, Skill};
 use crate::tools::{Baseline, ReadSet, Shells, Tool, ToolCtx, schema, str_arg};
 use crate::tools::persistent_browser::BrowserSession;
+
+#[cfg(test)]
+#[path = "evidence_tests.rs"]
+mod evidence_tests;
 
 pub struct AgentConfig {
     pub model: String,
@@ -99,6 +104,7 @@ struct Shared {
     main_context: Mutex<u64>,
     skills: Mutex<Vec<Skill>>,
     checkpoints: CheckpointControl,
+    evidence: Mutex<evidence::Ledger>,
 }
 
 #[derive(Default)]
@@ -177,6 +183,7 @@ fn export_requests(s: &Shared, history: &[Message], idle: bool) {
                 runner_state_version: checkpoint::RUNNER_STATE_VERSION.into(),
                 run_id: req.run_id.clone(), owner_id: req.owner_id.clone(),
                 history: history.to_vec(), plan: s.plan.lock().unwrap().clone(), counters,
+                evidence: Some(s.evidence.lock().unwrap().clone()),
             };
             state.validate(&req.run_id, &req.owner_id)?;
             checkpoint::json_bytes(&state)?;
@@ -271,6 +278,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
         question_wait: cfg.question_wait,
         sub_counter: AtomicU32::new(0), sub_slots: tokio::sync::Semaphore::new(subagents::MAX_CONCURRENT),
         main_context: Mutex::new(0),
+        evidence: Mutex::new(evidence::Ledger::new(&cfg.cwd)),
         skills: Mutex::new(cfg.skills),
         checkpoints: CheckpointControl::default(),
     });
@@ -283,9 +291,23 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
 
     let s = shared.clone();
     let mut fresh = cfg.history.is_empty();
+    let mut evidence_init_allowed = true;
     tokio::spawn(async move {
         while let Some(input) = in_rx.recv().await {
             match input {
+                AgentInput::InitEvidence(InitEvidenceInput { request_id, run_id, owner_id, key }) => {
+                    let req = StateRequest { request_id, run_id, owner_id, quiescent: None, boundary_id: None, hold: false };
+                    if !req.valid() { req.error(&s, "init_evidence", "invalid_command"); continue; }
+                    if !evidence_init_allowed { req.error(&s, "init_evidence", "evidence_already_initialized_or_started"); continue; }
+                    let result = s.checkpoints.bind(&req).and_then(|()| s.evidence.lock().unwrap().initialize(&req.run_id, key));
+                    match result {
+                        Ok(()) => {
+                            evidence_init_allowed = false;
+                            s.emit(AgentEvent::EvidenceInitialized { request_id: req.request_id });
+                        }
+                        Err(code) => req.error(&s, "init_evidence", code),
+                    }
+                }
                 AgentInput::CheckpointRelease(req) => {
                     let valid = !req.request_id.is_empty() && req.request_id.len() <= 256
                         && !req.request_id.chars().any(char::is_control);
@@ -319,6 +341,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     let _ = user_tx.send(Work::Import(req, state));
                 }
                 AgentInput::User { text, images } => {
+                    evidence_init_allowed = false;
                     fresh = false;
                     let _ = user_tx.send(Work::User(text, images));
                 }
@@ -332,6 +355,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 AgentInput::Mode { mode } => *s.mode.lock().unwrap() = mode,
                 AgentInput::Model { model, context_window } => *s.model.lock().unwrap() = (model, context_window),
                 AgentInput::Compact => {
+                    evidence_init_allowed = false;
                     fresh = false;
                     let _ = user_tx.send(Work::Compact);
                 }
@@ -362,6 +386,21 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 match Checkpoint::import(state, &req.run_id, &req.owner_id).await {
                     Ok(state) => match s.checkpoints.bind(&req) {
                         Ok(()) => {
+                            let mut ledger = state.evidence.unwrap_or_else(|| {
+                                let mut ledger = evidence::Ledger::new(&s.cwd);
+                                ledger.unverified.push("State predates the evidence ledger; re-run a check.".into());
+                                ledger
+                            });
+                            ledger.restore(evidence_tree::tree_hash(&s.cwd).ok().as_deref());
+                            // A new worker keeps the service-provisioned key,
+                            // not the earlier worker's sealed signing authority.
+                            if let Some(key) = s.evidence.lock().unwrap().key.clone() {
+                                if let Err(code) = ledger.initialize(&req.run_id, key) {
+                                    req.error(&s, "import_state", code);
+                                    continue;
+                                }
+                            }
+                            *s.evidence.lock().unwrap() = ledger;
                             history = state.history;
                             *s.plan.lock().unwrap() = state.plan;
                             s.sub_counter.store(state.counters.sub_counter, Ordering::Relaxed);
@@ -592,6 +631,21 @@ fn agent_tool_defs(sub: bool) -> Vec<ToolDef> {
     let mut defs = vec![];
     if !sub {
         defs.push(ToolDef {
+            name: "declare_task".into(),
+            description: "Declare task kind explicitly. Call this first for any run you consider a bug fix, before edits; never infer classification from prose. Bug runs require an assertion-failing changed test on the pinned non-test base, then the same test green, or an enumerated skip.".into(),
+            input_schema: schema(json!({"kind":{"type":"string","enum":["bug","feature","refactor","other"]},"repro_plan":{"type":"string","maxLength":2000}}), &["kind","repro_plan"]),
+        });
+        defs.push(ToolDef {
+            name: "skip_repro".into(),
+            description: "Record why a failing local regression test cannot cheaply run. Always disclosed, never presented as verification.".into(),
+            input_schema: schema(json!({"reason":{"type":"string","enum":["no_cheap_test_path","needs_external_service","ui_only","cannot_reproduce_locally"]}}), &["reason"]),
+        });
+        defs.push(ToolDef {
+            name: "declare_unverified".into(),
+            description: "End the advisory evidence gate with a plain reason. Always reported under Not verified in the generated publication section.".into(),
+            input_schema: schema(json!({"reason":{"type":"string","maxLength":1000}}), &["reason"]),
+        });
+        defs.push(ToolDef {
             name: "update_plan".into(),
             description: "Replace the plan shown to the user. Use it for work with several steps; keep exactly one step in_progress while working and mark steps done as soon as they are. Optionally explain what changed.".into(),
             input_schema: schema(
@@ -661,9 +715,15 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
         let started = Instant::now();
         let mut tool_count = 0u32;
         let mut rounds = 0u32;
-        let saved = if !run.is_sub() && s.checkpoints.resume_counters.swap(false, Ordering::Relaxed) {
+        let resumed = !run.is_sub() && s.checkpoints.resume_counters.swap(false, Ordering::Relaxed);
+        let saved = if resumed {
             s.checkpoints.counters.lock().unwrap().clone()
         } else { Counters::default() };
+        if !run.is_sub() {
+            let tree = evidence_tree::tree_hash(&s.cwd).ok();
+            // Imported active turns retain both budgets and the original tree.
+            s.evidence.lock().unwrap().begin_turn(tree, resumed);
+        }
         let mut reminders = PlanReminders { calls: saved.plan_calls, last: saved.plan_last, nudges: saved.plan_nudges };
         let mut compactions = TurnCompactions { count: saved.turn_compactions, skipped_history_len: saved.skipped_history_len };
         let mut context_used = if run.is_sub() { 0 } else { *s.main_context.lock().unwrap() };
@@ -703,7 +763,7 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 system: Some(if run.is_sub() {
                     format!("{}{}\n{}", s.sub_system, crate::prompt::instructions_section(&s.cwd), run.kind.unwrap().policy().prompt())
                 } else {
-                    format!("{}{}{skill_section}{reminder}", s.system, crate::prompt::instructions_section(&s.cwd))
+                    format!("{}{}{skill_section}{reminder}\nThe publication Verification section is generated from evidence recorded by the worker, not your prose. Use run_checks with an exact eligible command and cwd. A zero or unknown parsed test count does not satisfy the check gate. Evidence is transparency, not independent proof; declare_unverified records limitations.", s.system, crate::prompt::instructions_section(&s.cwd))
                 }),
                 messages: history.clone(),
                 tools,
@@ -750,6 +810,9 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 }
             };
             let text = final_text(&msg);
+            let reply_text_length = msg.content.iter().filter_map(|block| match block {
+                Block::Text { text, .. } => Some(text.encode_utf16().count()), _ => None,
+            }).sum();
             let calls: Vec<(String, String, Value)> = msg
                 .content
                 .iter()
@@ -757,6 +820,20 @@ fn run_loop<'a>(s: &'a Arc<Shared>, run: &'a Run, history: &'a mut Vec<Message>,
                 .collect();
             history.push(msg);
             if calls.is_empty() {
+                if !run.is_sub() && !cancel.is_cancelled() && stop == "end_turn" {
+                    let tree = evidence_tree::tree_hash(&s.cwd).ok();
+                    let gate = s.evidence.lock().unwrap().gate(&s.cwd, tree.as_deref());
+                    if let Some(message) = gate {
+                        // A deferred final is not publication prose. Reuse the
+                        // exact UTF-16 rollback boundary, leaving model history
+                        // intact while the API keeps only the eventual reply.
+                        if reply_text_length > 0 {
+                            s.emit(AgentEvent::StreamReset { agent_id: run.id.clone(), text_length: reply_text_length, reasoning_length: 0 });
+                        }
+                        history.push(Message::user_text(message));
+                        continue;
+                    }
+                }
                 if !run.is_sub() && !cancel.is_cancelled() {
                     let nudge = reminders.nudge(&s.plan.lock().unwrap(), s.plan_nudge_limit);
                     if let Some(nudge) = nudge {
@@ -1002,16 +1079,43 @@ struct Turn<'a> {
     tool_count: u32,
 }
 
-async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, input: Value) -> Block {
+async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, mut input: Value) -> Block {
     let Turn { run, cancel, started, tool_count } = turn;
     s.emit(AgentEvent::ToolCall { agent_id: run.id.clone(), call_id: id.clone(), name: name.clone() });
     if cancel.is_cancelled() {
         return result(id, name, "interrupted by the user before this call ran", true);
     }
     if run.is_sub() && matches!(name.as_str(), "task" | "update_plan" | "list_plan" | "ask_user" | "skill" | "declare_task" | "declare_unverified" | "skip_repro") {
-        return result(id, name, "subagent depth/capability limit: no delegation or parent state tools", true);
+        return result(id, name, "subagent depth/capability limit: parent state tools unavailable to subagents", true);
     }
     match name.as_str() {
+        "declare_task" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Declaration { kind: super::repro::TaskKind, repro_plan: String }
+            let Ok(d) = serde_json::from_value::<Declaration>(input.clone()) else { return result(id, name, "Expected kind and repro_plan", true); };
+            if d.repro_plan.len() > 2000 { return result(id, name, "repro_plan exceeds 2000 bytes", true); }
+            let mut ledger = s.evidence.lock().unwrap();
+            if ledger.task.as_ref().is_some_and(|t| t.kind != d.kind) { return result(id, name, "Task kind is already pinned for this run", true); }
+            let skip = ledger.task.as_ref().and_then(|t| t.skip);
+            ledger.task = Some(super::repro::TaskDeclaration { kind: d.kind, repro_plan: evidence::scrub(&d.repro_plan, 2000), skip });
+            return result(id, name, "Task kind recorded explicitly. For bugs, record red before production edits, then matching green, or skip_repro.", false);
+        }
+        "skip_repro" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Skip { reason: super::repro::SkipReason }
+            let Ok(skip) = serde_json::from_value::<Skip>(input.clone()) else { return result(id, name, "Expected an enumerated repro skip reason", true); };
+            let mut ledger = s.evidence.lock().unwrap();
+            let Some(task) = ledger.task.as_mut().filter(|t| t.kind == super::repro::TaskKind::Bug) else { return result(id, name, "Declare kind=bug first", true); };
+            task.skip = Some(skip.reason);
+            return result(id, name, "Repro skip recorded under Not verified", false);
+        }
+        "declare_unverified" => {
+            let Some(reason) = str_arg(&input, "reason") else { return result(id, name, "reason is required", true) };
+            s.evidence.lock().unwrap().declare(reason);
+            return result(id, name, "Recorded under Not verified. The evidence gate is advisory.", false);
+        }
         "update_plan" => return update_plan(s, run, id, name, &input),
         "list_plan" => return list_plan(s, id, name),
         "ask_user" => return ask_user(s, run, id, name, &input, cancel).await,
@@ -1028,6 +1132,24 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
             return result(id, name, text, !ok);
         }
         _ => {}
+    }
+    let repro = if name == "run_checks" && input.get("repro").is_some() {
+        if run.is_sub() { return result(id, name, "Repro records are parent-only", true); }
+        let policy = {
+            let ledger = s.evidence.lock().unwrap();
+            if !ledger.task.as_ref().is_some_and(|t| t.kind == super::repro::TaskKind::Bug) { return result(id, name, "Declare kind=bug first", true); }
+            ledger.policy.clone()
+        };
+        match super::repro::prepare(&s.cwd, &policy, &input) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => return result(id, name, e.to_string(), true),
+        }
+    } else { None };
+    // Never accept internal execution parameters from a caller.
+    if input.get("_repro_runner").is_some() || input.get("_repro_report").is_some() { return result(id, name, "Internal repro parameters are not tool arguments", true); }
+    if let Some(prepared) = &repro {
+        input = json!({"command":prepared.command,"cwd":prepared.request.cwd,"timeout_ms":super::repro::CHEAP_MS,"_repro_runner":prepared.runner});
+        if let Some(path) = &prepared.report { input["_repro_report"] = json!(path); }
     }
     let Some(tool) = s.tools.iter().find(|t| t.name() == name && tool_visible(t.as_ref(), run)).cloned() else {
         return result(id, name.clone(), format!("unknown tool `{name}`"), true);
@@ -1138,7 +1260,89 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
             return result(id, name, why, true);
         }
     }
-    let out = tool.run(&ctx, input).await;
+    let eligible = if repro.is_none() { s.evidence.lock().unwrap().check(&name, &input).cloned() } else { None };
+    let ui_attempt = matches!(name.as_str(), "browser" | "browser_open")
+        && input["url"].as_str().is_some_and(|url| (url.starts_with("http://") || url.starts_with("https://")) && url.len() <= 2048);
+    let before = if eligible.is_some() || ui_attempt { evidence_tree::tree_hash(&s.cwd).ok() } else { None };
+    let definition_changed_before = eligible.as_ref().is_some_and(|command| {
+        s.evidence.lock().unwrap().policy.command_definition_changed(&s.cwd, command).unwrap_or(true)
+    });
+    let record_start = evidence::now_ms();
+    let record_clock = Instant::now();
+    let record_input = input.clone();
+    let env_digest = evidence::environment_digest();
+    let mut out = tool.run(&ctx, input).await;
+    if let Some(prepared) = repro {
+        let accepted = (|| -> anyhow::Result<evidence::Record> {
+            use super::repro::Phase;
+            let parsed = out.content.iter().find_map(|p| match p { ResultPart::Text { text } => serde_json::from_str::<Value>(text).ok(), _ => None }).unwrap_or(Value::Null);
+            let exit = parsed["exit_code"].as_i64().and_then(|v| i32::try_from(v).ok());
+            let duration_ms = record_clock.elapsed().as_millis() as u64;
+            anyhow::ensure!(duration_ms < super::repro::CHEAP_MS, "Repro exceeded cheap limit (120s)");
+            let ledger = s.evidence.lock().unwrap();
+            let after = evidence_tree::repro_snapshot(&s.cwd, &ledger.policy.base, &prepared.request.test_files)?;
+            anyhow::ensure!(after.tree == prepared.tree, "Repro changed its execution tree");
+            anyhow::ensure!(prepared.request.repro != Phase::Red || after.non_test_equal, "Red refused: non-test tree differs from pinned base");
+            let cases = if prepared.request.repro == Phase::Red {
+                anyhow::ensure!(exit.is_some_and(|c| c != 0 && ![124,126,127,137].contains(&c)), "Red requires an assertion failure, not an infrastructure exit");
+                let cases: Vec<String> = serde_json::from_value(parsed["repro_results"]["failed"].clone()).unwrap_or_default();
+                anyhow::ensure!(!cases.is_empty(), "No structured assertion failure; compile/import/syntax errors do not count as red");
+                anyhow::ensure!(super::repro::attributed(&s.cwd, &prepared, &parsed["repro_results"], &cases), "Assertion failure did not originate in a requested changed test file");
+                cases
+            } else {
+                anyhow::ensure!(exit == Some(0), "Green requires exit 0");
+                let cases = ledger.records.iter().rev().find_map(|r| match &r.kind { evidence::EvidenceKind::ReproRed { test_id, cases, .. } if test_id == &prepared.fingerprint => Some(cases.clone()), _ => None }).ok_or_else(|| anyhow::anyhow!("No red record for these exact test contents"))?;
+                let passed: Vec<String> = serde_json::from_value(parsed["repro_results"]["passed"].clone()).unwrap_or_default();
+                anyhow::ensure!(cases.iter().all(|c| passed.contains(c)), "Same failing test ids were not observed passing");
+                cases
+            };
+            let kind = if prepared.request.repro == Phase::Red { evidence::EvidenceKind::ReproRed { test_id: prepared.fingerprint, test_files: prepared.request.test_files, cases: cases.clone() } } else { evidence::EvidenceKind::ReproGreen { test_id: prepared.fingerprint, test_files: prepared.request.test_files, cases: cases.clone() } };
+            Ok(evidence::Record {
+                run_id: String::new(), seq: 0, id: String::new(), command: prepared.command, cwd: prepared.request.cwd,
+                command_definition_changed: false, exit_code: exit, duration_ms, started_at: record_start,
+                tree_hash_before: prepared.tree, tree_hash_after: after.tree, tests_ran: Some(cases.len() as u64), env_clean: true, env_digest: env_digest.clone(),
+                output_tail: if matches!(kind, evidence::EvidenceKind::ReproRed { .. }) { parsed["repro_results"]["assertion"].as_str().unwrap_or("").into() } else { format!("Passed: {}", cases.join("\nPassed: ")) }, kind, sig: String::new(),
+            })
+        })();
+        match accepted {
+            Ok(record) => {
+                if let Some(record) = s.evidence.lock().unwrap().record(record) {
+                    s.emit(AgentEvent::EvidenceRecorded { record: Box::new(record) });
+                    out.content.push(ResultPart::Text { text: "Regression evidence recorded (worker transparency, not independent proof).".into() });
+                } else { out = crate::tools::ToolOutput::err("Repro could not be authenticated; no record created"); }
+            }
+            Err(e) => out = crate::tools::ToolOutput::err(format!("Repro not recorded: {e}")),
+        }
+    }
+    if let Some(before) = before {
+        if let Ok(after) = evidence_tree::tree_hash(&s.cwd) {
+            let parsed = out.content.iter().find_map(|p| match p {
+                ResultPart::Text { text } => serde_json::from_str::<Value>(text).ok(), _ => None,
+            }).unwrap_or(Value::Null);
+            let kind = if eligible.is_some() { evidence::EvidenceKind::Check } else {
+                // Record an attempt only. No assertions, DOM or page text become
+                // instructions or a claim that the interface works.
+                let (url, title) = evidence::ui_metadata(record_input["url"].as_str().unwrap_or(""), &out);
+                evidence::EvidenceKind::UiAttempt { url, title }
+            };
+            let record = evidence::Record {
+                run_id: String::new(),
+                command_definition_changed: definition_changed_before || eligible.as_ref().is_some_and(|command| {
+                    s.evidence.lock().unwrap().policy.command_definition_changed(&s.cwd, command).unwrap_or(true)
+                }),
+                seq: 0, id: String::new(),
+                command: eligible.as_ref().map(|c| c.command.clone()).unwrap_or_else(|| name.clone()),
+                cwd: eligible.as_ref().map(|c| c.cwd.clone()).unwrap_or_else(|| ".".into()),
+                exit_code: if eligible.is_some() { parsed["exit_code"].as_i64().and_then(|v| i32::try_from(v).ok()) } else if out.ok { Some(0) } else { None },
+                duration_ms: record_clock.elapsed().as_millis() as u64, started_at: record_start,
+                tree_hash_before: before, tree_hash_after: after,
+                tests_ran: parsed["tests_ran"].as_u64(), env_clean: eligible.is_some(), env_digest,
+                output_tail: if eligible.is_some() { parsed["output_tail"].as_str().unwrap_or("").into() } else { String::new() }, kind, sig: String::new(),
+            };
+            let recorded = s.evidence.lock().unwrap().record(record);
+            if let Some(record) = recorded { s.emit(AgentEvent::EvidenceRecorded { record: Box::new(record) }); }
+        }
+    }
     let images: Vec<_> = out.content.iter().filter_map(|p| match p {
         ResultPart::Image { media_type, data } => Some(ImageInput { media_type: media_type.clone(), data: data.clone(), id: None }),
         _ => None,
@@ -2307,6 +2511,7 @@ mod tests {
             turn_cancel: Mutex::new(CancellationToken::new()), interactive: false, question_wait: Duration::ZERO,
             sub_counter: AtomicU32::new(0), sub_slots: tokio::sync::Semaphore::new(subagents::MAX_CONCURRENT), main_context: Mutex::new(0), skills: Mutex::default(),
             checkpoints: CheckpointControl::default(),
+            evidence: Mutex::new(evidence::Ledger::new(std::path::Path::new("/tmp"))),
         })
     }
 

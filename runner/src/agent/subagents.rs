@@ -94,6 +94,8 @@ pub const TEST_PATTERNS: &[&str] = &[
     "api/test/**/*.test.ts", "web/src/**/*.test.ts", "web/src/**/*.test.tsx",
     "web/src/**/*.spec.ts", "web/src/**/*.spec.tsx", "runner/tests/**/*.rs",
     "runner/src/**/*_tests.rs", "containers/test_*.py",
+    "**/*.test.ts", "**/*.test.tsx", "**/*.test.js", "**/*.test.mjs", "**/*.spec.ts",
+    "**/test_*.py", "**/*_test.go", "tests/**/*.rs", "**/tests/**/*.rs",
 ];
 
 const READ: &[(&str, Grant)] = &[
@@ -190,6 +192,7 @@ pub fn test_path(cwd: &Path, path: &str) -> bool {
     let Some(real) = rule_path(cwd, path) else { return false };
     let lexical = Path::new(path).strip_prefix(cwd).unwrap_or(Path::new(path));
     if lexical.components().any(|c| !matches!(c, std::path::Component::Normal(_))) { return false; }
+    if lexical != Path::new(&real) { return false; }
     if !PATTERNS.is_match(lexical) || !PATTERNS.is_match(&real) { return false; }
     // An existing hard link could otherwise overwrite a production file.
     #[cfg(unix)]

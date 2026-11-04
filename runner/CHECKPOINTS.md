@@ -8,23 +8,35 @@ through the sealed checkpoint store, and coordinates recovery and cleanup.
 
 ## Commands and replies
 
+Before task execution, the API service generates a fresh random 32-byte key per
+worker and sends private `init_evidence {request_id,run_id,owner_id,key}`. The runner
+acknowledges `state.evidence_initialized {request_id}`. These are private controls,
+not model inputs or transcript events; the key never enters environments or logs.
+
+These minimal schema examples omit optional `evidence`. Real exports include the
+private ledger described below; never copy its signing key into a transcript.
+
 ```json
 {"type":"export_state","request_id":"save-1","run_id":"run-123","owner_id":"user-456"}
-{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-4","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+
 ```
 
 Send that **state object**, not its wrapper or a model request, to a fresh worker:
 
 ```json
-{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-4","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+
 {"type":"state.imported","request_id":"load-1"}
 ```
 
 Failures use `{"type":"state.error","request_id":"…","operation":"import_state","code":"…"}`
-(or operation `export_state`). Codes are `invalid_command`, `runner_not_fresh`,
+(or operation `export_state` / `init_evidence`). Codes are `invalid_command`,
+`runner_not_fresh`,
 `export_queue_full`, `incompatible_version`, `binding_mismatch`, `invalid_schema`,
 `invalid_counters_or_plan`, `invalid_role_placement`, `invalid_tool_call`,
-`unpaired_tools`, `invalid_image`, and `state_too_large`.
+`unpaired_tools`, `invalid_image`, `state_too_large`, `invalid_evidence_bounds`,
+`invalid_evidence_key`, `invalid_evidence_record`, and `invalid_evidence_staleness`.
 
 Request/run/owner IDs must be nonempty, at most 256 UTF-8 bytes, without control
 characters. Malformed command objects with a usable request ID get a correlated
@@ -188,13 +200,50 @@ Once a question resolves, the next checkpoint includes its paired result.
 - Both `SCHEMA_VERSION` and the explicit `RUNNER_STATE_VERSION` compatibility
   epoch must match exactly. The epoch is independent of Cargo's package version;
   **bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. Epoch 2 makes `sub_counter` the child-ID sequence and consumed
+  incompatible**. Current epoch is `gond-agent-checkpoint-4`. Epoch 2 made `sub_counter` the child-ID sequence and consumed
   general-purpose delegation allowance; epoch 1's unrestricted ID counter is not
   compatible. No old-version migration or permissive fallback is provided.
 - Commands supply the expected run and owner. Import checks both against state;
   the first export or successful import binds subsequent controls on that
   worker. This is not authentication: the service must independently check
   ownership and prevent checkpoint substitution/tampering.
+
+## Evidence state
+
+Optional `evidence` is a strict version-2 typed ledger: explicit task declaration/skip, private signing key, up to 40 signed
+records (including a pinned active red/green pair; ordinary FIFO eviction cannot erase it; see [event schema](../protocol/README.md#execution-evidence-and-publication)),
+frozen policy, sequence, gate/turn/resume/fix/review counters, stale IDs,
+limitations/declaration flag and initial turn tree. All nested ledger/record/kind
+fields reject unknown fields; validation checks bounds, UUID/sequence uniqueness,
+signatures for non-stale keyed records and staleness references. The advisory gate
+allows at most two continuations per turn, six per run and none at ten resumes;
+actual runner counters persist in sealed state, import preserves them, and restore
+increments the resume count. Separately, RunService durably reserves up to two
+rounds in `gate_budget` at `next`, before each task is delivered, capped at six.
+Before worker startup, gate rounds are seeded from `max(gate_rounds, gate_budget)`.
+A crash may spend unused allowance but cannot replenish it.
+
+The service-generated key belongs only in private controls, sealed checkpoint
+state and API live memory, never ordinary run rows, transcript events, environments
+or logs. The worker generates no signing authority; the API never adopts an
+exported key or a changed finish key as authority. HMAC-SHA256 signs compact JSON
+`{domain:"gond-agent:evidence:v1",run_id,record}`, recursively sorting object keys
+and retaining array order. `record` includes every field except `sig`, including
+run_id, seq, both tree hashes and `command_definition_changed`.
+These are **evidence recorded by the worker**, not independent proof: signatures
+authenticate records, while same-UID executed code can inspect process memory.
+Only a separate-container rerun could provide independent proof, out of scope.
+`env_clean` means an environment allow-list was applied; `env_digest` hashes its
+values, not an absence of secrets in HOME/`.npmrc` or elsewhere.
+
+Resume rekeys for the new worker with a fresh service-issued key, marks old records
+historical/stale without re-signing them, and preserves sequence and budget
+counters. Mismatched trees also make records stale; ledgerless imports request a
+new check. Ignored paths are NOT covered by tree identity, even if executed by a check.
+Evidence capture, publication snapshots and checkpoints use the same isolated Git
+helper, ignoring clone-local/system configuration and excludes but respecting
+worktree `.gitignore`; ignored dependencies such as `node_modules` may be absent after restore. Do not
+treat hidden ignored code as trusted based on a matching tree.
 
 ## Restored state and service integration
 
@@ -205,6 +254,17 @@ length are saved. Imported cadence/nudge/compaction counters are consumed by the
 first subsequent main turn; ordinary later user turns still reset their own
 turn-local budgets. Import itself stays idle and emits no model/tool work or
 ordinary transcript frames. The caller must send the intended continuation.
+
+Frozen evidence policy is restored with the ledger, unlike ordinary runtime
+configuration below. Policy/manifest edits do not alter frozen checks; a later
+run must pin a base containing those edits before discovering them anew.
+Additional commands use the fixed grammar documented in the protocol: `npm test`,
+`npm`/`pnpm`/`bun run <script>` from BASE's exact-cwd `package.json`, locked Cargo
+and fixed pytest/unittest forms. Arbitrary executables, URLs and shell syntax are
+not accepted; `allow-weaken` never bypasses grammar or BASE-script validation.
+Command definitions/configuration are compared against BASE before and after a
+check; `command_definition_changed=true` excludes gate and publication success and
+produces a weakening warning. Unknown test counts never count as success.
 
 Runtime configuration (model/effort, prompts/instructions, permission mode/rules,
 skills/tools, cadence interval/nudge limit, question timeout) comes from the new
@@ -249,3 +309,24 @@ leaves the worker alive and late replies are dropped; the Workspace boundary
 callback attempts release, discarding the worker if release fails. Tree restore deliberately
 does not restore staging metadata; export rejects newly staged ignored files to
 avoid silently losing them during capture or later publication.
+
+## Regression ordering and publication
+
+Task kind (`bug|feature|refactor|other`), bounded repro plan and enumerated skip live
+in the sealed ledger. `repro_red` and `repro_green` records retain sequence order,
+exact test-content identity, reporter test ids, and execution tree hashes. The
+active pair is pinned inside the 40-record bound; a new red replaces the previous
+pair. Rekeying never re-signs old red. A historical red may establish ordering,
+but green must run again on the current publication tree after restart.
+
+After admitting red, the service requests private `stage_repro` with its resolved
+commit identity. It reconstructs `BASE + changed test files` and requires the
+result to equal the signed red tree before creating the tests-only ancestor. No
+push occurs. A held boundary, unavailable stage, or tree-only restore can defer
+materialization: publication may reconstruct the identical test tree from the
+ledger and final test blobs. It never invents an upstream prerequisite for an
+unpublished local commit. If reconstruction is impossible, the description says
+`single commit`; ledger ordering still survives. Existing imported/kept commits
+retain their ancestors unchanged on all push/retry paths and keep the create-only
+branch lease. The service confirms ordering from the exact candidate's parent
+objects before every push, not from a snapshot response or title alone.

@@ -152,7 +152,13 @@ async fn checkpoint_import_is_control_only_restores_counters_and_rejects_nonfres
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateImported { request_id } if request_id == "restore")).await;
     assert!(events.iter().all(|e| matches!(e, AgentEvent::SessionStart { .. } | AgentEvent::StateImported { .. })));
     restored.input.send(export_command("again")).unwrap();
-    assert_eq!(exported(&mut restored, "again").await, state);
+    let mut expected = state.clone();
+    // Restore deliberately advances its durable resume budget and records the
+    // missing ignored-dependency caveat; all history, plans and counters survive.
+    let ledger = expected.evidence.as_mut().unwrap();
+    ledger.resumes += 1;
+    ledger.unverified.push("Ignored files such as node_modules may be absent after restore.".into());
+    assert_eq!(exported(&mut restored, "again").await, expected);
     restored.input.send(AgentInput::ExportState(ExportStateInput { request_id: "wrong-owner".into(), run_id: "run".into(), owner_id: "other".into(), quiescent: None, boundary_id: None, hold: false })).unwrap();
     let events = until(&mut restored, |e| matches!(e, AgentEvent::StateError { .. })).await;
     assert!(matches!(events.last(), Some(AgentEvent::StateError { request_id, code, .. }) if request_id == "wrong-owner" && code == "binding_mismatch"));

@@ -12,8 +12,8 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const SCHEMA_VERSION: u32 = 1;
 // Deliberate compatibility epoch, NOT Cargo's package version. Bump for changes to
 // history semantics, tool replay, compaction or counter interpretation.
-// Epoch 2: sub_counter also records consumed bounded-delegation allowance.
-pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-2";
+// Epoch 4 combines bounded delegation, recovery and regression evidence.
+pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-4";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +38,8 @@ pub struct Checkpoint {
     pub history: Vec<Message>,
     pub plan: Vec<TodoItem>,
     pub counters: Counters,
+    #[serde(default)]
+    pub evidence: Option<super::evidence::Ledger>,
 }
 
 pub fn valid_binding(run: &str, owner: &str) -> bool {
@@ -70,6 +72,10 @@ impl Checkpoint {
     pub fn validate(&self, run: &str, owner: &str) -> Result<(), &'static str> {
         if self.schema_version != SCHEMA_VERSION || self.runner_state_version != RUNNER_STATE_VERSION {
             return Err("incompatible_version");
+        }
+        if let Some(evidence) = &self.evidence {
+            evidence.validate()?;
+            if !evidence.run_id.is_empty() && evidence.run_id != run { return Err("binding_mismatch"); }
         }
         if !valid_binding(run, owner) || self.run_id != run || self.owner_id != owner {
             return Err("binding_mismatch");
@@ -110,6 +116,7 @@ impl Checkpoint {
         let bytes = json_bytes(&value)?;
         let mut state: Self = serde_json::from_slice(&bytes).map_err(|_| "invalid_schema")?;
         state.validate(run, owner)?;
+        state.runner_state_version = RUNNER_STATE_VERSION.into();
         // All images, including old tool results, use the same bounded raster policy.
         // A bad image rejects the import transaction rather than silently losing history.
         for message in &mut state.history {
@@ -161,6 +168,7 @@ mod tests {
             ],
             counters: Counters { sub_counter: 7, main_context: 1234, plan_calls: 8, plan_last: plan.clone(), plan_nudges: 1, turn_compactions: 2, skipped_history_len: Some(3) },
             plan,
+            evidence: None,
         }
     }
 

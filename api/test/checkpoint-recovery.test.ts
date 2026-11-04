@@ -34,7 +34,7 @@ vi.mock("../src/github", async original => {
 });
 
 const BASE = "a".repeat(40), HEAD = "b".repeat(40), TREE = "c".repeat(40);
-const VERSION = "gond-agent-checkpoint-2";
+const VERSION = "gond-agent-checkpoint-4";
 const PROMPT = "Repair the checkout without losing the original requirements.";
 const EARLIER = "I inspected the original requirements and found the failing parser.";
 const QUESTION = "Should the parser retain empty fields?";

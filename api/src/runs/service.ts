@@ -43,9 +43,12 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
+import { acceptEvidence, emptyEvidence, finishEvidence, weakenedEvidence, type Evidence } from "./evidence";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
+  /** Validated public evidence only. Signing keys belong exclusively to Live. */
+  evidence?: Evidence;
   ci_turn?: boolean;
   /** Unpublished work still belongs to an automatic round, even after a human queues work. */
   ci_publication_pending?: boolean;
@@ -62,6 +65,7 @@ export interface Run extends CiInfo {
   retired_backend?: string;
   title: string;
   prompt: string;
+  kind?: "bug" | "feature" | "refactor" | "other";
   pr_body?: string | null;
   status: RunStatus;
   queue_position?: number;
@@ -108,7 +112,7 @@ export interface Run extends CiInfo {
   auto_pr: boolean;
 }
 interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
-const RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
+const RUNNER_STATE_VERSION = "gond-agent-checkpoint-4";
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
 interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
@@ -118,6 +122,8 @@ export function parseRun(data: string): Run {
   return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
 }
 interface Live {
+  /** Service-generated once per worker, never serialized or refreshed at turn end. */
+  evidenceKey?: Buffer;
   workspace: Workspace;
   cwd: string;
   cursor: number;
@@ -259,7 +265,7 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
+    const stored = this.db.prepare("SELECT status,json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body,json_extract(data, '$.evidence') AS evidence FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null; evidence: string | null} | undefined;
     if (stored) assertRunTransition(stored.status, r.status);
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
@@ -268,6 +274,16 @@ export class Runs {
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
     r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
+    if (stored?.evidence) {
+      const evidence = JSON.parse(stored.evidence) as Evidence;
+      // Async lifecycle snapshots cannot roll replay protection or budgets back,
+      // including turns that consumed gate rounds without producing a record.
+      const rounds = Math.max(evidence.gate_rounds ?? 0, r.evidence?.gate_rounds ?? 0);
+      const resumes = Math.max(evidence.resumes ?? 0, r.evidence?.resumes ?? 0);
+      const gateBudget = Math.max(evidence.gate_budget ?? 0, r.evidence?.gate_budget ?? 0);
+      if (!r.evidence || evidence.last_seq > r.evidence.last_seq) r.evidence = evidence;
+      r.evidence = { ...r.evidence, gate_rounds: rounds, gate_budget: gateBudget, resumes };
+    }
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -298,6 +314,17 @@ export class Runs {
     }
   }
   append(id: string, event: Record<string, unknown>) {
+    // State replies are private control data, never transcript events.
+    if (typeof event.type === "string" && event.type.startsWith("state.")) return;
+    if (event.type === "evidence.recorded") {
+      if (Object.keys(event).some(key => key !== "type" && key !== "record")) return;
+      const run = this.get(id);
+      const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey, id);
+      if (!evidence) return;
+      run.evidence = evidence;
+      this.save(run);
+      event = { type: "evidence.recorded", record: evidence.records.at(-1) };
+    }
     if (event.type === "tool.images") {
       const run = this.get(id);
       const images: { id: string; media_type: string }[] = [];
@@ -507,6 +534,7 @@ export class Runs {
       model: string;
       effort?: string;
       prompt: string;
+      kind?: "bug" | "feature" | "refactor" | "other";
       title?: string;
       branch?: string;
       pr_body?: string;
@@ -521,6 +549,7 @@ export class Runs {
       attribution.authorize?.();
       return this.get(attribution.id, user);
     }
+    if (input.kind !== undefined && !["bug", "feature", "refactor", "other"].includes(input.kind)) throw new ApiError(400, "invalid_kind", "Choose a valid task kind.");
     const backend = assertBackend(input.backend);
     const fields = publicationFields(input);
     if (
@@ -561,6 +590,7 @@ export class Runs {
       effort: validateEffort(selectedModel, input.effort),
       title,
       prompt: input.prompt.trim(),
+      ...(input.kind ? {kind: input.kind} : {}),
       pr_body: fields.pr_body ?? null,
       status: "queued",
       step: null,
@@ -793,7 +823,7 @@ export class Runs {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
         try {
-          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
+          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r, r.pending[0]?.source === "ci"))));
         } catch (error) {
           if (!this.ciPublicationRefused(id, error)) throw error;
           r = this.get(id);
@@ -870,7 +900,17 @@ export class Runs {
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") return await workspace.destroy();
       let restored: SavedState | undefined;
       const start = async () => {
+        r.base_sha ??= (await git(checked.cwd, "rev-parse", `origin/${r.base_branch}`)).toString().trim();
+        r.evidence = { ...(r.evidence ?? emptyEvidence()), resumes: r.evidence ? (r.evidence.resumes ?? 0) + 1 : 0 };
+        this.save(r);
         await workspace!.rpc("start", {
+          kind: r.kind,
+          evidence_base_sha: r.base_sha,
+          evidence_mode: process.env.GOND_AGENT_EVIDENCE === "off" ? "off" : "on",
+          evidence_repo_policy: process.env.GOND_AGENT_EVIDENCE_REPO_POLICY === "allow-weaken" ? "allow-weaken" : "",
+          evidence_seq: r.evidence.last_seq,
+          evidence_gate_rounds: Math.max(r.evidence.gate_rounds ?? 0, r.evidence.gate_budget ?? 0),
+          evidence_resumes: r.evidence.resumes,
           model: r.model_id, effort: r.effort ?? "high",
           interactive: r.pending[0]?.source !== "ci" && (r.source === "web" || r.source === "mcp"),
           question_wait_minutes: questionWaitMinutes(),
@@ -915,7 +955,18 @@ export class Runs {
         }
       } else await start();
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
+      // Only this service chooses the key. The dedicated RPC waits for a private
+      // runner acknowledgement before any task can be delivered.
+      const signingKey = randomBytes(32);
+      await workspace.rpc("init_evidence", { run_id: id, owner_id: r.user_id, key: signingKey.toString("hex") });
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
+      // Keep the initial private export for policy inspection, never key acquisition.
+      // Older exports may be unavailable; no control reply is logged or published.
+      let initialEvidence: unknown;
+      try { initialEvidence = await workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable */ }
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
+        evidenceKey: signingKey,
         workspace,
         cwd: checked.cwd,
         cursor: 0,
@@ -937,6 +988,7 @@ export class Runs {
         .toString()
         .trim();
       r = { ...this.get(id), base_sha: r.base_sha };
+      r.evidence = finishEvidence(r.evidence, initialEvidence, signingKey);
       r.phase = "agent";
       this.save(r);
       await workspace.enableCheckpoints?.({ owner_id: r.user_id, base_sha: r.base_sha!, head_sha: (await git(checked.cwd, "rev-parse", "HEAD")).toString().trim(), identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) }, capture => {
@@ -961,6 +1013,9 @@ export class Runs {
         this.live.delete(id);
         return await workspace.destroy();
       }
+      // A failed turn without an admitted recovery must not be delivered again
+      // ahead of the new follow-up (or spend a second gate reservation).
+      if (!restored && !r.resume_from_checkpoint) delete r.active_message;
       const active = r.active_message;
       const finishing = r.recovery_phase === "finishing";
       const continuation = !!restored && (!!active || r.resume_from_checkpoint);
@@ -1077,6 +1132,9 @@ export class Runs {
     r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
+    // Reserve before delivering the task: a crash before the private finish
+    // export may spend unused allowance, but can never reset the global budget.
+    r.evidence = { ...(r.evidence ?? emptyEvidence()), gate_budget: Math.min(6, Math.max(r.evidence?.gate_budget ?? 0, r.evidence?.gate_rounds ?? 0) + 2) };
     r.work_kept = false;
     delete r.last_error;
     r.phase = "agent";
@@ -1145,7 +1203,17 @@ export class Runs {
         const modelDropped = event.type === "error" && event.message === "The model connection dropped 3 times";
         if (event.type === "error" && event.agent_id === "main")
           event.message = modelDropped ? "The model connection dropped 3 times" : "The model request failed.";
-        this.append(id, event);
+        const admitted = this.append(id, event);
+        if (event.type === "evidence.recorded" && !admitted) continue;
+        if (event.type === "evidence.recorded" && event.record?.kind?.type === "repro_red") {
+          // The authenticated tree, not timing/tool refusals, establishes red.
+          // Make a tests-only local ancestor without pushing or touching the lease.
+          const current = this.get(id);
+          try {
+            await live.workspace.rpc("stage_repro", {title: current.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, current.user_id)),
+              repro_stage: {base: current.base_sha, tree: event.record.tree_hash_before, test_files: event.record.kind.test_files}});
+          } catch { /* Resume/busy boundaries may defer materialization to publication. */ }
+        }
         const r = this.get(id);
         r.summary = fold(r.summary, event as any);
         Object.assign(r, totals(r.summary), {
@@ -1164,11 +1232,13 @@ export class Runs {
           continue;
         }
         if (event.type === "turn.end" && event.agent_id === "main") {
-          if (event.stop_reason === "error") continue;
+          if (event.stop_reason === "error") { await this.captureEvidence(id, live); continue; }
           if (event.stop_reason === "interrupted") {
+            await this.captureEvidence(id, live);
             live.busy = false;
-            r.phase = "agent";
-            this.status(r, "stopped");
+            const stopped = this.get(id);
+            stopped.phase = "agent";
+            this.status(stopped, "stopped");
           } else if (event.stop_reason !== "compacted") {
             await this.finish(id, live);
           }
@@ -1186,6 +1256,14 @@ export class Runs {
       await delay(batch.events.length ? 50 : 300);
     }
   }
+  private async captureEvidence(id: string, live: Live) {
+    let r = this.get(id);
+    let reply: unknown;
+    try { reply = await live.workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable; no private reply is logged */ }
+    r = this.get(id);
+    r.evidence = finishEvidence(r.evidence, reply, live.evidenceKey);
+    this.save(r);
+  }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
     if (r.status === "stopped") { live.busy = false; return; }
@@ -1199,6 +1277,10 @@ export class Runs {
     delete r.active_message;
     this.autoResuming.delete(id);
     r.auto_resume_pending = false;
+    this.save(r); // Private export yields/reloads: persist completion before it.
+    await this.captureEvidence(id, live);
+    r = this.get(id);
+    if (live.closed || r.status === "stopped") { live.busy = false; return; }
     r.phase = "finishing";
     r.recovery_phase = "finishing";
     this.status(r, "working", "Pushing changes");
@@ -1234,6 +1316,44 @@ export class Runs {
   }
   private checkpointUnavailable(id: string) {
     this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
+  }
+
+  /** Derive freshness on the service clone from the exact pinned commit being pushed. */
+  private evidenceBeforePush(run: Run, guard?: PushOptions["beforePush"]): PushOptions["beforePush"] {
+    // Inspect every publication, including gate-off/docs-only/no-record turns.
+    return async context => {
+      const current = this.get(run.id);
+      let tree: string | undefined;
+      let uiRequired: boolean | undefined;
+      let docsOnly = false;
+      let staging: "tests_first" | "single_commit" = "single_commit";
+      let warnings = ["Publication tree or verification diff unavailable."];
+      try {
+        const candidate = (await git(context.cwd, "rev-parse", `${context.head}^{tree}`)).toString().trim();
+        if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(candidate)) tree = candidate;
+        const diff = (await git(context.cwd, "diff", "--no-ext-diff", "--no-textconv", current.base_sha!, context.head, "--")).toString();
+        const paths = (await git(context.cwd, "diff", "--name-only", "--no-renames", "-z", current.base_sha!, context.head, "--")).toString().split("\0").filter(Boolean);
+        uiRequired = paths.some(path => path.startsWith("web/") || /\.(?:tsx|css)$/.test(path));
+        // Symlink mode changes must never inherit the regular-Markdown waiver.
+        docsOnly = paths.length > 0 && paths.every(path => path.endsWith(".md") && (!path.includes("/") || path.startsWith("docs/"))) && !/^(?:(?:old|new) mode 120000|(?:new|deleted) file mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/m.test(diff);
+        const red = [...(current.evidence?.records ?? [])].reverse().find(record => record.kind.type === "repro_red");
+        if (red && current.base_sha) {
+          try {
+            const parent = (await git(context.cwd, "rev-parse", `${context.head}^`)).toString().trim();
+            const parentTree = (await git(context.cwd, "rev-parse", `${parent}^{tree}`)).toString().trim();
+            const grandparent = (await git(context.cwd, "rev-parse", `${parent}^`)).toString().trim();
+            if (parentTree === red.tree_hash_before && grandparent === current.base_sha) staging = "tests_first";
+          } catch { /* No stage ancestor: disclose single commit, retain check freshness. */ }
+        }
+        warnings = weakenedEvidence(diff.slice(0, 2_000_000));
+        if (diff.length > 2_000_000) warnings.push("Verification diff truncated; additional test/policy changes may be omitted.");
+      } catch { tree = undefined; /* no freshness claim on incomplete service-side Git inspection */ }
+      // Keep the CI guard's final stop/PR recheck closest to the actual push.
+      if (guard) await guard(context);
+      const latest = this.get(run.id);
+      latest.evidence = { ...(latest.evidence ?? emptyEvidence()), publication_tree: tree, staging, weakened: warnings, ui_required: uiRequired, docs_only: docsOnly };
+      this.save(latest);
+    };
   }
   /** Recheck automatic-round policy against the pinned commit on every push attempt. */
   private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
@@ -1310,12 +1430,15 @@ export class Runs {
     // Only preflight a fresh snapshot. An imported retry may already exist remotely
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
-    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
+    const pushOptions = publicationPushOptions(r, this.evidenceBeforePush(r, this.ciBeforePush(r)));
+    const red = [...(r.evidence?.records ?? [])].reverse().find(record => record.kind.type === "repro_red");
+    const reproStage = red && red.kind.type === "repro_red" && r.evidence?.task?.kind === "bug" && !r.evidence.task.skip
+      ? {repro_stage: {base: r.base_sha, tree: red.tree_hash_before, test_files: red.kind.test_files}} : {};
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       options.backgroundPublication
-        ? { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options) }
-        : { title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
+        ? { ...reproStage, title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id), options) }
+        : { ...reproStage, title: r.title, identity: await commitIdentity(githubEnvFor(this.db, this.cfg.secret, r.user_id)) },
     ), { maxAttempts: 1 });
     const journal = this.get(id);
     journal.publication_head = snapshot.head;
@@ -1385,6 +1508,8 @@ export class Runs {
       r.deletions += Number(d) || 0;
     }
     r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, ci_pending_sha: pushed ? head : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    // Also surface weakening for legacy workers, which have no signed records.
+    if (r.evidence) r.evidence.weakened = [...new Set([...(r.evidence.weakened ?? []), ...weakenedEvidence(r.diff)])].sort().slice(0, 32);
     this.save(r);
     this.append(id, {
       type: "run.diff",
