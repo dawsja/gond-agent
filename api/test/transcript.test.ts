@@ -35,6 +35,63 @@ it("preserves transcript snapshots across batches and deduplicates reconnect rep
   expect(after).toEqual(createTranscript()([...initial, ...updates]));
 });
 
+it("keeps compaction markers ordered, replay-safe and independent of run completion", () => {
+  const append = createTranscript();
+  const events: StreamEvent[] = [
+    { seq: 1, ts: 1, type: "run.status", status: "working" },
+    { seq: 2, ts: 2, type: "text.delta", agent_id: "main", text: "Before" },
+    { seq: 3, ts: 3, type: "compacted", agent_id: "main", reason: "auto-round", before: 10000, after: 2000 },
+    { seq: 4, ts: 4, type: "text.delta", agent_id: "main", text: "After" },
+    { seq: 5, ts: 5, type: "compacted", agent_id: "explore-1", reason: "overflow", before: 9000, after: 1000 },
+    { seq: 6, ts: 6, type: "compacted" }, // Historical shape.
+  ];
+  const result = append(events);
+  expect(result.status).toBe("working");
+  expect(result.items).toMatchObject([
+    { kind: "text", text: "Before" },
+    { kind: "compacted", reason: "auto-round", before: 10000, after: 2000 },
+    { kind: "text", text: "After" },
+    { kind: "compacted" },
+  ]);
+  expect(result.items).toHaveLength(4);
+  expect(append(events)).toEqual(result);
+  expect(result).toEqual(createTranscript()(events));
+});
+
+it("rolls back partial text across compaction and a queued follow-up without mutating replay snapshots", () => {
+  const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq, type, agent_id: "main", ...fields });
+  const append = createTranscript();
+  const initial = [
+    event(1, "turn.start"),
+    event(2, "text.delta", { text: "Completed earlier response. " }),
+    event(3, "text.delta", { text: "Partial " }),
+    event(4, "compacted", { reason: "auto-round", before: 10000, after: 2000 }),
+    event(5, "text.delta", { text: "middle " }),
+    event(6, "user", { text: "Queued follow-up", images: [] }),
+    event(7, "text.delta", { text: "draft" }),
+  ];
+  const before = append(initial);
+  const frozenBefore = structuredClone(before);
+  const updates = [
+    event(8, "stream.reset", { text_length: "Partial middle draft".length, reasoning_length: 0 }),
+    event(9, "text.delta", { text: "Final reply" }),
+  ];
+  const after = append(updates);
+  expect(after.items).toEqual([
+    { kind: "text", key: "t2", text: "Completed earlier response. " },
+    { kind: "compacted", key: "compact4", reason: "auto-round", before: 10000, after: 2000 },
+    { kind: "user", key: "u6", text: "Queued follow-up", ts: 6, images: [] },
+    { kind: "text", key: "t9", text: "Final reply" },
+  ]);
+  const frozenAfter = structuredClone(after);
+  const all = [...initial, ...updates];
+  expect(append(all)).toEqual(frozenAfter);
+  expect(createTranscript()(all)).toEqual(frozenAfter);
+  expect(before).toEqual(frozenBefore);
+  expect(after).toEqual(frozenAfter);
+  expect(all.reduce(fold, emptySummary()).text).toBe("Completed earlier response. Final reply");
+});
+
 it("groups API, Claude and Codex activity without exposing transport names or merging external tools", () => {
   const append = createTranscript();
   const starts = [

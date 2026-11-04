@@ -119,6 +119,69 @@ async fn stream_retry_resets_only_partial_attempt_deltas_before_final_reply() {
 }
 
 #[tokio::test]
+async fn stream_retry_and_in_turn_compaction_finish_with_final_text_once() {
+    for reason in ["auto-round", "overflow"] {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(vec![]));
+        let main_attempts = Arc::new(AtomicU32::new(0));
+        let summary_attempts = Arc::new(AtomicU32::new(0));
+        let main_count = main_attempts.clone();
+        let summary_count = summary_attempts.clone();
+        let url = mock(Arc::new(move |req: &Value| {
+            if is_summary(req) {
+                return if summary_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    unfinished_response(&[json!({"type":"text","text":"discarded summary"})])
+                } else { sse(&[json!({"type":"text","text":"Earlier work"})], "end_turn") };
+            }
+            match main_count.fetch_add(1, Ordering::Relaxed) {
+                0 => unfinished_response(&[
+                    json!({"type":"text","text":"discarded main"}),
+                    json!({"type":"tool_call","id":"discarded","name":"bash","input":{"command":"printf duplicate >> executions"}}),
+                ]),
+                1 => {
+                    let reply = sse(&[json!({"type":"tool_call","id":"executed","name":"bash","input":{"command":"printf once >> executions"}})], "tool_use");
+                    if reason == "auto-round" { reply.replace("\"input_uncached\":100", "\"input_uncached\":8000") } else { reply }
+                }
+                2 if reason == "overflow" => "event: error\ndata: {\"code\":\"context_exceeded\",\"message\":\"maximum context length\",\"retryable\":true}\n\n".into(),
+                _ => sse(&[json!({"type":"text","text":"Final reply"})], "end_turn"),
+            }
+        }), seen.clone()).await;
+        let mut cfg = config(dir.path(), Mode::Allow);
+        cfg.context_window = 8192;
+        cfg.history = (0..7).map(|n| Message::user_text(format!("Earlier {n} ").repeat(100))).collect();
+        let mut h = spawn(ApiClient::new(url, None).with_retry_delay(std::time::Duration::ZERO), cfg);
+        h.input.send(AgentInput::User { text: "Continue".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { agent_id, .. } if agent_id == "main")).await;
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+        assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::TurnStart { agent_id } if agent_id == "main")).count(), 1);
+        assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::TurnEnd { agent_id, stop_reason } if agent_id == "main" && stop_reason == "end_turn")).count(), 1);
+        assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Compacted { agent_id, reason: actual, before, after } if agent_id == "main" && actual == reason && before > after)).count(), 1);
+        for agent in ["main", "compact"] {
+            assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::StreamReset { agent_id, .. } if agent_id == agent)).count(), 1);
+        }
+        let mut text: Vec<u16> = vec![];
+        for event in &events {
+            match event {
+                AgentEvent::TextDelta { agent_id, text: delta } if agent_id == "main" => text.extend(delta.encode_utf16()),
+                AgentEvent::StreamReset { agent_id, text_length, .. } if agent_id == "main" => text.truncate(text.len() - text_length),
+                _ => {}
+            }
+        }
+        assert_eq!(String::from_utf16(&text).unwrap(), "Final reply");
+        assert_eq!(std::fs::read_to_string(dir.path().join("executions")).unwrap(), "once");
+        assert_eq!(main_attempts.load(Ordering::Relaxed), if reason == "overflow" { 4 } else { 3 });
+        assert_eq!(summary_attempts.load(Ordering::Relaxed), 2);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests[0], requests[1], "transient retries keep the request identical");
+        let last = requests.last().unwrap().to_string();
+        assert!(last.contains("Earlier work"));
+        assert!(!last.contains("discarded"), "aborted main/summary text cannot enter compacted history");
+        assert_summary_bounds(&requests, 8192);
+        eprintln!("combined retry/{reason} evidence: main and summary reset once; tool executes once; final reply once");
+    }
+}
+
+#[tokio::test]
 async fn stream_retry_interrupt_stops_pending_retry() {
     let dir = tempfile::tempdir().unwrap();
     let seen = Arc::new(StdMutex::new(vec![]));

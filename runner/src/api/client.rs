@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,6 +27,22 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    pub status: Option<u16>,
+}
+
+impl ApiError {
+    pub(crate) fn context_overflow(&self) -> bool {
+        let code = self.code.to_ascii_lowercase();
+        let message = self.message.to_ascii_lowercase();
+        // Token wording also occurs in rate/quota and output limits. Only explicit
+        // context codes or HTTP 400 context wording enter compaction, never 429.
+        if self.status == Some(429) || code.contains("rate_limit") || code.contains("ratelimit") || code.contains("quota")
+            || ["max_tokens", "max_output_tokens", "max_completion_tokens"].iter().any(|part| code.contains(part) || message.contains(part)) {
+            return false;
+        }
+        matches!(code.as_str(), "context_exceeded" | "context_length_exceeded" | "model_context_window_exceeded" | "prompt_too_long" | "max_context_length_exceeded")
+            || (self.status == Some(400) && ["maximum context", "context length", "context window", "prompt is too long", "prompt length exceeds"].iter().any(|part| message.contains(part)))
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -36,14 +53,15 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+pub(crate) const SUMMARY_REQUEST_LIMIT: &str = "Too much history to summarise in one pass. Choose a model with a larger context window.";
 
 fn connection_dropped() -> anyhow::Error {
-    ApiError { code: "stream".into(), message: "The connection to the model dropped. Try again.".into(), retryable: true }.into()
+    ApiError { code: "stream".into(), message: "The connection to the model dropped. Try again.".into(), retryable: true, status: None }.into()
 }
 
 fn model_retryable(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<ApiError>() {
-        return error.retryable;
+        return error.retryable && !error.context_overflow();
     }
     error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
         error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
@@ -105,6 +123,7 @@ impl ApiClient {
         let body: Value = res.json().await.unwrap_or(Value::Null);
         let e = &body["error"];
         Err(ApiError {
+            status: Some(status),
             code: e["code"].as_str().unwrap_or(if status == 401 { "unauthorized" } else { "http_error" }).into(),
             message: e["message"].as_str().map(str::to_owned).unwrap_or_else(|| status_message(status).into()),
             retryable: e["retryable"].as_bool().unwrap_or(status == 429 || status >= 500),
@@ -122,19 +141,31 @@ impl ApiClient {
     /// execution until End: a partial tool call is only model output, never permission to execute.
     /// Dropping this stream cancels both an in-flight request and any pending backoff.
     pub async fn responses(&self, request: &ResponsesRequest) -> Result<EventStream> {
+        self.responses_with_budget(request, None).await
+    }
+
+    /// Summary chunks/merges share a cap which includes every underlying HTTP retry.
+    pub(crate) async fn responses_with_budget(&self, request: &ResponsesRequest, budget: Option<Arc<AtomicU32>>) -> Result<EventStream> {
         let api = self.clone();
         let request = Arc::new(request.clone());
         let stream = futures::stream::unfold((None::<EventStream>, 0u32, false), move |(mut stream, mut attempts, finished)| {
             let api = api.clone();
             let request = request.clone();
+            let budget = budget.clone();
             async move {
                 if finished { return None; }
                 loop {
                     let next = if let Some(active) = &mut stream {
                         active.next().await
                     } else {
+                        if budget.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
+                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true)));
+                        }
                         if attempts > 0 && !api.retry_delay.is_zero() {
                             tokio::time::sleep(api.retry_delay * (1 << (attempts - 1))).await;
+                        }
+                        if budget.as_ref().is_some_and(|n| n.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err()) {
+                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true)));
                         }
                         attempts += 1;
                         match api.open_response(&request).await {
@@ -146,7 +177,7 @@ impl ApiClient {
                         Some(Ok(StreamEvent::End { stop_reason, usage })) => {
                             return Some((Ok(StreamEvent::End { stop_reason, usage }), (None, attempts, true)));
                         }
-                        Some(Ok(StreamEvent::Error { code, message, retryable })) => ApiError { code, message, retryable }.into(),
+                        Some(Ok(StreamEvent::Error { code, message, retryable })) => ApiError { code, message, retryable, status: None }.into(),
                         Some(Ok(event)) => return Some((Ok(event), (stream, attempts, false))),
                         Some(Err(error)) => error,
                         None => connection_dropped(),
@@ -160,6 +191,7 @@ impl ApiClient {
                             code: "model_connection_dropped".into(),
                             message: "The model connection dropped 3 times".into(),
                             retryable: true,
+                            status: None,
                         };
                         return Some((Err(error.into()), (None, attempts, true)));
                     }
@@ -258,7 +290,7 @@ mod tests {
         let e = api.get::<Value>("/v1/me").await.unwrap_err();
         assert_eq!(api.describe(&e), "Can't reach Gond Agent. Check your internet connection and try again.");
 
-        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false }.into();
+        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false, status: Some(401) }.into();
         assert_eq!(api.describe(&signed_out), "You're not signed in.");
         assert_eq!(status_message(502), "Gond Agent is having trouble right now. Try again in a moment.");
     }
