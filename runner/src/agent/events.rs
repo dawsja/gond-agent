@@ -104,7 +104,9 @@ pub enum AgentEvent {
     #[serde(rename = "state.error")]
     StateError { request_id: String, operation: String, code: String },
     #[serde(rename = "error")]
-    Error { agent_id: String, message: String, retryable: bool },
+    Error { agent_id: String, message: String, retryable: bool, code: String, attempts: u32, status: Option<u16>, reset_at: Option<f64> },
+    #[serde(rename = "model.retry")]
+    Retry { agent_id: String, attempt: u32, max_attempts: u32, class: String, wait_seconds: f64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

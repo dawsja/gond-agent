@@ -44,7 +44,7 @@ async fn stream_retry_aborts_twice_then_executes_tools_once() {
 }
 
 #[tokio::test]
-async fn stream_retry_three_drops_report_named_error_without_executing_partial_tools() {
+async fn stream_retry_five_drops_report_named_error_without_executing_partial_tools() {
     let dir = tempfile::tempdir().unwrap();
     let seen = Arc::new(StdMutex::new(vec![]));
     let url = mock(Arc::new(|_: &Value| unfinished_response(&[
@@ -53,8 +53,9 @@ async fn stream_retry_three_drops_report_named_error_without_executing_partial_t
     let mut h = spawn(ApiClient::new(url, None).with_retry_delay(std::time::Duration::ZERO), config(dir.path(), Mode::Allow));
     h.input.send(AgentInput::User { text: "work".into(), images: vec![] }).unwrap();
     let events = until(&mut h, |e| matches!(e, AgentEvent::Error { .. })).await;
-    assert_eq!(seen.lock().unwrap().len(), 3);
-    assert!(matches!(events.last(), Some(AgentEvent::Error { message, retryable: true, .. }) if message == "The model connection dropped 3 times"));
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    assert!(matches!(events.last(), Some(AgentEvent::Error { code, attempts: 5, retryable: true, .. }) if code == "stream"));
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Retry { .. })).count(), 4);
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolStart { .. })));
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::StreamReset { .. })), "no visible output to reset");
     assert!(!dir.path().join("executions").exists());
@@ -73,7 +74,7 @@ async fn stream_retry_respects_nonretryable_errors_after_partial_output() {
     h.input.send(AgentInput::User { text: "work".into(), images: vec![] }).unwrap();
     let events = until(&mut h, |e| matches!(e, AgentEvent::Error { .. })).await;
     assert_eq!(seen.lock().unwrap().len(), 1);
-    assert!(matches!(events.last(), Some(AgentEvent::Error { message, retryable: false, .. }) if message == "The provider quota is exhausted."));
+    assert!(matches!(events.last(), Some(AgentEvent::Error { message, retryable: false, .. }) if message == "The provider account has no remaining credit or quota. Check billing with the provider."));
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::StreamReset { .. })), "terminal errors do not retry");
 }
 
@@ -194,4 +195,50 @@ async fn stream_retry_interrupt_stops_pending_retry() {
     assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "interrupted"));
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::ToolStart { .. })));
+}
+
+#[tokio::test]
+async fn server_errors_retry_only_model_requests_and_preserve_exhausted_cause() {
+    use crate::tools::testutil::http::{Res, serve};
+    for exhausted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        let url = serve(move |_| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if exhausted || n < 2 {
+                Res::new(503, "application/json", r#"{"error":{"code":"provider_unavailable","message":"secret https://private.invalid","retryable":true}}"#)
+            } else if n == 2 {
+                Res::new(200, "text/event-stream", sse(&[json!({"type":"tool_call","id":"once","name":"bash","input":{"command":"printf once >> executions"}})], "tool_use"))
+            } else {
+                Res::new(200, "text/event-stream", sse(&[json!({"type":"text","text":"Done"})], "end_turn"))
+            }
+        }).await;
+        let mut h = spawn(ApiClient::new(url, None).with_retry_delay(std::time::Duration::ZERO), config(dir.path(), Mode::Allow));
+        h.input.send(AgentInput::User { text: "work".into(), images: vec![] }).unwrap();
+        let events = until(&mut h, |e| if exhausted { matches!(e, AgentEvent::Error { .. }) } else { matches!(e, AgentEvent::TurnEnd { .. }) }).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), if exhausted { 5 } else { 4 });
+        assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Retry { class, .. } if class == "provider_unavailable")).count(), if exhausted { 4 } else { 2 });
+        if exhausted {
+            assert!(matches!(events.last(), Some(AgentEvent::Error { code, attempts:5, status:Some(503), message, .. }) if code == "provider_unavailable" && !message.contains("private.invalid")));
+            assert!(!dir.path().join("executions").exists());
+        } else {
+            assert_eq!(std::fs::read_to_string(dir.path().join("executions")).unwrap(), "once");
+            assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolStart { .. })).count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn stop_interrupts_model_backoff_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(StdMutex::new(vec![]));
+    let url = mock(Arc::new(|_| "event: error\ndata: {\"code\":\"provider_rate_limit\",\"retryable\":true,\"retry_after_ms\":120000}\n\n".into()), seen.clone()).await;
+    let mut h = spawn(ApiClient::new(url, None), config(dir.path(), Mode::Allow));
+    h.input.send(AgentInput::User { text:"work".into(), images:vec![] }).unwrap();
+    until(&mut h, |e| matches!(e, AgentEvent::Retry { attempt:2, wait_seconds, .. } if *wait_seconds == 120.0)).await;
+    h.input.send(AgentInput::Interrupt).unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(1), until(&mut h, |e| matches!(e, AgentEvent::TurnEnd { .. }))).await.unwrap();
+    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { stop_reason, .. }) if stop_reason == "interrupted"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

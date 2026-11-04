@@ -32,7 +32,12 @@ impl Default for Limits {
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Map { version: u32, head: String, worktree: String, files: Vec<Entry>, skipped: usize, listing_incomplete: bool, partial: bool }
+struct Map {
+    version: u32, head: String, worktree: String, files: Vec<Entry>, skipped: usize, listing_incomplete: bool, partial: bool,
+    // Per-call diagnostics, not part of the persisted cache format/key.
+    #[serde(skip)]
+    cache_bypass_reason: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry { path: String, symbols: Vec<Symbol> }
@@ -134,19 +139,30 @@ fn read_source(root: &Path, path: &Path, limits: Limits, remaining: &mut usize, 
 }
 
 async fn git(ctx: &ToolCtx, args: &[&str], max: usize, seconds: u64) -> Result<Vec<u8>, String> {
+    let home = tokio::task::spawn_blocking(Scratch::new).await
+        .map_err(|_| "Git configuration isolation stopped")?
+        .map_err(|_| "Could not create private Git configuration home")?;
     let mut cmd = Command::new("git");
-    cmd.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args);
+    // Use the same config scope for discovery, status and listing. Host-wide LFS filters
+    // must neither run during status nor disable caching for an unrelated repository.
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", &home.0).env("XDG_CONFIG_HOME", &home.0)
+        .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_COUNT").env_remove("GIT_CONFIG_PARAMETERS")
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args);
     super::process::capture(ctx, cmd, vec![], max, seconds).await
 }
 
 // Status alone is unchanged by a second dirty edit. Include cheap metadata for each dirty path,
 // including individual untracked files, without reading source contents or invoking diff drivers.
-async fn worktree_key(ctx: &ToolCtx, head: &str) -> Option<String> {
+async fn worktree_key(ctx: &ToolCtx, head: &str) -> Result<String, String> {
     // Status may run clean/process filters when refreshing dirty tracked files. Fail closed:
-    // read configuration names only and bypass caching entirely if any filter is configured.
-    let config = git(ctx, &["config", "--null", "--name-only", "--list"], 64 * 1024, 1).await.ok()?;
-    if config.split(|b| *b == 0).any(|key| key.starts_with(b"filter.")) { return None; }
-    let status = git(ctx, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"], LISTING_MAX, 1).await.ok()?;
+    // Inspect effective repository config and includes, including config.worktree. Do not use
+    // --local: status also reads the worktree scope. The helper excludes all host config.
+    let config = git(ctx, &["config", "--includes", "--null", "--name-only", "--list"], 64 * 1024, 1).await
+        .map_err(|e| format!("Git configuration discovery: {e}"))?;
+    if config.split(|b| *b == 0).any(|key| key.starts_with(b"filter.")) { return Err("repository-local filter configured".into()); }
+    let status = git(ctx, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"], LISTING_MAX, 1).await
+        .map_err(|e| format!("Git status discovery: {e}"))?;
     let root = ctx.cwd.clone();
     let head = head.to_owned();
     let cancel = ctx.cancel.clone();
@@ -158,8 +174,10 @@ async fn worktree_key(ctx: &ToolCtx, head: &str) -> Option<String> {
         let mut count = 0;
         while let Some(record) = records.next() {
             count += 1;
-            if count > 5000 || cancel.is_cancelled() || start.elapsed() >= Duration::from_secs(1) { return None; }
-            if record.len() < 4 || record[2] != b' ' { return None; }
+            if count > 5000 { return Err("dirty-path count limit exceeded".into()); }
+            if cancel.is_cancelled() { return Err("fingerprint interrupted".into()); }
+            if start.elapsed() >= Duration::from_secs(1) { return Err("dirty-path metadata deadline exceeded".into()); }
+            if record.len() < 4 || record[2] != b' ' { return Err("malformed Git status record".into()); }
             let path = raw_path(&record[3..]);
             match open_beneath(&root, &path, false).and_then(|f| f.metadata()) {
                 Ok(meta) => {
@@ -171,10 +189,10 @@ async fn worktree_key(ctx: &ToolCtx, head: &str) -> Option<String> {
                 }
                 Err(_) => hash.update(b"unavailable"),
             }
-            if record[..2].iter().any(|b| matches!(b, b'R' | b'C')) { records.next()?; }
+            if record[..2].iter().any(|b| matches!(b, b'R' | b'C')) { records.next().ok_or("missing Git status rename path")?; }
         }
-        Some(format!("{:x}", hash.finalize()))
-    }).await.ok().flatten()
+        Ok(format!("{:x}", hash.finalize()))
+    }).await.map_err(|_| "fingerprint metadata worker stopped".to_owned())?
 }
 
 fn raw_path(raw: &[u8]) -> PathBuf {
@@ -260,12 +278,17 @@ async fn load(ctx: &ToolCtx, limits: Limits, cache: bool) -> Result<Map, String>
     let head_bytes = git(ctx, &["rev-parse", "--verify", "HEAD"], 256, 1).await.unwrap_or_default();
     let head = String::from_utf8_lossy(&head_bytes).trim().to_owned();
     let head = if head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()) { head } else { "unborn".into() };
-    let worktree = if cache { worktree_key(ctx, &head).await } else { None };
+    let (worktree, cache_bypass_reason) = if cache {
+        match worktree_key(ctx, &head).await {
+            Ok(key) => (Some(key), None),
+            Err(reason) => (None, Some(reason)),
+        }
+    } else { (None, Some("caching disabled".into())) };
     let root = ctx.cwd.clone();
     let scan = tokio::task::spawn_blocking(move || {
         // No .git file/worktree redirect: cache belongs only to this clone's own Git directory.
         if let Some(key) = &worktree && let Some(map) = cache_read(&root, &head, key) { return Ok::<_, &'static str>(Err(map)); }
-        let map = Map { version: VERSION, head, worktree: worktree.unwrap_or_default(), ..Default::default() };
+        let map = Map { version: VERSION, head, worktree: worktree.unwrap_or_default(), cache_bypass_reason, ..Default::default() };
         let scratch = Scratch::new().map_err(|_| "Could not create repository map scratch space")?;
         Ok(Ok(Scan { map, scratch, snapshots: vec![], remaining: limits.bytes / 3, scanned: 0 }))
     }).await.map_err(|_| "Repository map scan stopped")??;
@@ -293,7 +316,8 @@ async fn load(ctx: &ToolCtx, limits: Limits, cache: bool) -> Result<Map, String>
     } else if !scan.map.files.is_empty() { scan.map.partial = true; }
     let root = ctx.cwd.clone(); let cancel = ctx.cancel.clone();
     tokio::task::spawn_blocking(move || {
-        let map = scan.finish(&tags, limits, start, &cancel)?;
+        let mut map = scan.finish(&tags, limits, start, &cancel)?;
+        if map.partial && map.cache_bypass_reason.is_none() { map.cache_bypass_reason = Some("partial map".into()); }
         if cache && !map.partial && !map.worktree.is_empty() { cache_write(&root, &map); }
         Ok(map)
     }).await.map_err(|_| "Repository map scan stopped")?
@@ -323,7 +347,8 @@ fn render(map: &Map, budget: usize, focus: &[String]) -> String {
     let mut files: Vec<_> = map.files.iter().collect();
     files.sort_by(|a,b| focused(&b.path).cmp(&focused(&a.path)).then_with(|| score(b).cmp(&score(a))).then_with(|| a.path.cmp(&b.path)));
     let symbol_count: usize = files.iter().map(|f| f.symbols.len()).sum();
-    let header = |truncated| format!("{FRAME}\nfiles={} symbols={} skipped={}{} partial={} truncated={} head={} tokens estimated as bytes/4; top<=3 symbols/file\n", files.len(), symbol_count, map.skipped, if map.listing_incomplete { "+unknown" } else { "" }, map.partial, truncated, map.head);
+    let diagnostic = map.cache_bypass_reason.as_ref().map(|r| format!(" cache_bypass={:?}", clean(r))).unwrap_or_default();
+    let header = |truncated| format!("{FRAME}\nfiles={} symbols={} skipped={}{} partial={} truncated={} head={}{} tokens estimated as bytes/4; top<=3 symbols/file\n", files.len(), symbol_count, map.skipped, if map.listing_incomplete { "+unknown" } else { "" }, map.partial, truncated, map.head, diagnostic);
     let mut body = String::new();
     let max = budget * 4;
     let mut truncated = false;

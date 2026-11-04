@@ -1,5 +1,5 @@
 import { modelStallMs } from "../config";
-import { ApiError } from "../wire";
+import { modelFailure } from "../model-errors";
 import { providerHeaders, providerURL, type ProviderConnection } from "../providers";
 import { anthropic } from "./anthropic";
 import { chatAdapter } from "./chat";
@@ -53,7 +53,7 @@ export async function callUpstream(url: string, headers: Record<string, string>,
     return new Response(body, {status:response.status, statusText:response.statusText, headers:response.headers});
   } catch {
     clear();
-    throw new ApiError(502, "provider_connection", "Could not reach the model provider. Check its URL and network access.", true);
+    throw modelFailure(502, "provider_connection");
   }
 }
 

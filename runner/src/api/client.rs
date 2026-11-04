@@ -22,12 +22,15 @@ fn status_message(status: u16) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ApiError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
     pub status: Option<u16>,
+    pub attempts: u32,
+    pub retry_after_ms: Option<u64>,
+    pub reset_at: Option<f64>,
 }
 
 impl ApiError {
@@ -56,16 +59,64 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 pub(crate) const SUMMARY_REQUEST_LIMIT: &str = "Too much history to summarise in one pass. Choose a model with a larger context window.";
 
 fn connection_dropped() -> anyhow::Error {
-    ApiError { code: "stream".into(), message: "The connection to the model dropped. Try again.".into(), retryable: true, status: None }.into()
+    ApiError { code: "stream".into(), message: "The connection to the model dropped. Try again.".into(), retryable: true, status: None, ..Default::default() }.into()
 }
 
-fn model_retryable(error: &anyhow::Error) -> bool {
-    if let Some(error) = error.downcast_ref::<ApiError>() {
-        return error.retryable && !error.context_overflow();
+#[derive(serde::Deserialize)]
+struct ModelPolicy { retryable: bool, message: String }
+
+fn model_policy(code: &str) -> (&'static str, &'static ModelPolicy) {
+    static TABLE: std::sync::OnceLock<std::collections::BTreeMap<String, ModelPolicy>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| serde_json::from_str(include_str!("../../model-errors.json")).expect("model error policy"));
+    table.get_key_value(code).or_else(|| table.get_key_value("unknown")).map(|(code, policy)| (code.as_str(), policy)).unwrap()
+}
+
+fn model_error(error: anyhow::Error, attempts: u32) -> ApiError {
+    let mut error = match error.downcast::<ApiError>() {
+        Ok(error) => error,
+        Err(error) => ApiError { code: if error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_body() || (e.is_request() && !e.is_builder())) { "network" } else { "unknown" }.into(), ..Default::default() },
+    };
+    // We talk to Gond Agent, not directly to a provider. A bare 401 (including
+    // worker/loopback authentication failures) is not evidence of a bad API key.
+    let provider_code = model_policy(&error.code).0 != "unknown"
+        && ["provider_", "chatgpt_", "subscription_"].iter().any(|prefix| error.code.starts_with(prefix));
+    if error.status == Some(401) && !provider_code {
+        error.code = "relay_auth".into();
+    } else if error.code == "http_error" || (model_policy(&error.code).0 == "unknown" && error.status.is_some()) {
+        error.code = match error.status { Some(403) => "provider_auth", Some(402) => "provider_quota", Some(429) => "provider_rate_limit", Some(500..=599) => "provider_unavailable", Some(400..=499) => "provider_request", _ => "unknown" }.into();
     }
-    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-        error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
-    })
+    if model_policy(&error.code).1.retryable {
+        match error.status {
+            Some(401) => error.code = "provider_auth".into(),
+            Some(402) => error.code = "provider_quota".into(),
+            Some(403) => error.code = "provider_forbidden".into(),
+            Some(400 | 422) => error.code = "provider_request".into(),
+            _ => {},
+        }
+    }
+    if error.context_overflow() { error.code = "context_exceeded".into(); }
+    let (code, policy) = model_policy(&error.code);
+    error.code = code.into();
+    error.message = policy.message.clone();
+    error.retryable = policy.retryable && !error.context_overflow();
+    error.attempts = attempts;
+    error
+}
+
+fn model_retryable(error: &ApiError) -> bool {
+    model_policy(&error.code).1.retryable && !error.context_overflow()
+}
+
+fn retry_after(value: &str, now: std::time::SystemTime) -> Option<u64> {
+    let delay = value.trim().parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| Duration::from_secs_f64(s.min(120.0)))
+        .or_else(|| httpdate::parse_http_date(value).ok()?.duration_since(now).ok())?;
+    Some(delay.as_millis().min(120_000) as u64)
+}
+
+fn retry_delay(base: Duration, attempt: u32, sample: f64, retry_after_ms: Option<u64>) -> Duration {
+    let ceiling = (base.as_secs_f64() * 2_f64.powi(attempt.saturating_sub(1).min(30) as i32)).min(60.0);
+    Duration::from_secs_f64((ceiling * sample.clamp(0.0, 1.0)).max(retry_after_ms.unwrap_or(0).min(120_000) as f64 / 1000.0))
 }
 
 #[derive(Clone)]
@@ -80,7 +131,7 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
         let http = crate::http::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(15)).build().expect("http client");
-        ApiClient { http, base: base.into().trim_end_matches('/').to_owned(), retry_delay: Duration::from_secs(1), token: Arc::new(RwLock::new(token)) }
+        ApiClient { http, base: base.into().trim_end_matches('/').to_owned(), retry_delay: Duration::from_secs(2), token: Arc::new(RwLock::new(token)) }
     }
 
     #[cfg(test)]
@@ -120,6 +171,7 @@ impl ApiClient {
             return Ok(res);
         }
         let status = res.status().as_u16();
+        let retry_after_ms = res.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|h| retry_after(h, std::time::SystemTime::now()));
         let body: Value = res.json().await.unwrap_or(Value::Null);
         let e = &body["error"];
         Err(ApiError {
@@ -127,6 +179,7 @@ impl ApiClient {
             code: e["code"].as_str().unwrap_or(if status == 401 { "unauthorized" } else { "http_error" }).into(),
             message: e["message"].as_str().map(str::to_owned).unwrap_or_else(|| status_message(status).into()),
             retryable: e["retryable"].as_bool().unwrap_or(status == 429 || status >= 500),
+            retry_after_ms: e["retry_after_ms"].as_u64().or(retry_after_ms), reset_at: e["reset_at"].as_f64(), attempts: 1,
         }
         .into())
     }
@@ -136,7 +189,7 @@ impl ApiClient {
         Ok(Self::check(res).await?.json().await?)
     }
 
-    /// Retry the identical model request until response.end, at most three attempts (1s/2s backoff).
+    /// Retry the identical model request until response.end, at most five attempts with bounded exponential full jitter.
     /// Start resets the consumer's message assembly between attempts. Callers MUST defer tool
     /// execution until End: a partial tool call is only model output, never permission to execute.
     /// Dropping this stream cancels both an in-flight request and any pending backoff.
@@ -148,7 +201,7 @@ impl ApiClient {
     pub(crate) async fn responses_with_budget(&self, request: &ResponsesRequest, budget: Option<Arc<AtomicU32>>) -> Result<EventStream> {
         let api = self.clone();
         let request = Arc::new(request.clone());
-        let stream = futures::stream::unfold((None::<EventStream>, 0u32, false), move |(mut stream, mut attempts, finished)| {
+        let stream = futures::stream::unfold((None::<EventStream>, 0u32, false, Duration::ZERO), move |(mut stream, mut attempts, finished, mut wait)| {
             let api = api.clone();
             let request = request.clone();
             let budget = budget.clone();
@@ -159,13 +212,11 @@ impl ApiClient {
                         active.next().await
                     } else {
                         if budget.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
-                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true)));
+                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true, Duration::ZERO)));
                         }
-                        if attempts > 0 && !api.retry_delay.is_zero() {
-                            tokio::time::sleep(api.retry_delay * (1 << (attempts - 1))).await;
-                        }
+                        if !wait.is_zero() { tokio::time::sleep(wait).await; wait = Duration::ZERO; }
                         if budget.as_ref().is_some_and(|n| n.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err()) {
-                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true)));
+                            return Some((Err(anyhow::anyhow!(SUMMARY_REQUEST_LIMIT)), (None, attempts, true, Duration::ZERO)));
                         }
                         attempts += 1;
                         match api.open_response(&request).await {
@@ -175,27 +226,24 @@ impl ApiClient {
                     };
                     let error = match next {
                         Some(Ok(StreamEvent::End { stop_reason, usage })) => {
-                            return Some((Ok(StreamEvent::End { stop_reason, usage }), (None, attempts, true)));
+                            return Some((Ok(StreamEvent::End { stop_reason, usage }), (None, attempts, true, Duration::ZERO)));
                         }
-                        Some(Ok(StreamEvent::Error { code, message, retryable })) => ApiError { code, message, retryable, status: None }.into(),
-                        Some(Ok(event)) => return Some((Ok(event), (stream, attempts, false))),
+                        Some(Ok(StreamEvent::Error { code, message, retryable, status, retry_after_ms, reset_at })) => ApiError { code, message, retryable, status, retry_after_ms, reset_at, attempts }.into(),
+                        Some(Ok(event)) => return Some((Ok(event), (stream, attempts, false, Duration::ZERO))),
                         Some(Err(error)) => error,
                         None => connection_dropped(),
                     };
-                    if model_retryable(&error) {
-                        if attempts < 3 {
-                            // Discard the old HTTP body, decoder and pending events before retrying.
-                            return Some((Ok(StreamEvent::Start), (None, attempts, false)));
-                        }
-                        let error = ApiError {
-                            code: "model_connection_dropped".into(),
-                            message: "The model connection dropped 3 times".into(),
-                            retryable: true,
-                            status: None,
-                        };
-                        return Some((Err(error.into()), (None, attempts, true)));
+                    let error = model_error(error, attempts);
+                    if model_retryable(&error) && attempts < 5 {
+                        // UUID v4 supplies independent OS randomness, without another runtime dependency.
+                        let bytes = *uuid::Uuid::new_v4().as_bytes();
+                        // Last 48 bits are uniformly random (unlike UUID's version/variant bits).
+                        let sample = u64::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], 0, 0]) as f64 / ((1_u64 << 48) - 1) as f64;
+                        let wait = retry_delay(api.retry_delay, attempts, sample, error.retry_after_ms);
+                        let event = StreamEvent::Retry { attempt: attempts + 1, max_attempts: 5, code: error.code, wait_seconds: wait.as_secs_f64() };
+                        return Some((Ok(event), (None, attempts, false, wait)));
                     }
-                    return Some((Err(error), (None, attempts, true)));
+                    return Some((Err(error.into()), (None, attempts, true, Duration::ZERO)));
                 }
             }
         });
@@ -280,6 +328,10 @@ impl SseDecoder {
 }
 
 #[cfg(test)]
+#[path = "retry_tests.rs"]
+mod retry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -290,7 +342,7 @@ mod tests {
         let e = api.get::<Value>("/v1/me").await.unwrap_err();
         assert_eq!(api.describe(&e), "Can't reach Gond Agent. Check your internet connection and try again.");
 
-        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false, status: Some(401) }.into();
+        let signed_out: anyhow::Error = ApiError { code: "unauthorized".into(), message: "You're not signed in.".into(), retryable: false, status: Some(401), ..Default::default() }.into();
         assert_eq!(api.describe(&signed_out), "You're not signed in.");
         assert_eq!(status_message(502), "Gond Agent is having trouble right now. Try again in a moment.");
     }

@@ -3,7 +3,7 @@ import type { Block, Message, ResponsesRequest, StopReason, StreamEvent, Usage }
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { dataUrl, maxOutput, parseArgs } from "./common";
-import { errorParts, providerFailure } from "./errors";
+import { providerStreamFailure } from "./errors";
 
 type Msg = Record<string, unknown>;
 
@@ -87,16 +87,15 @@ class ChatParser implements StreamParser {
   private chars = 0;
   constructor(private model: ModelRow) {}
 
-  push(_event: string | undefined, raw: string): StreamEvent[] {
+  push(event: string | undefined, raw: string): StreamEvent[] {
     let d: Record<string, any>;
     try {
       d = JSON.parse(raw);
     } catch {
       return []; // "[DONE]"
     }
-    if (d.error) {
-      const { code } = errorParts(d), failure = providerFailure(0, d);
-      return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
+    if (d.error || event === "error") {
+      return [providerStreamFailure(d)];
     }
     const out: StreamEvent[] = [];
     if (!this.started) {

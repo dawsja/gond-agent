@@ -1,4 +1,19 @@
-import { ApiError } from "../wire";
+import { modelFailure, retryAfterMs } from "../model-errors";
+import type { ApiError, StreamEvent } from "../wire";
+
+export function providerStreamFailure(body: Record<string, any>): StreamEvent {
+  const { code } = errorParts(body), failure = providerFailure(0, body);
+  const detail = body.error ?? body.response?.error ?? body;
+  const retry = retryAfterMs(String(detail.retry_after ?? ""));
+  const reset = Number(detail.reset_at ?? detail.resets_at ?? (Number.isFinite(detail.resets_in_seconds) ? Date.now() / 1000 + detail.resets_in_seconds : undefined));
+  return { event: "error", data: {
+    // Subscription codes are consumed and normalized by the relay, never sent as public prose.
+    code: code && /^(subscription_sharing_|chatpass_)/.test(code) ? code : failure.code,
+    message: failure.message, retryable: failure.retryable,
+    ...(retry === undefined ? {} : { retry_after_ms: retry }),
+    ...(Number.isFinite(reset) && reset > 0 && reset < 253402300800 ? { reset_at: reset } : {}),
+  } };
+}
 
 /** The machine-readable code and message of an OpenAI, Anthropic or compatible error body. */
 export function errorParts(body: unknown): { code?: string; message: string } {
@@ -19,20 +34,22 @@ export function providerFailure(status: number, body: unknown): ApiError {
   if (!rateLimit && !outputLimit && !/quota/i.test(code ?? "")
     && (["context_exceeded", "context_length_exceeded", "model_context_window_exceeded", "prompt_too_long", "max_context_length_exceeded"].includes((code ?? "").toLowerCase())
       || (status === 400 && /prompt is too long|maximum context|context length|context window|prompt length exceeds/i.test(message))))
-    return new ApiError(400, "context_exceeded", "The conversation is too long for this model.");
-  if (code === "insufficient_quota" || code === "billing_error")
-    return new ApiError(402, "provider_quota", "The provider account has no remaining credit or quota. Check billing with the provider.");
+    return modelFailure(400, "context_exceeded");
+  if (/usage_limit/i.test(code ?? "")) return modelFailure(429, "provider_usage_limit");
+  if (status === 402 || /quota|billing|credit_balance/i.test(code ?? "")
+    || /insufficient (?:credit|quota)|exceeded (?:your )?current quota|credit balance.*(?:low|exhaust)|billing (?:hard )?limit|payment required|out of credit/i.test(message))
+    return modelFailure(402, "provider_quota");
   if (status === 401 || code === "authentication_error" || code === "invalid_api_key")
-    return new ApiError(401, "provider_auth", "The provider rejected the API key. An administrator can update it in Settings → Models.");
+    return modelFailure(401, "provider_auth");
   if (status === 403 || code === "permission_error")
-    return new ApiError(403, "provider_forbidden", "This API key doesn't have access to the model.");
+    return modelFailure(403, "provider_forbidden");
   if (status === 404 || code === "not_found_error" || code === "model_not_found")
-    return new ApiError(404, "provider_model", "The provider doesn't recognize this model. Refresh the model list or choose another model.");
+    return modelFailure(404, "provider_model");
   if (rateLimit)
-    return new ApiError(429, "provider_rate_limit", "The provider is limiting requests right now. Gond Agent will retry shortly.", true);
-  if (status === 529 || status >= 500 || code === "overloaded_error" || code === "server_error" || code === "api_error")
-    return new ApiError(503, "provider_unavailable", "The model provider is unavailable right now. Gond Agent will retry shortly.", true);
+    return modelFailure(429, "provider_rate_limit");
+  if (status === 529 || status >= 500 || code === "overloaded_error" || code === "overloaded" || code === "server_error" || code === "api_error")
+    return modelFailure(status >= 500 && status <= 599 ? status : 503, "provider_unavailable");
   if (status === 400 || status === 422 || code === "invalid_request_error")
-    return new ApiError(400, "provider_request", "The provider rejected the request. Choose another model or check its settings.");
-  return new ApiError(502, "provider_error", "The model provider reported an error.", true);
+    return modelFailure(400, "provider_request");
+  return modelFailure(502, "provider_error");
 }

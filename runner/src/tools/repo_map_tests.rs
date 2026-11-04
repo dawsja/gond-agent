@@ -63,7 +63,7 @@ async fn cache_hit_head_version_corruption_oversize_and_private_atomic_file() {
     let (c, _rx) = ctx(d.path());
     let first = load(&c, Limits::default(), true).await.unwrap();
     let cache = d.path().join(".git/gond-agent/repo-map.json");
-    assert!(cache.exists());
+    assert!(cache.exists(), "cache not written; map:\n{}", render(&first, 2000, &[]));
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(fs::metadata(&cache).unwrap().permissions().mode() & 0o777, 0o600); }
     assert_eq!(fs::read_dir(cache.parent().unwrap()).unwrap().count(), 1, "no leftover temp file");
     assert_eq!(render(&first, 2000, &[]), render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]));
@@ -216,7 +216,7 @@ async fn tracked_edits_invalidate_cache_and_unchanged_tree_hits_it() {
     let (c, _rx) = ctx(d.path());
     let first = load(&c, Limits::default(), true).await.unwrap();
     let cache = d.path().join(".git/gond-agent/repo-map.json");
-    let modified = fs::metadata(&cache).unwrap().modified().unwrap();
+    let modified = fs::metadata(&cache).unwrap_or_else(|e| panic!("cache unavailable: {e}; map:\n{}", render(&first, 2000, &[]))).modified().unwrap();
     // A cache hit bypasses even a zero construction budget and leaves the file untouched.
     let hit = load(&c, Limits { wall: Duration::ZERO, ..Limits::default() }, true).await.unwrap();
     assert_eq!(render(&first, 2000, &[]), render(&hit, 2000, &[]));
@@ -250,20 +250,100 @@ fn snapshot_write_failure_skips_file_and_continues() {
 
 #[tokio::test]
 async fn status_filters_never_execute_repository_code() {
-    let d = repo();
-    put(d.path(), "a.ts", b"export function original() {}\n");
-    assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
-    let (c, _rx) = ctx(d.path());
-    load(&c, Limits::default(), true).await.unwrap();
-    put(d.path(), ".gitattributes", b"*.ts filter=hostile\n");
-    for (key, value) in [("filter.hostile.clean", "touch FILTER_EXECUTED; cat"), ("filter.hostile.required", "true")] {
-        assert!(std::process::Command::new("git").current_dir(d.path()).args(["config", key, value]).status().unwrap().success());
+    for scope in ["local", "include", "worktree", "worktree-include"] {
+        let included = scope.contains("include");
+        let worktree = scope.starts_with("worktree");
+        let d = repo();
+        put(d.path(), "a.ts", b"export function original() {}\n");
+        assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
+        let (c, _rx) = ctx(d.path());
+        load(&c, Limits::default(), true).await.unwrap();
+        let cache = d.path().join(".git/gond-agent/repo-map.json");
+        let before = fs::read(&cache).unwrap();
+        put(d.path(), ".gitattributes", b"*.ts filter=hostile\n");
+        let config_dir = tempfile::tempdir().unwrap();
+        if worktree {
+            assert!(std::process::Command::new("git").current_dir(d.path()).args(["config", "extensions.worktreeConfig", "true"]).status().unwrap().success());
+        }
+        let config = if included { config_dir.path().join("filters") }
+            else { d.path().join(if worktree { ".git/config.worktree" } else { ".git/config" }) };
+        for (key, value) in [("filter.hostile.clean", "touch FILTER_EXECUTED; cat"), ("filter.hostile.required", "true")] {
+            assert!(std::process::Command::new("git").args(["config", "--file"]).arg(&config).args([key, value]).status().unwrap().success());
+        }
+        if included {
+            assert!(std::process::Command::new("git").current_dir(d.path()).args(["config", if worktree { "--worktree" } else { "--local" }, "include.path"]).arg(&config).status().unwrap().success());
+        }
+        put(d.path(), "a.ts", b"export function modified() {}\n");
+        let map = load(&c, Limits::default(), true).await.unwrap();
+        let output = render(&map, 2000, &[]);
+        assert!(output.contains("modified"));
+        assert!(!d.path().join("FILTER_EXECUTED").exists(), "status invoked a clean filter (scope={scope})");
+        assert!(map.worktree.is_empty(), "unsafe status must bypass caching");
+        assert!(output.contains("cache_bypass=\"repository-local filter configured\""), "missing bypass diagnostic: {output}");
+        assert_eq!(fs::read(&cache).unwrap(), before, "unsafe status must not replace the old cache");
     }
-    put(d.path(), "a.ts", b"export function changed() {}\n");
-    let map = load(&c, Limits::default(), true).await.unwrap();
-    assert!(render(&map, 2000, &[]).contains("changed"));
-    assert!(!d.path().join("FILTER_EXECUTED").exists(), "status invoked a clean filter");
-    assert!(map.worktree.is_empty(), "unsafe status must bypass caching");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_git_filters_neither_execute_nor_disable_cache() {
+    const FIXTURE: &str = "REPO_MAP_HOST_CONFIG_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = PathBuf::from(root);
+        let (c, _rx) = ctx(&root);
+        // Without config isolation, refreshing this dirty tracked file could invoke a filter.
+        put(&root, "a.ts", b"export function modified() {}\n");
+        let first = load(&c, Limits::default(), true).await.unwrap();
+        let cache = root.join(".git/gond-agent/repo-map.json");
+        assert!(!root.join("HOST_FILTER_EXECUTED").exists(), "host filter executed");
+        assert!(cache.exists(), "host filter blocked caching; fingerprint={:?}; map:\n{}", first.worktree, render(&first, 2000, &[]));
+        assert!(!first.partial && !first.worktree.is_empty());
+        assert!(render(&first, 2000, &[]).contains("modified"));
+        let modified = fs::metadata(&cache).unwrap().modified().unwrap();
+        let hit = load(&c, Limits { wall: Duration::ZERO, ..Limits::default() }, true).await.unwrap();
+        assert_eq!(render(&first, 2000, &[]), render(&hit, 2000, &[]), "unchanged tree must hit the cache");
+        assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), modified);
+        assert!(!root.join("HOST_FILTER_EXECUTED").exists(), "host filter executed on cache hit");
+        return;
+    }
+    let executable = std::env::current_exe().unwrap();
+    let mut failures = vec![];
+    // Isolated child environments avoid mutating process-global HOME/config during parallel tests.
+    for source in ["explicit-global", "home", "home-include", "xdg", "system", "environment-count", "environment-parameters"] {
+        let d = repo();
+        put(d.path(), "a.ts", b"export function original() {}\n");
+        assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
+        put(d.path(), ".gitattributes", b"*.ts filter=x\n");
+        let host = tempfile::tempdir().unwrap();
+        let config = match source {
+            "home" | "home-include" => "home/.gitconfig",
+            "xdg" => "xdg/git/config",
+            _ => "filters.gitconfig",
+        };
+        put(host.path(), config, b"[filter \"x\"]\n\tclean = touch HOST_FILTER_EXECUTED; cat\n\trequired = true\n");
+        fs::create_dir_all(host.path().join("home")).unwrap();
+        fs::create_dir_all(host.path().join("xdg")).unwrap();
+        if source == "home-include" {
+            // Explicit includes still expand ~/; the Git child's HOME must be private/empty.
+            assert!(std::process::Command::new("git").current_dir(d.path()).args(["config", "include.path", "~/.gitconfig"]).status().unwrap().success());
+        }
+        let mut child = std::process::Command::new(&executable);
+        child.args(["--exact", "tools::repo_map::tests::host_git_filters_neither_execute_nor_disable_cache", "--nocapture", "--test-threads=1"])
+            .env(FIXTURE, d.path()).env("HOME", host.path().join("home")).env("XDG_CONFIG_HOME", host.path().join("xdg"))
+            .env_remove("GIT_CONFIG_NOSYSTEM").env_remove("GIT_CONFIG_GLOBAL").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_COUNT").env_remove("GIT_CONFIG_PARAMETERS");
+        if source == "explicit-global" { child.env("GIT_CONFIG_GLOBAL", host.path().join(config)); }
+        if source == "system" { child.env("GIT_CONFIG_SYSTEM", host.path().join(config)); }
+        if source == "environment-count" {
+            child.env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "filter.x.clean").env("GIT_CONFIG_VALUE_0", "touch HOST_FILTER_EXECUTED; cat");
+        }
+        if source == "environment-parameters" { child.env("GIT_CONFIG_PARAMETERS", "'filter.x.clean=touch HOST_FILTER_EXECUTED; cat'"); }
+        let result = child.output().unwrap();
+        if !result.status.success() {
+            failures.push(format!("{source}:\n{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr)));
+        }
+    }
+    assert!(failures.is_empty(), "host Git config regressions:\n{}", failures.join("\n"));
 }
 
 #[cfg(unix)]

@@ -1,4 +1,4 @@
-export type RetryClass = "network" | "tls" | "timeout" | "server" | "rate_limit" | "auth" | "client" | "rejected" | "unknown";
+export type RetryClass = string; // Model classes come from the shared fixed-vocabulary model policy.
 export interface RetryFailure {
   class: RetryClass;
   retryable: boolean;
