@@ -20,7 +20,6 @@ import {
   validRepo,
   validBranch,
   type GitHubOptions,
-  type PushOptions,
 } from "../github";
 import { githubEnvFor } from "../github-login";
 import { modelResponse } from "../responses";
@@ -40,16 +39,12 @@ import { ModelAccess } from "../access";
 import { SubscriptionAccounts } from "../subscriptions/accounts";
 import { ChatGPTProvider } from "../subscriptions/chatgpt";
 import { PullRequests } from "../pull-requests";
-import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
 import { capacityReason, releasable, type Capacity, type ReleaseCandidate, type WorkspaceState } from "./capacity";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
-export interface Run extends CiInfo {
-  ci_turn?: boolean;
-  /** Unpublished work still belongs to an automatic round, even after a human queues work. */
-  ci_publication_pending?: boolean;
+export interface Run {
   id: string;
   user_id: string;
   repo: string;
@@ -99,7 +94,7 @@ export interface Run extends CiInfo {
   summary: Summary;
   pending: RunMessage[];
   active_message?: RunMessage;
-  /** The human/CI task remains replayable if a later synthetic continuation cannot restore. */
+  /** The task remains replayable if a later synthetic continuation cannot restore. */
   recovery_task?: RunMessage;
   /** Completed model work must never be replayed as a fresh task after a crash. */
   recovery_phase?: "finishing";
@@ -110,13 +105,18 @@ export interface Run extends CiInfo {
   base_sha: string | null;
   auto_pr: boolean;
 }
-interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; source?: "ci"; recovery?: boolean }
+interface RunMessage { id?: string; text: string; images: string[]; effort?: string; model?: string; request_id?: string; recovery?: boolean }
 const RUNNER_STATE_VERSION = "gond-agent-checkpoint-2";
 const RESUME_FRAME = "The run was restarted. The work tree and conversation were restored from a checkpoint. Verify state before continuing. External effects may have happened after the checkpoint; do not repeat them without checking.";
-interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string; automatic?: boolean } }
+interface SavedState { runner: Record<string, unknown>; service: { active_message_id?: string } }
 /** Loads a stored run. Every loaded run names the built-in backend; retired agents are kept apart. */
 export function parseRun(data: string): Run {
-  const { backend, runtime_volume: _volume, runtime_version: _version, ...run } = JSON.parse(data) as Run & { runtime_volume?: unknown; runtime_version?: unknown };
+  // Legacy ci_* metadata is unused; ignore it without rewriting stored JSON or file dictionaries.
+  const metadata = (value: object) => Object.fromEntries(Object.entries(value).filter(([key, value]) => !key.startsWith("ci_") && !(key === "source" && value === "ci")));
+  const { backend, runtime_volume: _volume, runtime_version: _version, ...run } = metadata(JSON.parse(data)) as Run & { runtime_volume?: unknown; runtime_version?: unknown };
+  if (run.pending) run.pending = run.pending.map(message => metadata(message) as unknown as RunMessage);
+  if (run.active_message) run.active_message = metadata(run.active_message) as unknown as RunMessage;
+  if (run.recovery_task) run.recovery_task = metadata(run.recovery_task) as unknown as RunMessage;
   if (backend === undefined || backend === BACKEND) return { ...run, backend: BACKEND };
   return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
 }
@@ -152,7 +152,6 @@ export class Runs {
   private shuttingDown = false;
   private deletingAccounts = new Set<string>();
   private pullRequests: PullRequests;
-  private ci: CiWatch;
   private queue: RunQueue;
   private draining = false;
   private idleRelease?: Promise<void>;
@@ -169,24 +168,6 @@ export class Runs {
   ) {
     this.access = new ModelAccess(db, cfg.secret, subscriptions);
     this.pullRequests = new PullRequests(user => githubEnvFor(db, cfg.secret, user));
-    this.ci = new CiWatch({
-      get: id => this.get(id),
-      env: user => githubEnvFor(db, cfg.secret, user),
-      update: (id, patch, event) => { const r = this.get(id); Object.assign(r, patch); this.save(r); this.append(id, { type: "run.ci", ...event }); },
-      followUp: async (id, text, sha) => {
-        await this.validateFollowUp(id, this.get(id).user_id);
-        const r = this.get(id);
-        if (this.shuttingDown || r.head_sha !== sha || r.ci_cancelled_sha === sha || r.status !== "ready" || !["agent", "idle"].includes(r.phase) || r.pending.length || r.summary.question || ["closed", "merged"].includes(r.pr_state ?? "") || this.live.has(id) || this.booting.has(id) || (r.ci_round ?? 0) >= ciSettings().rounds) return false;
-        githubEnvFor(db, cfg.secret, r.user_id);
-        db.transaction(() => {
-          r.ci_round = (r.ci_round ?? 0) + 1;
-          r.ci_previous_sha = sha;
-          this.save(r);
-          this.enqueue(id, r.user_id, text, [], undefined, undefined, undefined, undefined, "ci");
-        })();
-        return true;
-      },
-    });
     this.checkpoints = new Checkpoints(db, cfg.data, cfg.secret);
     this.checkpointTimer = setInterval(() => {
       try { this.checkpoints.cleanup(); } catch { console.error("Checkpoint cleanup failed"); }
@@ -298,17 +279,16 @@ export class Runs {
   }
   save(r: Run) {
     assertBackend(r.backend);
-    const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls, json_extract(data, '$.ci_round') AS ci_round,pr_body FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; ci_round: number | null; pr_body: string | null} | undefined;
+    const stored = this.db.prepare("SELECT status, json_extract(data, '$.web_search_calls') AS calls,pr_body FROM runs WHERE id=?").get(r.id) as {status: RunStatus; calls: number | null; pr_body: string | null} | undefined;
     if (stored) assertRunTransition(stored.status, r.status);
     // Queue positions are a live owner-scoped view, never part of the durable snapshot.
     delete r.queue_position;
     delete r.queue_length;
     delete r.capacity;
     delete r.queue_reason;
-    // Lifecycle snapshots must not reset newer description overrides or search/CI counts.
+    // Lifecycle snapshots must not reset newer description overrides or search counts.
     if (stored) r.pr_body = stored.pr_body;
     if (stored?.calls != null) r.web_search_calls = Math.max(r.web_search_calls ?? 0, stored.calls);
-    r.ci_round = Math.max(r.ci_round ?? 0, stored?.ci_round ?? 0);
     r.updated_at = Date.now();
     this.db
       .prepare("UPDATE runs SET status=?,updated_at=?,data=? WHERE id=?")
@@ -399,7 +379,6 @@ export class Runs {
   async recover() {
     // Called after ContainerPool.recover has removed this instance's old workers.
     this.checkpoints.resetClaims();
-    this.db.prepare("UPDATE runs SET data=json_set(data, '$.ci_active', json('false'))").run();
     for (const row of this.db.prepare("SELECT data FROM runs WHERE status='working' AND deleted_at IS NULL").all() as { data: string }[]) {
       const r = parseRun(row.data);
       if (r.phase === "finishing") r.recovery_phase = "finishing";
@@ -754,26 +733,17 @@ export class Runs {
     model?:string,
     requestId?: string,
     pr_body?: unknown,
-    source?: "ci",
   ) {
-    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body, source))();
+    const accepted = this.db.transaction(() => this.acceptMessage(id, user, text, images, effort, model, requestId, pr_body))();
     if (accepted === false) return;
     this.drain();
   }
-  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown, source?: "ci") {
+  private acceptMessage(id: string, user: string, text: string, images: string[], effort?: string, model?: string, requestId?: string, pr_body?: unknown) {
     this.assertAccount(user);
     let r = this.get(id, user);
     const fields = publicationFields({ pr_body });
     assertActive(r);
-    if (source === "ci" && (r.status !== "ready" || r.pending.length || r.summary.question || this.live.get(id)?.busy || this.booting.has(id)))
-      throw new ApiError(409, "ci_busy", "Automatic CI fixes need an idle run with no pending question.");
-    if (!source) {
-      this.ci.stop(id);
-      r = this.get(id, user);
-      r.ci_publication_pending ||= r.ci_turn;
-      r.ci_turn = false;
-      r.auto_resume_pending = false; // A person's follow-up is never subject to automatic-resume caps.
-    }
+    r.auto_resume_pending = false; // A person's follow-up is never subject to automatic-resume caps.
     if (requestId && this.db.prepare("SELECT 1 FROM run_message_requests WHERE run_id=? AND request_id=?").get(id, requestId)) return false;
     if (this.shuttingDown) throw new ApiError(503, "restarting", "The server is restarting. Try again in a moment.");
     if (r.status === "merged" || r.pr_state === "merged")
@@ -784,7 +754,7 @@ export class Runs {
         "invalid_prompt",
         "Write a message of up to 20,000 characters.",
       );
-    if (this.live.get(id)?.closing || (this.live.get(id)?.closed && r.ci_state !== "gave_up")) throw new ApiError(409, "workspace_closing", "The workspace is closing. If closing failed, try Close workspace again before sending a follow-up.");
+    if (this.live.get(id)?.closing || this.live.get(id)?.closed) throw new ApiError(409, "workspace_closing", "The workspace is closing. If closing failed, try Close workspace again before sending a follow-up.");
     const question = r.summary.question;
     const answering = this.live.get(id);
     if (question && answering?.busy) {
@@ -824,11 +794,10 @@ export class Runs {
       this.db.prepare("UPDATE runs SET pr_body=? WHERE id=?").run(fields.pr_body, id);
       r.pr_body = fields.pr_body;
     }
-    r.pending.push({ id: randomBytes(12).toString("hex"), text, images, effort, model, ...(source ? { source } : {}), ...(requestId ? { request_id: requestId } : {}) });
+    r.pending.push({ id: randomBytes(12).toString("hex"), text, images, effort, model, ...(requestId ? { request_id: requestId } : {}) });
     this.save(r);
     this.append(id, {
-      type: source === "ci" ? "ci" : "user",
-      ...(source ? { source } : {}),
+      type: "user",
       text,
       images: images.map((id) => ({ id })),
     });
@@ -876,32 +845,14 @@ export class Runs {
       }
       r.phase = "booting";
       r.started_at ??= Date.now();
-      // A human message is not permission to publish an older automatic round.
-      // Drop its unpushed commit and resume from the confirmed remote branch.
-      if (r.kept_commit && r.pending.some(message => message.source !== "ci") && r.pending[0]?.source !== "ci" && (r.ci_publication_pending || r.ci_turn)) {
-        this.ciPublicationRefused(id, new ApiError(409, "ci_needs_person", "needs a person: unpushed changes from an automatic round require review."));
-        r = this.get(id);
-      }
       if (r.kept_commit) {
         const head = r.kept_commit;
         this.status(r, "working", "Pushing kept changes");
-        try {
-          await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r, this.ciBeforePush(r, r.pending[0]?.source === "ci")));
-        } catch (error) {
-          if (!this.ciPublicationRefused(id, error)) throw error;
-          r = this.get(id);
-          r.phase = "idle";
-          if (!r.pending.length) {
-            this.status(r, r.status === "stopped" ? "stopped" : "ready");
-            return;
-          }
-        }
+        await pushBranch(join(this.cfg.data, "checkouts", id), r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id), undefined, publicationPushOptions(r));
         r = this.get(id); // Stop and additional follow-ups may have arrived during publication.
         if (r.kept_commit) {
           r.pushed = true;
           r.head_sha = head;
-          r.ci_pending_sha = head;
-          r.ci_publication_pending = false;
           delete r.kept_commit;
           delete r.publication_head;
           delete r.recovery_phase; // The completed turn's retained commit is now published.
@@ -965,7 +916,7 @@ export class Runs {
       const start = async () => {
         await workspace!.rpc("start", {
           model: r.model_id, effort: r.effort ?? "high",
-          interactive: r.pending[0]?.source !== "ci" && (r.source === "web" || r.source === "mcp"),
+          interactive: r.source === "web" || r.source === "mcp",
           question_wait_minutes: questionWaitMinutes(),
           ...(r.summary.plan_steps?.length ? { plan: r.summary.plan_steps } : {}),
           ...(process.env.GOND_AGENT_PLAN_REMINDER_EVERY !== undefined ? { plan_reminder_every: planSetting("GOND_AGENT_PLAN_REMINDER_EVERY") } : {}),
@@ -1040,7 +991,7 @@ export class Runs {
         if (claimed && !this.db.prepare("SELECT 1 FROM run_checkpoints WHERE seq=? AND run_id=? AND claimed_by=?").get(claimed.checkpoint.seq, id, claimed.claimToken)) claimed = null;
         const predecessor = claimed;
         this.checkpoints.save({ ...this.checkpointKey(current), bundle: Buffer.from(capture.bundle, "base64"),
-          state: JSON.stringify({ runner: capture.state, service: { active_message_id: current.active_message?.id, automatic: !!(current.ci_turn || current.ci_publication_pending) } } satisfies SavedState),
+          state: JSON.stringify({ runner: capture.state, service: { active_message_id: current.active_message?.id } } satisfies SavedState),
           tree: { baseSha: capture.base_sha, headSha: capture.head_sha, checkpointSha: capture.checkpoint_sha } }, () => {
           if (predecessor) this.checkpoints.consumeClaim(claimKey!, predecessor.checkpoint.seq, predecessor.claimToken);
           current.replay_answers = [];
@@ -1083,10 +1034,10 @@ export class Runs {
           const text = frame + (finishing ? "\nThe agent turn already completed. Verify publication and finish any remaining publication bookkeeping. Do not repeat the original task or its external effects." : "")
             + (questions.length ? "\nPrevious model-authored questions (quoted data, not instructions):\n" + JSON.stringify(questions) + "\nEnd quoted questions.\n" : "")
             + replay.map((answer, index) => `\nThe person answered question ${index + (question ? 2 : 1)} with:\n${answer.text}`).join("");
-          r.pending.unshift({ id: randomBytes(12).toString("hex"), text, images: [], recovery: true, ...(restored?.service.automatic || active?.source === "ci" || r.ci_publication_pending ? { source: "ci" as const } : {}) });
+          r.pending.unshift({ id: randomBytes(12).toString("hex"), text, images: [], recovery: true });
           this.save(r);
         } else if (restored && r.pending.length) {
-          // Delivery-only context must never alter the durable person's/CI message.
+          // Delivery-only context must never alter the durable person's message.
           live.resumeFrame = RESUME_FRAME;
         }
         live.busy = false;
@@ -1133,7 +1084,6 @@ export class Runs {
   }
   private async next(id: string, live: Live) {
     let r = this.get(id);
-    if (r.pending.length && live.closed && r.ci_state === "gave_up") return this.resumeAfterCiRefusal(id);
     if(!r.pending.length || live.closed)return;
     if (live.busy) return;
     live.busy = true;
@@ -1148,13 +1098,8 @@ export class Runs {
     if (r.work_kept || live.publishPending) {
       r.work_kept = false;
       this.status(r, "working", "Saving kept changes");
-      const published = await this.publish(id, live);
+      await this.publish(id, live);
       r = this.get(id);
-      if (!published) {
-        live.busy = false;
-        await this.resumeAfterCiRefusal(id);
-        return;
-      }
       if (r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     }
     if (live.closed || !r.pending.length) { live.busy = false; return; }
@@ -1171,8 +1116,6 @@ export class Runs {
       r.recovery_task = message;
       delete r.recovery_phase;
     }
-    r.ci_turn = message.source === "ci";
-    r.ci_publication_pending = r.ci_turn;
     if (live.closed) return;
     r.summary = { ...emptySummary(), ...planState(r.summary.plan_steps) };
     r.work_kept = false;
@@ -1304,12 +1247,6 @@ export class Runs {
     this.status(r, "working", "Pushing changes");
     const published = await this.publish(id, live);
     r = this.get(id);
-    if (!published) {
-      live.busy = false;
-      await this.resumeAfterCiRefusal(id);
-      return;
-    }
-    r = this.get(id);
     if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
     catch { this.checkpointUnavailable(id); }
@@ -1326,10 +1263,6 @@ export class Runs {
     const merged = r.pr_state === "merged" && !r.pending.length;
     this.status(r, r.status === "stopped" ? "stopped" : merged ? "merged" : "ready");
     if (merged) await this.close(id);
-    else if (!r.pending.length && !r.summary.question && r.status === "ready" && (!published || (ciSettings().rounds && r.head_sha && r.ci_pending_sha === r.head_sha && r.ci_sha !== r.head_sha))) {
-      await this.close(id, false, true);
-      if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
-    }
     if (!live.closed && r.status === "ready" && !r.pending.length) await this.observeIdle(id, live);
     this.drain();
   }
@@ -1350,82 +1283,13 @@ export class Runs {
   private checkpointUnavailable(id: string) {
     this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
   }
-  /** Recheck automatic-round policy against the pinned commit on every push attempt. */
-  private ciBeforePush(run: Run, automatic = run.ci_publication_pending || run.ci_turn): PushOptions["beforePush"] {
-    if (!automatic) return undefined;
-    return async ({ cwd, branch, head }) => {
-      const current = this.get(run.id);
-      if (branch !== current.branch || current.status === "stopped" || ["closed", "merged"].includes(current.pr_state ?? ""))
-        throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
-      const baseline = current.ci_previous_sha;
-      if (!baseline) throw new ApiError(409, "ci_needs_person", "needs a person: the previous pushed commit is missing.");
-      let touchesConfig: boolean;
-      try { touchesConfig = await ciPushTouchesConfig(cwd, baseline, head); }
-      catch { throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix's commit history could not be verified."); }
-      if (touchesConfig) throw new ApiError(409, "ci_needs_person", "needs a person: automatic fixes cannot push changes to CI configuration.");
-      if (current.pr_number) {
-        const pr = await gh<{ state: string; merged?: boolean }>(`repos/${current.repo}/pulls/${current.pr_number}`, "GET", undefined, githubEnvFor(this.db, this.cfg.secret, current.user_id));
-        if (pr.state !== "open" || pr.merged) throw new ApiError(409, "ci_needs_person", "needs a person: the pull request is closed or merged.");
-      }
-      const latest = this.get(run.id);
-      if (latest.status === "stopped" || ["closed", "merged"].includes(latest.pr_state ?? ""))
-        throw new ApiError(409, "ci_needs_person", "needs a person: the automatic fix was stopped or the pull request is closed.");
-    };
-  }
-  private ciPublicationRefused(id: string, error: unknown): boolean {
-    if (!(error instanceof ApiError) || error.code !== "ci_needs_person") return false;
-    const current = this.get(id);
-    delete current.publication_head;
-    delete current.recovery_phase; // Refused automatic work is discarded, not resumed.
-    // Refusing an automatic publication must never consume a person's follow-up.
-    current.pending = current.pending.filter(message => message.source !== "ci");
-    if (current.pending.length) {
-      delete current.kept_commit;
-      current.ci_publication_pending = false;
-    }
-    const reason = current.pending.length
-      ? `${error.message} The unpushed automatic changes were dropped; your message will continue from the last pushed branch.`
-      : error.message;
-    Object.assign(current, { ci_state: "gave_up", ci_reason: reason, ci_active: false });
-    this.save(current);
-    this.append(id, { type: "run.ci", state: "gave_up", round: current.ci_round ?? 0, sha: current.head_sha, failing: current.ci_failing ?? [], reason });
-    return true;
-  }
-  private async resumeAfterCiRefusal(id: string) {
-    // The worker and API clone may both contain the refused configuration. Never
-    // deliver human work there: release them, then reopen from the pushed branch.
-    const reserved = this.booting.has(id);
-    this.booting.add(id); // Reserve the checkout until teardown and requeue finish.
-    try {
-      try { await this.close(id); }
-      catch {
-        console.error("Couldn't release refused automatic workspace", id);
-        const live = this.live.get(id);
-        if (live) live.closing = false; // A follow-up retries cleanup, never the refused publication.
-        this.status(this.get(id), "failed", null, "Couldn't release the automatic workspace. Your queued messages are kept. Send a follow-up to retry.");
-        return;
-      }
-      const r = this.get(id);
-      r.phase = "idle";
-      if (r.pending.length) {
-        this.status(r, "queued");
-        this.queue.join(id);
-      } else this.status(r, r.status === "stopped" ? "stopped" : "ready");
-    } finally {
-      if (!reserved) {
-        this.booting.delete(id);
-        this.cancelledBoots.delete(id);
-      }
-      this.drain();
-    }
-  }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
     const pending = live.publishPending ??= {};
     // Only preflight a fresh snapshot. An imported retry may already exist remotely
     // after a lost response; the create-only lease reconciles that exact commit.
     if (!pending.snapshot && r.explicit_branch && !r.pushed) await assertBranchAvailable(r.repo, r.branch, githubEnvFor(this.db, this.cfg.secret, r.user_id));
-    const pushOptions = publicationPushOptions(r, this.ciBeforePush(r));
+    const pushOptions = publicationPushOptions(r);
     const snapshot = pending.snapshot ??= await withRetry("snapshot", async () => live.workspace.rpc<{ bundle: string; head: string }>(
       "snapshot",
       options.backgroundPublication
@@ -1443,11 +1307,6 @@ export class Runs {
       );
       pending.imported = true;
     } catch (error) {
-      if (this.ciPublicationRefused(id, error)) {
-        snapshot.bundle = "";
-        live.publishPending = undefined;
-        return false;
-      }
       if (error instanceof RetryError && error.step === "push") {
         pending.imported = true;
         snapshot.bundle = ""; // The imported commit, not another in-memory bundle, is the retry source.
@@ -1467,7 +1326,6 @@ export class Runs {
     snapshot.bundle = "";
     await this.recordDiff(id, live, snapshot.head, true);
     const current = this.get(id);
-    current.ci_publication_pending = false;
     delete current.publication_head;
     this.save(current);
     live.publishPending = undefined;
@@ -1499,7 +1357,7 @@ export class Runs {
       r.additions += Number(a) || 0;
       r.deletions += Number(d) || 0;
     }
-    r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, ci_pending_sha: pushed ? head : r.ci_pending_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
+    r = { ...this.get(id), pushed: r.pushed, head_sha: r.head_sha, diff: r.diff, files: r.files, additions: r.additions, deletions: r.deletions };
     this.save(r);
     this.append(id, {
       type: "run.diff",
@@ -1558,7 +1416,6 @@ export class Runs {
   }
   async stop(id: string, user: string) {
     this.get(id, user);
-    this.ci.stop(id);
     const r = this.get(id, user);
     if (r.status === "merged") return;
     r.auto_resume_pending = false;
@@ -1590,9 +1447,6 @@ export class Runs {
     if (this.queue.has(id) || r.status === "interrupted") { await this.stop(id, user); return { closed: true }; }
     if (this.booting.has(id) || live?.busy || (live?.closing && !live.closed) || r.pending.length || ["queued", "working"].includes(r.status))
       throw new ApiError(409, "workspace_busy", "Wait for the current turn to finish or stop it before closing the workspace.");
-    r.ci_cancelled_sha = r.head_sha ?? undefined;
-    this.save(r);
-    this.ci.stop(id);
     if (!live) {
       this.discardCheckpoint(id, user);
       r.resume_from_checkpoint = false;
@@ -1602,8 +1456,6 @@ export class Runs {
     // A failed destroy retains its capacity reservation. Retry teardown instead
     // of reporting success or accepting a message into a closed worker.
     if (live.closed) {
-      // Apply explicit-close policy even when joining automatic teardown. Do not
-      // await its destruction here: CI close can race its own post-push cleanup.
       this.discardCheckpoint(id, user);
       r.resume_from_checkpoint = false;
       this.save(r);
@@ -1617,8 +1469,7 @@ export class Runs {
       // must not create a branch or push changes after the person pressed Stop.
       if (!beforeClose || r.status !== "stopped") await this.publish(id, live, {});
       if (beforeClose && !await beforeClose()) return { closed: false };
-      // Automatic idle release preserves the paired tree/conversation checkpoint,
-      // just like CI auto-close; explicit Close still discards it.
+      // Automatic idle release preserves the paired tree/conversation checkpoint.
       live.releaseForWaiting = !!beforeClose;
       await this.close(id, false, !!beforeClose);
       return { closed: true };
@@ -1631,7 +1482,6 @@ export class Runs {
   }
   async remove(id: string, user: string) {
     this.get(id, user);
-    this.ci.stop(id);
     await this.stop(id, user);
     await this.launches.get(id);
     await this.close(id);
@@ -1717,7 +1567,6 @@ export class Runs {
   async shutdown() {
     this.shuttingDown = true;
     for (const live of this.live.values()) clearTimeout(live.destroyRetry);
-    this.ci.stopAll();
     clearInterval(this.queueTimer);
     clearInterval(this.checkpointTimer);
     this.subscriptions.close();

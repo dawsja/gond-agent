@@ -132,7 +132,6 @@ function saveCheckpoint(id: string) {
 }
 
 beforeEach(async () => {
-  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   vi.clearAllMocks();
   vi.mocked(checkout).mockReset().mockResolvedValue({ cwd: "/fake", archive: Buffer.from("repo") });
   dir = mkdtempSync(join(tmpdir(), "gond-run-queue-"));
@@ -524,7 +523,7 @@ describe("persistent workspace queue", () => {
     expect(runs.history(stopped[0]!, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
   });
 
-  it.each(["dirty", "unpublished commit", "question", "pending message", "CI watch"])("keeps unsafe stopped workspaces: %s", async unsafe => {
+  it.each(["dirty", "unpublished commit", "question", "pending message"])("keeps unsafe stopped workspaces: %s", async unsafe => {
     const active = await create(); await finish(active.id);
     await runs.stop(active.id, "a"); await flush();
     const run = runs.get(active.id);
@@ -532,7 +531,6 @@ describe("persistent workspace queue", () => {
     if (unsafe === "unpublished commit") { run.pushed = false; run.head_sha = null; workspaces.get(active.id)!.state.head = "c".repeat(40); }
     if (unsafe === "question") run.summary.question = { request_id: "q", question: "Which?" };
     if (unsafe === "pending message") run.pending.push({ text: "Still pending", images: [] });
-    if (unsafe === "CI watch") run.ci_active = true;
     runs.save(run);
     const waiting = await create("b");
     await vi.advanceTimersByTimeAsync(600_000); await flush();
@@ -542,7 +540,7 @@ describe("persistent workspace queue", () => {
     expect(importBundle).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["dirty", "different head", "question", "waiting for input", "CI watch", "pending message", "interrupted", "auto resume", "checkpoint resume", "recovery finishing", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
+  it.each(["dirty", "different head", "question", "waiting for input", "pending message", "interrupted", "auto resume", "checkpoint resume", "recovery finishing", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
     const active = await create(); await finish(active.id);
     if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;
     else if (unsafe === "different head") workspaces.get(active.id)!.state.head = "c".repeat(40);
@@ -553,7 +551,6 @@ describe("persistent workspace queue", () => {
         r.status = "working";
         r.summary.question = { request_id: "q", question: "Which?" };
       }
-      if (unsafe === "CI watch") r.ci_active = true;
       if (unsafe === "pending message") r.pending.push({ text: "Pending", images: [] });
       if (unsafe === "interrupted") { r.status = "working"; runs.save(r); r.status = "interrupted"; }
       if (unsafe === "auto resume") { r.phase = "auto_resume_pending"; r.auto_resume_pending = true; }

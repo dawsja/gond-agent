@@ -38,8 +38,6 @@ export function openStore(data: string) {
   })();
   clearExternalProfileImages(db);
   retireCodingAgents(db);
-  // Additive and idempotent: automatic CI rounds survive restarts and follow-ups.
-  db.prepare("UPDATE runs SET data=json_set(data,'$.ci_round',0) WHERE json_extract(data,'$.backend')='builtin' AND json_type(data,'$.ci_round') IS NULL").run();
   // Add metadata without rewriting historical JSON rows or transcript events.
   if (!(db.pragma("table_info(runs)") as { name: string }[]).some(column => column.name === "pr_body"))
     db.exec("ALTER TABLE runs ADD COLUMN pr_body TEXT");

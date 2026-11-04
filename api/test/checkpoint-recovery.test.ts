@@ -9,7 +9,7 @@ import type { Workspace, WorkspaceCheckpoint, WorkspaceCheckpointOptions, Worksp
 import { openStore } from "../src/db";
 import { branchHead, checkout, importBundle } from "../src/github";
 import { saveProviderSettings } from "../src/providers";
-import { Runs } from "../src/runs/service";
+import { Runs, parseRun } from "../src/runs/service";
 import { ApiError } from "../src/wire";
 
 // Same command-scoped GitHub fixtures as runs-local: no Docker, Git or model network calls.
@@ -161,10 +161,6 @@ async function restart() {
   db = openStore(dir);
   runs = new Runs(db, cfg, factory);
 }
-function disableCiNetwork() {
-  const ci = (runs as unknown as { ci: { start(id: string, sha: string): void } }).ci;
-  return vi.spyOn(ci, "start").mockImplementation(() => {});
-}
 function account(id: string) {
   db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)')
     .run(id, "User", `${id}@example.test`, 0, Date.now(), Date.now());
@@ -173,7 +169,6 @@ function account(id: string) {
 }
 
 beforeEach(async () => {
-  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   vi.stubEnv("GOND_AGENT_CHECKPOINT_MAX_MB", "1024");
   vi.stubEnv("GOND_AGENT_CHECKPOINT_RETENTION_DAYS", "7");
   dir = mkdtempSync(join(tmpdir(), "gond-agent-checkpoint-recovery-"));
@@ -201,6 +196,68 @@ afterEach(async () => {
 });
 
 describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", () => {
+  it("finishes, publishes and captures checkpoints without starting post-push automation", async () => {
+    const { run, worker } = await checkpointed();
+    const flushed = vi.spyOn(worker, "flushCheckpoints");
+    const captured = vi.spyOn(worker, "captureCheckpoint");
+    worker.events.push({ type: "turn.end", agent_id: "main", stop_reason: "end_turn" });
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    expect(flushed).toHaveBeenCalled();
+    expect(captured).toHaveBeenCalledWith({ head_sha: HEAD });
+    expect(importBundle).toHaveBeenCalledTimes(1);
+    expect(runs.get(run.id)).toMatchObject({ pushed: true, head_sha: HEAD, pr_number: 42, phase: "agent" });
+    expect(runs.get(run.id).recovery_phase).toBeUndefined();
+    expect(worker.destroy).not.toHaveBeenCalled();
+    expect(runs).not.toHaveProperty("ci");
+    const history = runs.history(run.id, 0);
+    expect(history.filter(event => event.type === "run.ci" || event.type === "ci")).toEqual([]);
+    expect(history.filter(event => event.type === "user")).toHaveLength(1);
+    const service = storedState(rows(run.id).at(-1)!).service;
+    expect(service).not.toHaveProperty("automatic");
+    console.info(`[publication without CI] status=${runs.get(run.id).status} pushed=${runs.get(run.id).pushed} PR=${runs.get(run.id).pr_number} workspace_destroyed=${worker.destroyed} run.ci=0 event_types=${JSON.stringify(history.map(event => event.type))}`);
+  });
+
+  it("parseRun tolerates legacy ci_* fields in stored runs and checkpoint recovery metadata", async () => {
+    const { run } = await checkpointed();
+    const original = runs.get(run.id);
+    const legacyFields = { ci_active: true, ci_turn: true, ci_publication_pending: true, ci_round: 2,
+      ci_state: "pending", ci_sha: HEAD, ci_previous_sha: BASE, ci_failing: ["tests"], ci_reason: "old" };
+    await runs.shutdown(); // Seed the previous version's state after the live writer stops.
+    const stored = JSON.stringify({ ...original, ...legacyFields,
+      active_message: { ...original.active_message, source: "ci", ...legacyFields },
+      recovery_task: { ...original.recovery_task, source: "ci", ...legacyFields } });
+    db.prepare("UPDATE runs SET data=? WHERE id=?").run(stored, run.id);
+    const oldCheckpoint = rows(run.id).at(-1)!;
+    const saved = storedState(oldCheckpoint);
+    const legacyCheckpoint = runs.checkpoints.save({ runId: run.id, ownerId: "u", runnerVersion: VERSION,
+      bundle: Buffer.from("opaque-checkpoint-bundle"), tree: { baseSha: BASE, headSha: HEAD, checkpointSha: TREE },
+      state: JSON.stringify({ runner: saved.runner, service: { ...saved.service, automatic: true, ...legacyFields } }) });
+    const stateBefore = readFileSync(join(dir, "checkpoints", legacyCheckpoint.state_path));
+    db.close();
+    db = openStore(dir);
+    runs = new Runs(db, cfg, factory);
+    // Neither startup nor a read migrates the historical JSON/checkpoint files.
+    expect((db.prepare("SELECT data FROM runs WHERE id=?").get(run.id) as { data: string }).data).toBe(stored);
+    expect(readFileSync(join(dir, "checkpoints", legacyCheckpoint.state_path))).toEqual(stateBefore);
+    expect(runs.get(run.id)).toEqual(parseRun(stored));
+    expect(Object.keys(runs.get(run.id)).some(key => key.startsWith("ci_"))).toBe(false);
+    finishUsers = true;
+    await runs.recover();
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    const resumed = workers.at(-1)!;
+    expect(resumed.imported).toEqual(saved.runner);
+    expect(resumed.calls.find(call => call.method === "start")?.args).toMatchObject({ interactive: true });
+    expect(resumed.users()).toHaveLength(1);
+    expect(resumed.users()[0]).toContain("The run was restarted.");
+    expect(resumed.users()[0]).not.toContain(PROMPT);
+    expect(runs.get(run.id)).toMatchObject({ pushed: true, pr_number: 42, auto_resume_pending: false, pending: [] });
+    expect(runs.get(run.id).recovery_phase).toBeUndefined();
+    expect(storedState(rows(run.id).at(-1)!).service).not.toHaveProperty("automatic");
+    expect(runs.history(run.id, 0).filter(event => event.type === "run.ci")).toEqual([]);
+    expect(resumed.destroy).not.toHaveBeenCalled();
+    console.info(`[legacy recovery] ci_fields_ignored=true checkpoint_history_restored=true continuation_deliveries=${resumed.users().length} interactive=true status=${runs.get(run.id).status} pushed=${runs.get(run.id).pushed} PR=${runs.get(run.id).pr_number} run.ci=0`);
+  });
+
   it.each([false, true])("restores idle-released conversation for a follow-up (first reopen fails: %s)", async reopenFails => {
     cfg.maxRuns = 1;
     finishUsers = true;
@@ -286,11 +343,10 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
   });
 
   it("keeps delivery-only resume framing out of durable messages over two restores", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
-    disableCiNetwork();
     finishUsers = true;
     const { run, worker } = await checkpointed();
-    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"));
+    await runs.close(run.id, false, true);
     finishUsers = false;
     const followUp = "Handle the next parser edge case.";
     vi.spyOn(FakeWorkspace.prototype, "capture").mockImplementation(async () => {});
@@ -437,32 +493,6 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     expect(resumed.users()[0]!.split("The run was restarted.")).toHaveLength(2);
     expect(resumed.imported!.history).toEqual([message("user", PROMPT), message("assistant", EARLIER)]);
     expect(runs.get(run.id).pending).toEqual([]);
-  });
-
-  it("with explicit CI opt-in, auto-closes a completed turn and restores earlier history for its CI fix", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
-    const watch = disableCiNetwork();
-    finishUsers = true;
-    const { run, worker } = await checkpointed();
-    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1), { timeout: 5000 });
-    expect(runs.get(run.id).status).toBe("ready");
-    expect(watch).toHaveBeenCalledWith(run.id, HEAD);
-    const saved = storedState(rows(run.id).at(-1)!);
-    expect(saved.runner.history).toEqual([message("user", PROMPT), message("assistant", EARLIER)]);
-    finishUsers = false;
-    await runs.validateFollowUp(run.id, "u");
-    runs.enqueue(run.id, "u", "Fix the failing parser CI check.", [], undefined, undefined, undefined, undefined, "ci");
-    const fix = "Fix the failing parser CI check.";
-    await vi.waitFor(() => expect(workers.at(-1)!.users().filter(text => text.includes(fix))).toHaveLength(1), { timeout: 5000 });
-    const reopened = workers.at(-1)!;
-    expect(reopened).not.toBe(worker);
-    expect(reopened.imported).toEqual(saved.runner);
-    expect(reopened.calls.find(call => call.method === "restore_checkpoint")?.args).toMatchObject({ published_head: HEAD });
-    expect(reopened.calls.find(call => call.method === "start")?.args).toMatchObject({ interactive: false });
-    expect(reopened.users().filter(text => text.includes(fix))).toHaveLength(1);
-    expect(reopened.users()).toHaveLength(1); // Framing must not create an extra model turn.
-    expect(vi.mocked(checkout).mock.calls.at(-1)?.[5]).toBe(true);
-    console.info(`[checkpoint CI reopen] restored history=${JSON.stringify(reopened.imported!.history)} CI fix deliveries=${reopened.users().filter(text => text.includes(fix)).length}`);
   });
 
   it("preserves a follow-up accepted while finish is flushing checkpoints", async () => {
@@ -641,49 +671,6 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
       expect(branchHead).not.toHaveBeenCalled();
       expect(vi.mocked(checkout).mock.calls.at(-1)?.[11]).toBe(true);
     }
-  });
-
-  it("keeps CI provenance on the restored continuation when a human follows up while interrupted", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
-    disableCiNetwork();
-    finishUsers = true;
-    const { run, worker } = await checkpointed();
-    await vi.waitFor(() => expect(worker.destroy).toHaveBeenCalledTimes(1));
-    finishUsers = false;
-    const fix = "Fix the parser CI failure before accepting more work.";
-    await runs.validateFollowUp(run.id, "u");
-    runs.enqueue(run.id, "u", fix, [], undefined, undefined, undefined, undefined, "ci");
-    await vi.waitFor(() => expect(storedState(rows(run.id).at(-1)!).runner.history).toContainEqual({ role: "user", content: [{ type: "text", text: expect.stringContaining(fix) }] }));
-    expect(runs.get(run.id).active_message?.source).toBe("ci");
-    const checkpoint = rows(run.id).at(-1)!;
-    const saved = storedState(checkpoint);
-    expect(saved.service.automatic).toBe(true);
-    vi.stubEnv("GOND_AGENT_AUTO_RESUME", "0");
-    await restart();
-    await runs.recover();
-    expect(runs.get(run.id).status).toBe("interrupted");
-    const checked = deferred();
-    const checkoutMock = vi.mocked(checkout).mockImplementationOnce(async () => {
-      await checked.promise;
-      return { cwd: "/fake", archive: Buffer.from("repo") };
-    });
-    const human = "Also improve the parser error message.";
-    try {
-      runs.enqueue(run.id, "u", human);
-      await vi.waitFor(() => expect(checkoutMock).toHaveBeenCalledTimes(3));
-      expect(runs.get(run.id)).toMatchObject({ ci_turn: false, ci_publication_pending: true });
-      checked.resolve();
-      await vi.waitFor(() => expect(workers).toHaveLength(3));
-      await vi.waitFor(() => expect(workers.at(-1)!.users()).toHaveLength(1));
-      const resumed = workers.at(-1)!;
-      expect(resumed.imported).toEqual(saved.runner);
-      expect(resumed.users()[0]).toContain("The run was restarted.");
-      expect(resumed.users()[0]).not.toContain(human);
-      expect(runs.get(run.id)).toMatchObject({ ci_turn: true, ci_publication_pending: true, active_message: { source: "ci" } });
-      expect(runs.get(run.id).pending.map(item => item.text)).toEqual([human]);
-      await vi.waitFor(() => expect(rows(run.id).at(-1)!.seq).toBeGreaterThan(checkpoint.seq));
-      expect(storedState(rows(run.id).at(-1)!).service.automatic).toBe(true);
-    } finally { checked.resolve(); }
   });
 
   it("automatically resumes at most twice across repeated process restarts", async () => {
@@ -881,16 +868,17 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
   });
 
   it("removes owned checkpoint files before auth deletion, including soft-deleted runs, without touching another owner", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
-    disableCiNetwork();
     finishUsers = true;
     account("other");
     const active = await checkpointed();
-    await vi.waitFor(() => expect(active.worker.destroy).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(runs.get(active.run.id).status).toBe("ready"), { timeout: 5000 });
+    await runs.close(active.run.id, false, true);
     const deleted = await checkpointed();
-    await vi.waitFor(() => expect(deleted.worker.destroy).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(runs.get(deleted.run.id).status).toBe("ready"), { timeout: 5000 });
+    await runs.close(deleted.run.id, false, true);
     const other = await checkpointed("web", "other");
-    await vi.waitFor(() => expect(other.worker.destroy).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(runs.get(other.run.id).status).toBe("ready"), { timeout: 5000 });
+    await runs.close(other.run.id, false, true);
     const owned = [...rows(active.run.id), ...rows(deleted.run.id)];
     const retained = rows(other.run.id);
     for (const id of [active.run.id, deleted.run.id, other.run.id]) expect(rows(id).length).toBeGreaterThanOrEqual(1);

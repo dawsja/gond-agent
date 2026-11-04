@@ -71,8 +71,6 @@ const cfg = (): Config => ({
   runMemoryMB: 2048,
 });
 beforeEach(async () => {
-  // This suite covers retained live workspaces; enabled CI release/reopen is in ci-service.test.ts.
-  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   dir = mkdtempSync(join(tmpdir(), "gond-agent-run-"));
   db = openStore(dir);
   await createAuthentication(db, cfg());
