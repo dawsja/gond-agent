@@ -55,7 +55,7 @@ describe("OpenAI Responses", () => {
   });
   it("turns a failed response into a retryable plain error", async () => {
     const { events, result } = await replay(responsesAdapter, row("openai", "gpt-5.5"), "openai-responses-failed.sse");
-    expect(events.at(-1)).toEqual({ event: "error", data: { code: "rate_limit_exceeded", message: "The provider is limiting requests right now. Gond Agent will retry shortly.", retryable: true } });
+    expect(events.at(-1)).toEqual({ event: "error", data: { code: "provider_rate_limit", message: "The provider is limiting requests right now. Gond Agent will retry shortly.", retryable: true } });
     expect(result).toBeNull();
   });
 });
@@ -97,7 +97,7 @@ describe("OpenAI Chat Completions and compatible proxies", () => {
   });
   it("reports context overflow plainly and sends images and tool results in Chat format", async () => {
     const { events } = await replay(chatAdapter, row("openai", "gpt-4.1"), "chat-context-error.sse");
-    expect(events.at(-1)).toEqual({ event: "error", data: { code: "context_length_exceeded", message: "The conversation is too long for this model.", retryable: false } });
+    expect(events.at(-1)).toEqual({ event: "error", data: { code: "context_exceeded", message: "The conversation is too long for this model.", retryable: false } });
     const body = chatAdapter.build({ model: "m", system: "sys", messages: conversation, tools }, row("openai", "gpt-4.1", { reasoning: "none", images: true })).body as Record<string, any>;
     expect(body.messages.map((m: { role: string }) => m.role)).toEqual(["system", "user", "assistant", "tool", "user"]);
     expect(body.messages[1].content[1]).toEqual({ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } });
@@ -121,7 +121,7 @@ describe("Anthropic Messages", () => {
     const budget = anthropic.build({ model: "m", messages: conversation, reasoning: { effort: "medium" } }, row("anthropic", "claude-sonnet-4-5", { reasoning: "budget" })).body as Record<string, any>;
     expect(budget.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
     const { events } = await replay(anthropic, row("anthropic", "claude-sonnet-4-6"), "anthropic-overloaded.sse");
-    expect(events.at(-1)).toEqual({ event: "error", data: { code: "overloaded_error", message: "The model provider is unavailable right now. Gond Agent will retry shortly.", retryable: true } });
+    expect(events.at(-1)).toEqual({ event: "error", data: { code: "provider_unavailable", message: "The model provider is unavailable right now. Gond Agent will retry shortly.", retryable: true } });
   });
 });
 
@@ -173,7 +173,7 @@ describe("model relay errors", () => {
       const response = await modelResponse(db, secret, "u", "r", new Request("http://worker/v1/responses", { method: "POST", body: JSON.stringify({ model: "p:gpt-4.1", messages: conversation.slice(0, 1) }) }));
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: { code: "provider_auth", message: "The provider rejected the API key. An administrator can update it in Settings → Models.", retryable: false } });
-      expect(logged).toEqual(["model request failed 401 invalid_api_key"]);
+      expect(logged).toEqual(["model request failed 401 provider_auth"]);
     } finally {
       vi.restoreAllMocks();
       db.close(); rmSync(dir, { recursive: true, force: true });

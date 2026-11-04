@@ -1,0 +1,144 @@
+{
+  "context_exceeded": {
+    "retryable": false,
+    "message": "The conversation is too long for this model."
+  },
+  "provider_quota": {
+    "retryable": false,
+    "message": "The provider account has no remaining credit or quota. Check billing with the provider."
+  },
+  "relay_auth": {
+    "retryable": false,
+    "message": "Gond Agent couldn't authenticate the model connection. Sign in again or restart the run."
+  },
+  "provider_auth": {
+    "retryable": false,
+    "message": "The provider rejected the API key. An administrator can update it in Settings → Models."
+  },
+  "provider_forbidden": {
+    "retryable": false,
+    "message": "This API key doesn't have access to the model."
+  },
+  "provider_model": {
+    "retryable": false,
+    "message": "The provider doesn't recognize this model. Refresh the model list or choose another model."
+  },
+  "provider_rate_limit": {
+    "retryable": true,
+    "message": "The provider is limiting requests right now. Gond Agent will retry shortly."
+  },
+  "provider_unavailable": {
+    "retryable": true,
+    "message": "The model provider is unavailable right now. Gond Agent will retry shortly."
+  },
+  "provider_request": {
+    "retryable": false,
+    "message": "The provider rejected the request. Choose another model or check its settings."
+  },
+  "provider_error": {
+    "retryable": false,
+    "message": "The model provider reported an unrecognized error. Check the model connection."
+  },
+  "chatgpt_usage_unavailable": {
+    "retryable": true,
+    "message": "ChatGPT couldn't check your plan usage right now. Gond Agent will retry shortly."
+  },
+  "chatgpt_user_unavailable": {
+    "retryable": true,
+    "message": "ChatGPT account information is temporarily unavailable. Gond Agent will retry shortly."
+  },
+  "chatgpt_not_eligible": {
+    "retryable": false,
+    "message": "ChatGPT plan usage isn't available for this account, workspace or policy. Use an API key connection instead."
+  },
+  "chatgpt_invalid_user": {
+    "retryable": false,
+    "message": "ChatGPT couldn't validate this account. If this continues, sign in again in Settings → Models."
+  },
+  "chatgpt_route": {
+    "retryable": false,
+    "message": "This request type isn't available with a ChatGPT plan."
+  },
+  "chatgpt_not_authorized": {
+    "retryable": false,
+    "message": "This sign-in doesn't allow Gond Agent to use your ChatGPT plan. Continue with ChatGPT again and allow plan usage, or use an API key connection."
+  },
+  "chatgpt_unauthorized": {
+    "retryable": false,
+    "message": "ChatGPT didn't accept this sign-in. Sign in again in Settings → Models."
+  },
+  "chatgpt_forbidden": {
+    "retryable": false,
+    "message": "ChatGPT blocked this request by policy, for example the permitted region."
+  },
+  "chatgpt_rate_limit": {
+    "retryable": true,
+    "message": "ChatGPT is limiting requests right now. Gond Agent will retry shortly."
+  },
+  "chatgpt_unavailable": {
+    "retryable": true,
+    "message": "ChatGPT plan usage is unavailable right now. Gond Agent will retry shortly."
+  },
+  "chatgpt_rejected": {
+    "retryable": false,
+    "message": "ChatGPT rejected this request. Choose another model or try again."
+  },
+  "chatgpt_exchange": {
+    "retryable": true,
+    "message": "ChatGPT sign-in couldn't be completed. Try again."
+  },
+  "chatgpt_usage_limit": {
+    "retryable": false,
+    "message": "You've reached a ChatGPT plan usage limit. Review ChatGPT settings → Usage. Gond Agent doesn't switch to API billing."
+  },
+  "chatgpt_unsupported": {
+    "retryable": false,
+    "message": "ChatGPT plan usage doesn't support part of this request. Choose another model or use an API key connection."
+  },
+  "stream": {
+    "retryable": true,
+    "message": "The connection to the model dropped. Try again."
+  },
+  "network": {
+    "retryable": true,
+    "message": "The connection to the model was interrupted. Try again shortly."
+  },
+  "truncated": {
+    "retryable": true,
+    "message": "The model stopped before finishing. Try again."
+  },
+  "unknown": {
+    "retryable": false,
+    "message": "The model request failed for an unrecognized reason. Check the model connection."
+  },
+  "too_large": { "retryable": false, "message": "The model request is too large." },
+  "invalid_request": { "retryable": false, "message": "Send a valid model request with a model and message." },
+  "invalid_image": { "retryable": false, "message": "Image bytes must be processed by the worker before a model request." },
+  "invalid_effort": { "retryable": false, "message": "Choose an effort supported by this model." },
+  "invalid_model": { "retryable": false, "message": "Choose an available model." },
+  "retired_model": { "retryable": false, "message": "That model is no longer available. Choose an available model." },
+  "unknown_model": { "retryable": false, "message": "That model is not available. Refresh the model list or choose another model." },
+  "provider_required": { "retryable": false, "message": "Configure this model's provider in Settings → Models." },
+  "not_found": { "retryable": false, "message": "That model connection is no longer available. Choose another model." },
+  "unknown_subscription": { "retryable": false, "message": "That subscription is not supported. Choose another model." },
+  "provider_usage_limit": {
+    "retryable": false,
+    "message": "The provider usage limit has been reached. Wait for the limit to reset before trying again."
+  },
+  "provider_connection": {
+    "retryable": true,
+    "message": "Could not reach the model provider. Check its URL and network access."
+  },
+  "rate_limit_exceeded": {
+    "retryable": true,
+    "message": "The provider is limiting requests right now. Gond Agent will retry shortly."
+  },
+  "subscription_signin": {
+    "retryable": false,
+    "message": "Sign in to ChatGPT again in Settings → Models to keep using your plan."
+  },
+  "subscription_plan_disabled": {
+    "retryable": false,
+    "message": "ChatGPT plan use is not enabled for this sign-in. Enable plan usage in Settings → Models."
+  }
+}

@@ -485,10 +485,12 @@ describe("ChatGPT plan models and inference", () => {
         const response = await relay(model);
         return { status: response.status, ...(await response.json()).error };
       };
-      const limit = await failWith(429, { error: { code: "subscription_sharing_usage_limit_exceeded", message: "limit" } });
+      const limit = await failWith(429, { error: { code: "subscription_sharing_usage_limit_exceeded", message: "limit-secret", resets_at: 1900000000 } });
       expect(limit).toMatchObject({ status: 429, code: "chatgpt_usage_limit", retryable: false });
-      expect(limit.message).toContain("https://chatgpt.com/settings/usage");
+      expect(limit.message).toContain("ChatGPT settings → Usage");
+      expect(limit.message).not.toMatch(/https?:|limit-secret/);
       expect(limit.message).toContain("doesn't switch to API billing");
+      expect(limit.message).toContain("2030-03-17T17:46:40.000Z");
       // Plan requests pause instead of hammering the limit.
       const responses = mock.count("/v1/responses");
       const paused = await relay(model);
@@ -501,13 +503,15 @@ describe("ChatGPT plan models and inference", () => {
       expect(await failWith(503, { error: { code: "subscription_sharing_usage_unavailable" } })).toMatchObject({ status: 503, code: "chatgpt_usage_unavailable", retryable: true });
       expect(await failWith(503, { error: { code: "subscription_sharing_user_unavailable" } })).toMatchObject({ status: 503, retryable: true });
       expect(await failWith(503, { detail: "Direct routing is unavailable." })).toMatchObject({ status: 503, code: "chatgpt_unavailable", retryable: true });
-      expect(await failWith(400, { error: { code: "subscription_sharing_unsupported_capability", param: "tools[0]" } })).toMatchObject({ status: 400, message: expect.stringContaining("(tools[0])") });
+      expect(await failWith(400, { error: { code: "subscription_sharing_unsupported_capability", param: "tools[0]" } })).toMatchObject({ status: 400, code: "chatgpt_unsupported", message: expect.stringContaining("doesn't support part of this request") });
       expect(await failWith(403, { error: { code: "subscription_sharing_route_not_supported" } })).toMatchObject({ status: 403, code: "chatgpt_route" });
       expect(await failWith(403, { detail: "Region" })).toMatchObject({ status: 403, code: "chatgpt_forbidden" });
 
       mock.streamFailure = "subscription_sharing_usage_limit_exceeded";
       const streamed = await (await relay(model)).text();
       expect(streamed).toMatch(/event: error\ndata: \{"code":"chatgpt_usage_limit"/);
+      expect((streamed.match(/event: error/g) ?? [])).toHaveLength(1);
+      expect(streamed).not.toMatch(/response.end|truncated/);
       db.prepare("UPDATE subscription_accounts SET limited_at=NULL").run();
 
       const authCalls = mock.count("/api/accounts/authorize") + mock.count("/api/accounts/oauth/token");

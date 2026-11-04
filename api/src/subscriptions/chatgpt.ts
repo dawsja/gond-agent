@@ -1,3 +1,5 @@
+import { modelFailure } from "../model-errors";
+import { providerFailure } from "../adapters/errors";
 // "Sign in with ChatGPT" plan usage for open-source apps:
 // https://developers.openai.com/siwc/token-sharing-open-source
 import { createHash, randomBytes, timingSafeEqual, type JsonWebKey } from "node:crypto";
@@ -43,33 +45,37 @@ function errorCode(body: unknown): { code?: string; param?: string } {
 
 /** Plain messages for the documented plan-usage errors. None of them falls back to API billing. */
 export function chatgptFailure(status: number, body: unknown): Failure {
-  const { code, param } = errorCode(body);
-  const manage = `Review it in ChatGPT settings → Usage (${CHATGPT_USAGE_URL}).`;
+  const { code } = errorCode(body);
   switch (code) {
+    case "usage_limit_reached":
+    case "usage_limit_exceeded":
     case "subscription_sharing_usage_limit_exceeded":
-      return { effect: "limited", error: new ApiError(429, "chatgpt_usage_limit", `You've reached a ChatGPT plan usage limit for Gond Agent. ${manage} Gond Agent doesn't switch to API billing.`) };
+      return { effect: "limited", error: modelFailure(429, "chatgpt_usage_limit") };
     case "subscription_sharing_usage_unavailable":
-      return { error: new ApiError(503, "chatgpt_usage_unavailable", "ChatGPT couldn't check your plan usage right now. Gond Agent will retry shortly.", true) };
+      return { error: modelFailure(503, "chatgpt_usage_unavailable") };
     case "subscription_sharing_user_unavailable":
-      return { error: new ApiError(503, "chatgpt_user_unavailable", "ChatGPT account information is temporarily unavailable. Gond Agent will retry shortly.", true) };
+      return { error: modelFailure(503, "chatgpt_user_unavailable") };
     case "subscription_sharing_user_not_eligible":
-      return { effect: "not_eligible", error: new ApiError(403, "chatgpt_not_eligible", "ChatGPT plan usage isn't available for this account, workspace or policy. Use an API key connection instead.") };
+      return { effect: "not_eligible", error: modelFailure(403, "chatgpt_not_eligible") };
     case "subscription_sharing_invalid_user":
-      return { error: new ApiError(401, "chatgpt_invalid_user", "ChatGPT couldn't validate this account. If this continues, sign in again in Settings → Models.") };
+      return { error: modelFailure(401, "chatgpt_invalid_user") };
     case "subscription_sharing_unsupported_capability":
-      return { error: new ApiError(400, "chatgpt_unsupported", `ChatGPT plan usage doesn't support part of this request${param ? ` (${param})` : ""}. Choose another model or use an API key connection.`) };
+      return { error: modelFailure(400, "chatgpt_unsupported") };
     case "subscription_sharing_route_not_supported":
-      return { error: new ApiError(403, "chatgpt_route", "This request type isn't available with a ChatGPT plan.") };
+      return { error: modelFailure(403, "chatgpt_route") };
     case "chatpass_v2_scope_not_authorized":
     case "chatpass_v2_invalid_authorization_context":
-      return { effect: "not_eligible", error: new ApiError(403, "chatgpt_not_authorized", "This sign-in doesn't allow Gond Agent to use your ChatGPT plan. Continue with ChatGPT again and allow plan usage, or use an API key connection.") };
+      return { effect: "not_eligible", error: modelFailure(403, "chatgpt_not_authorized") };
   }
-  if (status === 401) return { error: new ApiError(401, "chatgpt_unauthorized", "ChatGPT didn't accept this sign-in. Sign in again in Settings → Models.") };
-  if (status === 403) return { error: new ApiError(403, "chatgpt_forbidden", "ChatGPT blocked this request by policy, for example the permitted region.") };
-  if (status === 429) return { error: new ApiError(429, "chatgpt_rate_limit", "ChatGPT is limiting requests right now. Gond Agent will retry shortly.", true) };
-  if (status === 503 || status >= 500 || status === 0) return { error: new ApiError(503, "chatgpt_unavailable", "ChatGPT plan usage is unavailable right now. Gond Agent will retry shortly.", true) };
-  if (code === "context_length_exceeded") return { error: new ApiError(400, "context_exceeded", "The conversation is too long for this model.") };
-  return { error: new ApiError(502, "chatgpt_rejected", "ChatGPT rejected this request. Choose another model or try again.") };
+  // Permanent model failures take precedence over status-zero SSE and generic outages.
+  const generic = providerFailure(status, body);
+  if (["context_exceeded", "provider_quota"].includes(generic.code) || (status === 0 && ["provider_auth", "provider_forbidden", "provider_request"].includes(generic.code))) return { error: generic };
+  if (status === 401) return { error: modelFailure(401, "chatgpt_unauthorized") };
+  if (status === 403) return { error: modelFailure(403, "chatgpt_forbidden") };
+  if (status === 429) return { error: modelFailure(429, "chatgpt_rate_limit") };
+  if (status === 503 || status >= 500 || status === 0) return { error: modelFailure(503, "chatgpt_unavailable") };
+  if (code === "context_length_exceeded") return { error: modelFailure(400, "context_exceeded") };
+  return { error: modelFailure(502, "chatgpt_rejected") };
 }
 
 export class ChatGPTProvider implements SubscriptionProvider {

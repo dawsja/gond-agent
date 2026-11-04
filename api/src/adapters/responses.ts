@@ -3,7 +3,7 @@ import type { Block, Message, Opaque, Provider, ResponsesRequest, StopReason, St
 import { emptyUsage } from "../wire";
 import type { Adapter, ModelRow, StreamParser, UpstreamRequest } from "./types";
 import { dataUrl, maxOutput, parseArgs, sameModel } from "./common";
-import { errorParts, providerFailure } from "./errors";
+import { providerStreamFailure } from "./errors";
 
 /** Plan usage accepts function tools only inside a namespace; the runner's tools share this one. */
 export const TOOL_NAMESPACE = "gond";
@@ -101,13 +101,15 @@ class ResponsesParser implements StreamParser {
   private chars = 0;
   constructor(private model: ModelRow) {}
 
-  push(_event: string | undefined, raw: string): StreamEvent[] {
+  push(event: string | undefined, raw: string): StreamEvent[] {
     let d: Record<string, any>;
     try {
       d = JSON.parse(raw);
     } catch {
       return [];
     }
+    if (event === "error") return [providerStreamFailure(d)];
+    d.type ??= event;
     switch (d.type as string) {
       case "response.created":
         return [{ event: "response.start", data: { id: d.response?.id ?? "", model: this.model.id } }];
@@ -149,6 +151,8 @@ class ResponsesParser implements StreamParser {
       case "response.incomplete": {
         this.applyUsage(d.response?.usage);
         const reason = d.response?.incomplete_details?.reason;
+        if (d.type === "response.incomplete" && !["max_output_tokens", "content_filter"].includes(reason))
+          return [providerStreamFailure({ error: { code: reason ?? "server_error" } })];
         const stop: StopReason =
           d.type === "response.completed"
             ? this.sawTool
@@ -165,8 +169,7 @@ class ResponsesParser implements StreamParser {
       case "response.failed":
       case "error": {
         // Keep the provider's code so subscription access can apply its own recovery.
-        const { code } = errorParts(d), failure = providerFailure(0, d);
-        return [{ event: "error", data: { code: code ?? failure.code, message: failure.message, retryable: failure.retryable } }];
+        return [providerStreamFailure(d)];
       }
       default:
         return [];
