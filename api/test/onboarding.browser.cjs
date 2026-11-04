@@ -505,6 +505,14 @@ const key = 'fixture-only-provider-key';
       // Approved A layout: real streamed messages, quiet disclosures and visible failures.
       let activitySeq = 3;
       const activity = (type, fields) => sockets.at(-1).send(JSON.stringify({ seq: ++activitySeq, ts: Date.now(), type, ...fields }));
+      activity('run.ci', { state: 'failing', round: 1, sha: 'a'.repeat(40), failing: ['typecheck'] });
+      await expect(page.getByRole('status', { name: 'CI status', exact: true })).toHaveText('CI failing · round 1 · typecheck');
+      activity('ci', { source: 'ci', text: 'Fix the failed checks.', images: [] });
+      const automaticCI = page.getByRole('button', { name: 'Automatic CI', exact: true });
+      await expect(automaticCI).toHaveAttribute('aria-expanded', 'false');
+      await automaticCI.click();
+      await expect(page.getByLabel('Automatic CI', { exact: true }).getByText('Fix the failed checks.', { exact: true })).toBeVisible();
+      await automaticCI.click();
       queuePosition = 2;
       activity('run.queued', { position: 2, length: 3 });
       await expect(page.getByRole('status').filter({ hasText: 'Waiting for a free workspace' })).toHaveText('Waiting for a free workspace (position 2 of 3)');
