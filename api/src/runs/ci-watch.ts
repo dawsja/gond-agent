@@ -4,8 +4,8 @@ import { command } from "../command";
 import { gh, git, validBranch, validRepo } from "../github";
 import { ApiError } from "../wire";
 
-// Workspace release preserves a paired tree/history checkpoint for each CI handoff.
-const DEFAULT_CI_FIX_ROUNDS = 2;
+// Automatic CI fixes remain opt-in while checkpoint-backed resume is validated.
+const DEFAULT_CI_FIX_ROUNDS = 0;
 
 export type CiState = "pending" | "passing" | "failing" | "none" | "gave_up" | "unavailable";
 export interface CiInfo {

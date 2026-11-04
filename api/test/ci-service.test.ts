@@ -106,8 +106,8 @@ afterEach(async () => {
 });
 
 describe("run service automatic CI hooks", () => {
-  it("explicit zero disables CI: a pushed turn keeps its workspace and does not watch CI", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
+  it.each([undefined, "0"])("keeps CI disabled with rounds=%s: a pushed turn retains its workspace", async rounds => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", rounds);
     seed();
     const { live, destroy } = workspace();
     const start = vi.spyOn(watcher(), "start");
@@ -122,14 +122,14 @@ describe("run service automatic CI hooks", () => {
     expect(live.busy).toBe(false);
     expect(runs.get("run")).toMatchObject({ status: "ready", phase: "agent", head_sha: NEXT, ci_round: 0, pending: [] });
     expect(runs.get("run").ci_state).toBeUndefined();
-    watcher().start("run", NEXT); // The watcher itself also honors explicit zero.
+    watcher().start("run", NEXT); // The watcher honors both the default and explicit zero.
     await watcher().settled("run");
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("defaults to two CI rounds and releases the pushed workspace before watching", async () => {
-    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", undefined);
-    seed({ ci_round: 1 }); // The default still permits watching after the first round.
+  it("releases the pushed workspace before watching with explicit CI opt-in", async () => {
+    vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
+    seed({ ci_round: 1 }); // Explicit opt-in still permits watching after the first round.
     const { live, destroy } = workspace();
     const request = vi.fn(async (endpoint: string): Promise<unknown> => {
       expect(destroy).toHaveBeenCalledTimes(1);

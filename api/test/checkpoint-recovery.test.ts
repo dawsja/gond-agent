@@ -383,7 +383,7 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     expect(runs.get(run.id).pending).toEqual([]);
   });
 
-  it("auto-closes a completed turn for CI but imports its earlier history when a CI fix reopens it", async () => {
+  it("with explicit CI opt-in, auto-closes a completed turn and restores earlier history for its CI fix", async () => {
     vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "2");
     const watch = disableCiNetwork();
     finishUsers = true;
