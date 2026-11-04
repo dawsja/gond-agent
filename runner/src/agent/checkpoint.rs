@@ -241,6 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_stored_images_survive_export_and_import_uses_raster_policy() {
+        let _images = crate::images::test_guard().await;
         use base64::{Engine, engine::general_purpose::STANDARD};
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();

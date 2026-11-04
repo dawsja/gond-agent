@@ -1961,6 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn attached_images_reach_the_model() {
+        let _images = crate::images::test_guard().await;
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(StdMutex::new(vec![]));
         let handler: Handler = Arc::new(|_: &Value| sse(&[json!({"type":"text","text":"A cat."})], "end_turn"));

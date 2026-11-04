@@ -8,7 +8,9 @@ Images shared in replies appear as captioned cards on the run page, with click o
 keyboard enlargement. Use `share_image {path, caption?}` for screenshots or other
 raster files anywhere under the workspace or `/tmp`, including browser screenshots
 and other tool outputs. Any readable regular raster image in those locations can
-be shared; non-images and SVG are rejected. Local Markdown paths cannot be served
+be shared; non-images and SVG are rejected. Symlinked workspace or `/tmp` roots
+are resolved canonically; `TMPDIR` does not grant access to another location.
+Local Markdown paths cannot be served
 and now show “image not available (local path)”. Remote Markdown images remain
 links, never automatic requests. Shared images survive workspace release and
 follow the run's owner-only access and retention rules. Limits: four sharing

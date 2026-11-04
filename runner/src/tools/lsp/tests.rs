@@ -4,7 +4,9 @@ use super::*;
 use tempfile::TempDir;
 
 fn project() -> TempDir {
-    tempfile::tempdir().unwrap()
+    // Direct Server fixtures need the same canonical root as the production LSP
+    // entry point; otherwise symlinked TMPDIR aliases make valid file URIs look external.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
 }
 
 pub(super) fn fixture_command(language: Language, log: &Path, mode: &str) -> Command {

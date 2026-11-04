@@ -14,6 +14,14 @@ const MAX_PIXELS: u64 = 100_000_000;
 const MAX_ALLOCATION: u64 = 128 * 1024 * 1024;
 static DECODERS: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
+// The production try-acquire pool is process-global. Independent unit tests must
+// not consume one another's slots; never raise the production limit for tests.
+#[cfg(test)]
+pub(crate) async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TESTS.lock().await
+}
+
 fn encode(bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|_| "Cannot identify image")?;
     let mut limits = image::Limits::default();
@@ -126,6 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_small_transparent_and_invalid_images() {
+        let _images = test_guard().await;
         for (width, height, alpha) in [(6000, 4000, false), (64, 48, false), (64, 48, true)] {
             let (kind, bytes) = normalise(png(width, height, alpha)).await.unwrap();
             let decoded = image::load_from_memory(&bytes).unwrap();
@@ -166,6 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_postprocessing_caps_both_viewports() {
+        let _images = test_guard().await;
         let mut parts = vec![];
         for (w, h) in [(1440, 900), (390, 844)] {
             parts.push(ResultPart::Image { media_type: "image/png".into(), data: STANDARD.encode(png(w, h, false)) });
@@ -178,6 +188,15 @@ mod tests {
             let image = image::load_from_memory(&bytes).unwrap();
             assert!(image.width().max(image.height()) <= MAX_IMAGE_DIMENSION);
         }
+    }
+
+    #[tokio::test]
+    async fn occupied_decoder_slots_return_busy_and_recover_after_release() {
+        let _images = test_guard().await;
+        let permits = DECODERS.clone().try_acquire_many_owned(2).unwrap();
+        assert_eq!(normalise(png(16, 16, false)).await.unwrap_err(), "Image processing is busy; try again");
+        drop(permits);
+        assert!(normalise(png(16, 16, false)).await.is_ok());
     }
 
     #[test]

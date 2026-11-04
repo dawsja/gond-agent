@@ -227,9 +227,11 @@ The replacement starts with a fixed untrusted-text warning in a **user-role** me
 ### Sharing reply images
 
 `share_image {path,caption?}` is a parent-only, bounded `Access::Read` tool.
-Paths are canonicalized within the workspace or `/tmp` only; descriptor-relative
-no-follow component opens prevent symlink swaps, and the opened descriptor must
-be a regular file. Any readable regular raster image under either location can be
+Paths and both allowed roots are canonicalized before component-prefix checks,
+so symlinked workspace/tmp roots work without widening access. Production uses
+only the workspace and literal `/tmp`, never `TMPDIR`; injected roots are test-only.
+Component-prefix checks reject `/tmpfoo`. Descriptor-relative no-follow component
+opens prevent symlink swaps, and the opened descriptor must be a regular file. Any readable regular raster image under either location can be
 shared, including browser screenshots and other tool outputs. Metadata and bounded
 reads enforce 20 MiB before decoding. Non-images are rejected, as are devices,
 `/proc`, network fetches and SVG. The existing normalizer and its
