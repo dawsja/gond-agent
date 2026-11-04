@@ -101,6 +101,8 @@ export function fold(s: Summary, ev: Ev): Summary {
       return main ? { ...s, question: null } : s;
     case "text.delta":
       return main ? { ...s, text: s.text + ev.text } : s;
+    case "stream.reset":
+      return main ? { ...s, text: s.text.slice(0, Math.max(0, s.text.length - ev.text_length)) } : s;
     case "tool.start":
       return { ...s, step: stepLabel(ev.name, ev.title ?? "") };
     case "todos": {
