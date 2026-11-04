@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import hmac
+import hashlib
 import http.server
 import io
 import json
@@ -32,6 +33,8 @@ state_lock = threading.Lock()
 state_waiters = {}  # At most one RPC, separate from worker/event/model locks.
 CHECKPOINT_REF = "refs/gond-agent/checkpoint"
 checkpoint_lock = threading.Lock()
+capture_lock = threading.Lock()  # No capture/release queue and no overlapping tree/state pairs.
+held_boundary = None  # (worker, opaque controller boundary ID, runner boundary ID)
 worker = None
 relay_token = None
 events = []
@@ -167,12 +170,34 @@ def workspace_quiescent():
 def workspace_state():
     """Fail-closed release evidence using private Git config/index, without staging edits."""
     with checkpoint_lock, checkpoint_repository() as (git, env, _, head):
+        gitdir = pathlib.Path(ROOT).resolve() / ".git"
+        # Publication exports HEAD only. Stashes, tags/notes and commits on other
+        # local branches must not disappear just because the current tree is clean.
+        refs = {}
+        packed = clone_git_file(gitdir, "packed-refs")
+        if packed.exists():
+            for line in packed.read_text().splitlines():
+                if line and not line.startswith(("#", "^")):
+                    sha, name = line.split()
+                    refs[name] = sha
+        root = clone_git_file(gitdir, "refs")
+        for entry in root.rglob("*"):
+            entry = clone_git_file(gitdir, str(entry.relative_to(gitdir)))
+            if entry.is_file():
+                name = entry.relative_to(gitdir).as_posix()
+                if not name.startswith("refs/remotes/"):
+                    refs[name] = entry.read_text().strip()
+        for name, sha in refs.items():
+            if name.startswith("refs/remotes/"):
+                continue
+            if not name.startswith("refs/heads/") or git("rev-list", "--max-count=1", checkpoint_sha(sha), "--not", head).strip():
+                return {"head": head, "clean": False}
         # Parent snapshots cannot preserve dirty submodule contents. Be conservative
         # even for apparently clean gitlinks, rather than trust submodule config.
         submodules = any(entry.startswith(b"160000 ") for entry in git("ls-tree", "-rz", head).split(b"\0"))
         if submodules or not workspace_quiescent():
             return {"head": head, "clean": False}
-        index = clone_git_file(pathlib.Path(ROOT).resolve() / ".git", "index")
+        index = clone_git_file(gitdir, "index")
         if not index.exists():
             return {"head": head, "clean": False}
         private_index = env["GIT_INDEX_FILE"]
@@ -191,7 +216,7 @@ def checkpoint_message(base, head):
     return f"Gond Agent checkpoint\n\nbase_sha: {base}\nhead_sha: {head}\n"
 
 
-def checkpoint_tree(req):
+def checkpoint_tree(req, state_digest=None):
     """Export the working tree, not the staging area; never publish this commit."""
     base = checkpoint_sha(req.get("base_sha"))
     identity = req.get("identity", {})
@@ -200,6 +225,10 @@ def checkpoint_tree(req):
         raise RuntimeError("A connected GitHub commit identity is required.")
     with checkpoint_lock, checkpoint_repository() as (git, env, scratch, head):
         checkpoint_commit(git, base)
+        # Production pins an upstream-recoverable checkout/publication commit,
+        # not a possibly unpublished local HEAD. The tree still starts at HEAD.
+        parent = checkpoint_sha(req["head_sha"]) if "head_sha" in req else head
+        checkpoint_commit(git, parent)
         # Staging metadata is deliberately not restored. A newly force-added
         # ignored file would otherwise vanish from export or later publication.
         index = clone_git_file(pathlib.Path(ROOT).resolve() / ".git", "index")
@@ -216,31 +245,38 @@ def checkpoint_tree(req):
         git("read-tree", head)
         git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
         tree = git("write-tree").decode().strip()
+        fingerprint = hashlib.sha256(f"{base}:{parent}:{tree}:{state_digest}".encode()).hexdigest() if state_digest else None
+        if fingerprint and fingerprint == req.get("previous_fingerprint"):
+            return {"unchanged": True}
         env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER")
                     for key, field in (("NAME", "name"), ("EMAIL", "email"))})
         # Stable internal metadata; publication still uses the normal snapshot path.
         env.update({"GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"})
-        commit = git("commit-tree", tree, "-p", head, input=checkpoint_message(base, head).encode()).decode().strip()
+        commit = git("commit-tree", tree, "-p", parent, input=checkpoint_message(base, parent).encode()).decode().strip()
         git("update-ref", CHECKPOINT_REF, commit)
         bundle = scratch / "checkpoint.bundle"
-        # Exclude all original history, including shallow boundaries. Only HEAD is
-        # a prerequisite; the separately pinned base must also exist on restore.
-        git("bundle", "create", "--version=2", str(bundle), CHECKPOINT_REF, "^" + head)
+        # Exclude pinned history, including shallow boundaries. Only the parent
+        # is a prerequisite; the separately pinned base must also exist on restore.
+        git("bundle", "create", "--version=2", str(bundle), CHECKPOINT_REF, "^" + parent)
         if bundle.stat().st_size > MAX_CHECKPOINT_BUNDLE:
             raise RuntimeError("The checkpoint bundle is too large.")
-        return {"bundle": base64.b64encode(bundle.read_bytes()).decode(),
-                "base_sha": base, "head_sha": head, "checkpoint_sha": commit}
+        return {**({"fingerprint": fingerprint} if fingerprint else {}), "bundle": base64.b64encode(bundle.read_bytes()).decode(),
+                "base_sha": base, "head_sha": parent, "checkpoint_sha": commit}
 
 
 def restore_checkpoint(req):
     """Validate first, then apply a tree-only patch in the worker, never host Git.
 
-    The caller must supply the persisted base/HEAD pins, not trust bundle metadata.
+    The caller must supply the persisted base/HEAD pins and optional published
+    HEAD from its authenticated journal, not trust bundle metadata.
     Failure is the seam for a caller to fall back to its regular fresh checkout.
     """
     base = checkpoint_sha(req.get("base_sha"))
     head = checkpoint_sha(req.get("head_sha"))
     commit = checkpoint_sha(req.get("checkpoint_sha"))
+    published_head = req.get("published_head")
+    if published_head is not None:
+        published_head = checkpoint_sha(published_head)
     encoded = req.get("bundle")
     if not isinstance(encoded, str) or len(encoded) > 4 * ((MAX_CHECKPOINT_BUNDLE + 2) // 3):
         raise RuntimeError("The checkpoint bundle is too large.")
@@ -251,9 +287,11 @@ def restore_checkpoint(req):
         if worker and worker.poll() is None:
             raise RuntimeError("The worker is already running.")
         with checkpoint_repository() as (git, _, scratch, current_head):
-            if current_head != head:
+            if current_head != head and current_head != published_head:
                 raise RuntimeError("The checkpoint HEAD does not match the clone.")
             checkpoint_commit(git, base)
+            # The pinned old HEAD must already exist, never come from the bundle.
+            checkpoint_commit(git, head)
             bundle = scratch / "checkpoint.bundle"
             bundle.write_bytes(body)
             expected = f"{commit} {CHECKPOINT_REF}\n".encode()
@@ -268,6 +306,11 @@ def restore_checkpoint(req):
                 raise RuntimeError("Invalid checkpoint parent.")
             if git("show", "-s", "--format=%B", commit).decode().strip() != checkpoint_message(base, head).strip():
                 raise RuntimeError("The checkpoint pins do not match.")
+            # Publication may have committed this exact checkpoint tree before
+            # the next capture. Reconcile only that journal-authenticated HEAD.
+            if (current_head != head and
+                    git("rev-parse", commit + "^{tree}") != git("rev-parse", current_head + "^{tree}")):
+                raise RuntimeError("The checkpoint tree does not match the published HEAD.")
             for entry in git("ls-tree", "-rz", commit).split(b"\0"):
                 if not entry:
                     continue
@@ -276,11 +319,11 @@ def restore_checkpoint(req):
                     raise RuntimeError("Checkpoint submodules are not supported.")
                 if any(part.lower() == b".git" or part in (b"", b".", b"..") for part in path.split(b"/")):
                     raise RuntimeError("Unsafe checkpoint path.")
-            git("read-tree", head)
+            git("read-tree", current_head)
             patch = scratch / "tree.patch"
             with patch.open("wb") as output:
                 git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary", "--full-index",
-                    head, commit, "--", output=output)
+                    current_head, commit, "--", output=output)
             if patch.stat().st_size:
                 # No --index/--cached, reset or checkout: the real index, HEAD,
                 # refs and ignored files retain ordinary publication semantics.
@@ -302,7 +345,10 @@ def state_json(state):
 
 
 def fail_state_waiters(source):
+    global held_boundary
     # Caller holds worker_lock; always acquire locks in worker -> state order.
+    if held_boundary and held_boundary[0] is source:
+        held_boundary = None
     with state_lock:
         for key, (owner, _, replies) in list(state_waiters.items()):
             if owner is source:
@@ -331,12 +377,19 @@ def write_state_frame(source, frame, deadline):
         os.set_blocking(fd, blocking)
 
 
-def state_rpc(req):
+def state_rpc(req, expected_worker=None):
     """Export returns {state: ...}; import returns True. Correlation stays internal."""
     global worker, relay_token
     operation = req["method"]
-    frame = {"type": operation, "request_id": uuid.uuid4().hex,
-             "run_id": req.get("run_id"), "owner_id": req.get("owner_id")}
+    frame = {"type": operation, "request_id": uuid.uuid4().hex}
+    if operation == "checkpoint.release":
+        frame["boundary_id"] = req.get("boundary_id")
+    else:
+        frame.update({"run_id": req.get("run_id"), "owner_id": req.get("owner_id")})
+    if operation == "export_state":
+        for field in ("quiescent", "boundary_id", "hold"):
+            if field in req:
+                frame[field] = req[field]
     if operation == "import_state":
         if "state" not in req:
             raise RuntimeError("Missing worker state.")
@@ -347,7 +400,7 @@ def state_rpc(req):
     deadline = time.monotonic() + STATE_TIMEOUT
     try:
         with worker_lock:
-            if not worker or worker.poll() is not None:
+            if not worker or worker.poll() is not None or (expected_worker is not None and worker is not expected_worker):
                 raise RuntimeError("The worker is not running.")
             with state_lock:
                 if state_waiters:
@@ -384,6 +437,7 @@ def state_rpc(req):
 
 
 def drain(stream, source=None):
+    global held_boundary
     try:
         for line in stream:
             try:
@@ -393,7 +447,16 @@ def drain(stream, source=None):
             if not isinstance(event, dict):
                 continue
             kind = event.get("type")
-            if isinstance(kind, str) and kind.startswith("state."):
+            if kind == "checkpoint.ready":
+                with worker_lock:
+                    boundary = event.get("boundary_id")
+                    if source is worker and source is not None and isinstance(boundary, str) and re.fullmatch(r"[0-9]{1,20}", boundary):
+                        if held_boundary is None:
+                            token = uuid.uuid4().hex
+                            held_boundary = (source, token, boundary)
+                            emit({"checkpoint": {"boundary_id": token}})
+                continue
+            if isinstance(kind, str) and (kind.startswith("state.") or kind.startswith("checkpoint.")):
                 # Filter BEFORE ordinary event handling, even without a waiter or
                 # worker identity. Late, unsolicited and stale state never leaks.
                 with worker_lock, state_lock:
@@ -401,7 +464,8 @@ def drain(stream, source=None):
                     pending = state_waiters.get(key) if isinstance(key, str) else None
                     if source is not None and source is worker and pending and pending[0] is source:
                         _, operation, replies = pending
-                        expected = "state.exported" if operation == "export_state" else "state.imported"
+                        expected = {"export_state": "state.exported", "import_state": "state.imported",
+                                    "checkpoint.release": "checkpoint.released"}[operation]
                         if kind == expected or (kind == "state.error" and event.get("operation") == operation):
                             with contextlib.suppress(queue.Full):
                                 replies.put_nowait(event)
@@ -412,6 +476,34 @@ def drain(stream, source=None):
     finally:
         with worker_lock:
             fail_state_waiters(source)
+
+
+def checkpoint_rpc(req):
+    """Capture while held; release is separate so the API can persist before resuming."""
+    global held_boundary
+    if not capture_lock.acquire(blocking=False):
+        raise RuntimeError("A checkpoint operation is already pending.")
+    try:
+        with worker_lock:
+            held = held_boundary
+            if not held or held[0] is not worker or held[1] != req.get("boundary_id") or worker.poll() is not None:
+                raise RuntimeError("The checkpoint boundary is no longer available.")
+        if req["method"] == "checkpoint.release":
+            # Retire before writing: the runner can reach its next boundary as
+            # soon as release is read, even before this RPC's acknowledgement.
+            with worker_lock:
+                held_boundary = None
+            return state_rpc({"method": "checkpoint.release", "boundary_id": held[2]}, expected_worker=held[0])
+        state = state_rpc({"method": "export_state", "run_id": req.get("run_id"),
+                           "owner_id": req.get("owner_id"), "boundary_id": held[2]}, expected_worker=held[0])
+        state_digest = hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        tree = checkpoint_tree(req, state_digest)
+        with worker_lock:
+            if held_boundary != held or worker is not held[0] or worker.poll() is not None:
+                raise RuntimeError("The checkpoint boundary is no longer available.")
+        return {**tree, **state, "boundary_id": held[1]}
+    finally:
+        capture_lock.release()
 
 
 def worker_env(req):
@@ -456,10 +548,12 @@ def dispatch(req):
         return True
     if method in ("export_state", "import_state"):
         return state_rpc(req)
+    if method in ("checkpoint", "checkpoint.release"):
+        return checkpoint_rpc(req)
     if method == "send":
         value = req["input"]
         kind = value.get("type") if isinstance(value, dict) else None
-        if not isinstance(kind, str) or kind in ("export_state", "import_state") or kind.startswith("state."):
+        if not isinstance(kind, str) or kind in ("export_state", "import_state") or kind.startswith(("state.", "checkpoint.")):
             raise RuntimeError("Invalid worker input; state controls require a dedicated request.")
         with worker_lock:
             if not worker or worker.poll() is not None:
@@ -484,20 +578,31 @@ def dispatch(req):
     if method == "workspace_state":
         return workspace_state()
     if method == "checkpoint_tree":
-        return checkpoint_tree(req)
+        with worker_lock:
+            if worker and worker.poll() is None:
+                raise RuntimeError("Running workers require a held checkpoint capture.")
+            return checkpoint_tree(req)
     if method == "restore_checkpoint":
         return restore_checkpoint(req)
     if method == "snapshot":
-        command(["git", "-c", "core.hooksPath=/dev/null", "add", "--all"])
-        if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode:
-            identity = req.get("identity", {})
-            if any(not isinstance(identity.get(key), str) or not identity[key].strip() or any(c in identity[key] for c in "\r\n\0<>") for key in ("name", "email")):
-                raise RuntimeError("A connected GitHub commit identity is required.")
-            env = dict(os.environ)
-            env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER") for key, field in (("NAME", "name"), ("EMAIL", "email"))})
-            command(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", req.get("title", "Changes")], env=env)
-        command(["git", "bundle", "create", "/tmp/work.bundle", "HEAD"])
-        return {"bundle": base64.b64encode(pathlib.Path("/tmp/work.bundle").read_bytes()).decode(), "head": command(["git", "rev-parse", "HEAD"]).decode().strip()}
+        if not capture_lock.acquire(blocking=False):
+            raise RuntimeError("A checkpoint operation is already pending.")
+        try:
+            with worker_lock:
+                if held_boundary:
+                    raise RuntimeError("The worker is held for a checkpoint.")
+            command(["git", "-c", "core.hooksPath=/dev/null", "add", "--all"])
+            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode:
+                identity = req.get("identity", {})
+                if any(not isinstance(identity.get(key), str) or not identity[key].strip() or any(c in identity[key] for c in "\r\n\0<>") for key in ("name", "email")):
+                    raise RuntimeError("A connected GitHub commit identity is required.")
+                env = dict(os.environ)
+                env.update({f"GIT_{role}_{key}": identity[field] for role in ("AUTHOR", "COMMITTER") for key, field in (("NAME", "name"), ("EMAIL", "email"))})
+                command(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", req.get("title", "Changes")], env=env)
+            command(["git", "bundle", "create", "/tmp/work.bundle", "HEAD"])
+            return {"bundle": base64.b64encode(pathlib.Path("/tmp/work.bundle").read_bytes()).decode(), "head": command(["git", "rev-parse", "HEAD"]).decode().strip()}
+        finally:
+            capture_lock.release()
     if method == "diff":
         return command(["git", "--no-pager", "diff", "--no-ext-diff", req["base"], "--"]).decode(errors="replace")[:2000000]
     raise RuntimeError("Unknown workspace method.")

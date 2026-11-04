@@ -22,7 +22,7 @@ export function releasable(candidate: ReleaseCandidate, now: number): boolean {
   return candidate.delayMs > 0 && candidate.live && !candidate.busy && !candidate.closing && !candidate.booting &&
     !candidate.publicationPending && candidate.idleSince !== undefined && now - candidate.idleSince >= candidate.delayMs &&
     run.status === "ready" && ["agent", "idle"].includes(run.phase) && !run.pending.length && !run.summary.question &&
-    !run.ci_active && !run.ci_publication_pending && !run.auto_resume_pending && run.pr_state !== "merged" &&
+    !run.ci_active && !run.ci_publication_pending && !run.auto_resume_pending &&
     !run.work_kept && !run.kept_commit && run.pushed && !!run.head_sha && state?.clean === true && state.head === run.head_sha;
 }
 

@@ -125,6 +125,7 @@ function queuedIds() {
 function countRuns() { return (db.prepare("SELECT count(*) AS n FROM runs").get() as { n: number }).n; }
 
 beforeEach(async () => {
+  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   vi.clearAllMocks();
   vi.mocked(checkout).mockReset().mockResolvedValue({ cwd: "/fake", archive: Buffer.from("repo") });
   dir = mkdtempSync(join(tmpdir(), "gond-run-queue-"));
@@ -249,11 +250,22 @@ describe("persistent workspace queue", () => {
     expect(checkout).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves work after a worker exits, then drains after explicit close without retrying ahead of waiting work", async () => {
+  it("drains after worker loss without retrying ahead of waiting work", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const active = await create(), waiting = await create("b");
-    // The container can still contain uncommitted work even if its worker exited.
     workspaces.get(active.id)!.exit();
+    await flush();
+    // Worker-loss cleanup is independent of capacity reclamation. Checkpoint
+    // restoration is covered by checkpoint-recovery.test.ts; this worker has none.
+    expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: false });
+    expect(releases).toEqual([active.id]);
+    expect(starts).toEqual([active.id, waiting.id]);
+  });
+
+  it("preserves unpublished work after model failure until explicit close", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const active = await create(), waiting = await create("b");
+    workspaces.get(active.id)!.emit({ type: "error", agent_id: "main", message: "Fixture model failure" });
     await flush();
     expect(runs.get(active.id)).toMatchObject({ status: "failed", work_kept: true });
     expect(releases).toEqual([]);
@@ -431,17 +443,49 @@ describe("persistent workspace queue", () => {
     expect(workspaces.get(oldest.id)!.users()).toEqual(["Reopen released branch"]);
   });
 
-  it.each(["dirty", "different head", "question", "CI watch", "pending message", "auto resume", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
+  it.each(["open", "merged"] as const)("automatically starts tiny queued work when every slot is idle, with the oldest PR %s", async oldestState => {
+    cfg.maxRuns = 2;
+    const oldest = await create(); await finish(oldest.id);
+    vi.setSystemTime(Date.now() + 1000);
+    const newer = await create(); await finish(newer.id);
+    for (const [id, state] of [[oldest.id, oldestState], [newer.id, oldestState === "open" ? "merged" : "open"]] as const) {
+      const run = runs.get(id);
+      run.pr_number = id === oldest.id ? 1 : 2;
+      run.pr_state = state;
+      runs.save(run);
+      expect(run).toMatchObject({ status: "ready", pushed: true });
+    }
+    const reclaim = vi.spyOn(runs, "close");
+    const waiting = await create("b", "Say OK");
+    expect(runs.get(waiting.id)).toMatchObject({ status: "queued", capacity: { occupied: 2, working: 0 } });
+
+    // Only the service safety-net timer runs: no manual close, drain or polling.
+    await vi.advanceTimersByTimeAsync(120_000); await flush();
+    expect(releases).toEqual([oldest.id]);
+    expect(reclaim).toHaveBeenCalledWith(oldest.id, true);
+    expect(starts).toEqual([oldest.id, newer.id, waiting.id]);
+    expect(workspaces.get(waiting.id)!.users()).toEqual(["Say OK"]);
+    expect(runs.get(waiting.id).status).toBe("working");
+    expect(queuedIds()).toEqual([]);
+    expect(workspaces.get(oldest.id)!.calls.filter(c => c.method === "snapshot")).toHaveLength(2);
+    expect(runs.history(oldest.id, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
+  });
+
+  it.each(["dirty", "different head", "question", "waiting for input", "CI watch", "pending message", "auto resume", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
     const active = await create(); await finish(active.id);
     if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;
     else if (unsafe === "different head") workspaces.get(active.id)!.state.head = "c".repeat(40);
     else {
       const r = runs.get(active.id);
       if (unsafe === "question") r.summary.question = { request_id: "q", question: "Which?" };
+      if (unsafe === "waiting for input") {
+        r.status = "working";
+        r.summary.question = { request_id: "q", question: "Which?" };
+      }
       if (unsafe === "CI watch") r.ci_active = true;
       if (unsafe === "pending message") r.pending.push({ text: "Pending", images: [] });
       if (unsafe === "auto resume") r.phase = "auto_resume_pending";
-      if (unsafe === "merged pending") r.pr_state = "merged";
+      if (unsafe === "merged pending") { r.pr_state = "merged"; r.phase = "merged_pending"; }
       runs.save(r);
     }
     const waiting = await create("b");

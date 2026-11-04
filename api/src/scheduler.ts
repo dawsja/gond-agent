@@ -170,6 +170,7 @@ export class Scheduler {
           .prepare("UPDATE runners SET data=? WHERE id=?")
           .run(JSON.stringify(r), raw.id);
       }
+      this.runs.checkpoints?.cleanup(); // Unlink files before FK retention cascades remove metadata.
       this.db
         .prepare(
           "DELETE FROM runs WHERE deleted_at IS NOT NULL AND deleted_at<?",

@@ -4,10 +4,11 @@ import { ChevronRight, ExternalLink, GitMerge, GitPullRequest, GitPullRequestClo
 import { useEffect, useState } from "react"
 import { useNavigate, useParams } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
+import { Button } from "@shared/ui/button"
 import { FollowUpInput } from "@/components/workspace/task-input"
 import { QueueReason } from "./queue-reason"
 import { queueLabel, runElapsed } from "@/lib/format"
-import { useCloseRun, useDeleteRun, useMe, useModelCatalog, useRun, useSendMessage, useStopRun } from "@/lib/queries"
+import { useCloseRun, useDeleteRun, useMe, useModelCatalog, useResumeRun, useRun, useSendMessage, useStopRun } from "@/lib/queries"
 import { PlanIndicator } from "../settings/chatgpt-plan"
 import { useRunStream } from "@/lib/run-stream"
 import { devOpen } from "@/lib/dev-open"
@@ -33,6 +34,7 @@ export function RunScreen() {
   const { data: catalog } = useModelCatalog(), models = catalog?.models
   const stream = useRunStream(id)
   const stop = useStopRun()
+  const resume = useResumeRun()
   const close = useCloseRun()
   const del = useDeleteRun()
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -72,6 +74,7 @@ export function RunScreen() {
   const live = r.status === "working" || r.status === "queued"
   const merged = r.status === "merged" || r.pr_state === "merged"
   const retired = !!r.retired_backend
+  const interrupted = r.status === "interrupted"
   const PullIcon = merged ? GitMerge : r.pr_state === "closed" ? GitPullRequestClosed : GitPullRequest
   const author = r.user_id === me?.user?.id ? (me?.user?.name ?? "You") : (r.user_name ?? "Teammate")
   const modelName = models?.find((m) => m.id === r.model_id)?.display_name
@@ -199,20 +202,29 @@ export function RunScreen() {
         <ScrollToBottomButton shown={shown} onClick={scrollToBottom} />
         <div ref={composer} data-run-composer {...attach.handlers} className="relative mx-auto w-full max-w-[720px] px-8 pt-2 pb-5 max-md:px-3 max-md:pb-3">
           {r.status === "queued" && <div role="status" className="mb-3 px-1 text-[13px] text-muted-foreground"><p>{queueLabel(r)}</p><QueueReason run={r} /></div>}
+          {interrupted && !merged && !retired && (
+            <div className="mb-3 flex flex-wrap items-center gap-2 px-1">
+              <p role="status" className="min-w-0 flex-1 text-[13px] text-muted-foreground">Interrupted. Resume to continue from saved progress.</p>
+              <Button variant="outline" size="sm" disabled={stop.isPending || resume.isPending} onClick={() => stop.mutate({ id: r.id, arg: undefined })}>Stop</Button>
+              <Button size="sm" disabled={resume.isPending || stop.isPending} onClick={() => resume.mutate({ id: r.id, arg: undefined })}>{resume.isPending ? "Resuming…" : "Resume"}</Button>
+            </div>
+          )}
           <DropHint show={attach.dragging} />
           <input {...attach.inputProps} />
           <ImageTray items={attach.items} onRemove={attach.remove} className="mb-2" />
           <FollowUpInput
-            disabled={merged || retired || send.isPending || attach.busy}
+            disabled={merged || retired || interrupted || send.isPending || attach.busy}
             attached={attach.items.length}
             value={draft}
             onValueChange={setDraft}
-            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={merged || retired} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto") ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={merged || retired} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={merged || retired} /></div></>}
+            leading={<><AttachButton onClick={attach.pick} count={attach.items.length} disabled={merged || retired || interrupted} /><div className="flex min-w-0 flex-1 items-center gap-2"><ModelPicker models={models?.filter(m => m.id !== "auto") ?? []} value={pickedModel || r.model_id} label="Follow-up model" disabled={merged || retired || interrupted} onChange={value => { setPickedModel(value); setEffort("default") }} /><EffortPicker model={models?.find(m => m.id === (pickedModel || r.model_id))} value={effort ?? r.effort ?? "default"} onChange={setEffort} disabled={merged || retired || interrupted} /></div></>}
             placeholder={
               retired
                 ? "Claude Code and Codex agents were removed. Start a new run to continue."
                 : merged
                 ? "This pull request is merged"
+                : interrupted
+                  ? "Resume this run to continue"
                 : r.status === "stopped" && !r.error
                   ? "Tell the agent what to do instead"
                   : r.status === "failed" && r.live?.phase === "agent"
@@ -232,8 +244,8 @@ export function RunScreen() {
             }}
           />
           {!retired && <PlanIndicator model={models?.find(m => m.id === (pickedModel || r.model_id))} connections={catalog?.connections} />}
-          {(attach.error ?? send.error ?? close.error) && (
-            <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message ?? close.error?.message}</p>
+          {(attach.error ?? send.error ?? resume.error ?? stop.error ?? close.error) && (
+            <p className="mt-2 px-1 text-[12px] text-failed">{attach.error ?? send.error?.message ?? resume.error?.message ?? stop.error?.message ?? close.error?.message}</p>
           )}
         </div>
       </section>

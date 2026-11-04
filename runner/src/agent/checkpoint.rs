@@ -12,7 +12,8 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const SCHEMA_VERSION: u32 = 1;
 // Deliberate compatibility epoch, NOT Cargo's package version. Bump for changes to
 // history semantics, tool replay, compaction or counter interpretation.
-pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-1";
+// Epoch 2: sub_counter also records consumed bounded-delegation allowance.
+pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-2";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -176,6 +177,7 @@ mod tests {
         let cases = [
             ("/schema_version", json!(2)),
             ("/runner_state_version", json!("future")),
+            ("/runner_state_version", json!("gond-agent-checkpoint-1")),
             ("/run_id", json!("other")),
             ("/owner_id", json!("other")),
             ("/history/0/role", json!("system")),

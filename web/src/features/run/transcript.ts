@@ -1,5 +1,7 @@
 // Turns a run's event stream (protocol/README.md §2–3) into what the run screen draws.
 import type { RunStatus } from "../../lib/api"
+import { isRunStatus } from "../../../../shared/run-state"
+import { RUN_UI } from "../../lib/run-state"
 import { EDIT_TOOLS, EXPLORE_TOOLS, presentTool } from "./tool-presentation"
 
 // Event fields depend on their type; see protocol/README.md.
@@ -45,6 +47,7 @@ export type Item =
       images: { id: string; media_type: string }[]
     }
   | { kind: "text"; key: string; text: string }
+  | { kind: "run-message"; key: string; text: string }
   | { kind: "ci"; key: string; text: string }
   | { kind: "ci-status"; key: string; state: CiState; round: number; sha: string; failing: string[]; reason?: string }
   | { kind: "explore"; key: string; tools: ToolCall[] }
@@ -228,11 +231,21 @@ export function createTranscript() {
         case "run.dequeued":
           queueRevision++
           break
+        case "run.resumed":
+        case "run.checkpoint_fallback": {
+          const text = ev.type === "run.resumed"
+            ? "Run resumed from saved progress."
+            : "Saved progress could not be restored. Continuing from the last pushed branch."
+          items.push({ kind: "run-message", key: `rm${ev.seq}`, text })
+          log.push({ ts: ev.ts, source: "runner", text })
+          break
+        }
         case "run.status":
+          if (!isRunStatus(ev.status)) break
           status = ev.status
           step = ev.step ?? null
           if (ev.step) log.push({ ts: ev.ts, source: "runner", text: ev.step })
-          if (ev.status === "failed" || ev.status === "stopped" || ev.status === "merged") {
+          if (RUN_UI[ev.status].endText) {
             items.push({ kind: "end", key: `e${ev.seq}`, status: ev.status, error: ev.error, ts: ev.ts })
             log.push({ ts: ev.ts, source: "runner", text: ev.status === "failed" ? `failed: ${ev.error ?? ""}` : ev.status })
           } else if (ev.status === "ready") {

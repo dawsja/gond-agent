@@ -25,7 +25,7 @@ function safe(): ReleaseCandidate {
 }
 
 describe("idle release safety table (shared by reporting and eviction)", () => {
-  it.each(["queued", "working", "ready", "failed", "stopped", "merged", "interrupted", "auto_resume_pending", "merged_pending"])("status %s", status => {
+  it.each(["queued", "working", "ready", "failed", "stopped", "merged", "interrupted"] as const)("status %s", status => {
     const candidate = safe(); candidate.run.status = status;
     expect(releasable(candidate, now)).toBe(status === "ready");
   });
@@ -41,7 +41,6 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
     ["different worker head", c => { c.state!.head = "b".repeat(40); }],
     ["dirty worktree", c => { c.state!.clean = false; }],
     ["unknown worker evidence", c => { c.state = undefined; }],
-    ["merged PR", c => { c.run.pr_state = "merged"; }],
     ["auto resume pending", c => { c.run.auto_resume_pending = true; }],
     ["finishing", c => { c.run.phase = "finishing"; }],
     ["booting phase", c => { c.run.phase = "booting"; }],
@@ -58,6 +57,15 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
   ];
   it.each(unsafe)("never releases %s", (_name, change) => {
     const candidate = safe(); change(candidate);
+    expect(releasable(candidate, now)).toBe(false);
+  });
+  it.each(["open", "merged"] as const)("allows a safely published ready workspace with a %s PR", state => {
+    const candidate = safe(); candidate.run.pr_state = state;
+    expect(releasable(candidate, now)).toBe(true);
+    candidate.run.phase = "merged_pending";
+    expect(releasable(candidate, now)).toBe(false);
+    candidate.run.summary.question = { request_id: "q", question: "Which?" };
+    candidate.run.phase = "agent";
     expect(releasable(candidate, now)).toBe(false);
   });
   it("admits exactly at the idle boundary, including idle phase", () => {
