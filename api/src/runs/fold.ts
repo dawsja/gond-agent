@@ -1,7 +1,7 @@
 // Folds the agent event stream (protocol/README.md) into the summary a run row shows, and merges
 // streaming deltas so the stored transcript has one row per burst instead of one per token.
 
-export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "stopped";
+export type { RunStatus } from "../../../shared/run-state";
 
 export type Ev = { type: string; [k: string]: any };
 

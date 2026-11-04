@@ -2,14 +2,7 @@ import type { ReactNode } from "react"
 import { cn } from "@/lib/utils"
 
 // Shared scheme-aware surface, typography and lifecycle tokens.
-export const STATUS = {
-  queued: "var(--status-stopped)",
-  working: "var(--status-working)",
-  ready: "var(--status-ready)",
-  merged: "var(--status-merged)",
-  failed: "var(--status-failed)",
-  stopped: "var(--status-stopped)",
-} as const
+export { STATUS } from "@/lib/run-state"
 
 /** Tint any CSS color: `tint(STATUS.ready, 14)` → 14% of the hue over transparent. */
 export const tint = (color: string, pct: number) => `color-mix(in srgb, ${color} ${pct}%, transparent)`

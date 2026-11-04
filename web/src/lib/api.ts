@@ -1,11 +1,11 @@
 import type { Theme } from "../../../shared/theme-preference"
+import type { RunStatus } from "../../../shared/run-state"
 // Typed client for the self-hosted server. Everything goes through the same origin: `/api/*` and
 // `/ws/*` (under the app's base path) are forwarded to the API (Vite proxy locally, a service binding
 // when deployed).
 import type { Accent } from "../../../shared/accents"
 
-
-export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "stopped"
+export type { RunStatus } from "../../../shared/run-state"
 
 export interface Run {
   id: string
