@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Container control + loopback model relay. Only Docker's attached stdio reaches the host."""
 import base64
+import hmac
 import http.server
 import io
 import json
 import os
 import pathlib
 import queue
+import secrets
 import select
 import socket
 import time
@@ -21,6 +23,7 @@ import uuid
 ROOT = "/workspace/repo"
 MAX_FRAME = 256 * 1024 * 1024
 worker = None
+relay_token = None
 events = []
 event_lock = threading.Lock()
 worker_lock = threading.Lock()
@@ -56,14 +59,16 @@ def drain(stream, source=None):
 
 def worker_env(req):
     """The built-in runner reaches models only through the loopback relay; no model credentials exist here."""
-    return {**os.environ, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
+    if not relay_token:
+        raise RuntimeError("The model relay is not ready.")
+    return {**os.environ, "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_API_URL": "http://127.0.0.1:8787", "GOND_AGENT_MODEL": req["model"], "GOND_AGENT_EFFORT": req.get("effort", "high"), "GOND_AGENT_HOME": "/tmp/gond-agent", "GOND_AGENT_INITIAL_PLAN": json.dumps(req.get("plan", [])),
             "GOND_AGENT_QUESTION_WAIT_MINUTES": str(req.get("question_wait_minutes", 240)),
             "GOND_AGENT_INTERACTIVE": "true" if req.get("interactive") is True else "false",
             "GOND_AGENT_PLAN_REMINDER_EVERY": str(req.get("plan_reminder_every", 6)), "GOND_AGENT_PLAN_NUDGE_LIMIT": str(req.get("plan_nudge_limit", 2))}
 
 
 def dispatch(req):
-    global worker
+    global worker, relay_token
     method = req["method"]
     if method == "ping":
         return {"ready": True}
@@ -78,10 +83,16 @@ def dispatch(req):
         with worker_lock:
             if worker and worker.poll() is None:
                 raise RuntimeError("The worker is already running.")
-            pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
-            with open("/tmp/worker.log", "ab") as log:
-                worker = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            relay_token = secrets.token_urlsafe(32)
+            try:
+                pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                with open("/tmp/worker.log", "ab") as log:
+                    worker = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            except Exception:
+                # No worker owns this credential if startup fails. Keep the relay closed.
+                relay_token = None
+                raise
             threading.Thread(target=drain, args=(worker.stdout, worker), daemon=True).start()
         return True
     if method == "send":
@@ -132,6 +143,29 @@ def handle(req):
 
 
 class ModelProxy(http.server.BaseHTTPRequestHandler):
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        # Check every method/path before routing, including unsupported endpoints.
+        authorization = self.headers.get_all("Authorization", [])
+        if not relay_token or len(authorization) != 1 or not hmac.compare_digest(
+                authorization[0].encode("utf-8"), ("Bearer " + relay_token).encode("utf-8")):
+            self.send_error(401, "Unauthorized")
+            return False
+        if self.headers.get_all("Origin") is not None or self.headers.get_all("Host", []) not in (
+                ["127.0.0.1:8787"], ["localhost:8787"]):
+            self.send_error(403)
+            return False
+        if self.command == "POST":
+            content_types = self.headers.get_all("Content-Type", [])
+            if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
+                self.send_error(415)
+                return False
+        if self.command not in ("GET", "POST"):
+            self.send_error(403)
+            return False
+        return True
+
     def relay(self):
         if (self.command, self.path) not in [("GET", "/v1/models"), ("POST", "/v1/responses"), ("POST", "/v1/search")]:
             self.send_error(403)

@@ -11,6 +11,8 @@ mod prompt;
 mod skills;
 mod tools;
 mod transport;
+#[cfg(test)]
+mod relay_security_tests;
 
 use anyhow::{Context, Result};
 use agent::AgentConfig;
@@ -20,7 +22,8 @@ use permissions::Mode;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cwd = std::env::current_dir().context("no working directory")?;
-    let api = ApiClient::new(std::env::var("GOND_AGENT_API_URL").context("GOND_AGENT_API_URL is required")?, None);
+    let token = std::env::var(config::RELAY_TOKEN_ENV).ok().filter(|t| !t.is_empty()).context("Local relay authentication is required")?;
+    let api = ApiClient::new(std::env::var("GOND_AGENT_API_URL").context("GOND_AGENT_API_URL is required")?, Some(token));
     let model = std::env::var("GOND_AGENT_MODEL").unwrap_or_else(|_| "auto".into());
     let catalog: serde_json::Value = api.get("/v1/models").await?;
     let context_window = catalog["models"].as_array().and_then(|ms| ms.iter().find(|m| m["id"] == model)).and_then(|m| m["context_window"].as_u64()).unwrap_or(200_000);
@@ -29,7 +32,7 @@ async fn main() -> Result<()> {
     let mut tools = tools::builtin(); tools.extend(extra_tools);
     let search_available = catalog["web_search"].as_bool() == Some(true);
     if catalog["web_search"].as_bool() == Some(true) {
-        tools.push(tools::bounded(std::sync::Arc::new(tools::web_search::WebSearch { relay: std::env::var("GOND_AGENT_API_URL")? })));
+        tools.push(tools::bounded(std::sync::Arc::new(tools::web_search::WebSearch { api: api.clone() })));
     } else {
         eprintln!("web_search is unavailable: configure a provider in Settings > Web search. No fallback is used.");
     }

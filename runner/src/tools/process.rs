@@ -7,7 +7,7 @@ use tokio::process::Command;
 use super::ToolCtx;
 
 pub async fn capture(ctx: &ToolCtx, mut command: Command, input: Vec<u8>, max: usize, timeout: u64) -> Result<Vec<u8>, String> {
-    command.current_dir(&ctx.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    command.env_remove(crate::config::RELAY_TOKEN_ENV).current_dir(&ctx.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| "Could not start workspace tooling. Rebuild the worker image with its required dependencies.".to_owned())?;
