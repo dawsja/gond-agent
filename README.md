@@ -6,13 +6,20 @@ Self-hosted coding agents that turn repository tasks into pull requests. Every a
 
 Images shared in replies appear as captioned cards on the run page, with click or
 keyboard enlargement. Use `share_image {path, caption?}` for screenshots or other
-raster files in the workspace or `/tmp`; local Markdown paths cannot be served
+raster files anywhere under the workspace or `/tmp`, including browser screenshots
+and other tool outputs. Any readable regular raster image in those locations can
+be shared; non-images and SVG are rejected. Local Markdown paths cannot be served
 and now show “image not available (local path)”. Remote Markdown images remain
 links, never automatic requests. Shared images survive workspace release and
 follow the run's owner-only access and retention rules. Limits: four sharing
 attempts per execution turn, 32 saved images / 16 MiB per run; 20 MiB input,
 1568px longest side and 1 MiB normalized JPEG/PNG output per image. No new
-network access or dependencies are needed.
+network access or dependencies are needed. Both worker and service strip caption
+control/format characters (including bidi controls and ZWJ/ZWNJ), tags and variation
+selectors, with a 1000-character input cap. The service checks PNG/JPEG signatures
+against the declared type; image responses use `private, no-store`, `nosniff` and a
+`sandbox` CSP. Submission is not confirmation: the service may decline at a cap,
+in which case the person sees “Image sharing limit reached” and the image is not saved.
 
 ## Connect an external agent with MCP
 

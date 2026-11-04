@@ -505,8 +505,17 @@ describe("local authentication and persistence", () => {
     expect((await call(`/api/v1/runs/wrong-run/images/${event.image_id}`, undefined, owner)).status).toBe(404);
     const served = await call(path, undefined, owner);
     expect(served.status).toBe(200);
+    expect(served.headers.get("content-type")).toBe("image/png");
     expect(served.headers.get("cache-control")).toBe("private, no-store");
+    expect(served.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(served.headers.get("content-security-policy")).toBe("sandbox");
     expect(Buffer.from(await served.arrayBuffer())).toEqual(bytes);
+    const toolEvent = runs.append("share-run", { type: "tool.images", agent_id: "main", call_id: "browser1", images: [{ media_type: "image/png", data: bytes.toString("base64") }] }) as any;
+    const toolImage = await call(`/api/v1/runs/share-run/images/${toolEvent.images[0].id}`, undefined, owner);
+    expect(toolImage.headers.get("cache-control")).toBe("private, no-store");
+    expect(toolImage.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(toolImage.headers.get("content-security-policy")).toBe("sandbox");
+    expect(Buffer.from(await toolImage.arrayBuffer())).toEqual(bytes);
     // Attached images do not meet orphan-upload cleanup's run_id IS NULL rule.
     db.prepare("DELETE FROM images WHERE run_id IS NULL AND created_at<?").run(Date.now() + 1000);
     expect((await call(path, undefined, owner)).status).toBe(200);

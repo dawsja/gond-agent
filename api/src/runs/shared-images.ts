@@ -15,6 +15,9 @@ export function storeSharedImage(db: Store, runId: string, ownerId: string, inpu
       (input.caption !== undefined && (typeof input.caption !== "string" || [...input.caption].length > 1000))) return;
   const bytes = Buffer.from(image.data, "base64");
   if (!bytes.length || bytes.length > MAX_IMAGE_BYTES || bytes.toString("base64") !== image.data) return;
+  // The worker is not a MIME authority. Reject mismatches before quota admission.
+  const signature = Buffer.from(image.media_type === "image/png" ? "89504e470d0a1a0a" : "ffd8ff", "hex");
+  if (!bytes.subarray(0, signature.length).equals(signature)) return;
   const usage = db.prepare(`SELECT count(*) AS count, coalesce(sum(length(i.bytes)),0) AS bytes,
     coalesce(sum(e.seq > coalesce((SELECT max(seq) FROM events WHERE run_id=? AND json_extract(data,'$.type')='turn.start' AND json_extract(data,'$.agent_id')='main'),0)),0) AS turn
     FROM events e JOIN images i ON i.id=json_extract(e.data,'$.image_id') AND i.run_id=e.run_id
@@ -26,5 +29,6 @@ export function storeSharedImage(db: Store, runId: string, ownerId: string, inpu
   db.prepare("INSERT INTO images(id,user_id,run_id,media_type,bytes,created_at) VALUES(?,?,?,?,?,?)")
     .run(imageId, ownerId, runId, image.media_type, bytes, Date.now());
   return { type: "image.shared", agent_id: "main", image_id: imageId, media_type: image.media_type,
-    caption: typeof input.caption === "string" ? input.caption.replace(/[\u0000-\u001f\u007f]/g, "") : "" };
+    // Match the runner/LSP policy, including removal of ZWJ/ZWNJ and bidi controls.
+    caption: typeof input.caption === "string" ? input.caption.replace(/[\p{Cc}\p{Cf}\u{E0000}-\u{E007F}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu, "") : "" };
 }

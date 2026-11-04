@@ -229,31 +229,43 @@ The replacement starts with a fixed untrusted-text warning in a **user-role** me
 `share_image {path,caption?}` is a parent-only, bounded `Access::Read` tool.
 Paths are canonicalized within the workspace or `/tmp` only; descriptor-relative
 no-follow component opens prevent symlink swaps, and the opened descriptor must
-be a regular file. Metadata and bounded reads enforce 20 MiB before decoding.
-No devices, `/proc`, network fetches or SVG. The existing normalizer and its
+be a regular file. Any readable regular raster image under either location can be
+shared, including browser screenshots and other tool outputs. Metadata and bounded
+reads enforce 20 MiB before decoding. Non-images are rejected, as are devices,
+`/proc`, network fetches and SVG. The existing normalizer and its
 pixel/allocation/concurrency/deadline limits are unchanged. Captions accept at
-most 1000 Unicode characters. `MAX_PER_TURN=4` reserves attempts before async work
+most 1000 Unicode characters. Independently in the runner (before emitting) and
+service (before storing), strip control characters, Unicode Cf (including bidi
+overrides/isolates and ZWJ/ZWNJ), tags U+E0000–E007F, and variation selectors
+U+FE00–FE0F/U+E0100–E01EF. ZWJ/ZWNJ are not retained, matching the LSP sanitizer.
+`MAX_PER_TURN=4` reserves attempts before async work
 (failures count); each main execution turn resets the allowance. Subagents neither
 receive the tool nor pass its runtime guard.
 
 The worker emits `{type:"image.shared",agent_id:"main",call_id,image:{media_type,data},caption}`
 with normalized JPEG/PNG bytes. The API transactionally admits/stores the blob
-and transcript reference, replacing it with
+and transcript reference only after verifying a PNG/JPEG signature matching the
+declared media type (mismatches consume no quota), replacing it with
 `{type:"image.shared",agent_id:"main",image_id,media_type,caption,seq,ts}`.
 It enforces `MAX_SHARED_PER_TURN=4` accepted images since the latest main
 `turn.start` (queued user messages and child turns do not reset it),
 `MAX_SHARED_PER_RUN=32` and `MAX_SHARED_BYTES=16 MiB`, deriving usage from durable
 events and image rows so worker replacement, old checkpoints and fallback cannot
 replenish the run quota. Excess admissions produce the fixed
-`image.share_rejected` transcript notice; the asynchronous tool result says
-submitted, not guaranteed saved. Invalid inputs are dropped without inline bytes.
+`image.share_rejected` transcript notice. The asynchronous tool result explicitly
+says the service may still decline at a cap; the person then sees “Image sharing
+limit reached. This image was not saved.” Submission is not confirmation.
+Invalid inputs are dropped without inline bytes.
 These constants mirror `runner/src/tools/share_image.rs`.
 
 Shared images use the existing owner/run-scoped image table and authenticated
 GET `/api/v1/runs/:id/images/:image`; responses are `private, no-store` to avoid
-cross-session browser reuse. Retention/account deletion/run deletion is identical
+cross-session browser reuse, with `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox` (also for `tool.images`). Retention/account deletion/run deletion is identical
 to `tool.images`. React caches blobs for five inactive minutes; every mounted
-consumer owns/revokes its object URL. Captioned cards use caption alt text (fallback
+consumer owns/revokes its object URL. The shared React Query blob cache deduplicates
+image GETs across tool details, attachments, card enlargement and remounts during
+that lifetime; HTTP `no-store` does not disable this in-memory cache. Captioned cards use caption alt text (fallback
 “Shared image”), focus-visible keyboard enlargement and Escape/focus restoration.
 Old events keep their existing fold. Local Markdown image paths show a muted
 unavailable note; remote HTTP(S) images stay links, and existing inline data/blob

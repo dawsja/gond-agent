@@ -40,6 +40,12 @@ test('legacy text and tool images retain their existing shape', () => {
   assert.deepEqual(result.items[0].tools[0].images, [{ id: 'old', media_type: 'image/jpeg' }])
   assert.equal(result.items[1].text, 'Legacy reply')
 })
+test('a service cap rejection tells the person the image was not saved', () => {
+  const result = createTranscript()([{ type: 'image.share_rejected', agent_id: 'main', seq: 1, ts: 1 }])
+  assert.deepEqual(result.items.map(({ kind, text }) => ({ kind, text })), [
+    { kind: 'run-message', text: 'Image sharing limit reached. This image was not saved.' },
+  ])
+})
 
 test('real Markdown rendering explains local paths and never requests remote images', () => {
   const { Prose } = load(new URL('../../shared/prose.tsx', import.meta.url))

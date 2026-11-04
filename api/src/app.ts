@@ -62,7 +62,8 @@ export function createApp(
   });
   app.use("*", async (c, next) => {
     await next();
-    c.header("Content-Security-Policy", "img-src 'self' data: blob:");
+    // Image responses supply a sandbox policy; do not overwrite it with the SPA policy.
+    if (!c.res.headers.has("Content-Security-Policy")) c.header("Content-Security-Policy", "img-src 'self' data: blob:");
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "same-origin");
     c.header("X-Frame-Options", "DENY");
@@ -525,6 +526,8 @@ export function createApp(
       headers: {
         "content-type": img.media_type,
         "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+        "content-security-policy": "sandbox",
       },
     });
   });

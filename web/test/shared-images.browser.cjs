@@ -46,3 +46,41 @@ for (const width of [1440, 390]) for (const theme of ['light', 'dark']) {
     } finally { await page.close(); }
   });
 }
+test('no-store tool images and reply cards reuse blobs through expansion, focus and transcript remount', async () => {
+  const page = await browser.newPage();
+  const requests = [], errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/api/v1/runs/fixture/images/*', async route => {
+    requests.push(route.request().url().split('/').pop());
+    await route.fulfill({ status: 200, headers: {
+      'content-type': 'image/png', 'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff', 'content-security-policy': 'sandbox',
+    }, body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6p8AAAAASUVORK5CYII=', 'base64') });
+  });
+  try {
+    await page.goto(`${origin}/agents/test/fixtures/shared-images.html?network=1`);
+    const card = page.getByRole('button', { name: 'Enlarge image: Desktop Home pagination — 10 runs per page' });
+    const tool = page.getByRole('button', { name: 'Browser checks finished' });
+    await expect(card).toBeVisible();
+    await expect(page.getByRole('img', { name: 'Attached image', exact: true })).toBeVisible();
+    for (let i = 0; i < 2; i++) {
+      await tool.click();
+      await expect(page.getByRole('img', { name: 'Wide browser screenshot' })).toBeVisible();
+      await tool.click();
+      await expect(page.getByRole('img', { name: 'Wide browser screenshot' })).not.toBeVisible();
+      await card.click();
+      await expect(page.getByRole('dialog').getByRole('img')).toBeVisible();
+      await page.keyboard.press('Escape');
+    }
+    await page.getByRole('button', { name: 'Toggle transcript' }).click();
+    await expect(card).toHaveCount(0);
+    await page.getByRole('button', { name: 'Toggle transcript' }).click();
+    await expect(card).toBeVisible();
+    await tool.click();
+    await expect(page.getByRole('img', { name: 'Wide browser screenshot' })).toBeVisible();
+    await page.evaluate(() => { window.dispatchEvent(new Event('blur')); window.dispatchEvent(new Event('focus')); });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.deepEqual(requests.sort(), ['img_fixture', 'img_tool'], 'one GET per image despite no-store');
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});

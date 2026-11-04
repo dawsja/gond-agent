@@ -2,6 +2,7 @@ import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import sharp from "sharp";
 import { openStore } from "../src/db";
 import { setSetting } from "../src/db";
 import { createAuthentication, seal } from "../src/auth";
@@ -1055,10 +1056,38 @@ describe("persistent local run lifecycle", () => {
     expect(row.bytes.toString()).toBe("jpeg fixture");
     expect(runs.history(r.id, 0).find((e) => e.type === "tool.images").images).toEqual(images);
   });
+  it("rejects forged image types without consuming quota and strips hostile captions independently of the worker", async () => {
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Share images" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const raster = sharp({ create: { width: 16, height: 16, channels: 3, background: "white" } });
+    const png = await raster.png().toBuffer(), jpeg = await raster.jpeg().toBuffer();
+    const share = (bytes: Buffer, media_type: string, caption = "Desktop") => runs.append(r.id, {
+      type: "image.shared", agent_id: "main", caption, image: { media_type, data: bytes.toString("base64") },
+    }) as any;
+    for (const [bytes, type] of [[png, "image/jpeg"], [jpeg, "image/png"], [Buffer.from("<html>not an image</html>"), "image/png"],
+      [Buffer.from("not an image"), "image/jpeg"], [png.subarray(0, 7), "image/png"], [jpeg.subarray(0, 2), "image/jpeg"]] as const) {
+      expect(share(bytes, type)).toBeUndefined();
+    }
+    expect(share(png, "image/png", "🖼".repeat(1001))).toBeUndefined();
+    expect(db.prepare("SELECT count(*) AS n FROM images WHERE run_id=?").get(r.id)).toEqual({ n: 0 });
+    expect(runs.history(r.id, 0).filter(e => e.type.startsWith("image."))).toEqual([]);
+    const controls = "\u0000\u001f\u007f\u0085\u00ad\u061c\u180e\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\u2066\u2067\u2068\u2069\ufeff\u{110bd}\u{1d173}";
+    const range = (start: number, end: number) => Array.from({ length: end - start + 1 }, (_, i) => String.fromCodePoint(start + i)).join("");
+    const hostile = `Desk${controls}${range(0xE0000, 0xE007F)}${range(0xFE00, 0xFE0F)}${range(0xE0100, 0xE01EF)}top 🖼 café`;
+    const event = share(png, "image/png", hostile);
+    expect(event).toMatchObject({ type: "image.shared", caption: "Desktop 🖼 café" });
+    expect(runs.history(r.id, 0).find(e => e.image_id === event.image_id)?.caption).toBe("Desktop 🖼 café");
+    expect(share(jpeg, "image/jpeg", "🖼".repeat(1000)).caption).toBe("🖼".repeat(1000));
+    expect(share(png, "image/png").type).toBe("image.shared");
+    expect(share(jpeg, "image/jpeg").type).toBe("image.shared");
+    expect(share(png, "image/png").type).toBe("image.share_rejected");
+    expect(db.prepare("SELECT count(*) AS n FROM images WHERE run_id=?").get(r.id)).toEqual({ n: 4 });
+  });
   it("bounds shared images durably across turns and worker/checkpoint replacement", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Share images" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
-    const data = Buffer.alloc(1024 * 1024, 1).toString("base64");
+    const jpeg = await sharp({ create: { width: 16, height: 16, channels: 3, background: "white" } }).jpeg().toBuffer();
+    const data = Buffer.concat([jpeg, Buffer.alloc(1024 * 1024 - jpeg.length)]).toString("base64");
     const share = (overrides = {}) => runs.append(r.id, { type: "image.shared", agent_id: "main", caption: "Desktop", image: { media_type: "image/jpeg", data }, ...overrides }) as any;
     expect(share({ agent_id: "child" })).toBeUndefined();
     expect(share({ image: { media_type: "image/svg+xml", data } })).toBeUndefined();
@@ -1071,7 +1100,7 @@ describe("persistent local run lifecycle", () => {
     }
     runs.append(r.id, { type: "turn.start", agent_id: "main" });
     expect(share().type).toBe("image.share_rejected"); // 16 MiB total
-    const small = Buffer.from("small").toString("base64");
+    const small = (await sharp({ create: { width: 16, height: 16, channels: 3, background: "white" } }).png().toBuffer()).toString("base64");
     expect(share({ image: { media_type: "image/png", data: small } }).type).toBe("image.share_rejected");
     expect(db.prepare("SELECT count(*) AS n FROM images WHERE run_id=?").get(r.id)).toEqual({ n: 16 });
     // A new service has no live worker or checkpoint counters to consult.
