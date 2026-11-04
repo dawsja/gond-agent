@@ -39,6 +39,9 @@ pub enum AgentEvent {
     TextDelta { agent_id: String, text: String },
     #[serde(rename = "reasoning.delta")]
     ReasoningDelta { agent_id: String, text: String },
+    /// Roll back a retried attempt's deltas; lengths are UTF-16 code units for host consumers.
+    #[serde(rename = "stream.reset")]
+    StreamReset { agent_id: String, text_length: usize, reasoning_length: usize },
     #[serde(rename = "tool.start")]
     ToolStart { agent_id: String, call_id: String, name: String, input: Value, title: String },
     #[serde(rename = "tool.output")]
@@ -144,6 +147,10 @@ mod tests {
     fn json_shapes_match_protocol() {
         let e = AgentEvent::ToolEnd { agent_id: "main".into(), call_id: "c".into(), ok: true, summary: "s".into(), output: "o".into(), diff: None };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"tool.end","agent_id":"main","call_id":"c","ok":true,"summary":"s","output":"o"}"#);
+        let reset = AgentEvent::StreamReset { agent_id: "main".into(), text_length: 3, reasoning_length: 0 };
+        let json = r#"{"type":"stream.reset","agent_id":"main","text_length":3,"reasoning_length":0}"#;
+        assert_eq!(serde_json::to_string(&reset).unwrap(), json);
+        assert_eq!(serde_json::from_str::<AgentEvent>(json).unwrap(), reset);
         let i: AgentInput = serde_json::from_str(r#"{"type":"permission.reply","request_id":"r1","decision":"always"}"#).unwrap();
         assert_eq!(i, AgentInput::PermissionReply { request_id: "r1".into(), decision: Decision::Always, message: None });
         let m: AgentInput = serde_json::from_str(r#"{"type":"mode","mode":"plan"}"#).unwrap();

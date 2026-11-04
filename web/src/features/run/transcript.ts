@@ -63,6 +63,8 @@ export interface Transcript {
   /** Unified diffs of the agent's own edits, oldest first (before the runner's commit diff exists). */
   editDiffs: string[]
   committed: number
+  /** Refresh live queue metadata even when a position update does not change status. */
+  queueRevision: number
 }
 
 const OUTPUT_CAP = 8_000
@@ -77,12 +79,13 @@ export function createTranscript() {
   let status: RunStatus | null = null
   let step: string | null = null
   let committed = 0
+  let queueRevision = 0
   let startedAt: number | null = null
   let lastSeq = 0
   const owners = new WeakMap<ToolCall | SubAgent, Item>()
   const snapshots = new WeakMap<Item, Item>()
   const dirty = new Set<Item>()
-  let snapshot: Transcript = { items: [], status, step, startedAt, log: [], editDiffs: [], committed }
+  let snapshot: Transcript = { items: [], status, step, startedAt, log: [], editDiffs: [], committed, queueRevision }
   const last = () => items[items.length - 1]
   const mark = (item: Item | undefined) => { if (item) dirty.add(item) }
 
@@ -110,6 +113,20 @@ export function createTranscript() {
           const l = last()
           if (l?.kind === "text") { mark(l); l.text += ev.text }
           else items.push({ kind: "text", key: `t${ev.seq}`, text: ev.text })
+          break
+        }
+        case "stream.reset": {
+          if (!main) break
+          let remaining = ev.text_length
+          // Queued follow-ups can insert user items in the middle of this attempt.
+          for (let i = items.length - 1; i >= 0 && remaining > 0; i--) {
+            const item = items[i]
+            if (item.kind !== "text") continue
+            const removed = Math.min(remaining, item.text.length)
+            remaining -= removed
+            if (removed === item.text.length) items.splice(i, 1)
+            else { mark(item); item.text = item.text.slice(0, -removed) }
+          }
           break
         }
         case "compacted":
@@ -189,6 +206,10 @@ export function createTranscript() {
           if (a) Object.assign(a, { status: ev.ok ? "done" : "failed", summary: ev.summary })
           break
         }
+        case "run.queued":
+        case "run.dequeued":
+          queueRevision++
+          break
         case "run.status":
           status = ev.status
           step = ev.step ?? null
@@ -231,7 +252,7 @@ export function createTranscript() {
         }
         return copy
       }),
-      status, step, startedAt, committed,
+      status, step, startedAt, committed, queueRevision,
       log: log.length === snapshot.log.length ? snapshot.log : log.slice(),
       editDiffs: editDiffs.length === snapshot.editDiffs.length ? snapshot.editDiffs : editDiffs.slice(),
     }

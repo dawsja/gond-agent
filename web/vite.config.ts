@@ -1,7 +1,20 @@
 import { resolve } from "node:path"
+import { readFileSync } from "node:fs"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
 import { defineConfig, type Plugin, searchForWorkspaceRoot } from "vite"
+import { themeInitScript } from "../shared/theme-preference.ts"
+
+// Generate first-paint colors from the source palettes, never a second hardcoded palette.
+function firstPaintScript() {
+  const css = readFileSync(new URL("./src/index.css", import.meta.url), "utf8")
+  const background = (selector: string) => {
+    const value = css.match(new RegExp(`(?:^|\\n)${selector} \\{[^}]*?--background:\\s*(#[\\da-f]{6});`, "i"))?.[1]
+    if (!value) throw new Error(`Missing ${selector} background for theme bootstrap`)
+    return value
+  }
+  return themeInitScript({ light: background(":root"), dark: background("\\.dark") })
+}
 
 // Dev only: /__frame?src=/path&w=390&h=844 renders the app in an iframe of exactly that size, so
 // shot.sh can capture phone layouts (headless Edge won't make a window narrower than ~484px).
@@ -23,7 +36,10 @@ const phoneFrame = (): Plugin => ({
 // https://vite.dev/config/
 export default defineConfig({
   base: "/agents/",
-  plugins: [react(), tailwindcss(), phoneFrame()],
+  plugins: [react(), tailwindcss(), phoneFrame(), {
+    name: "gond-agent-first-paint-theme",
+    transformIndexHtml: { order: "pre", handler: html => html.replace("<!--theme-init-->", `<script>${firstPaintScript()}</script>`) },
+  }],
   server: {
     fs: { allow: [searchForWorkspaceRoot(process.cwd()), resolve(import.meta.dirname, "../shared")] },
     port: 5180,

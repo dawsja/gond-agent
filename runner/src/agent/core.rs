@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 #[cfg(test)]
@@ -21,6 +21,7 @@ use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
 use super::events::{AgentEvent, AgentInput, Decision, ImageInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
+use crate::api::client::SUMMARY_REQUEST_LIMIT;
 use crate::permissions::{self, Access, Mode, Rule, Verdict};
 use crate::skills::{self, Skill};
 use crate::tools::{Baseline, ReadSet, Shells, Tool, ToolCtx, schema, str_arg};
@@ -242,7 +243,7 @@ const AUTO_COMPACT_PCT: u64 = 85;
 const MAX_COMPACTIONS: u32 = 5;
 const MAX_SUMMARY_REQUESTS: u32 = 16;
 const NOTHING_MORE_TO_COMPACT: &str = "Nothing more to compact without losing recent context. Choose a model with a larger context window.";
-const SUMMARY_REQUEST_LIMIT: &str = "Too much history to summarise in one pass. Choose a model with a larger context window.";
+
 
 #[derive(Debug)]
 struct NothingMoreToCompact;
@@ -356,17 +357,7 @@ fn overflow_response(response: &Streamed) -> bool {
 }
 
 fn context_overflow(e: &anyhow::Error) -> bool {
-    let Some(e) = e.downcast_ref::<ApiError>() else { return false; };
-    let code = e.code.to_ascii_lowercase();
-    let message = e.message.to_ascii_lowercase();
-    // Wording about token limits also occurs in TPM/quota and output-token errors.
-    // Stream errors have no HTTP status, so only explicit context codes qualify.
-    if e.status == Some(429) || code.contains("rate_limit") || code.contains("ratelimit") || code.contains("quota")
-        || ["max_tokens", "max_output_tokens", "max_completion_tokens"].iter().any(|part| code.contains(part) || message.contains(part)) {
-        return false;
-    }
-    matches!(code.as_str(), "context_exceeded" | "context_length_exceeded" | "model_context_window_exceeded" | "prompt_too_long" | "max_context_length_exceeded")
-        || (e.status == Some(400) && ["maximum context", "context length", "context window", "prompt is too long", "prompt length exceeds"].iter().any(|part| message.contains(part)))
+    e.downcast_ref::<ApiError>().is_some_and(ApiError::context_overflow)
 }
 
 async fn compact_in_turn(s: &Arc<Shared>, run: &Run, history: &mut Vec<Message>, reason: &str, count: &mut u32, cancel: &CancellationToken) -> Result<()> {
@@ -623,111 +614,99 @@ enum Streamed {
     Failed(anyhow::Error),
 }
 
-fn retryable(e: &anyhow::Error) -> bool {
-    match e.downcast_ref::<ApiError>() {
-        Some(a) => a.retryable,
-        None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request()),
-    }
-}
-
 async fn stream_once(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel: &CancellationToken) -> Streamed {
     stream_with_budget(s, run, req, cancel, &mut None).await
 }
 
 async fn stream_with_budget(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel: &CancellationToken, budget: &mut Option<u32>) -> Streamed {
-    const ATTEMPTS: u32 = 4;
-    'attempt: for attempt in 0..ATTEMPTS {
-        if let Some(remaining) = budget {
-            if *remaining == 0 { return Streamed::Failed(anyhow!(SUMMARY_REQUEST_LIMIT)); }
-            *remaining -= 1;
-        }
-        if attempt > 0 {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))) => {}
-                _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
-            }
-        }
-        let opened = tokio::select! {
-            r = s.api.responses(req) => r,
-            _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
+    if *budget == Some(0) { return Streamed::Failed(anyhow!(SUMMARY_REQUEST_LIMIT)); }
+    // Count actual HTTP attempts, including transient retries, against the shared
+    // chunk/merge summary budget. Only the API client owns transient backoff.
+    let remaining = (*budget).map(|n| Arc::new(AtomicU32::new(n)));
+    let response = stream_response(s, run, req, cancel, remaining.clone()).await;
+    if let Some(remaining) = remaining { *budget = Some(remaining.load(Ordering::Relaxed)); }
+    response
+}
+
+async fn stream_response(s: &Arc<Shared>, run: &Run, req: &ResponsesRequest, cancel: &CancellationToken, budget: Option<Arc<AtomicU32>>) -> Streamed {
+    let opened = tokio::select! {
+        r = async {
+            if budget.is_some() { s.api.responses_with_budget(req, budget).await }
+            else { s.api.responses(req).await }
+        } => r,
+        _ = cancel.cancelled() => return Streamed::Cancelled(MessageBuilder::default().finish()),
+    };
+    let mut stream = match opened {
+        Ok(st) => st,
+        Err(e) => return Streamed::Failed(e),
+    };
+    let mut builder = MessageBuilder::default();
+    // Each block's kind by its index (the model's numbers: a map, so a huge one can't allocate).
+    let mut kinds: HashMap<usize, String> = HashMap::new();
+    let (mut text_length, mut reasoning_length) = (0, 0);
+    loop {
+        let next = tokio::select! {
+            n = stream.next() => n,
+            _ = cancel.cancelled() => return Streamed::Cancelled(builder.finish()),
         };
-        let mut stream = match opened {
-            Ok(st) => st,
-            Err(e) if !context_overflow(&e) && retryable(&e) && attempt + 1 < ATTEMPTS => continue 'attempt,
-            Err(e) => return Streamed::Failed(e),
+        let ev = match next {
+            None => return Streamed::Failed(anyhow!("The connection to the model dropped before the reply finished.")),
+            Some(Err(e)) => return Streamed::Failed(e),
+            Some(Ok(ev)) => ev,
         };
-        let mut builder = MessageBuilder::default();
-        // Each block's kind by its index (the model's numbers: a map, so a huge one can't allocate).
-        let mut kinds: HashMap<usize, String> = HashMap::new();
-        let mut produced = false;
-        loop {
-            let next = tokio::select! {
-                n = stream.next() => n,
-                _ = cancel.cancelled() => return Streamed::Cancelled(builder.finish()),
-            };
-            let ev = match next {
-                None => {
-                    if !produced && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(anyhow!("The connection to Gond Agent dropped before the reply finished. Try again."));
-                }
-                Some(Err(e)) => {
-                    if !produced && !context_overflow(&e) && retryable(&e) && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(e);
-                }
-                Some(Ok(ev)) => ev,
-            };
-            match &ev {
-                StreamEvent::BlockStart { index, kind, .. } => {
-                    kinds.insert(*index, kind.clone());
-                }
-                StreamEvent::BlockDelta { index, text: Some(t), .. } => {
-                    produced = true;
-                    let agent_id = run.id.clone();
-                    let text = t.clone();
-                    s.emit(if kinds.get(index).is_some_and(|k| k == "reasoning") {
-                        AgentEvent::ReasoningDelta { agent_id, text }
-                    } else {
-                        AgentEvent::TextDelta { agent_id, text }
-                    });
-                }
-                StreamEvent::BlockDelta { .. } => produced = true,
-                StreamEvent::End { stop_reason, usage } => {
-                    let context_used = if run.is_sub() {
-                        *s.main_context.lock().unwrap()
-                    } else {
-                        let used = usage.context_tokens();
-                        *s.main_context.lock().unwrap() = used;
-                        used
-                    };
-                    let (_, window) = s.model.lock().unwrap().clone();
-                    s.emit(AgentEvent::Usage {
-                        input: usage.input_uncached + usage.cache_read + usage.cache_write,
-                        output: usage.output,
-                        cache_read: usage.cache_read,
-                        context_used,
-                        context_window: window,
-                    });
-                    let stop = stop_reason.clone();
-                    builder.apply(&ev);
-                    return Streamed::Done(builder.finish(), stop, usage.context_tokens());
-                }
-                StreamEvent::Error { code, message, retryable } => {
-                    let error: anyhow::Error = ApiError { code: code.clone(), message: message.clone(), retryable: *retryable, status: None }.into();
-                    if *retryable && !context_overflow(&error) && !produced && attempt + 1 < ATTEMPTS {
-                        continue 'attempt;
-                    }
-                    return Streamed::Failed(error);
-                }
-                StreamEvent::Start | StreamEvent::BlockEnd { .. } => {}
+        match &ev {
+            StreamEvent::BlockStart { index, kind, .. } => {
+                kinds.insert(*index, kind.clone());
             }
-            builder.apply(&ev);
+            StreamEvent::BlockDelta { index, text: Some(t), .. } => {
+                let agent_id = run.id.clone();
+                let text = t.clone();
+                s.emit(if kinds.get(index).is_some_and(|k| k == "reasoning") {
+                    reasoning_length += text.encode_utf16().count();
+                    AgentEvent::ReasoningDelta { agent_id, text }
+                } else {
+                    text_length += text.encode_utf16().count();
+                    AgentEvent::TextDelta { agent_id, text }
+                });
+            }
+            StreamEvent::BlockDelta { .. } => {}
+            StreamEvent::End { stop_reason, usage } => {
+                let context_used = if run.is_sub() {
+                    *s.main_context.lock().unwrap()
+                } else {
+                    let used = usage.context_tokens();
+                    *s.main_context.lock().unwrap() = used;
+                    used
+                };
+                let (_, window) = s.model.lock().unwrap().clone();
+                s.emit(AgentEvent::Usage {
+                    input: usage.input_uncached + usage.cache_read + usage.cache_write,
+                    output: usage.output,
+                    cache_read: usage.cache_read,
+                    context_used,
+                    context_window: window,
+                });
+                let stop = stop_reason.clone();
+                builder.apply(&ev);
+                return Streamed::Done(builder.finish(), stop, usage.context_tokens());
+            }
+            StreamEvent::Error { code, message, retryable } => {
+                return Streamed::Failed(ApiError { code: code.clone(), message: message.clone(), retryable: *retryable, status: None }.into());
+            }
+            StreamEvent::Start => {
+                // The client can restart an interrupted attempt. Nothing from that attempt may
+                // enter history or execute: tools are dispatched only after Streamed::Done.
+                if text_length > 0 || reasoning_length > 0 {
+                    s.emit(AgentEvent::StreamReset { agent_id: run.id.clone(), text_length, reasoning_length });
+                }
+                (text_length, reasoning_length) = (0, 0);
+                builder = MessageBuilder::default();
+                kinds.clear();
+            }
+            StreamEvent::BlockEnd { .. } => {}
         }
+        builder.apply(&ev);
     }
-    Streamed::Failed(anyhow!("Gond Agent didn't respond after {ATTEMPTS} tries. Try again in a moment."))
 }
 
 /// Keep only what can be replayed from an interrupted response: text, no half-written tool calls.
@@ -1003,6 +982,11 @@ mod tests {
     use crate::agent::events::Decision;
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    include!("stream_retry_tests.rs");
+    #[cfg(unix)]
+    include!("relay_security_tests.rs");
 
     type Handler = Arc<dyn Fn(&Value) -> String + Send + Sync>;
 

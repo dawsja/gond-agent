@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { createTranscript, type StreamEvent } from "../../web/src/features/run/transcript";
 import { activityLabel, groupLabel, presentTool } from "../../web/src/features/run/tool-presentation";
+import { emptySummary, fold } from "../src/runs/fold";
 
 it("preserves transcript snapshots across batches and deduplicates reconnect replay", () => {
   const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq * 100, type, ...fields });
@@ -55,6 +56,40 @@ it("keeps compaction markers ordered, replay-safe and independent of run complet
   expect(result.items).toHaveLength(4);
   expect(append(events)).toEqual(result);
   expect(result).toEqual(createTranscript()(events));
+});
+
+it("rolls back partial text across compaction and a queued follow-up without mutating replay snapshots", () => {
+  const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq, type, agent_id: "main", ...fields });
+  const append = createTranscript();
+  const initial = [
+    event(1, "turn.start"),
+    event(2, "text.delta", { text: "Completed earlier response. " }),
+    event(3, "text.delta", { text: "Partial " }),
+    event(4, "compacted", { reason: "auto-round", before: 10000, after: 2000 }),
+    event(5, "text.delta", { text: "middle " }),
+    event(6, "user", { text: "Queued follow-up", images: [] }),
+    event(7, "text.delta", { text: "draft" }),
+  ];
+  const before = append(initial);
+  const frozenBefore = structuredClone(before);
+  const updates = [
+    event(8, "stream.reset", { text_length: "Partial middle draft".length, reasoning_length: 0 }),
+    event(9, "text.delta", { text: "Final reply" }),
+  ];
+  const after = append(updates);
+  expect(after.items).toEqual([
+    { kind: "text", key: "t2", text: "Completed earlier response. " },
+    { kind: "compacted", key: "compact4", reason: "auto-round", before: 10000, after: 2000 },
+    { kind: "user", key: "u6", text: "Queued follow-up", ts: 6, images: [] },
+    { kind: "text", key: "t9", text: "Final reply" },
+  ]);
+  const frozenAfter = structuredClone(after);
+  const all = [...initial, ...updates];
+  expect(append(all)).toEqual(frozenAfter);
+  expect(createTranscript()(all)).toEqual(frozenAfter);
+  expect(before).toEqual(frozenBefore);
+  expect(after).toEqual(frozenAfter);
+  expect(all.reduce(fold, emptySummary()).text).toBe("Completed earlier response. Final reply");
 });
 
 it("groups API, Claude and Codex activity without exposing transport names or merging external tools", () => {
@@ -120,4 +155,91 @@ it("updates the PR presentation after external merges without duplicating the op
   expect(merged.items).toHaveLength(1);
   expect(merged.items[0]).toMatchObject({ kind: "pr", state: "merged", number: 42 });
   expect(merged.log.at(-1)?.text).toBe("merged pull request #42");
+});
+
+it("refreshes queue metadata on position changes and dequeue without duplicating replay", () => {
+  const append = createTranscript();
+  const queued = {seq:1, ts:1, type:"run.queued", position:2, length:3};
+  const before = append([queued]);
+  expect(append([queued]).queueRevision).toBe(before.queueRevision);
+  const after = append([
+    {seq:2, ts:2, type:"run.queued", position:1, length:2},
+    {seq:3, ts:3, type:"run.dequeued"},
+  ]);
+  expect(after.queueRevision).toBe(before.queueRevision + 2);
+  expect(after.items).toEqual([]);
+});
+
+it("discards aborted attempts and shows the successful reply once in transcript and summary", () => {
+  const event = (seq: number, type: string, fields = {}): StreamEvent => ({ seq, ts: seq, type, agent_id: "main", ...fields });
+  const append = createTranscript();
+  let summary = emptySummary();
+  const push = (events: StreamEvent[]) => {
+    summary = events.reduce(fold, summary);
+    return append(events);
+  };
+  const start = [
+    event(1, "user", { text: "Fix this" }),
+    event(2, "turn.start"),
+    event(3, "text.delta", { text: "Completed earlier response. " }),
+    event(4, "text.delta", { text: "🦀" }),
+    event(5, "text.delta", { text: "draft" }),
+    event(6, "reasoning.delta", { text: "🤔" }),
+  ];
+  const before = push(start);
+  const frozen = structuredClone(before);
+  const reset = event(7, "stream.reset", { text_length: 7, reasoning_length: 2 });
+  expect(push([reset]).items.at(-1)).toMatchObject({ kind: "text", text: "Completed earlier response. " });
+  expect(summary.text).toBe("Completed earlier response. ");
+  expect(before).toEqual(frozen);
+
+  const retry = [
+    event(8, "tool.start", { call_id: "read", name: "read", input: { path: "file.ts" } }),
+    event(9, "tool.end", { call_id: "read", ok: true, output: "kept output" }),
+    event(10, "text.delta", { text: "second partial" }),
+    event(11, "todos", { items: [{ text: "Fix", status: "done" }] }),
+    event(12, "stream.reset", { text_length: "second partial".length, reasoning_length: 0 }),
+    event(13, "text.delta", { text: "Final " }),
+    event(14, "text.delta", { text: "reply" }),
+    event(15, "turn.end", { stop_reason: "end_turn" }),
+  ];
+  const after = push(retry);
+  expect(after.items.filter(item => item.kind === "text")).toEqual([
+    { kind: "text", key: "t3", text: "Completed earlier response. " },
+    { kind: "text", key: "t13", text: "Final reply" },
+  ]);
+  expect(summary.text).toBe("Completed earlier response. Final reply");
+  expect(after.items.find(item => item.kind === "explore")).toMatchObject({ tools: [{ status: "done", output: "kept output" }] });
+  expect(after.items.find(item => item.kind === "plan")).toMatchObject({ steps: [{ text: "Fix", status: "done" }] });
+  const all = [...start, reset, ...retry];
+  expect(append(all)).toEqual(after); // Reconnect replay must not roll back twice.
+  expect(createTranscript()(all)).toEqual(after);
+  expect(all.reduce(fold, emptySummary())).toEqual(summary);
+});
+
+it("keeps other agents and reasoning-only resets from changing main text", () => {
+  const events: StreamEvent[] = [
+    { seq: 1, ts: 1, type: "turn.start", agent_id: "main" },
+    { seq: 2, ts: 2, type: "text.delta", agent_id: "main", text: "Kept" },
+    { seq: 3, ts: 3, type: "text.delta", agent_id: "helper", text: "draft" },
+    { seq: 4, ts: 4, type: "stream.reset", agent_id: "helper", text_length: 5, reasoning_length: 0 },
+    { seq: 5, ts: 5, type: "stream.reset", agent_id: "main", text_length: 0, reasoning_length: 2 },
+  ];
+  expect(createTranscript()(events).items).toEqual([{ kind: "text", key: "t2", text: "Kept" }]);
+  expect(events.reduce(fold, emptySummary()).text).toBe("Kept");
+});
+
+it("rolls back an attempt even when a follow-up was queued between its deltas", () => {
+  const events: StreamEvent[] = [
+    { seq: 1, ts: 1, type: "turn.start", agent_id: "main" },
+    { seq: 2, ts: 2, type: "text.delta", agent_id: "main", text: "Partial " },
+    { seq: 3, ts: 3, type: "user", text: "Queued follow-up", images: [] },
+    { seq: 4, ts: 4, type: "text.delta", agent_id: "main", text: "draft" },
+    { seq: 5, ts: 5, type: "stream.reset", agent_id: "main", text_length: 13, reasoning_length: 0 },
+    { seq: 6, ts: 6, type: "text.delta", agent_id: "main", text: "Final reply" },
+  ];
+  const transcript = createTranscript()(events);
+  expect(transcript.items.filter(item => item.kind === "text")).toEqual([{ kind: "text", key: "t6", text: "Final reply" }]);
+  expect(transcript.items.find(item => item.kind === "user")).toMatchObject({ text: "Queued follow-up" });
+  expect(events.reduce(fold, emptySummary()).text).toBe("Final reply");
 });

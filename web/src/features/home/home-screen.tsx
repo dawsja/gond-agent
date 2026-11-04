@@ -3,7 +3,7 @@ import { useMemo, useState } from "react"
 import { useLocation, useNavigate } from "react-router"
 import { Tabs, TabsList, TabsTrigger } from "@shared/ui/tabs"
 import type { Run } from "@/lib/api"
-import { ago, greeting, repoName, runElapsed } from "@/lib/format"
+import { ago, greeting, queueLabel, repoName, runElapsed } from "@/lib/format"
 import { useDeleteRun, useMe, useModels, useRuns, useStopRun } from "@/lib/queries"
 import { ConfirmDialog } from "../studio/confirm-dialog"
 import { devOpen } from "@/lib/dev-open"
@@ -56,7 +56,7 @@ function RunMenu({ run, first }: { run: Run; first?: boolean }) {
           {live && (
             <MenuItem onSelect={() => stop.mutate({ id: run.id, arg: undefined })}>
               <Square className="size-3 fill-current" />
-              <span className="min-w-0 flex-1 truncate">Stop</span>
+              <span className="min-w-0 flex-1 truncate">{run.status === "queued" ? "Cancel" : "Stop"}</span>
             </MenuItem>
           )}
           {(run.pr_url || live) && <MenuSeparator />}
@@ -72,9 +72,10 @@ function RunMenu({ run, first }: { run: Run; first?: boolean }) {
 
 function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelName?: string }) {
   const navigate = useNavigate()
+  const stop = useStopRun()
   const live = run.status === "working" || run.status === "queued"
   const ended = run.status === "failed" || run.status === "stopped"
-  const note = live ? (run.step ?? (run.status === "queued" ? "Waiting for a worker" : "Working")) : ended ? (run.error ?? "Stopped") : undefined
+  const note = run.status === "queued" ? queueLabel(run) : live ? (run.step ?? "Working") : ended ? (run.error ?? "Stopped") : undefined
   const elapsed = runElapsed(run)
   return (
     <li
@@ -98,7 +99,7 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
               <span className="text-subtle" style={mono}>
                 └
               </span>
-              <span className={cn("truncate", run.status === "failed" ? "text-failed" : live ? "text-foreground" : "")}>{note}</span>
+              <span className={cn(run.status === "queued" ? "whitespace-normal" : "truncate", run.status === "failed" ? "text-failed" : live ? "text-foreground" : "")}>{note}</span>
               {live && run.plan_total > 0 && (
                 <span className="shrink-0 text-[12px] text-muted-foreground" style={mono}>
                   · plan {run.plan_done}/{run.plan_total}
@@ -146,6 +147,16 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-5 max-md:-mt-1 max-md:-mr-1">
+        {run.status === "queued" && (
+          <button
+            type="button"
+            disabled={stop.isPending}
+            onClick={(e) => { e.stopPropagation(); stop.mutate({ id: run.id, arg: undefined }) }}
+            className="inline-flex h-8 items-center rounded-[4px] border border-border px-3 text-[13px] text-foreground transition-colors hover:bg-raised"
+          >
+            Cancel
+          </button>
+        )}
         <div className="w-[112px] max-md:hidden">
           <PrChip status={run.status} state={run.pr_state} number={run.pr_number} files={run.files} />
         </div>

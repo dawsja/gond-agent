@@ -13,12 +13,20 @@ export async function modelResponse(db: Store, secret: string, userId: string, r
   try {
     return await relay(db, secret, access, userId, runId, req);
   } catch (error) {
+    // An upstream AbortError is a dropped model connection, not necessarily worker cancellation.
+    // Genuine downstream cancellation must not be turned into a retryable response.
+    if (req.signal.aborted) throw error;
+    if (error instanceof Error && error.name === "AbortError") {
+      console.error("model request failed", error.name);
+      error = new ApiError(502, "stream", "The connection to the model dropped. Try again.", true);
+    }
     if (!(error instanceof ApiError)) throw error;
     return Response.json({ error: { code: error.code, message: error.message, retryable: error.retryable } }, { status: error.status });
   }
 }
 
 async function relay(db: Store, secret: string, access: ModelAccess, userId: string, runId: string, req: Request): Promise<Response> {
+  req.signal.throwIfAborted();
   const reader = req.body?.getReader();
   let size = 0;
   const parts: Uint8Array[] = [];
@@ -45,6 +53,7 @@ async function relay(db: Store, secret: string, access: ModelAccess, userId: str
     adapter = adapterFor(model),
     abort = new AbortController();
   if (body.reasoning && model.capabilities.reasoning !== "none") validateEffort(model, body.reasoning.effort);
+  req.signal.throwIfAborted();
   req.signal.addEventListener("abort", () => abort.abort(), { once: true });
   for (const message of body.messages)
     for (const block of message.content)
@@ -81,8 +90,11 @@ async function relay(db: Store, secret: string, access: ModelAccess, userId: str
   const stream = new ReadableStream<Uint8Array>({
     async start(out) {
       try {
-        for await (const rec of parseSse(upstream.body!))
+        for await (const rec of parseSse(upstream.body!)) {
+          abort.signal.throwIfAborted();
           for (const ev of parser.push(rec.event, rec.data)) out.enqueue(encodeEvent(remap(ev)));
+        }
+        abort.signal.throwIfAborted();
         const result = parser.result();
         const u = result?.usage ?? emptyUsage();
         const cost = Math.ceil((u.input_uncached * model.input_micros + u.output * model.output_micros + u.cache_read * model.cache_read_micros + u.cache_write * model.cache_write_micros) / 1_000_000);
@@ -96,6 +108,10 @@ async function relay(db: Store, secret: string, access: ModelAccess, userId: str
           out.enqueue(encodeEvent({ event: "error", data: { code: "truncated", message: "The model stopped before finishing. Try again.", retryable: true } }));
         out.close();
       } catch (e) {
+        if (abort.signal.aborted) {
+          try { out.close(); } catch { /* disconnected */ }
+          return;
+        }
         console.error("model stream failed", e instanceof Error ? e.name : "error");
         try {
           out.enqueue(encodeEvent({ event: "error", data: { code: "stream", message: "The connection to the model dropped. Try again.", retryable: true } }));

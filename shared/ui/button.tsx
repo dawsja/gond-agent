@@ -5,11 +5,11 @@ import { cn } from "../utils"
 type Variant = "default" | "outline" | "ghost" | "link" | "destructive"
 export interface ButtonProps extends ComponentProps<"button"> { variant?: Variant; size?: "default" | "sm" | "icon"; asChild?: boolean }
 const variants: Record<Variant, string> = {
-  default: "bg-primary text-primary-foreground hover:bg-primary/85",
+  default: "bg-primary text-primary-foreground hover:bg-primary-hover",
   outline: "border border-input bg-card text-foreground hover:bg-accent",
   ghost: "text-muted-foreground hover:bg-accent hover:text-foreground",
   link: "text-link underline-offset-4 hover:underline",
-  destructive: "bg-destructive text-primary-foreground hover:bg-destructive/85",
+  destructive: "bg-destructive text-primary-foreground hover:bg-destructive-hover",
 }
 export function Button({ className, variant = "default", size = "default", asChild, type = "button", ...props }: ButtonProps) {
   const Component = asChild ? Slot.Root : "button"

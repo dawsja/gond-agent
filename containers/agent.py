@@ -84,10 +84,15 @@ def dispatch(req):
             if worker and worker.poll() is None:
                 raise RuntimeError("The worker is already running.")
             relay_token = secrets.token_urlsafe(32)
-            pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
-            with open("/tmp/worker.log", "ab") as log:
-                worker = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            try:
+                pathlib.Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+                with open("/tmp/worker.log", "ab") as log:
+                    worker = subprocess.Popen(["/usr/local/bin/gond-agent-worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=log, text=True, bufsize=1, start_new_session=True, env=worker_env(req))
+            except Exception:
+                # No worker owns this credential if startup fails. Keep the relay closed.
+                relay_token = None
+                raise
             threading.Thread(target=drain, args=(worker.stdout, worker), daemon=True).start()
         return True
     if method == "send":

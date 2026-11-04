@@ -11,6 +11,8 @@ mod prompt;
 mod skills;
 mod tools;
 mod transport;
+#[cfg(test)]
+mod relay_security_tests;
 
 use anyhow::{Context, Result};
 use agent::AgentConfig;

@@ -39,6 +39,11 @@ export function runElapsed(r: { status: string; created_at: number; started_at: 
   return duration(end - start)
 }
 
+export function queueLabel(r: { queue_position?: number; queue_length?: number }): string {
+  const position = r.queue_position, length = r.queue_length
+  return `Waiting for a free workspace${position !== undefined && length !== undefined ? ` (position ${position} of ${length})` : ""}`
+}
+
 export function greeting(d = new Date()): string {
   const h = d.getHours()
   return h < 5 ? "Good evening" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening"

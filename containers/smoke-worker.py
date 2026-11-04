@@ -110,7 +110,7 @@ def main():
         env = {**os.environ, "GOND_AGENT_API_URL": f"http://127.0.0.1:{model.server_port}", "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_MODEL": "fixture", "GOND_AGENT_HOME": str(pathlib.Path(tmp) / "home")}
         try:
             try:
-                proc = subprocess.run(["/usr/local/bin/gond-agent-worker"], input='{"type":"user","text":"Implement and verify the feature"}\n', text=True, capture_output=True, cwd=root, env=env, timeout=180)
+                proc = subprocess.run([os.environ.get("GOND_IMAGE_WORKER", "/usr/local/bin/gond-agent-worker")], input='{"type":"user","text":"Implement and verify the feature"}\n', text=True, capture_output=True, cwd=root, env=env, timeout=180)
             except subprocess.TimeoutExpired as error:
                 assert relay_token.encode() not in (error.stdout or b""), "Relay token leaked to worker stdout"
                 assert relay_token.encode() not in (error.stderr or b""), "Relay token leaked to worker stderr"

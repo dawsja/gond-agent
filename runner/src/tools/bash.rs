@@ -473,6 +473,7 @@ fn term_group(pid: u32) {
 #[cfg(windows)]
 fn term_group(pid: u32) {
     let _ = std::process::Command::new("taskkill")
+        .env_remove(crate::config::RELAY_TOKEN_ENV)
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

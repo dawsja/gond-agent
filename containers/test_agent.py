@@ -196,6 +196,7 @@ print(output)
             return original_generate(size)
 
         original_generate = agent.secrets.token_urlsafe
+        inherited_token = os.environ.get("GOND_AGENT_RELAY_TOKEN")
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), \
                 mock.patch.dict(os.environ, {"TMPDIR": self.temp.name}), \
                 mock.patch.object(agent, "open", side_effect=lambda *_: contextlib.nullcontext(log), create=True), \
@@ -204,6 +205,7 @@ print(output)
             for request_id in (1, 2):
                 agent.handle({"id": request_id, "method": "start", "model": "fixture"})
 
+        self.assertEqual(os.environ.get("GOND_AGENT_RELAY_TOKEN"), inherited_token)
         self.assertEqual(generate_token.call_args_list, [mock.call(32), mock.call(32)])
         self.assertEqual(len(spawns), 2)
         tokens = [kwargs["env"]["GOND_AGENT_RELAY_TOKEN"] for _, kwargs in spawns]
@@ -216,8 +218,31 @@ print(output)
             self.assertNotIn(token, repr([args for args, _ in spawns]))
             self.assertNotIn(token, output.getvalue() + errors.getvalue() + log.getvalue().decode())
 
+    def test_rejected_start_preserves_live_worker_and_failed_spawn_revokes_token(self):
+        live_worker = mock.Mock()
+        live_worker.poll.return_value = None
+        agent.worker = live_worker
+        with mock.patch.object(agent.secrets, "token_urlsafe") as generate:
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                agent.dispatch({"method": "start", "model": "fixture"})
+            generate.assert_not_called()
+        self.assertEqual(agent.relay_token, "fixture-relay-secret")
+        self.assertIs(agent.worker, live_worker)
+
+        agent.worker = None
+        with mock.patch.dict(os.environ, {"TMPDIR": self.temp.name}), \
+                mock.patch.object(agent, "open", return_value=contextlib.nullcontext(io.BytesIO()), create=True), \
+                mock.patch.object(agent.subprocess, "Popen", side_effect=OSError("Cannot start worker")):
+            with self.assertRaises(OSError):
+                agent.dispatch({"method": "start", "model": "fixture"})
+        self.assertIsNone(agent.relay_token)
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            agent.worker_env({"model": "fixture"})
+
 
 class ModelProxyTest(unittest.TestCase):
+    endpoints = (("GET", "/v1/models"), ("POST", "/v1/responses"), ("POST", "/v1/search"))
+
     def setUp(self):
         self.token = agent.secrets.token_urlsafe(32)
         agent.relay_token = self.token
@@ -279,8 +304,7 @@ class ModelProxyTest(unittest.TestCase):
 
     def test_authentication_precedes_all_paths_and_methods(self):
         expected = None
-        for method, path in [("GET", "/v1/models"), ("POST", "/v1/responses"),
-                             ("POST", "/v1/search"), ("GET", "/v1/images/secret"),
+        for method, path in [*self.endpoints, ("GET", "/v1/images/secret"),
                              ("POST", "/v1/images/generations"), ("OPTIONS", "/v1/responses"),
                              ("DELETE", "/unsupported")]:
             for auth in (None, "Bearer wrong", "Basic wrong", "Bearer non-ascii-\u00e9"):
@@ -294,19 +318,33 @@ class ModelProxyTest(unittest.TestCase):
         self.assert_rejected(401)
 
     def test_browser_origins_and_untrusted_or_duplicate_hosts_are_forbidden(self):
-        # A no-cors simple POST must not reach the stdio relay, even with valid auth.
-        for origin in ("https://untrusted.example", "null", ""):
-            self.assert_rejected(403, headers=(("Origin", origin),), content_type="text/plain")
-        for hosts in ((), ("evil.example:8787",), ("127.0.0.1",), ("localhost",),
-                      ("127.0.0.1:8787.evil.example",), ("LOCALHOST:8787",),
-                      ("localhost:8787", "localhost:8787"), ("127.0.0.1:8787, localhost:8787",)):
-            with self.subTest(hosts=hosts):
-                self.assert_rejected(403, hosts=hosts)
+        for method, path in self.endpoints:
+            for origin in ("https://untrusted.example", "null", ""):
+                with self.subTest(method=method, path=path, origin=origin):
+                    self.assert_rejected(403, method=method, path=path, headers=(("Origin", origin),))
+            for hosts in ((), ("evil.example:8787",), ("127.0.0.1",), ("localhost",),
+                          ("127.0.0.1:8787.evil.example",), ("LOCALHOST:8787",),
+                          ("localhost:8787", "localhost:8787"), ("127.0.0.1:8787, localhost:8787",)):
+                with self.subTest(method=method, path=path, hosts=hosts):
+                    self.assert_rejected(403, method=method, path=path, hosts=hosts)
+
+    def test_browser_simple_posts_never_reach_upstream(self):
+        for path in ("/v1/responses", "/v1/search"):
+            for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=fixture"):
+                with self.subTest(path=path, content_type=content_type):
+                    # A browser can send these without a CORS preflight, but cannot
+                    # attach Authorization. Neither this nor a leaked token grants Origin access.
+                    headers = (("Origin", "https://untrusted.example"),)
+                    self.assert_rejected(401, path=path, authorization=None,
+                                         headers=headers, content_type=content_type)
+                    self.assert_rejected(403, path=path, headers=headers, content_type=content_type)
 
     def test_post_requires_json_and_unsupported_endpoints_stay_forbidden(self):
-        for content_type in (None, "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
-            self.assert_rejected(415, content_type=content_type)
-        self.assert_rejected(415, headers=(("Content-Type", "application/json"),))
+        for path in ("/v1/responses", "/v1/search"):
+            for content_type in (None, "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
+                with self.subTest(path=path, content_type=content_type):
+                    self.assert_rejected(415, path=path, content_type=content_type)
+            self.assert_rejected(415, path=path, headers=(("Content-Type", "application/json"),))
         for method, path in [("POST", "/v1/images/generations"), ("GET", "/v1/images/secret"),
                              ("OPTIONS", "/v1/models"), ("PUT", "/v1/responses")]:
             self.assert_rejected(403, method=method, path=path)
@@ -338,7 +376,7 @@ class ModelProxyTest(unittest.TestCase):
             with self.subTest(path=path), concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 body = b"" if method == "GET" else b'{"fixture":true}'
                 result = executor.submit(self.request, method, path, hosts=(host,), body=body,
-                                         content_type="application/json; charset=utf-8")
+                                         content_type=None if method == "GET" else "application/json; charset=utf-8")
                 frame = self.frames.get(timeout=3)
                 model = frame["model"]
                 self.assertEqual(frame, {"model": {"id": model["id"], "method": method,
