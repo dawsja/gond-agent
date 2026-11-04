@@ -2,6 +2,7 @@
 """Container control + loopback model relay. Only Docker's attached stdio reaches the host."""
 import base64
 import contextlib
+import errno
 import hmac
 import hashlib
 import http.server
@@ -29,6 +30,32 @@ MAX_FRAME = 256 * 1024 * 1024
 MAX_CHECKPOINT_BUNDLE = 64 * 1024 * 1024
 MAX_STATE = 4 * 1024 * 1024
 STATE_TIMEOUT = 120
+# Public diagnostics only; never return runner codes or exception text verbatim.
+CHECKPOINT_FAILURE_REASONS = frozenset({
+    "tree_too_large", "state_too_large", "storage_limit", "timeout",
+    "background_shells_active", "staged_ignored_files", "busy", "worker_unavailable",
+    "invalid_state", "git_failed", "storage_failed", "unknown",
+})
+CHECKPOINT_METHODS = frozenset({"checkpoint", "checkpoint.release", "checkpoint_tree",
+                                "restore_checkpoint", "export_state", "import_state", "init_evidence"})
+
+
+class CheckpointFailure(RuntimeError):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason if isinstance(reason, str) and reason in CHECKPOINT_FAILURE_REASONS else "unknown"
+
+
+def checkpoint_failure_reason(error):
+    if isinstance(error, CheckpointFailure):
+        return error.reason
+    if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+        return "timeout"
+    if isinstance(error, OSError) and error.errno in (errno.EACCES, errno.ENOSPC, errno.EROFS, errno.EIO, errno.EDQUOT):
+        return "storage_failed"
+    return "unknown"
+
+
 state_lock = threading.Lock()
 state_waiters = {}  # At most one RPC, separate from worker/event/model locks.
 CHECKPOINT_REF = "refs/gond-agent/checkpoint"
@@ -139,7 +166,7 @@ def checkpoint_repository(allow_unborn=False):
                 stderr=subprocess.PIPE, timeout=120)
             if result.returncode:
                 # Never echo untrusted repository diagnostics (or embedded secrets).
-                raise RuntimeError("The checkpoint Git operation failed.")
+                raise CheckpointFailure("git_failed", "The checkpoint Git operation failed.")
             return result.stdout
 
         git("init", "--quiet", "--template=", str(scratch / "repo"))
@@ -243,7 +270,7 @@ def capture_tree(git, env, head):
             env["GIT_INDEX_FILE"] = temporary_index
         tracked = set(git("ls-tree", "-rz", "--name-only", head).split(b"\0")) if head else set()
         if ignored - tracked:
-            raise RuntimeError("Newly staged ignored files are not supported by checkpoints.")
+            raise CheckpointFailure("staged_ignored_files", "Newly staged ignored files are not supported by checkpoints.")
     git("read-tree", head if head else "--empty")
     git("add", "--all", "--", str(pathlib.Path(ROOT).resolve()))
     return git("write-tree").decode().strip()
@@ -409,7 +436,7 @@ def checkpoint_tree(req, state_digest=None):
         # is a prerequisite; the separately pinned base must also exist on restore.
         git("bundle", "create", "--version=2", str(bundle), CHECKPOINT_REF, "^" + parent)
         if bundle.stat().st_size > MAX_CHECKPOINT_BUNDLE:
-            raise RuntimeError("The checkpoint bundle is too large.")
+            raise CheckpointFailure("tree_too_large", "The checkpoint bundle is too large.")
         return {**({"fingerprint": fingerprint} if fingerprint else {}), "bundle": base64.b64encode(bundle.read_bytes()).decode(),
                 "base_sha": base, "head_sha": parent, "checkpoint_sha": commit}
 
@@ -486,12 +513,13 @@ def state_json(state):
     """Measure only the canonical, compact UTF-8 state, not its RPC envelope."""
     try:
         body = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if len(body.encode("utf-8")) > MAX_STATE:
-            raise ValueError()
-        return body
+        size = len(body.encode("utf-8"))
     except (ValueError, TypeError, UnicodeError, RecursionError):
         # Serialization diagnostics can contain private payloads.
-        raise RuntimeError("Invalid or oversized worker state.") from None
+        raise CheckpointFailure("invalid_state", "Invalid or oversized worker state.") from None
+    if size > MAX_STATE:
+        raise CheckpointFailure("state_too_large", "Invalid or oversized worker state.")
+    return body
 
 
 def fail_state_waiters(source):
@@ -556,14 +584,14 @@ def state_rpc(req, expected_worker=None):
     try:
         with worker_lock:
             if not worker or worker.poll() is not None or (expected_worker is not None and worker is not expected_worker):
-                raise RuntimeError("The worker is not running.")
+                raise CheckpointFailure("worker_unavailable", "The worker is not running.")
             with state_lock:
                 if state_waiters:
-                    raise RuntimeError("A worker state operation is already pending.")
+                    raise CheckpointFailure("busy", "A worker state operation is already pending.")
                 state_waiters[key] = (worker, operation, replies)
             try:
                 write_state_frame(worker, frame, deadline)
-            except Exception:
+            except Exception as error:
                 # A partial JSONL frame cannot be reused safely. Discard this worker
                 # rather than concatenate a later interrupt/import onto private state.
                 source, worker, relay_token = worker, None, None
@@ -571,18 +599,23 @@ def state_rpc(req, expected_worker=None):
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(source.pid, signal.SIGKILL)
                 source.wait(timeout=5)
-                raise RuntimeError("The worker state request failed.") from None
+                reason = "timeout" if isinstance(error, TimeoutError) else "worker_unavailable"
+                raise CheckpointFailure(reason, "The worker state request failed.") from None
         # Never hold worker_lock while waiting: interrupts, drains and replacement
         # must remain available even when the runner cannot reach an export seam.
         try:
             reply = replies.get(timeout=max(0, deadline - time.monotonic()))
         except queue.Empty:
-            raise RuntimeError("The worker state request timed out.") from None
-        if not reply or reply["type"] == "state.error":
-            raise RuntimeError("The worker state request failed.")
+            raise CheckpointFailure("timeout", "The worker state request timed out.") from None
+        if not reply:
+            raise CheckpointFailure("worker_unavailable", "The worker state request failed.")
+        if reply["type"] == "state.error":
+            code = reply.get("code")
+            reason = {"runner_not_idle": "busy", "export_queue_full": "busy"}.get(code, code) if isinstance(code, str) else "unknown"
+            raise CheckpointFailure(reason, "The worker state request failed.")
         if operation == "export_state":
             if "state" not in reply:
-                raise RuntimeError("Invalid worker state reply.")
+                raise CheckpointFailure("invalid_state", "Invalid worker state reply.")
             state_json(reply["state"])
             return {"state": reply["state"]}
         return True
@@ -638,12 +671,12 @@ def checkpoint_rpc(req):
     """Capture while held; release is separate so the API can persist before resuming."""
     global held_boundary
     if not capture_lock.acquire(blocking=False):
-        raise RuntimeError("A checkpoint operation is already pending.")
+        raise CheckpointFailure("busy", "A checkpoint operation is already pending.")
     try:
         with worker_lock:
             held = held_boundary
             if not held or held[0] is not worker or held[1] != req.get("boundary_id") or worker.poll() is not None:
-                raise RuntimeError("The checkpoint boundary is no longer available.")
+                raise CheckpointFailure("worker_unavailable", "The checkpoint boundary is no longer available.")
         if req["method"] == "checkpoint.release":
             # Retire before writing: the runner can reach its next boundary as
             # soon as release is read, even before this RPC's acknowledgement.
@@ -656,7 +689,7 @@ def checkpoint_rpc(req):
         tree = checkpoint_tree(req, state_digest)
         with worker_lock:
             if held_boundary != held or worker is not held[0] or worker.poll() is not None:
-                raise RuntimeError("The checkpoint boundary is no longer available.")
+                raise CheckpointFailure("worker_unavailable", "The checkpoint boundary is no longer available.")
         return {**tree, **state, "boundary_id": held[1]}
     finally:
         capture_lock.release()
@@ -766,9 +799,14 @@ def handle(req):
     try:
         response = {"id": req["id"], "result": dispatch(req)}
     except Exception as error:
-        print("Workspace request failed:", req.get("method"), type(error).__name__, file=sys.stderr)
-        traceback.print_exc()
         response = {"id": req.get("id"), "error": "The workspace request failed."}
+        if isinstance(req.get("method"), str) and req["method"] in CHECKPOINT_METHODS:
+            reason = checkpoint_failure_reason(error)
+            response["checkpoint_reason"] = reason
+            print("Workspace checkpoint request failed:", req.get("method"), reason, file=sys.stderr)
+        else:
+            print("Workspace request failed:", req.get("method"), type(error).__name__, file=sys.stderr)
+            traceback.print_exc()
     emit(response)
 
 

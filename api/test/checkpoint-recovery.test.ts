@@ -368,6 +368,8 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
       expect(runs.get(run.id).error).toContain("could not be saved");
       expect(runs.get(run.id).error).toContain(outcome === "timeout" ? "within 10 seconds" : "size or storage limit");
       expect(runs.get(run.id).error).toContain("last pushed branch");
+      expect(runs.history(run.id, 0).filter(event => event.type === "run.checkpoint_unavailable").at(-1))
+        .toMatchObject({ reason: outcome === "timeout" ? "timeout" : "storage_limit" });
       expect(rows(run.id)).toHaveLength(0);
       gate.resolve();
       await vi.advanceTimersByTimeAsync(0);
@@ -375,6 +377,18 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
       expect(importBundle).not.toHaveBeenCalled();
       expect(pushBranch).not.toHaveBeenCalled();
     } finally { gate.resolve(); vi.useRealTimers(); }
+  });
+
+  it("reports a fixed state_too_large reason when full stored history exceeds the API state cap", async () => {
+    const { run, worker } = await checkpointed();
+    const previous = rows(run.id).at(-1)!;
+    worker.history.push(message("assistant", "private-history-marker" + "x".repeat(4 * 1024 * 1024)));
+    await worker.capture();
+    expect(worker.captureErrors).toHaveLength(1);
+    expect(runs.history(run.id, 0).filter(event => event.type === "run.checkpoint_unavailable").at(-1))
+      .toMatchObject({ reason: "state_too_large" });
+    expect(rows(run.id).at(-1)!.seq).toBe(previous.seq);
+    expect(JSON.stringify(runs.history(run.id, 0))).not.toContain("private-history-marker");
   });
 
   it("serializes follow-up admission against a failed close capture, and explicit Close deletes the saved pair", async () => {

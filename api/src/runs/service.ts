@@ -1,4 +1,5 @@
-import { CheckpointError, Checkpoints } from "../checkpoints";
+import { Checkpoints } from "../checkpoints";
+import { CheckpointCaptureError, checkpointFailureReason } from "../checkpoint-failures";
 import { storeSharedImage } from "./shared-images";
 import { listRunPage, type RunListOptions } from "./list";
 import { runDiff, preferPullDiff, type PullDiff } from "./diff";
@@ -130,7 +131,9 @@ const EVIDENCE_SETTLE_TIMEOUT_MS = 30_000;
 const FAILED_CHECKPOINT_TIMEOUT_MS = 10_000;
 const FAILED_CHECKPOINT_SAVED = "Your changes and the conversation are saved; send a follow-up to continue.";
 const CHECKPOINT_CLOSED = "The workspace was closed; send a follow-up to retry from the last pushed branch.";
-class EvidenceTimeout extends Error {}
+class EvidenceTimeout extends CheckpointCaptureError {
+  constructor(message: string) { super("timeout", message); }
+}
 /** Evidence is advisory; bound each operation without cancelling its underlying work. */
 async function evidenceRequest<T>(request: () => Promise<T>, timeoutMs = EVIDENCE_EXPORT_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1171,8 +1174,8 @@ export class Runs {
           this.save(current);
         });
         if (predecessor) claimed = null;
-      }, () => this.checkpointUnavailable(id)); }
-      catch { this.checkpointUnavailable(id); }
+      }, error => this.checkpointUnavailable(id, error)); }
+      catch (error) { this.checkpointUnavailable(id, error); }
       r = this.get(id);
       if (this.shuttingDown || this.cancelledBoots.has(id) || r.status === "stopped") {
         live.closed = true;
@@ -1463,7 +1466,7 @@ export class Runs {
     try { await evidenceRequest(() => flush, EVIDENCE_FLUSH_TIMEOUT_MS); }
     catch (error) {
       if (live.closed || this.live.get(id) !== live) return;
-      this.checkpointUnavailable(id);
+      this.checkpointUnavailable(id, error);
       // Timing out does not cancel tree export/persistence or release its hold.
       // Give that same operation a separate bounded drain before publication's
       // snapshot. Persistence failures already settle after release in the pool.
@@ -1516,7 +1519,7 @@ export class Runs {
     if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     if (!this.workerAlive(live)) { await this.workerLost(id, live); return; }
     try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
-    catch { this.checkpointUnavailable(id); }
+    catch (error) { this.checkpointUnavailable(id, error); }
     r = this.get(id);
     if (live.closed || this.live.get(id) !== live || r.status === "stopped" || r.status === "merged") { live.busy = false; await this.observeIdle(id, live); return; }
     if (published && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
@@ -1582,8 +1585,10 @@ export class Runs {
       if (this.workerAlive(live) && this.live.get(id) === live && !live.busy && live.idleSince === since) live.state = state;
     } catch { /* Unknown worker evidence fails closed and is reprobed on drain. */ }
   }
-  private checkpointUnavailable(id: string) {
-    this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
+  private checkpointUnavailable(id: string, error?: unknown) {
+    const reason = checkpointFailureReason(error);
+    console.error("Checkpoint unavailable", id, reason); // Never log exception text or state.
+    this.append(id, { type: "run.checkpoint_unavailable", reason, message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
   }
   private async publish(id: string, live: Live, options: Pick<GitHubOptions, "backgroundPublication"> = { backgroundPublication: true }) {
     const r = this.get(id);
@@ -1862,8 +1867,10 @@ export class Runs {
       // Caller timeout does not cancel the RPC. Fence its save callback before
       // deleting artifacts, so a late reply cannot resurrect a closed run's pair.
       live.checkpointDisabled = true;
+      if (live.workspace.captureCheckpoint) this.checkpointUnavailable(id, error);
+      const failureReason = checkpointFailureReason(error);
       const reason = error instanceof EvidenceTimeout ? " within 10 seconds" :
-        error instanceof CheckpointError && error.code === "limit" ? " because the checkpoint exceeds the size or storage limit" : "";
+        ["tree_too_large", "state_too_large", "storage_limit"].includes(failureReason) ? " because the checkpoint exceeds the size or storage limit" : "";
       return { saved: false, message: `Your changes and the conversation could not be saved${reason}. Send a follow-up to retry from the last pushed branch.` };
     }
   }

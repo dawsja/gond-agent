@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { command } from "./command";
 import type { Config } from "./config";
+import { CheckpointCaptureError, isCheckpointFailureReason } from "./checkpoint-failures";
 
 export interface WorkspaceCheckpointOptions {
   owner_id: string;
@@ -122,12 +123,12 @@ export class ContainerPool {
       models.clear();
     };
     const send = (frame: unknown) => new Promise<void>((resolve, reject) => {
-      if (!child || disconnected || destroyed) return reject(new Error("Workspace disconnected"));
+      if (!child || disconnected || destroyed) return reject(new CheckpointCaptureError("worker_unavailable", "Workspace disconnected"));
       child.stdin.write(JSON.stringify(frame) + "\n", (error) => error ? reject(error) : resolve());
     });
     const destroy = () => destruction ??= (async () => {
       destroyed = true;
-      fail(new Error("Workspace stopped"));
+      fail(new CheckpointCaptureError("worker_unavailable", "Workspace stopped"));
       child?.stdin.end();
       try { await this.cleanup(id); }
       finally {
@@ -140,7 +141,7 @@ export class ContainerPool {
     })().catch((e) => { destruction = undefined; throw e; });
     const rpc = <T = any>(method: string, args: Record<string, unknown> = {}) => new Promise<T>((resolve, reject) => {
       const key = String(++sequence);
-      const timer = setTimeout(() => { pending.delete(key); reject(new Error("Workspace request timed out")); }, 180_000);
+      const timer = setTimeout(() => { pending.delete(key); reject(new CheckpointCaptureError("timeout", "Workspace request timed out")); }, 180_000);
       pending.set(key, { resolve, reject, timer });
       void send({ id: key, method, ...args }).catch((error) => {
         clearTimeout(timer); pending.delete(key); reject(error);
@@ -199,6 +200,7 @@ export class ContainerPool {
         checkpointError = error ?? new Error("Workspace checkpoint release failed");
         // A failed release leaves execution position unknown. Never reuse it.
         console.error("Workspace checkpoint release failed", id);
+        try { checkpointHandler?.onError?.(error); } catch { /* Never log private state. */ }
         await destroy().catch(() => {});
       }).finally(() => {
         checkpointTask = undefined;
@@ -208,16 +210,16 @@ export class ContainerPool {
     const flushCheckpoints = async () => {
       while (checkpointTask) await checkpointTask;
       if (checkpointError !== undefined) throw checkpointError;
-      if (destroyed || disconnected) throw new Error("Workspace disconnected");
+      if (destroyed || disconnected) throw new CheckpointCaptureError("worker_unavailable", "Workspace disconnected");
     };
     const captureCheckpoint: NonNullable<Workspace["captureCheckpoint"]> = async (options) => {
       if (!checkpointHandler) throw new Error("Workspace checkpoints are not enabled");
-      if (capturePending) throw new Error("Workspace checkpoint capture is already pending");
+      if (capturePending) throw new CheckpointCaptureError("busy", "Workspace checkpoint capture is already pending");
       capturePending = true;
       try {
         // A prior failed save must not prevent trying a new post-publication capture.
         try { await flushCheckpoints(); }
-        catch { if (destroyed || disconnected) throw new Error("Workspace disconnected"); }
+        catch { if (destroyed || disconnected) throw new CheckpointCaptureError("worker_unavailable", "Workspace disconnected"); }
         checkpointError = undefined;
         if (options) checkpointHandler.options.head_sha = options.head_sha;
         const before = checkpointSequence;
@@ -294,7 +296,7 @@ export class ContainerPool {
       child = spawn(this.cfg.dockerBin, ["start", "--attach", "--interactive", name], { stdio: ["pipe", "pipe", "pipe"] });
       child.stdin.on("error", (error) => fail(error));
       child.on("error", (error) => fail(error));
-      child.on("exit", () => fail(new Error("Workspace exited")));
+      child.on("exit", () => fail(new CheckpointCaptureError("worker_unavailable", "Workspace exited")));
       child.stderr.on("data", (data: Buffer) => console.error("workspace", id, data.toString().slice(-1000)));
       let buffer = "";
       child.stdout.on("data", (data: Buffer) => {
@@ -311,7 +313,11 @@ export class ContainerPool {
             const p = pending.get(frame.id);
             if (!p) continue;
             pending.delete(frame.id); clearTimeout(p.timer);
-            if (typeof frame.error === "string") p.reject(new Error(frame.error)); else p.resolve(frame.result);
+            if (typeof frame.error === "string") {
+              p.reject("checkpoint_reason" in frame
+                ? new CheckpointCaptureError(isCheckpointFailureReason(frame.checkpoint_reason) ? frame.checkpoint_reason : "unknown")
+                : new Error(frame.error));
+            } else p.resolve(frame.result);
           } catch { fail(new Error("Invalid workspace response")); child?.kill(); }
         }
       });

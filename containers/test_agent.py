@@ -746,6 +746,27 @@ class StateControlTest(unittest.TestCase):
         self.assertFalse(agent.state_waiters)
         self.assertEqual(agent.events, [])
 
+    def test_runner_failure_codes_survive_as_safe_checkpoint_reasons(self):
+        for code, expected in [("state_too_large", "state_too_large"),
+                               ("background_shells_active", "background_shells_active"),
+                               ("runner_not_idle", "busy"), ("private-secret", "unknown")]:
+            with self.subTest(code=code):
+                frame, results = self.begin()
+                self.old.reply({"type": "state.error", "request_id": frame["request_id"],
+                                "operation": "export_state", "code": code})
+                failure = results.get(timeout=3)
+                output = io.StringIO()
+                with mock.patch.object(agent, "dispatch", side_effect=failure), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                    agent.handle({"id": "safe", "method": "checkpoint"})
+                wire = json.loads(output.getvalue())
+                self.assertEqual(wire.get("checkpoint_reason"), expected)
+                self.assertNotIn("private", output.getvalue())
+        with mock.patch.object(agent, "STATE_TIMEOUT", 0), \
+                contextlib.redirect_stdout(output := io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            agent.handle({"id": "safe", "method": "export_state"})
+        self.assertEqual(json.loads(output.getvalue()).get("checkpoint_reason"), "timeout")
+
     def test_state_size_limit_measures_compact_utf8_on_import_and_export(self):
         self.assertEqual(agent.MAX_STATE, 4 * 1024 * 1024)
         # 8 bytes of JSON structure plus 2 UTF-8 bytes per é, not ASCII escapes.
@@ -1648,6 +1669,34 @@ class CheckpointTest(unittest.TestCase):
             self.restore(data)
         self.assertEqual(self.state(), before)
         self.assertEqual((self.root / ".git/config").read_bytes(), config)
+
+    def test_tree_cap_reason_and_gitignored_build_outputs(self):
+        before = self.state()
+        artifact = os.urandom(16 * 1024)
+        (self.root / "ignored-build-output.png").write_bytes(artifact)
+        with mock.patch.object(agent, "MAX_CHECKPOINT_BUNDLE", 2048):
+            # A large ignored artifact must not consume the compressed tree budget.
+            self.export()
+            (self.root / "untracked-screenshot.png").write_bytes(artifact)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                agent.handle({"id": "safe", "method": "checkpoint_tree", "base_sha": self.base,
+                              "identity": self.identity})
+            self.assertEqual(json.loads(output.getvalue()).get("checkpoint_reason"), "tree_too_large")
+        self.assertEqual(self.state(), before)
+
+    def test_state_cap_and_git_timeout_have_distinct_wire_reasons(self):
+        cases = [("state_too_large", "import_state", mock.patch.object(agent, "MAX_STATE", 16)),
+                 ("timeout", "checkpoint_tree", mock.patch.object(agent.subprocess, "run",
+                    side_effect=subprocess.TimeoutExpired("private-command", 120)))]
+        for reason, method, patcher in cases:
+            with self.subTest(reason=reason), patcher:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                    agent.handle({"id": "safe", "method": method, "base_sha": self.base,
+                                  "identity": self.identity, "state": {"private": "x" * 100}})
+                self.assertEqual(json.loads(output.getvalue()).get("checkpoint_reason"), reason)
+                self.assertNotIn("private", output.getvalue())
 
     def test_size_caps_and_dirty_restore_fail_before_apply(self):
         self.write("edit.txt", "saved\n")
