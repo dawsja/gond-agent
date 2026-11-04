@@ -9,6 +9,14 @@ use crate::agent::events::{AgentEvent, AgentInput};
 /// JSONL protocol: AgentInput lines on stdin, AgentEvent lines on stdout. Exits when stdin closes
 /// and the current turn has finished.
 pub async fn jsonl(mut agent: AgentHandle) -> Result<i32> {
+    let result = jsonl_inner(&mut agent).await;
+    let _ = agent.input.send(AgentInput::Interrupt);
+    // main uses process::exit after this returns, so cleanup cannot rely on Drop.
+    agent.browser.shutdown().await;
+    result
+}
+
+async fn jsonl_inner(agent: &mut AgentHandle) -> Result<i32> {
     let input = agent.input.clone();
     let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
