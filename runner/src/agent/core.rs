@@ -1103,7 +1103,7 @@ mod tests {
             crate::tools::testutil::http::Res::new(200, "application/json", r#"{"results":[{"title":"Fixture","url":"https://example.test","snippet":"Fixture text"}]}"#)
         }).await;
         let mut cfg = config(dir.path(), Mode::Allow);
-        cfg.tools.push(crate::tools::bounded(Arc::new(crate::tools::web_search::WebSearch { relay: search_url })));
+        cfg.tools.push(crate::tools::bounded(Arc::new(crate::tools::web_search::WebSearch { api: ApiClient::new(search_url, None) })));
         let mut h = spawn(ApiClient::new(url, None), cfg);
         h.input.send(AgentInput::User { text: "go".into(), images: vec![] }).unwrap();
         let events = until(&mut h, |e| matches!(e, AgentEvent::Question { .. })).await;

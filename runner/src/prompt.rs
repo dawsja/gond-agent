@@ -11,7 +11,7 @@ The service snapshots and commits changes, pushes the run branch, and opens a pu
 
 /// The checked-out branch in `cwd`, if it's a git repository.
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    let o = std::process::Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd).output().ok()?;
+    let o = std::process::Command::new("git").env_remove(crate::config::RELAY_TOKEN_ENV).args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 

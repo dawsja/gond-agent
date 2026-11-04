@@ -31,7 +31,7 @@ pub(super) fn shell_command(cmd: &str) -> Command {
         let sh = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
         let mut c = Command::new(sh);
         c.arg("-c").arg(format!("exec 2>&1\n{cmd}")).process_group(0);
-        c.env("GOND_AGENT", "1").env_remove("GOND_AGENT_TOKEN");
+        c.env("GOND_AGENT", "1").env_remove("GOND_AGENT_TOKEN").env_remove(crate::config::RELAY_TOKEN_ENV);
         c
     }
     #[cfg(windows)]
@@ -40,7 +40,7 @@ pub(super) fn shell_command(cmd: &str) -> Command {
         c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]).arg(windows_script(cmd));
         // CREATE_NO_WINDOW: no console flashes up for each command.
         c.creation_flags(0x0800_0000);
-        c.env("GOND_AGENT", "1").env_remove("GOND_AGENT_TOKEN");
+        c.env("GOND_AGENT", "1").env_remove("GOND_AGENT_TOKEN").env_remove(crate::config::RELAY_TOKEN_ENV);
         c
     }
 }

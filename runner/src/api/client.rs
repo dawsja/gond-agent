@@ -48,7 +48,7 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
-        let http = crate::http::builder().connect_timeout(Duration::from_secs(15)).build().expect("http client");
+        let http = crate::http::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(15)).build().expect("http client");
         ApiClient { http, base: base.into().trim_end_matches('/').to_owned(), token: Arc::new(RwLock::new(token)) }
     }
 
@@ -70,7 +70,7 @@ impl ApiClient {
         e.to_string()
     }
 
-    fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut r = self.http.request(method, format!("{}{}", self.base, path));
         if let Some(t) = self.token.read().ok().and_then(|t| t.clone()) {
             r = r.bearer_auth(t);
