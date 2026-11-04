@@ -653,7 +653,7 @@ it("uses only the MCP token owner's GitHub connection, never another account's",
     const client = await connect();
     const denied = await call(client, "list_repositories");
     expect(denied.result.isError).toBe(true);
-    expect(JSON.stringify(denied.body)).toContain("Connect your GitHub account in Settings > Connections");
+    expect(JSON.stringify(denied.body)).toContain("Connect your GitHub account in Plugins > GitHub");
     expect(JSON.stringify(denied.body)).not.toContain("other-users-token");
   } finally { vi.unstubAllEnvs(); }
 });

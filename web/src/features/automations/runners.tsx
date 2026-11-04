@@ -8,7 +8,7 @@ import { useBranches, useDeleteRunner, useGithub, useModels, useRepos, useSaveRu
 import { cn } from "@/lib/utils"
 import { PickerPopover } from "@/components/workspace/picker-popover"
 import { ModelPicker } from "@/components/workspace/model-picker"
-import { Switch } from "../studio/switch"
+import { Switch } from "@shared/ui/switch"
 import { mono, pickerChip } from "../studio/theme"
 
 const chip = cn(pickerChip, "px-2.5")
@@ -236,9 +236,10 @@ export function RunnerCard({ runner, disabled, editing, onEdit }: { runner: Runn
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <button type="button" aria-label={`Edit ${runner.name}`} disabled={disabled} onClick={onEdit} className="grid size-8 place-items-center rounded-[4px] border border-border text-foreground hover:bg-raised disabled:opacity-50"><Pencil className="size-3.5" /></button>
-          <Switch checked={runner.enabled && !disabled} disabled={disabled || save.isPending} onChange={(enabled) => save.mutate({ id: runner.id, enabled })} label={`Enable ${runner.name}`} />
+          <Switch checked={save.isPending ? save.variables.enabled : runner.enabled} disabled={disabled} pending={save.isPending} onCheckedChange={enabled => save.mutate({ id: runner.id, enabled })} aria-label={`Enable ${runner.name}`} />
         </div>
       </header>
+      {save.isError && <p role="alert" className="px-5 pb-4 text-sm text-failed">{save.error.message}</p>}
       {editing && <Editor runner={runner} onClose={onEdit} />}
     </section>
   )

@@ -35,12 +35,13 @@ vi.mock("../src/github", async (original) => {
     })),
     importBundle: vi.fn(async () => {}),
     pushBranch: vi.fn(async () => {}),
+    fetchDiffBase: vi.fn(async () => {}),
     git: vi.fn(async (_cwd: string, ...args: string[]) =>
       Buffer.from(
-        args[0] === "rev-parse"
+        args[0] === "rev-parse" || args[0] === "merge-base"
           ? "a".repeat(40)
           : args.includes("--numstat")
-            ? "2\t1\tsrc/app.ts\n"
+            ? "2\t1\tsrc/app.ts\0"
             : "diff --git a/src/app.ts b/src/app.ts\n",
       ),
     ),
@@ -1221,23 +1222,26 @@ describe("persistent local run lifecycle", () => {
   it("refreshes externally merged PRs once, preserves concurrent run updates and blocks follow-ups", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(1); // Publish warms the cache.
     let resolve!: (value: unknown) => void;
     vi.mocked(gh).mockImplementationOnce(() => new Promise(done => { resolve = done; }) as never);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 30_001);
     const a = runs.refreshPulls("u", r.id), b = runs.refreshPulls("u");
+    clock.mockRestore();
     const latest = runs.get(r.id); latest.title = "Updated title"; runs.save(latest);
-    resolve({ data: { p0: { pullRequest: { state: "MERGED" } } } });
+    resolve({ data: { p0: { pullRequest: { state: "MERGED", headRefOid: "b".repeat(40), additions: 2249, deletions: 76, changedFiles: 32 } } } });
     await Promise.all([a, b]);
-    expect(runs.get(r.id)).toMatchObject({ status: "merged", pr_state: "merged", title: "Updated title" });
-    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(1);
+    expect(runs.get(r.id)).toMatchObject({ status: "merged", pr_state: "merged", title: "Updated title", files: 32, additions: 2249, deletions: 76 });
+    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(2);
     expect(vi.mocked(gh).mock.calls.find(c => c[0] === "graphql")?.[3]?.GH_TOKEN).toBe("test-managed-github-token");
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(runs.history(r.id, 0).filter(e => e.type === "run.pr" && e.state === "merged")).toHaveLength(1);
     expect(() => runs.enqueue(r.id, "u", "Continue")).toThrow(/new run after merging/);
     await runs.refreshPulls("u", r.id);
-    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(1);
+    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(2);
     db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,?,?,?)').run("other", "Other", "other@example.test", 0, Date.now(), Date.now());
     await expect(runs.refreshPulls("other", r.id)).rejects.toThrow(/doesn't exist/);
-    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(1);
+    expect(vi.mocked(gh).mock.calls.filter(c => c[0] === "graphql")).toHaveLength(2);
   });
   it("records an external merge during a turn without interrupting its export", async () => {
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Fix it" });
@@ -1248,7 +1252,10 @@ describe("persistent local run lifecycle", () => {
     await vi.waitFor(() => expect(importBundle).toHaveBeenCalledTimes(2));
     vi.mocked(gh).mockResolvedValueOnce({ data: { p0: { pullRequest: { state: "MERGED" } } } });
     try {
-      await runs.refreshPulls("u", r.id);
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 30_001);
+      const refresh = runs.refreshPulls("u", r.id);
+      clock.mockRestore();
+      await refresh;
       expect(runs.get(r.id)).toMatchObject({ status: "working", pr_state: "merged" });
       expect(destroy).not.toHaveBeenCalled();
       expect(() => runs.enqueue(r.id, "u", "Another change")).toThrow(/new run after merging/);

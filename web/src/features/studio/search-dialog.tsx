@@ -1,7 +1,7 @@
 // Search everything from the sidebar's search button: runs, pages and settings, in one dialog in the middle
 // of the screen. Styled like the composer's pickers and shared/menu.tsx: 4px corners, border-strong,
 // 32px rows, no motion. Arrows move, Enter opens, Esc closes.
-import { Settings2, KeyRound, type LucideIcon, Search, Trash2 } from "lucide-react"
+import { Settings2, KeyRound, type LucideIcon, Plug, Search, Trash2 } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router"
@@ -60,6 +60,7 @@ export function SearchDialog({
         to: `/runs/${r.id}`,
       })),
       ...pages.map((p) => ({ id: `page:${p.to}`, group: "Pages" as const, title: p.label, icon: <p.icon className="size-3.5" />, to: p.to })),
+      { id: "page:github", group: "Pages" as const, title: "GitHub", icon: <Plug className="size-3.5" />, keywords: "plugins connections repositories shared", to: "/plugins/github" },
       ...SETTINGS.map((s) => ({
         id: `setting:${s.to}`,
         group: "Settings" as const,

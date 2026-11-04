@@ -29,14 +29,17 @@ const PluginsScreen = lazy(() =>
     default: m.PluginsScreen,
   }))
 )
+const GithubPluginScreen = lazy(() =>
+  import("@/features/plugins/github-plugin").then((m) => ({ default: m.GithubPluginScreen }))
+)
 const AutomationsScreen = lazy(() =>
   import("@/features/automations/automations-screen").then((m) => ({
     default: m.AutomationsScreen,
   }))
 )
-const SettingsScreen = lazy(() =>
-  import("@/features/settings/settings-screen").then((m) => ({
-    default: m.SettingsScreen,
+const SettingsRoute = lazy(() =>
+  import("@/app/settings-route").then((m) => ({
+    default: m.SettingsRoute,
   }))
 )
 
@@ -64,8 +67,11 @@ export function App() {
               <Route path="/runs/:id" element={<RunScreen />} />
               <Route path="/usage" element={<UsageScreen />} />
               <Route path="/plugins" element={<PluginsScreen />} />
+              <Route path="/plugins/github" element={<GithubPluginScreen />} />
               <Route path="/automations" element={<AutomationsScreen />} />
-              <Route path="/settings" element={<SettingsScreen />} />
+              <Route path="/settings" element={<SettingsRoute />} />
+              <Route path="/settings/connections" element={<SettingsRoute />} />
+              <Route path="/settings/github" element={<SettingsRoute />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>
