@@ -98,3 +98,16 @@ it("updates the PR presentation after external merges without duplicating the op
   expect(merged.items[0]).toMatchObject({ kind: "pr", state: "merged", number: 42 });
   expect(merged.log.at(-1)?.text).toBe("merged pull request #42");
 });
+
+it("refreshes queue metadata on position changes and dequeue without duplicating replay", () => {
+  const append = createTranscript();
+  const queued = {seq:1, ts:1, type:"run.queued", position:2, length:3};
+  const before = append([queued]);
+  expect(append([queued]).queueRevision).toBe(before.queueRevision);
+  const after = append([
+    {seq:2, ts:2, type:"run.queued", position:1, length:2},
+    {seq:3, ts:3, type:"run.dequeued"},
+  ]);
+  expect(after.queueRevision).toBe(before.queueRevision + 2);
+  expect(after.items).toEqual([]);
+});

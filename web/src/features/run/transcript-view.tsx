@@ -315,7 +315,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
     <div className="mx-auto flex w-full max-w-[720px] flex-col gap-5 px-8 pt-6 pb-8 max-md:px-4 max-md:pt-4">
       {t.items.length === 0 && <UserMessage text={run.prompt} ts={run.created_at} runId={run.id} author={author} authorId={run.user_id} base={run.base_branch} first />}
       {t.items.map(render)}
-      {live && !busyTool && (
+      {live && run.status !== "queued" && !busyTool && (
         <Activity label={t.step ?? run.step ?? "Working"} />
       )}
     </div>

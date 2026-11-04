@@ -8,6 +8,9 @@ export interface Config {
   dockerBin: string;
   workerImage: string;
   maxRuns: number;
+  queueMax?: number;
+  queueMaxPerAccount?: number;
+  queueWaitHours?: number;
   runCPUs: number;
   runMemoryMB: number;
 }
@@ -54,6 +57,7 @@ export function configFromEnv(): Config {
   questionWaitMinutes();
   planSetting("GOND_AGENT_PLAN_REMINDER_EVERY");
   planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT");
+  const queue = queueSettings();
   const secret = process.env.BETTER_AUTH_SECRET ?? "";
   if (secret.length < 32)
     throw new Error("BETTER_AUTH_SECRET must contain at least 32 characters");
@@ -80,7 +84,22 @@ export function configFromEnv(): Config {
     dockerBin: process.env.DOCKER_BIN ?? "docker",
     workerImage: process.env.GOND_AGENT_WORKER_IMAGE ?? "ghcr.io/dawsja/gond-agent-worker:main",
     maxRuns: Number(process.env.MAX_ACTIVE_RUNS ?? 5),
+    ...queue,
     runCPUs: Number(process.env.RUN_CPUS ?? 2),
     runMemoryMB: Number(process.env.RUN_MEMORY_MB ?? 2048),
+  };
+}
+export function queueSettings() {
+  const read = (name: string, fallback: number) => {
+    const raw = process.env[name] ?? String(fallback);
+    const n = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < 1 || n > 0xffff_ffff)
+      throw new Error(`Invalid ${name}`);
+    return n;
+  };
+  return {
+    queueMax: read("GOND_AGENT_QUEUE_MAX", 50),
+    queueMaxPerAccount: read("GOND_AGENT_QUEUE_MAX_PER_ACCOUNT", 10),
+    queueWaitHours: read("GOND_AGENT_QUEUE_WAIT_HOURS", 24),
   };
 }

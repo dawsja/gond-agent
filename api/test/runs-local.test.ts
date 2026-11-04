@@ -209,7 +209,8 @@ describe("persistent local run lifecycle", () => {
     const second = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Second"});
     await vi.waitFor(() => expect(runs.get(second.id).status).toBe("ready"));
     await vi.waitFor(() => expect(runs.get(first.id).status).toBe("ready"));
-    await expect(runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"})).rejects.toMatchObject({code:"run_limit"});
+    const third = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"});
+    expect(third).toMatchObject({status:"queued",queue_position:1,queue_length:1});
     const history = runs.history(first.id, 0);
     vi.mocked(importBundle).mockRejectedValueOnce(new Error("push failed"));
     await expect(runs.closeSession(first.id, "u")).rejects.toThrow("push failed");
@@ -219,7 +220,6 @@ describe("persistent local run lifecycle", () => {
     expect(runs.history(first.id, 0).slice(0, history.length)).toEqual(history);
     expect(runs.get(first.id).diff).toContain("src/app.ts");
     expect(runs.get(first.id).pushed).toBe(true);
-    const third = await runs.create("u", {repo:"acme/app",model:"auto",prompt:"Third"});
     await vi.waitFor(() => expect(runs.get(third.id).status).toBe("ready"));
     await runs.closeSession(third.id, "u");
     runs.enqueue(first.id, "u", "Resume");
@@ -241,7 +241,7 @@ describe("persistent local run lifecycle", () => {
       expect(destroy).toHaveBeenCalledTimes(1);
     } finally { clock.mockRestore(); }
   });
-  it("does not resume a stopped workspace when all slots are occupied", async () => {
+  it("queues a stopped closed workspace when all slots are occupied", async () => {
     const first=await runs.create("u",{repo:"acme/app",model:"local:coder",prompt:"First"});
     await vi.waitFor(()=>expect(runs.get(first.id).status).toBe("ready"));
     await runs.stop(first.id,"u");
@@ -251,9 +251,10 @@ describe("persistent local run lifecycle", () => {
       await vi.waitFor(()=>expect(runs.get(run.id).status).toBe("ready"));
     }
     const before=runs.history(first.id,0).length;
-    expect(()=>runs.enqueue(first.id,"u","Continue")).toThrow(/All workspaces are busy/);
-    expect(runs.get(first.id).pending).toHaveLength(0);
-    expect(runs.history(first.id,0)).toHaveLength(before);
+    runs.enqueue(first.id,"u","Continue");
+    expect(runs.get(first.id)).toMatchObject({status:"queued",queue_position:1,queue_length:1});
+    expect(runs.get(first.id).pending).toHaveLength(1);
+    expect(runs.history(first.id,0).slice(before).map(event => event.type)).toEqual(["user","run.queued"]);
   });
   it("enforces capacity when concurrent starts finish repository lookup together", async () => {
     let release!: () => void;
@@ -267,10 +268,10 @@ describe("persistent local run lifecycle", () => {
     await vi.waitFor(() => expect(vi.mocked(gh).mock.calls.filter(args => args[0] === "repos/acme/app")).toHaveLength(3));
     release();
     const results = await outcomes;
-    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(2);
-    const rejected = results.find(result => result.status === "rejected") as PromiseRejectedResult;
-    expect(rejected.reason.code).toBe("run_limit");
-    expect(runs.list("u")).toHaveLength(2);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(3);
+    expect(runs.list("u")).toHaveLength(3);
+    expect(runs.list("u").filter(run => run.status === "queued")).toEqual([expect.objectContaining({queue_position:1,queue_length:1})]);
+    expect(checkout).toHaveBeenCalledTimes(2);
     vi.mocked(gh).mockImplementation(original);
   });
   it("answers a worker question through MCP and continues the session", async () => {

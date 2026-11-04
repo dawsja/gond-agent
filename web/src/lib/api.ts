@@ -21,6 +21,8 @@ export interface Run {
   title: string
   prompt: string
   status: RunStatus
+  queue_position?: number
+  queue_length?: number
   step: string | null
   plan_done: number
   summary?: { plan_steps?: { text: string; status: "pending" | "in_progress" | "done" }[] }

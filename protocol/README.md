@@ -19,13 +19,13 @@ Tools return JSON in MCP text content. Tool failures set `isError` and return cu
 | `read_session_event` | `session_id`, `seq`, optional character `cursor`; returns a large event as JSON text in 32,000-character pages. Advance the event sequence only after reading its final page. |
 | `get_session_diff` | `session_id`, optional character `cursor`; 32,000-character diff pages, nullable continuation and `updated_at`. Restart if the revision changes. |
 | `send_session_message` | `session_id`, `text`, `request_id`; optional `model`, `effort` (any available model). Sessions of the removed Claude Code/Codex agents return `retired_backend`. |
-| `close_session` | `session_id`; save and push idle/stopped workspace changes, then release capacity. Refuses busy workspaces; preserves history and resumes from pushed branch on follow-up. |
-| `stop_session` | `session_id`; existing run interruption. |
+| `close_session` | `session_id`; cancel capacity-queued work, or save and push idle/stopped workspace changes, then release capacity. Refuses busy live workspaces; preserves history and resumes from pushed branch on follow-up. |
+| `stop_session` | `session_id`; cancel capacity-queued work, or interrupt the turn without destroying a live workspace or freeing its slot. |
 | `open_session_pull_request` | `session_id`; open or return its existing PR. |
 
 Event pages contain at most 128,000 JSON characters; oversized individual events return a `large_event` reference instead of silently losing transcript content. Reads revalidate access while waiting and before responding. Disconnecting a read does not stop execution. Lists and diffs reflect live state rather than a snapshot.
 
-Start and follow-up `request_id` values are 1–100 characters, token-scoped and persisted across restart. Retry with identical arguments; changed arguments conflict. Start reserves a stable run ID before asynchronous work; run insertion and initial queueing are atomic. Follow-up enqueue and result persistence are atomic. Sessions retain `source: "mcp"` and token ID attribution. No billing fallback, direct shell/file access, merges, account deletion or image input tools are added.
+Start and follow-up `request_id` values are 1–100 characters, token-scoped and persisted across restart. Retry with identical arguments; changed arguments conflict. Start reserves a stable run ID before asynchronous work; run insertion and initial queueing are atomic. A start retry returns the existing owned run's current state and queue position, never another run. Follow-up enqueue and result persistence are atomic. Sessions retain `source: "mcp"` and token ID attribution. No billing fallback, direct shell/file access, merges, account deletion or image input tools are added.
 
 Retention keeps all request records for valid tokens. Scheduler cleanup removes records for invalid tokens and deletes token metadata 30 days after expiry or revocation. Schedule claims older than 30 days are removed unless they match a schedule's current occurrence.
 
@@ -84,6 +84,18 @@ Authenticated `GET /api/v1/models` powers agent and scheduled-run model pickers.
 
 A run starts with `POST /api/v1/runs {repo,base_branch?,model,prompt,images?}`. Messages, stop, pull creation, merge and deletion are scoped to the authenticated owner. Upload images first to `/api/v1/images`. Run status: queued, working, ready, failed, stopped, merged. A one-use ticket from `POST /api/v1/runs/:id/ticket` opens `/ws/runs/:id?ticket=...&after=<seq>`. Replay resumes after a persisted sequence number. Events carry seq and ts; run.info describes live status without becoming a transcript row. A ping gets a pong. Tickets expire after one minute and are consumed on use.
 
+### Persistent workspace queue
+
+Admission counts distinct live plus booting workspaces against `MAX_ACTIVE_RUNS`, including retained ready/idle/stopped/model-failed live workspaces. Browser/HTTP creates, MCP `start_session` and closed-workspace follow-ups validate before queue admission. When capacity is unavailable, accepted work waits durably instead of requiring caller retries. Queue sequence and pending work survive service restart; interrupted working runs retain the existing failed recovery behavior.
+
+Drain FIFO within each account, selecting the account with the fewest occupied workspaces first. New admissions must not jump waiting work. Drain on capacity release, admission and startup, with a 60-second safety net; reads/polling are not required to start accepted work. Scheduler `source: runner` (also `schedule` supported) is excluded from the queue and its bounds: capacity rejection remains `run_limit`, with retries on later scheduler ticks as before and no queue jumping.
+
+HTTP run get/list/event reads and MCP `get_session`, `list_sessions` entries and `read_session_events` expose additive `queue_position` and `queue_length` while waiting. Position is 1-based relative FIFO order among **only the caller account's queued runs**; length is that account's queued-run count. Neither reveals global queue size/order or guarantees the actual start rank across accounts. Live run events include `run.queued {position,length}` on admission and queue updates, with the same account-local semantics, and `run.dequeued` when leaving the waiting queue. These are service run events, not worker protocol controls.
+
+Configuration accepts positive integers: `GOND_AGENT_QUEUE_MAX` (default 50 total waiting runs), `GOND_AGENT_QUEUE_MAX_PER_ACCOUNT` (default 10), and `GOND_AGENT_QUEUE_WAIT_HOURS` (default 24). Exceeding either queue bound returns HTTP 429 `queue_full` with message "Too many runs are waiting. Try again later." MCP reports the same customer-safe error code/message through its tool-error contract. Expiry fails waiting work with a plain message after the configured wait; it imposes no time budget on an active workspace.
+
+Stop cancels capacity-queued work; close/remove also cancels waiting. Stop remains nondestructive for live workspaces and does not free their slots. Close saves/pushes retained workspace changes before freeing capacity and automatically starting waiting work; publication failure retains the workspace.
+
 ## Backend, model access and effort
 
 There is one backend, the built-in runner (`backend: "builtin"`). Run creation, loading, saving and follow-ups check it: `POST /api/v1/runs`, schedules and MCP `start_session` reject any other `backend` with 400 `invalid_backend`, and model IDs of the removed agents (`cli-codex:…`, `cli-claude-code:…`) return 404 `retired_model`. Runs created by Claude Code or Codex before the upgrade load with `backend: "builtin"` and `retired_backend: "claude-code" | "codex"`; their transcripts, diffs and pull requests stay readable, and messages to them return 409 `retired_backend`.
@@ -141,7 +153,7 @@ Append your own requirements to `prompt`. Reuse `request_id` only for identical 
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_session","arguments":{"request_id":"ticket-123-v1","repo":"owner/repo","model":"local:coder","prompt":"Implement ticket 123. Follow our review and testing rules appended here."}}}
 ```
 ```json
-{"id":"run_abc","status":"queued","state":"queued","done":false,"waiting_for_input":false,"asking_question":false,"question":null,"pr_url":null,"last_error":null}
+{"id":"run_abc","status":"queued","state":"queued","done":false,"queue_position":1,"queue_length":1,"waiting_for_input":false,"asking_question":false,"question":null,"pr_url":null,"last_error":null}
 ```
 Repeat the event read with the returned cursor until `done` or `waiting_for_input`, rather than assuming an empty page means finished:
 ```json
@@ -178,7 +190,7 @@ Runs have no elapsed-time, idle, step, token-total or tool-call budgets. Explici
 
 ### Release finished sessions
 
-After reading the result and diff and opening any desired PR, call `close_session` to free the workspace slot. Finished sessions do not expire automatically. Stop is non-destructive and does not free a slot. Close refuses while a turn, pending message or startup is active. For stopped work it snapshots and pushes uncommitted edits first; if snapshot or push fails, the workspace stays open. History and diff remain readable, and a follow-up shallow-clones the pushed branch. The workspace's More → Close workspace action and `POST /api/v1/runs/:id/close` use the same owner-scoped operation.
+After reading the result and diff and opening any desired PR, call `close_session` to free the workspace slot and automatically start waiting work. Finished sessions do not expire automatically. Stop is non-destructive for live workspaces and does not free a slot; it cancels capacity-queued work instead. Close also cancels capacity-queued work, but refuses while a live turn, pending message or startup is active. For stopped work it snapshots and pushes uncommitted edits first; if snapshot or push fails, the workspace stays open. History and diff remain readable, and a follow-up shallow-clones the pushed branch, queuing if capacity is unavailable. The workspace's More → Close workspace action and `POST /api/v1/runs/:id/close` use the same owner-scoped operation.
 
 ```json
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"close_session","arguments":{"session_id":"run_abc"}}}
