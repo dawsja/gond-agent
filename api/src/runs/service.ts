@@ -40,7 +40,7 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
-import { acceptEvidence, emptyEvidence, evidenceKey, finishEvidence, weakenedEvidence, type Evidence } from "./evidence";
+import { acceptEvidence, emptyEvidence, finishEvidence, weakenedEvidence, type Evidence } from "./evidence";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
@@ -103,7 +103,7 @@ export function parseRun(data: string): Run {
   return { ...run, backend: BACKEND, retired_backend: run.retired_backend ?? String(backend) };
 }
 interface Live {
-  /** Captured once, before the first task, never serialized or refreshed at turn end. */
+  /** Service-generated once per worker, never serialized or refreshed at turn end. */
   evidenceKey?: Buffer;
   workspace: Workspace;
   cwd: string;
@@ -282,7 +282,7 @@ export class Runs {
     if (event.type === "evidence.recorded") {
       if (Object.keys(event).some(key => key !== "type" && key !== "record")) return;
       const run = this.get(id);
-      const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey);
+      const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey, id);
       if (!evidence) return;
       run.evidence = evidence;
       this.save(run);
@@ -784,10 +784,15 @@ export class Runs {
         ...(process.env.GOND_AGENT_PLAN_NUDGE_LIMIT !== undefined ? { plan_nudge_limit: planSetting("GOND_AGENT_PLAN_NUDGE_LIMIT") } : {}),
       });
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
-      // Legacy workers/mocks may not export evidence. Fail closed without logging
-      // the reply or blocking ordinary work; never retry key acquisition later.
-      let signingKey: Buffer | undefined;
-      try { signingKey = evidenceKey(await workspace.rpc("export_state", { run_id: id, owner_id: r.user_id })); } catch { /* unavailable */ }
+      // Only this service chooses the key. The dedicated RPC waits for a private
+      // runner acknowledgement before any task can be delivered.
+      const signingKey = randomBytes(32);
+      await workspace.rpc("init_evidence", { run_id: id, owner_id: r.user_id, key: signingKey.toString("hex") });
+      if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
+      // Keep the initial private export for policy inspection, never key acquisition.
+      // Older exports may be unavailable; no control reply is logged or published.
+      let initialEvidence: unknown;
+      try { initialEvidence = await workspace.rpc("export_state", { run_id: id, owner_id: r.user_id }); } catch { /* unavailable */ }
       if (this.shuttingDown || this.cancelledBoots.has(id) || this.get(id).status === "stopped") return await workspace.destroy();
       const live: Live = {
         evidenceKey: signingKey,
@@ -804,6 +809,7 @@ export class Runs {
         .toString()
         .trim();
       r = { ...this.get(id), base_sha: r.base_sha };
+      r.evidence = finishEvidence(r.evidence, initialEvidence, signingKey);
       r.phase = "agent";
       this.save(r);
       try { await this.next(id, live); }

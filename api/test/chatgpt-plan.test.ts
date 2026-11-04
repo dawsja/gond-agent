@@ -350,6 +350,11 @@ describe("ChatGPT plan models and inference", () => {
     expect(rpcs.filter(r => r.method === "export_state")).toEqual([
       { method: "export_state", args: { run_id: runId, owner_id: user } },
     ]);
+    expect(rpcs.filter(r => r.method === "init_evidence")).toEqual([
+      { method: "init_evidence", args: { run_id: runId, owner_id: user, key: expect.stringMatching(/^[a-f0-9]{64}$/) } },
+    ]);
+    expect(rpcs.findIndex(r => r.method === "init_evidence")).toBeGreaterThan(rpcs.findIndex(r => r.method === "start"));
+    expect(rpcs.findIndex(r => r.method === "init_evidence")).toBeLessThan(rpcs.findIndex(r => r.method === "export_state"));
     expect(rpcs.findIndex(r => r.method === "export_state")).toBeGreaterThan(rpcs.findIndex(r => r.method === "start"));
     expect(rpcs.findIndex(r => r.method === "export_state")).toBeLessThan(rpcs.findIndex(r => r.method === "send"));
     const relayed = await (await handler!(runnerRequest(model))).text();

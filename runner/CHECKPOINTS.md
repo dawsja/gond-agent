@@ -5,28 +5,35 @@ These are **not** model tools, user messages, or transcript events. The controll
 forwards these over dedicated RPCs and isolates replies from transcript events;
 the API has an opaque sealed storage module. Scheduling, automatic recovery and
 checkpoint lifecycle integration are not included. RunService does already use
-private state export to capture evidence keys before task execution and metadata
-at turn finish; this does not enable checkpoint-backed recovery.
+private `init_evidence` to install a service-issued key before task execution and
+state export for metadata at turn finish, never to adopt exported signing authority.
+This does not enable checkpoint-backed recovery.
 
 ## Commands and replies
+
+Before task execution, the API service generates a fresh random 32-byte key per
+worker and sends private `init_evidence {request_id,run_id,owner_id,key}`. The runner
+acknowledges `state.evidence_initialized {request_id}`. These are private controls,
+not model inputs or transcript events; the key never enters environments or logs.
 
 These minimal schema examples omit optional `evidence`. Real exports include the
 private ledger described below; never copy its signing key into a transcript.
 
 ```json
 {"type":"export_state","request_id":"save-1","run_id":"run-123","owner_id":"user-456"}
-{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"state.exported","request_id":"save-1","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-3","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 ```
 
 Send that **state object**, not its wrapper or a model request, to a fresh worker:
 
 ```json
-{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-2","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
+{"type":"import_state","request_id":"load-1","run_id":"run-123","owner_id":"user-456","state":{"schema_version":1,"runner_state_version":"gond-agent-checkpoint-3","run_id":"run-123","owner_id":"user-456","history":[],"plan":[],"counters":{"sub_counter":0,"main_context":0,"plan_calls":0,"plan_last":[],"plan_nudges":0,"turn_compactions":0,"skipped_history_len":null}}}
 {"type":"state.imported","request_id":"load-1"}
 ```
 
 Failures use `{"type":"state.error","request_id":"…","operation":"import_state","code":"…"}`
-(or operation `export_state`). Codes are `invalid_command`, `runner_not_fresh`,
+(or operation `export_state` / `init_evidence`). Codes are `invalid_command`,
+`runner_not_fresh`,
 `export_queue_full`, `incompatible_version`, `binding_mismatch`, `invalid_schema`,
 `invalid_counters_or_plan`, `invalid_role_placement`, `invalid_tool_call`,
 `unpaired_tools`, `invalid_image`, `state_too_large`, `invalid_evidence_bounds`,
@@ -76,15 +83,16 @@ EOF waits for accepted state controls as well as active turns.
   normalization; bad/unresolved images reject the transaction. Normalization
   can change bytes/media type, and decoder saturation is an import error.
 - `SCHEMA_VERSION` remains 1; the explicit `RUNNER_STATE_VERSION` compatibility
-  epoch is `gond-agent-checkpoint-2`, independent of Cargo's package version.
+  epoch is `gond-agent-checkpoint-3`, independent of Cargo's package version.
   **Bump it whenever history/tool/compaction/counter semantics become
-  incompatible**. One narrow compatibility path accepts ledgerless epoch-1 state
-  and upgrades the epoch; it supplies no prior execution evidence. Other epochs,
-  including epoch-1 state with a ledger, are rejected.
-- Commands supply the expected run and owner. Import checks both against state;
-  the first export or successful import binds subsequent controls on that
-  worker. This is not authentication: the service must independently check
-  ownership and prevent checkpoint substitution/tampering.
+  incompatible**. The legacy compatibility path accepts only ledgerless epoch-1
+  or epoch-2 state and upgrades the epoch; it supplies no prior execution evidence.
+  **Old ledger-bearing epoch-2 state is rejected**, as is ledger-bearing epoch-1
+  state and other incompatible epochs.
+- Controls supply the expected run and owner; initialization binds the signing
+  authority to them, and import checks both against state. Subsequent controls
+  must respect the worker's binding. This is not authentication: the service must
+  independently check ownership and prevent checkpoint substitution/tampering.
 
 ## Evidence state
 
@@ -101,20 +109,26 @@ rounds in `gate_budget` at `next`, before each task is delivered, capped at six.
 Before worker startup, gate rounds are seeded from `max(gate_rounds, gate_budget)`.
 A crash may spend unused allowance but cannot replenish it.
 
-The key belongs only in private state RPCs, sealed checkpoint state and API live
-memory, never ordinary run rows, transcript events, child environments or logs.
-The API captures it before the first task and does not adopt a changed finish key.
+The service-generated key belongs only in private controls, sealed checkpoint
+state and API live memory, never ordinary run rows, transcript events, environments
+or logs. The worker generates no signing authority; the API never adopts an
+exported key or a changed finish key as authority. HMAC-SHA256 signs compact JSON
+`{domain:"gond-agent:evidence:v1",run_id,record}`, recursively sorting object keys
+and retaining array order. `record` includes every field except `sig`, including
+run_id, seq, both tree hashes and `command_definition_changed`.
 These are **evidence recorded by the worker**, not independent proof: signatures
 authenticate records, while same-UID executed code can inspect process memory.
 Only a separate-container rerun could provide independent proof, out of scope.
 `env_clean` means an environment allow-list was applied; `env_digest` hashes its
 values, not an absence of secrets in HOME/`.npmrc` or elsewhere.
 
-Restore marks records stale on missing keys or mismatched trees. Missing keys are
-replaced without re-signing historical records; ledgerless imports request a new
-check. Ignored paths are NOT covered by tree identity, even if executed by a check.
-Capture ignores clone-local/system excludes, but respects worktree `.gitignore`;
-ignored dependencies such as `node_modules` may be absent after restore. Do not
+Resume rekeys for the new worker with a fresh service-issued key, marks old records
+historical/stale without re-signing them, and preserves sequence and budget
+counters. Mismatched trees also make records stale; ledgerless imports request a
+new check. Ignored paths are NOT covered by tree identity, even if executed by a check.
+Evidence capture, publication snapshots and checkpoints use the same isolated Git
+helper, ignoring clone-local/system configuration and excludes but respecting
+worktree `.gitignore`; ignored dependencies such as `node_modules` may be absent after restore. Do not
 treat hidden ignored code as trusted based on a matching tree.
 
 ## Restored state and remaining integration seams
@@ -130,6 +144,13 @@ ordinary transcript frames. The caller must send the intended continuation.
 Frozen evidence policy is restored with the ledger, unlike ordinary runtime
 configuration below. Policy/manifest edits do not alter frozen checks; a later
 run must pin a base containing those edits before discovering them anew.
+Additional commands use the fixed grammar documented in the protocol: `npm test`,
+`npm`/`pnpm`/`bun run <script>` from BASE's exact-cwd `package.json`, locked Cargo
+and fixed pytest/unittest forms. Arbitrary executables, URLs and shell syntax are
+not accepted; `allow-weaken` never bypasses grammar or BASE-script validation.
+Command definitions/configuration are compared against BASE before and after a
+check; `command_definition_changed=true` excludes gate and publication success and
+produces a weakening warning. Unknown test counts never count as success.
 
 Runtime configuration (model/effort, prompts/instructions, permission mode/rules,
 skills/tools, cadence interval/nudge limit, question timeout) comes from the new

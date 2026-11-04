@@ -12,7 +12,7 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const SCHEMA_VERSION: u32 = 1;
 // Deliberate compatibility epoch, NOT Cargo's package version. Bump for changes to
 // history semantics, tool replay, compaction or counter interpretation.
-pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-2";
+pub const RUNNER_STATE_VERSION: &str = "gond-agent-checkpoint-3";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -70,10 +70,13 @@ pub fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, &'static str> {
 impl Checkpoint {
     pub fn validate(&self, run: &str, owner: &str) -> Result<(), &'static str> {
         if self.schema_version != SCHEMA_VERSION || (self.runner_state_version != RUNNER_STATE_VERSION
-            && !(self.runner_state_version == "gond-agent-checkpoint-1" && self.evidence.is_none())) {
+            && !(matches!(self.runner_state_version.as_str(), "gond-agent-checkpoint-1" | "gond-agent-checkpoint-2") && self.evidence.is_none())) {
             return Err("incompatible_version");
         }
-        if let Some(evidence) = &self.evidence { evidence.validate()?; }
+        if let Some(evidence) = &self.evidence {
+            evidence.validate()?;
+            if !evidence.run_id.is_empty() && evidence.run_id != run { return Err("binding_mismatch"); }
+        }
         if !valid_binding(run, owner) || self.run_id != run || self.owner_id != owner {
             return Err("binding_mismatch");
         }

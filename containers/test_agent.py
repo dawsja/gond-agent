@@ -547,9 +547,29 @@ class StateControlTest(unittest.TestCase):
                 source.wait(timeout=3)
                 thread.join(3)
 
+    def test_evidence_key_uses_only_the_private_correlated_control_path(self):
+        key = "07" * 32
+        environment = dict(os.environ)
+        frame, results = self.begin("init_evidence", key=key, request_id="caller-controlled")
+        self.assertEqual(set(frame), {"type", "request_id", "run_id", "owner_id", "key"})
+        self.assertEqual(frame["type"], "init_evidence")
+        self.assertTrue(frame["key"] == key)
+        self.assertNotEqual(frame["request_id"], "caller-controlled")
+        # Wrong-operation and unsolicited key-shaped replies never become events.
+        self.old.reply({"type": "state.imported", "request_id": frame["request_id"], "key": key})
+        self.assertTrue(results.empty())
+        self.old.reply({"type": "state.evidence_initialized", "request_id": frame["request_id"]})
+        self.assertIs(results.get(timeout=3), True)
+        self.assertEqual(agent.dispatch({"method": "events"})["events"], [])
+        self.assertEqual(os.environ, environment)
+        for invalid in (None, "x" * 64, key + "00", "PRIVATE-EVIDENCE-KEY"):
+            with self.assertRaisesRegex(RuntimeError, "Invalid evidence initialization"):
+                agent.dispatch({"method": "init_evidence", "run_id": "run", "owner_id": "owner", "key": invalid})
+        self.assertTrue(self.old.requests.empty())
+
     def test_unsolicited_stale_wrong_operation_and_late_frames_are_dropped(self):
         secret = {"private": "must never enter events"}
-        for kind in ("state.exported", "state.imported", "state.error", "state.future"):
+        for kind in ("state.exported", "state.imported", "state.evidence_initialized", "state.error", "state.future"):
             event = {"type": kind, "request_id": "unsolicited", "state": secret}
             self.old.reply(event)
             agent.drain(io.StringIO(json.dumps(event) + "\n"))
@@ -601,7 +621,7 @@ class StateControlTest(unittest.TestCase):
         self.assertEqual(agent.events, [])
 
     def test_send_cannot_bypass_state_controls(self):
-        for kind in ("export_state", "import_state", "state.exported", "state.imported", "state.error"):
+        for kind in ("export_state", "import_state", "init_evidence", "state.exported", "state.imported", "state.evidence_initialized", "state.error"):
             with self.subTest(kind=kind), self.assertRaisesRegex(RuntimeError, "dedicated"):
                 agent.dispatch({"method": "send", "input": {"type": kind, "state": {"secret": True}}})
         self.assertTrue(self.old.requests.empty())
@@ -784,16 +804,53 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(self.git("show", "HEAD:untracked"), b"new\n")
         self.assertEqual(agent.tree_hash(), first)
 
-    def test_snapshot_ignores_hostile_config_hooks_environment_and_preserves_bundles(self):
+    def test_hash_checkpoint_snapshot_include_code_hidden_by_global_excludes(self):
+        home = pathlib.Path(self.temp.name, "global-home")
+        (home / ".config/git").mkdir(parents=True)
+        (home / ".config/git/ignore").write_text("*.py\n")
+        excludes = home / "custom-excludes"
+        excludes.write_text("*.py\n")
+        config = home / ".gitconfig"
+        for source, content in (("default", ""), ("core-excludes-file", f"[core]\n\texcludesFile = {excludes}\n")):
+            with self.subTest(source=source):
+                config.write_text(content)
+                name = source + ".py"
+                self.write(name, "print('included')\n")
+                env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+                       "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1"}
+                # Establish that ordinary Git really would hide this new code.
+                self.assertEqual(subprocess.check_output(["/usr/bin/git", "check-ignore", name],
+                                                         cwd=self.root, env=env), (name + "\n").encode())
+                with mock.patch.dict(os.environ, env):
+                    expected = agent.tree_hash()
+                    checkpoint = self.export()
+                    published = agent.dispatch({"method": "snapshot", "identity": self.identity})
+                self.assertEqual(self.git("rev-parse", published["head"] + "^{tree}").decode().strip(), expected)
+                self.assertEqual(self.git("show", "HEAD:" + name), b"print('included')\n")
+                bundle = pathlib.Path(self.temp.name, "global-excludes.bundle")
+                bundle.write_bytes(base64.b64decode(checkpoint["bundle"]))
+                self.git("fetch", "-q", str(bundle), agent.CHECKPOINT_REF)
+                self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}").decode().strip(), expected)
+                self.assertEqual(self.git("show", "FETCH_HEAD:" + name), b"print('included')\n")
+
+    def test_info_exclude_hidden_code_hash_checkpoint_snapshot_parity_without_filters_or_hooks(self):
         shallow = pathlib.Path(self.temp.name, "publication-shallow")
         self.git("clone", "-q", "--depth", "1", "--no-tags", self.root.as_uri(), str(shallow))
         self.root = shallow
         agent.ROOT = str(shallow)
-        self.write(".gitattributes", "*.txt filter=unsafe\n")
+        self.write(".gitattributes", "*.txt filter=unsafe\n*.py text eol=lf filter=unsafe\n")
         self.write("edit.txt", "published\n")
-        self.write("hidden", "included despite private excludes\n")
-        (self.root / ".git/info/exclude").write_text("hidden\n")
+        code = b"print('included despite private excludes')\n"
+        (self.root / "hidden.py").write_bytes(code.replace(b"\n", b"\r\n"))
+        (self.root / ".git/info/exclude").write_text("hidden.py\n")
+        self.assertEqual(self.git("check-ignore", "hidden.py"), b"hidden.py\n")
+        excludes = pathlib.Path(self.temp.name, "local-excludes")
+        excludes.write_text("hidden.py\n")
+        self.git("config", "core.excludesFile", str(excludes))
+        global_config = pathlib.Path(self.temp.name, "global-config")
+        global_config.write_text(f"[core]\n\texcludesFile = {excludes}\n")
         self.git("config", "filter.unsafe.clean", "touch filter-ran; cat")
+        self.git("config", "filter.unsafe.smudge", "touch filter-ran; cat")
         self.git("config", "core.fsmonitor", "touch fsmonitor-ran")
         self.git("config", "core.worktree", "/missing")
         bad_config = pathlib.Path(self.temp.name, "bad-publication-config")
@@ -805,10 +862,18 @@ class CheckpointTest(unittest.TestCase):
             hook.write_text("#!/bin/sh\ntouch hook-ran\nexit 1\n")
             hook.chmod(0o755)
         config_before = (self.root / ".git/config").read_bytes()
-        expected = agent.tree_hash()
+        head_before = (self.root / ".git/HEAD").read_bytes()
+        index_before = (self.root / ".git/index").read_bytes()
         with mock.patch.dict(os.environ, {"GIT_DIR": "/missing", "GIT_INDEX_FILE": "/missing",
+                                         "GIT_CONFIG_GLOBAL": str(global_config), "HOME": self.temp.name,
                                          "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor",
                                          "GIT_CONFIG_VALUE_0": "touch env-ran", "GIT_OBJECT_DIRECTORY": "/missing"}):
+            expected = agent.tree_hash()
+            checkpoint = self.export(base_sha=self.head)
+            self.assertEqual((self.root / ".git/HEAD").read_bytes(), head_before)
+            self.assertEqual((self.root / ".git/index").read_bytes(), index_before)
+            with agent.checkpoint_repository() as (_, _, _, head):
+                self.assertEqual(head, self.head)
             published = agent.dispatch({"method": "snapshot", "identity": self.identity, "title": "Safe snapshot"})
             # An unchanged tree needs no identity and must not create a commit.
             unchanged = agent.dispatch({"method": "snapshot"})
@@ -828,7 +893,20 @@ class CheckpointTest(unittest.TestCase):
         bundle.write_bytes(base64.b64decode(published["bundle"]))
         self.git("fetch", "-q", str(bundle), "HEAD", cwd=receiver)
         self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), published["head"])
-        self.assertEqual(self.git("show", "FETCH_HEAD:hidden", cwd=receiver), b"included despite private excludes\n")
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}", cwd=receiver).decode().strip(), expected)
+        self.assertEqual(self.git("show", "FETCH_HEAD:hidden.py", cwd=receiver), code)
+        self.assertEqual(self.git("show", "FETCH_HEAD:edit.txt", cwd=receiver), b"published\n")
+        self.assertEqual(self.git("show", "FETCH_HEAD:.gitattributes", cwd=receiver),
+                         (self.root / ".gitattributes").read_bytes())
+        # Inspect the actual checkpoint bundle too, not just the shared helper's
+        # return value: its tree and normalized code must match publication.
+        bundle.write_bytes(base64.b64decode(checkpoint["bundle"]))
+        self.git("fetch", "-q", str(bundle), agent.CHECKPOINT_REF, cwd=receiver)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), checkpoint["checkpoint_sha"])
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}", cwd=receiver).decode().strip(), expected)
+        self.assertEqual(self.git("show", "FETCH_HEAD:hidden.py", cwd=receiver), code)
+        self.assertEqual(self.git("show", "FETCH_HEAD:edit.txt", cwd=receiver), b"published\n")
+        self.assertEqual((self.root / "hidden.py").read_bytes(), code.replace(b"\n", b"\r\n"))
 
     def test_newly_staged_ignored_files_fail_closed_without_mutating_clone(self):
         self.write("ignored-tracked", "private work\n")

@@ -375,6 +375,11 @@ def state_rpc(req):
             raise RuntimeError("Missing worker state.")
         state_json(req["state"])
         frame["state"] = req["state"]
+    if operation == "init_evidence":
+        key = req.get("key")
+        if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
+            raise RuntimeError("Invalid evidence initialization.")
+        frame["key"] = key
     replies = queue.Queue(maxsize=1)
     key = frame["request_id"]
     deadline = time.monotonic() + STATE_TIMEOUT
@@ -434,7 +439,8 @@ def drain(stream, source=None):
                     pending = state_waiters.get(key) if isinstance(key, str) else None
                     if source is not None and source is worker and pending and pending[0] is source:
                         _, operation, replies = pending
-                        expected = "state.exported" if operation == "export_state" else "state.imported"
+                        expected = {"export_state": "state.exported", "import_state": "state.imported",
+                                    "init_evidence": "state.evidence_initialized"}[operation]
                         if kind == expected or (kind == "state.error" and event.get("operation") == operation):
                             with contextlib.suppress(queue.Full):
                                 replies.put_nowait(event)
@@ -493,12 +499,12 @@ def dispatch(req):
             worker = replacement
             threading.Thread(target=drain, args=(worker.stdout, worker), daemon=True).start()
         return True
-    if method in ("export_state", "import_state"):
+    if method in ("export_state", "import_state", "init_evidence"):
         return state_rpc(req)
     if method == "send":
         value = req["input"]
         kind = value.get("type") if isinstance(value, dict) else None
-        if not isinstance(kind, str) or kind in ("export_state", "import_state") or kind.startswith("state."):
+        if not isinstance(kind, str) or kind in ("export_state", "import_state", "init_evidence") or kind.startswith("state."):
             raise RuntimeError("Invalid worker input; state controls require a dedicated request.")
         with worker_lock:
             if not worker or worker.poll() is not None:

@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { acceptEvidence, canonicalEvidence, cleanEvidenceText, emptyEvidence, evidenceKey, finishEvidence, neutralizeVerification, verificationBlock, weakenedEvidence, VERIFICATION_START, VERIFICATION_END } from "../src/runs/evidence";
+import { acceptEvidence, canonicalEvidence, cleanEvidenceText, emptyEvidence, finishEvidence, neutralizeVerification, verificationBlock, weakenedEvidence, VERIFICATION_START, VERIFICATION_END } from "../src/runs/evidence";
 import { descriptionFor } from "../src/runs/publication";
 import { emptySummary } from "../src/runs/fold";
 import { evidenceSigningKey as key, evidenceState, evidenceTree as tree, signedRecord } from "./fixtures/evidence";
@@ -10,13 +10,36 @@ it("matches recursively sorted serde_json canonical bytes, including a nested UI
     .toBe('{"a":{"a":null,"b":true},"z":[{"a":"é 🛠\\n","z":1}]}');
   const record = signedRecord({ kind: { type: "ui_attempt", title: "UI", url: "http://localhost:3000/" } });
   // Independent canonical wire vector: changing property insertion order must not change the MAC.
-  const wire = `{"command":"npm test","cwd":".","duration_ms":25,"env_clean":true,"env_digest":"${"b".repeat(64)}","exit_code":0,"id":"00000000-0000-4000-8000-000000000001","kind":{"title":"UI","type":"ui_attempt","url":"http://localhost:3000/"},"output_tail":"3 tests passed","seq":1,"started_at":1700000000000,"tests_ran":3,"tree_hash_after":"${tree}","tree_hash_before":"${tree}"}`;
+  const wire = `{"domain":"gond-agent:evidence:v1","record":{"command":"npm test","command_definition_changed":false,"cwd":".","duration_ms":25,"env_clean":true,"env_digest":"${"b".repeat(64)}","exit_code":0,"id":"00000000-0000-4000-8000-000000000001","kind":{"title":"UI","type":"ui_attempt","url":"http://localhost:3000/"},"output_tail":"3 tests passed","run_id":"run","seq":1,"started_at":1700000000000,"tests_ran":3,"tree_hash_after":"${tree}","tree_hash_before":"${tree}"},"run_id":"run"}`;
   expect(record.sig).toBe(createHmac("sha256", key).update(wire).digest("hex"));
   const reordered = Object.fromEntries(Object.entries(record).reverse());
-  expect(acceptEvidence(undefined, reordered, key)?.records).toEqual([record]);
+  expect(acceptEvidence(undefined, reordered, key, "run")?.records).toEqual([record]);
 });
 
 describe("authenticated bounded evidence", () => {
+  it("binds every field to the evidence domain and the expected service run", () => {
+    const good = signedRecord();
+    const { sig: _sig, ...unsigned } = good;
+    const mac = (value: unknown) => createHmac("sha256", key).update(canonicalEvidence(value)).digest("hex");
+    expect(acceptEvidence(undefined, good, key, "another-run")).toBeUndefined();
+    expect(acceptEvidence(undefined, signedRecord({ run_id: "another-run" }), key, "run")).toBeUndefined();
+    for (const sig of [
+      mac(unsigned), // Old bare-record signatures are not accepted.
+      mac({ domain: "other:evidence:v1", run_id: "run", record: unsigned }),
+      mac({ domain: "gond-agent:evidence:v1", run_id: "another-run", record: unsigned }),
+    ]) expect(acceptEvidence(undefined, { ...good, sig }, key, "run")).toBeUndefined();
+    for (const patch of [
+      { run_id: "another-run" }, { seq: 2 }, { command_definition_changed: true },
+      { tree_hash_before: "c".repeat(40) }, { tree_hash_after: "c".repeat(40) },
+      { kind: { type: "ui_attempt", url: "http://localhost/", title: "UI" } },
+    ]) expect(acceptEvidence(undefined, { ...good, ...patch }, key, "run")).toBeUndefined();
+    for (const field of ["run_id", "command_definition_changed"]) {
+      const missing = { ...good } as Record<string, unknown>;
+      delete missing[field];
+      expect(acceptEvidence(undefined, missing, key, "run")).toBeUndefined();
+    }
+    expect(acceptEvidence(undefined, good, key, "run")?.last_seq).toBe(1);
+  });
   it("rejects unsigned, malformed, unknown, oversized and tampered records without advancing replay state", () => {
     const good = signedRecord();
     const { sig: _sig, ...unsigned } = good;
@@ -27,22 +50,22 @@ describe("authenticated bounded evidence", () => {
       signedRecord({ kind: { type: "check", extra: 1 } as any }), signedRecord({ env_digest: "" }),
       signedRecord({ output_tail: "\ud800" }), signedRecord({ id: "not-a-uuid" }),
     ];
-    for (const value of invalid) expect(acceptEvidence(undefined, value, key)).toBeUndefined();
-    expect(acceptEvidence(undefined, good, undefined)).toBeUndefined();
-    expect(acceptEvidence(undefined, good, Buffer.alloc(32))).toBeUndefined();
-    expect(acceptEvidence(undefined, good, key)?.last_seq).toBe(1);
-    expect(acceptEvidence(undefined, signedRecord({ exit_code: null, tests_ran: null, output_tail: "🛠" }), key)).toBeDefined();
+    for (const value of invalid) expect(acceptEvidence(undefined, value, key, "run")).toBeUndefined();
+    expect(acceptEvidence(undefined, good, undefined, "run")).toBeUndefined();
+    expect(acceptEvidence(undefined, good, Buffer.alloc(32), "run")).toBeUndefined();
+    expect(acceptEvidence(undefined, good, key, "run")?.last_seq).toBe(1);
+    expect(acceptEvidence(undefined, signedRecord({ exit_code: null, tests_ran: null, output_tail: "🛠" }), key, "run")).toBeDefined();
   });
   it("rejects replayed IDs and out-of-order sequence numbers after durable reload/follow-ups", () => {
-    const first = acceptEvidence(undefined, signedRecord(), key)!;
+    const first = acceptEvidence(undefined, signedRecord(), key, "run")!;
     const restored = JSON.parse(JSON.stringify(first));
-    expect(acceptEvidence(restored, signedRecord(), key)).toBeUndefined();
-    expect(acceptEvidence(restored, signedRecord({ seq: 2 }), key)).toBeUndefined(); // same UUID
-    expect(acceptEvidence(restored, signedRecord({ seq: 0, id: "00000000-0000-4000-8000-000000000002" }), key)).toBeUndefined();
-    const next = acceptEvidence(restored, signedRecord({ seq: 2, id: "00000000-0000-4000-8000-000000000002" }), key)!;
+    expect(acceptEvidence(restored, signedRecord(), key, "run")).toBeUndefined();
+    expect(acceptEvidence(restored, signedRecord({ seq: 2 }), key, "run")).toBeUndefined(); // same UUID
+    expect(acceptEvidence(restored, signedRecord({ seq: 0, id: "00000000-0000-4000-8000-000000000002" }), key, "run")).toBeUndefined();
+    const next = acceptEvidence(restored, signedRecord({ seq: 2, id: "00000000-0000-4000-8000-000000000002" }), key, "run")!;
     expect(next.ids).toHaveLength(2);
     expect(first.records).toHaveLength(1);
-    expect(acceptEvidence({ ...next, ids: Array(4096).fill("retained") }, signedRecord({ seq: 3 }), key)).toBeUndefined();
+    expect(acceptEvidence({ ...next, ids: Array(4096).fill("retained") }, signedRecord({ seq: 3 }), key, "run")).toBeUndefined();
   });
   it("accepts the runner's base-pinned 128-check policy and preserves private budgets without records", () => {
     const reply = evidenceState();
@@ -62,7 +85,6 @@ describe("authenticated bounded evidence", () => {
   });
   it("captures metadata privately but never adopts a finish-time key or checkpoint records", () => {
     const initial = evidenceState();
-    expect(evidenceKey(initial)).toEqual(key);
     const state = finishEvidence(undefined, initial, key);
     expect(state.policy?.source).toBe(".gond-agent/checks.json");
     expect(state.unverified).toEqual(["UI attempt not recorded."]);
@@ -72,14 +94,13 @@ describe("authenticated bounded evidence", () => {
     const off = evidenceState(null);
     off.state.evidence.policy.enabled = false;
     expect(verificationBlock(finishEvidence(undefined, off, undefined))).toContain("Verification gate: off.");
-    expect(evidenceKey(true)).toBeUndefined();
     expect(finishEvidence(undefined, true, undefined).records).toEqual([]);
   });
 });
 
 it("renders only service-tree freshness, explicit exits/counts, no zero-test/dirty/UI pass claims", () => {
   const record = signedRecord();
-  const state = { ...acceptEvidence(undefined, record, key)!, publication_tree: tree };
+  const state = { ...acceptEvidence(undefined, record, key, "run")!, publication_tree: tree };
   expect(verificationBlock(state)).toContain("1 fresh successful check(s): evidence recorded by the worker");
   expect(verificationBlock(state).replace(/\bnot verified\b/gi, "")).not.toMatch(/\bverified\b/i);
   expect(verificationBlock(state)).toContain("### Not verified");
@@ -87,7 +108,7 @@ it("renders only service-tree freshness, explicit exits/counts, no zero-test/dir
   expect(verificationBlock(state)).toContain("allow-list digest:");
   expect(verificationBlock(state)).toContain("HOME and .npmrc may still expose credentials");
   expect(verificationBlock(state)).not.toContain("Environment: clean");
-  for (const patch of [{ tree_hash_before: "b".repeat(40) }, { tree_hash_after: "b".repeat(40) }, { env_clean: false }, { exit_code: 1 }, { exit_code: null }, { tests_ran: 0 }, { tests_ran: null }, { kind: { type: "ui_attempt" as const, title: "Page", url: "http://localhost/" } }]) {
+  for (const patch of [{ tree_hash_before: "b".repeat(40) }, { tree_hash_after: "b".repeat(40) }, { env_clean: false }, { command_definition_changed: true }, { exit_code: 1 }, { exit_code: null }, { tests_ran: 0 }, { tests_ran: null }, { kind: { type: "ui_attempt" as const, title: "Page", url: "http://localhost/" } }]) {
     const body = verificationBlock({ ...state, records: [signedRecord(patch)] });
     expect(body).toContain("Not verified.");
   }
@@ -104,6 +125,19 @@ it("renders only service-tree freshness, explicit exits/counts, no zero-test/dir
   expect(verificationBlock({ ...policyState, records: [record, signedRecord({ seq: 2, kind: { type: "ui_attempt", url: "http://localhost/", title: "UI" } })] })).not.toContain("Missing a fresh UI attempt");
   const failedLater = signedRecord({ seq: 2, exit_code: 1, id: "00000000-0000-4000-8000-000000000002" });
   expect(verificationBlock({ ...state, records: [record, failedLater] })).toContain("Not verified.");
+});
+
+it("marks changed command definitions inconclusive in each record and both warning sections", () => {
+  const record = signedRecord({ command_definition_changed: true });
+  const body = verificationBlock({ ...emptyEvidence(), records: [record], publication_tree: tree });
+  expect(body).toContain("Not verified.");
+  expect(body).not.toContain("fresh successful check(s)");
+  expect(body).toContain("Failed or inconclusive checks: 1");
+  expect(body).toContain("command definition changed: yes");
+  expect(body).toContain("Command definition changed: yes");
+  for (const section of ["Not verified", "Evidence weakened"]) {
+    expect(body.split(`### ${section}\n`)[1].split("\n### ")[0]).toContain("Command definition changed: .: npm test");
+  }
 });
 
 it("bounds details, dynamically fences hostile output, strips invisible Unicode and prefers failures", () => {

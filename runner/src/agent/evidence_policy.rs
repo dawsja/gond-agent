@@ -188,6 +188,7 @@ fn discover_with(cwd: &Path, base: Option<&str>, off: bool, allow_weaken: bool) 
                     ensure!(checks.len() <= CHECK_LIMIT, "Too many evidence checks");
                     for check in checks {
                         validate_check(check)?;
+                        validate_base_script(&repo, &files, check)?;
                     }
                 }
                 Ok(parsed)
@@ -231,6 +232,62 @@ impl EvidencePolicy {
         if !self.checks.contains(&check) {
             self.checks.push(check);
         }
+    }
+
+    /// Whether a check's definition/configuration differs from pinned BASE.
+    /// This is worker-recorded evidence, not independent proof. Inspect a private
+    /// snapshot, never the checkout's index/config or a moving HEAD as baseline.
+    /// Errors must be treated as changed by the caller (fail closed).
+    pub fn command_definition_changed(&self, cwd: &Path, command: &CheckCommand) -> Result<bool> {
+        oid(&self.base)?;
+        validate_check(command)?;
+        let repo = Repository::new(cwd)?;
+        ensure!(
+            repo.git(&["cat-file", "-t", &self.base])? == b"commit\n",
+            "Invalid evidence base"
+        );
+        let base_files = repo.files(&self.base)?;
+        validate_base_script(&repo, &base_files, command)?;
+        let tree = repo.snapshot()?;
+        let paths = repo.git(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--no-renames",
+            "--name-only",
+            "-r",
+            "-z",
+            &self.base,
+            &tree,
+            "--",
+        ])?;
+        let current_files = repo.files(&tree)?;
+        for path in paths.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let path = std::str::from_utf8(path).context("Invalid evidence configuration path")?;
+            let (directory, name) = path.rsplit_once('/').unwrap_or((".", path));
+            if name == "package.json" {
+                // Ancestor manifests can define hooks/workspace behavior. Compare
+                // scripts semantically: dependency-only edits are not a waiver.
+                if !ancestor_directory(directory, &command.cwd) {
+                    continue;
+                }
+                let before = base_files.iter().find(|f| f.path.as_deref() == Some(path));
+                let after = current_files
+                    .iter()
+                    .find(|f| f.path.as_deref() == Some(path));
+                match (before, after) {
+                    (Some(before), Some(after)) if before.mode == after.mode => {
+                        if package_scripts(&repo, before)? != package_scripts(&repo, after)? {
+                            return Ok(true);
+                        }
+                    }
+                    // Includes additions, deletions and transitions to/from symlinks.
+                    _ => return Ok(true),
+                }
+            } else if definition_config(path, name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Classify the exact snapshot being gated. `tree_oid` is the result of
@@ -328,75 +385,239 @@ fn validate_check(check: &CheckCommand) -> Result<()> {
         !command.is_empty() && command.len() <= 200 && command.trim() == command,
         "Invalid evidence command"
     );
-    // A single, literal command only. No quoting/expansion, redirects, shell
-    // operators, globs, command substitutions, or control characters.
+    // Literal tokens only, with one ASCII space between tokens. This is an
+    // allowlist grammar, not an executable denylist or a shell parser.
     ensure!(
         command
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b" _-./:=+@%,".contains(&b)),
+            .all(|b| b.is_ascii_alphanumeric() || b" _-./:=".contains(&b))
+            && !command.contains("  "),
         "Invalid evidence command"
     );
-    let program = command.split(' ').next().unwrap_or("");
-    ensure!(
-        program
+    let tokens: Vec<_> = command.split(' ').collect();
+    let valid = match tokens.as_slice() {
+        ["npm", "test"] => true,
+        ["npm" | "pnpm" | "bun", "run", script] => script_name(script),
+        [
+            "cargo",
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ] => true,
+        ["cargo", "test", flags @ ..] => cargo_test_flags(flags),
+        ["pytest", flags @ ..] => flags.iter().all(|flag| {
+            matches!(
+                *flag,
+                "-q" | "-qq"
+                    | "--quiet"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "-x"
+                    | "--exitfirst"
+                    | "--strict-markers"
+                    | "--strict-config"
+                    | "--disable-warnings"
+                    | "--tb=short"
+                    | "--tb=long"
+                    | "--tb=auto"
+            )
+        }),
+        ["python3", "-m", "unittest", args @ ..] => unittest_args(args),
+        _ => false,
+    };
+    ensure!(valid, "Invalid evidence command");
+    Ok(())
+}
+
+fn script_name(script: &str) -> bool {
+    script
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && script
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b)),
-        "Invalid evidence command"
-    );
-    let executable = program.rsplit('/').next().unwrap_or("");
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+}
+
+fn cargo_test_flags(flags: &[&str]) -> bool {
+    let split = flags
+        .iter()
+        .position(|flag| *flag == "--")
+        .unwrap_or(flags.len());
+    let (cargo, harness) = flags.split_at(split);
+    cargo.contains(&"--locked")
+        && cargo.iter().all(|flag| {
+            matches!(
+                *flag,
+                "--locked"
+                    | "--workspace"
+                    | "--all-targets"
+                    | "--all-features"
+                    | "--release"
+                    | "--offline"
+                    | "--frozen"
+                    | "--no-fail-fast"
+                    | "-q"
+                    | "--quiet"
+                    | "-v"
+                    | "--verbose"
+            )
+        })
+        && (harness.is_empty() || harness == ["--", "--test-threads=1"])
+}
+
+fn unittest_args(mut args: &[&str]) -> bool {
+    if args.first() == Some(&"discover") {
+        args = &args[1..];
+        while let Some((flag, rest)) = args.split_first() {
+            if matches!(
+                *flag,
+                "-v" | "--verbose" | "-q" | "--quiet" | "-f" | "--failfast"
+            ) {
+                args = rest;
+                continue;
+            }
+            let Some((value, rest)) = rest.split_first() else {
+                return false;
+            };
+            let valid = match *flag {
+                "-s" | "--start-directory" | "-t" | "--top-level-directory" => {
+                    normalized_cwd(value).is_ok()
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
+                        && !value.starts_with('-')
+                }
+                // No shell globs/quotes. Omit -p to use unittest's default
+                // test*.py pattern; literal filenames are safe discovery args.
+                "-p" | "--pattern" => {
+                    script_name(value) && !value.contains(':') && value.ends_with(".py")
+                }
+                _ => false,
+            };
+            if !valid {
+                return false;
+            }
+            args = rest;
+        }
+        true
+    } else {
+        args.iter().all(|flag| {
+            matches!(
+                *flag,
+                "-v" | "--verbose" | "-q" | "--quiet" | "-f" | "--failfast"
+            )
+        })
+    }
+}
+
+fn package_scripts(repo: &Repository, file: &File) -> Result<Option<serde_json::Value>> {
+    let bytes = repo
+        .blob(&file.oid, MANIFEST_LIMIT)?
+        .context("Evidence manifest too large")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(value.is_object(), "Invalid evidence manifest");
+    if let Some(scripts) = value.get("scripts") {
+        ensure!(
+            scripts
+                .as_object()
+                .is_some_and(|scripts| scripts.values().all(|v| v.is_string())),
+            "Invalid evidence scripts"
+        );
+    }
+    Ok(value.get("scripts").cloned())
+}
+
+fn validate_base_script(repo: &Repository, files: &[File], check: &CheckCommand) -> Result<()> {
+    let tokens: Vec<_> = check.command.split(' ').collect();
+    let script = match tokens.as_slice() {
+        ["npm", "test"] => "test",
+        ["npm" | "pnpm" | "bun", "run", script] => *script,
+        _ => return Ok(()),
+    };
+    let path = if check.cwd == "." {
+        "package.json".into()
+    } else {
+        format!("{}/package.json", check.cwd)
+    };
+    let file = files
+        .iter()
+        .find(|f| f.path.as_deref() == Some(path.as_str()))
+        .context("Missing base evidence manifest")?;
+    let scripts = package_scripts(repo, file)?;
     ensure!(
-        !executable.is_empty() && !executable.starts_with('-'),
-        "Invalid evidence command"
-    );
-    ensure!(
-        !matches!(
-            executable,
-            "sh" | "bash"
-                | "dash"
-                | "zsh"
-                | "fish"
-                | "csh"
-                | "ksh"
-                | "env"
-                | "eval"
-                | "exec"
-                | "command"
-                | "builtin"
-                | "true"
-                | "false"
-                | ":"
-                | "."
-                | "source"
-                | "exit"
-                | "return"
-                | "export"
-                | "set"
-                | "unset"
-                | "grep"
-                | "egrep"
-                | "fgrep"
-                | "rg"
-                | "sed"
-                | "awk"
-                | "gawk"
-                | "mawk"
-                | "head"
-                | "tail"
-                | "cut"
-                | "sort"
-                | "uniq"
-                | "tr"
-                | "tee"
-                | "xargs"
-                | "cat"
-                | "echo"
-                | "printf"
-                | "wc"
-                | "yes"
-        ),
-        "Invalid evidence command"
+        scripts
+            .as_ref()
+            .and_then(|s| s.get(script))
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| !s.trim().is_empty()),
+        "Missing base evidence script"
     );
     Ok(())
+}
+
+fn ancestor_directory(directory: &str, cwd: &str) -> bool {
+    directory == "."
+        || directory == cwd
+        || cwd
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn definition_config(path: &str, name: &str) -> bool {
+    // Deliberately conservative across workspace members: Cargo/Python and
+    // runner configs can redirect discovery or load helpers in another member.
+    path.starts_with(".github/workflows/")
+        || path.starts_with(".circleci/")
+        || name == ".gitlab-ci.yml"
+        || name == ".gitlab-ci.yaml"
+        || name == "Jenkinsfile"
+        || name.starts_with("Jenkinsfile.")
+        || matches!(
+            name,
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "pytest.ini"
+                | ".pytest.ini"
+                | "pyproject.toml"
+                | "setup.cfg"
+                | "tox.ini"
+                | "conftest.py"
+                | ".npmrc"
+                | "bunfig.toml"
+                | "pnpm-workspace.yaml"
+                | "cypress.json"
+                | "biome.json"
+                | "biome.jsonc"
+                | "ruff.toml"
+                | ".ruff.toml"
+                | ".babelrc"
+                | ".babelrc.json"
+                | ".babelrc.js"
+        )
+        || ((path.starts_with(".cargo/") || path.contains("/.cargo/"))
+            && matches!(name, "config" | "config.toml"))
+        || [
+            "jest.",
+            "vitest.",
+            "vite.config.",
+            "playwright.",
+            "cypress.config.",
+            "babel.config.",
+            "karma.conf.",
+            "ava.config.",
+            "eslint.config.",
+            ".eslintrc",
+            "tsconfig.",
+            ".mocharc",
+            ".nycrc",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn pytest_dependency(value: &str) -> bool {
@@ -460,6 +681,7 @@ struct Repository {
 struct File {
     path: Option<String>,
     oid: String,
+    mode: String,
 }
 
 impl Repository {
@@ -626,6 +848,7 @@ impl Repository {
                     .ok()
                     .map(str::to_owned),
                 oid: header[2].into(),
+                mode: header[0].into(),
             });
         }
         Ok(files)
@@ -755,7 +978,7 @@ mod tests {
         fs::create_dir_all(root.join("web")).unwrap();
         fs::write(
             root.join("web/package.json"),
-            r#"{"scripts":{"test":"hostile || true","lint":"lint","typecheck":"tsc"}}"#,
+            r#"{"scripts":{"test":"hostile || true","lint":"lint","typecheck":"tsc","verify":"vitest run"}}"#,
         )
         .unwrap();
         fs::write(root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
@@ -766,7 +989,7 @@ mod tests {
         .unwrap();
         write_policy(
             root,
-            "enabled=false\nui='none'\n[[checks]]\ncommand='make verify'\ncwd='.'\n",
+            "enabled=false\nui='none'\n[[checks]]\ncommand='pnpm run verify'\ncwd='web'\n",
         );
         let base = commit(root);
         fs::write(root.join("web/package.json"), "{}").unwrap();
@@ -784,8 +1007,8 @@ mod tests {
             cwd: "web".into()
         }));
         assert!(policy.checks.contains(&CheckCommand {
-            command: "make verify".into(),
-            cwd: ".".into()
+            command: "pnpm run verify".into(),
+            cwd: "web".into()
         }));
         let allowed = discover_with(root, Some(&base), false, true);
         assert!(!allowed.enabled);
@@ -803,10 +1026,10 @@ mod tests {
             "docs=['**']".to_owned(),
             "[[checks]]\ncommand='npm test || true'\ncwd='.'".to_owned(),
             "[[checks]]\ncommand='grep PASS result'\ncwd='.'".to_owned(),
-            "[[checks]]\ncommand='make check'\ncwd='../escape'".to_owned(),
+            "[[checks]]\ncommand='npm test'\ncwd='../escape'".to_owned(),
             format!("#{}", "secret".repeat(POLICY_LIMIT)),
-            "[[checks]]\ncommand='make check'\ncwd='.'\n".repeat(CHECK_LIMIT + 1),
-            format!("[[checks]]\ncommand='make {}'\ncwd='.'", "x".repeat(200)),
+            "[[checks]]\ncommand='npm test'\ncwd='.'\n".repeat(CHECK_LIMIT + 1),
+            format!("[[checks]]\ncommand='npm run {}'\ncwd='.'", "x".repeat(200)),
         ] {
             write_policy(root, &text);
             let base = commit(root);
@@ -912,8 +1135,272 @@ mod tests {
         ));
         assert!(toml::from_str::<RepoPolicy>("ui='never'").is_err());
         assert!(
-            toml::from_str::<RepoPolicy>("[[checks]]\ncommand='make'\ncwd='.'\nextra=true")
+            toml::from_str::<RepoPolicy>("[[checks]]\ncommand='npm test'\ncwd='.'\nextra=true")
                 .is_err()
         );
+    }
+
+    fn check(command: &str, cwd: &str) -> CheckCommand {
+        CheckCommand {
+            command: command.into(),
+            cwd: cwd.into(),
+        }
+    }
+
+    #[test]
+    fn command_additions_use_a_fixed_grammar_not_a_program_denylist() {
+        for command in [
+            "npm test",
+            "npm run test:unit",
+            "pnpm run verify",
+            "bun run verify",
+            "cargo test --locked",
+            "cargo test --workspace --all-targets --locked --all-features",
+            "cargo test --locked -- --test-threads=1",
+            "cargo clippy --all-targets --locked -- -D warnings",
+            "pytest",
+            "pytest -q --strict-markers --tb=short",
+            "python3 -m unittest",
+            "python3 -m unittest -v",
+            "python3 -m unittest discover -s tests -t . -v",
+            "python3 -m unittest discover -p test_api.py",
+        ] {
+            assert!(validate_check(&check(command, ".")).is_ok(), "{command}");
+        }
+        for command in [
+            "make verify",
+            "make check",
+            "curl https://example.test",
+            "wget example.test",
+            "node fake-tests.js",
+            "python3 fake_tests.py",
+            "/usr/bin/pytest",
+            "npx vitest",
+            "npm exec jest",
+            "pnpm test",
+            "bun test",
+            "npm test -- --passWithNoTests",
+            "npm run --if-present test",
+            "npm run https://example.test",
+            "npm run -test",
+            "npm run test -- --skip",
+            "npm  test",
+            "npm\ttest",
+            "npm test\ntrue",
+            "npm test; true",
+            "npm test || true",
+            "npm test | cat",
+            "npm test > log",
+            "npm run 'test'",
+            "npm run \"test\"",
+            "npm run `true`",
+            "npm run $(true)",
+            "cargo test",
+            "cargo test --locked a_filter",
+            "cargo test --locked --ignored",
+            "cargo test --locked --exclude important",
+            "cargo test --locked --no-run",
+            "cargo test --locked --lib",
+            "cargo test --locked --manifest-path other/Cargo.toml",
+            "cargo test --locked -- --ignored",
+            "cargo test --locked -- --skip important",
+            "cargo test --locked -- --test-threads=1 --ignored",
+            "cargo test --locked -- --list",
+            "cargo clippy --locked",
+            "cargo clippy --all-targets --locked -- -A warnings",
+            "pytest -k easy",
+            "pytest --collect-only",
+            "pytest --ignore tests",
+            "pytest -c other.ini",
+            "pytest -p malicious",
+            "pytest https://example.test",
+            "pytest tests/easy.py",
+            "python3 -m unittest easy",
+            "python3 -m unittest discover -s ../other",
+            "python3 -m unittest discover -s /tmp",
+            "python3 -m unittest discover -k easy",
+            "python3 -m unittest discover -p 'test_*.py'",
+            "python3 -m unittest discover -p test_*.py",
+            "python3 -m unittest discover -s",
+        ] {
+            assert!(validate_check(&check(command, ".")).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn additions_require_scripts_in_the_exact_base_directory_even_when_weakening_is_allowed() {
+        let temp = fixture();
+        let root = temp.path();
+        fs::create_dir(root.join("web")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"tests","verify":"tests"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("web/package.json"),
+            r#"{"scripts":{"ci":"tests"}}"#,
+        )
+        .unwrap();
+        write_policy(
+            root,
+            "[[checks]]\ncommand='npm run verify'\ncwd='.'\n[[checks]]\ncommand='pnpm run ci'\ncwd='web'\n[[checks]]\ncommand='bun run ci'\ncwd='web'\n",
+        );
+        let base = commit(root);
+        // Neither a worktree policy edit nor a newly defined script changes BASE.
+        write_policy(root, "enabled=false\nui='none'\n");
+        fs::write(
+            root.join("web/package.json"),
+            r#"{"scripts":{"verify":"exit 0"}}"#,
+        )
+        .unwrap();
+        let policy = discover_with(root, Some(&base), false, false);
+        assert!(policy.enabled);
+        assert_eq!(policy.ui, UiRequirement::Attempt);
+        assert!(policy.notes.is_empty());
+        for command in ["npm run verify", "pnpm run ci", "bun run ci"] {
+            let cwd = if command == "npm run verify" {
+                "."
+            } else {
+                "web"
+            };
+            assert!(policy.checks.contains(&check(command, cwd)));
+        }
+        fs::write(root.join("web/package.json"), "{}").unwrap();
+        for command in [
+            "npm test",
+            "npm run verify",
+            "npm run test",
+            "make check",
+            "cargo test --locked -- --ignored",
+        ] {
+            write_policy(
+                root,
+                &format!("enabled=false\nui='none'\n[[checks]]\ncommand='{command}'\ncwd='web'\n"),
+            );
+            let bad_base = commit(root);
+            fs::write(
+                root.join("web/package.json"),
+                r#"{"scripts":{"verify":"tests","test":"tests"}}"#,
+            )
+            .unwrap();
+            for allow in [false, true] {
+                let policy = discover_with(root, Some(&bad_base), false, allow);
+                assert_eq!(policy.notes, [MALFORMED], "{command}");
+                assert!(policy.enabled);
+                assert_eq!(policy.ui, UiRequirement::Attempt);
+                assert_eq!(policy.checks, [check("npm test", ".")]);
+            }
+            fs::write(root.join("web/package.json"), "{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn definition_comparison_is_base_pinned_and_compares_ancestor_scripts_semantically() {
+        let temp = fixture();
+        let root = temp.path();
+        fs::create_dir(root.join("web")).unwrap();
+        let manifest =
+            r#"{"scripts":{"test":"vitest run","lint":"eslint"},"dependencies":{"x":"1"}}"#;
+        fs::write(root.join("package.json"), manifest).unwrap();
+        fs::write(root.join("web/package.json"), manifest).unwrap();
+        let base = commit(root);
+        let policy = discover_with(root, Some(&base), false, false);
+        let command = check("npm test", "web");
+        let changed = || policy.command_definition_changed(root, &command).unwrap();
+        assert!(!changed());
+        // Reordering scripts/JSON and changing dependencies is not a definition edit.
+        fs::write(
+            root.join("web/package.json"),
+            r#"{"dependencies":{"x":"2"},"scripts":{"lint":"eslint","test":"vitest run"}}"#,
+        )
+        .unwrap();
+        assert!(!changed());
+        // Even a different script in an ancestor may be a hook or delegated check.
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"vitest run","lint":"exit 0"}}"#,
+        )
+        .unwrap();
+        assert!(changed());
+        fs::write(root.join("package.json"), manifest).unwrap();
+        fs::write(
+            root.join("web/package.json"),
+            r#"{"scripts":{"test":"exit 0","lint":"eslint"}}"#,
+        )
+        .unwrap();
+        commit(root);
+        assert!(changed()); // A later HEAD cannot bless an edited test script.
+        fs::write(root.join("web/package.json"), manifest).unwrap();
+        assert!(!changed());
+        fs::remove_file(root.join("web/package.json")).unwrap();
+        assert!(changed());
+        fs::write(root.join("web/package.json"), "not JSON").unwrap();
+        assert!(policy.command_definition_changed(root, &command).is_err());
+        #[cfg(unix)]
+        {
+            fs::remove_file(root.join("web/package.json")).unwrap();
+            std::os::unix::fs::symlink("/dev/null", root.join("web/package.json")).unwrap();
+            assert!(changed()); // Do not follow symlinks when comparing manifests.
+        }
+    }
+
+    #[test]
+    fn definition_configs_detect_additions_edits_deletions_without_checkout_side_effects() {
+        let temp = fixture();
+        let root = temp.path();
+        let paths = [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config",
+            "member/.cargo/config.toml",
+            "pytest.ini",
+            "pyproject.toml",
+            "setup.cfg",
+            "tox.ini",
+            "tests/conftest.py",
+            ".github/workflows/tests.yml",
+            ".circleci/config.yml",
+            ".gitlab-ci.yml",
+            "Jenkinsfile",
+            "web/jest.config.js",
+            "web/vitest.config.ts",
+            "web/playwright.config.ts",
+        ];
+        for path in paths {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "base\n").unwrap();
+        }
+        let base = commit(root);
+        let policy = discover_with(root, Some(&base), false, false);
+        let command = check("cargo test --locked", ".");
+        let changed = || policy.command_definition_changed(root, &command).unwrap();
+        // Local excludes/config/hooks are not consulted and the real index is untouched.
+        fs::write(root.join(".git/info/exclude"), "*.toml\n*.yml\n").unwrap();
+        git(root, &["config", "core.fsmonitor", "touch monitor-ran"]);
+        git(
+            root,
+            &["config", "filter.hostile.clean", "touch filter-ran; cat"],
+        );
+        fs::write(root.join(".gitattributes"), "* filter=hostile\n").unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        assert!(!changed());
+        for path in paths {
+            let path = root.join(path);
+            fs::write(&path, "changed\n").unwrap();
+            assert!(changed(), "edit {}", path.display());
+            fs::remove_file(&path).unwrap();
+            assert!(changed(), "delete {}", path.display());
+            fs::write(path, "base\n").unwrap();
+        }
+        fs::write(root.join("web/vitest.workspace.ts"), "new\n").unwrap();
+        assert!(changed());
+        assert_eq!(index, fs::read(root.join(".git/index")).unwrap());
+        assert!(!root.join("monitor-ran").exists());
+        assert!(!root.join("filter-ran").exists());
+        let mut invalid = policy.clone();
+        invalid.base = "0".repeat(40);
+        assert!(invalid.command_definition_changed(root, &command).is_err());
     }
 }

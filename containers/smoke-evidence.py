@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real JSONL worker + local fake model + the API's real evidence validator.
+"""Real JSONL worker + local fake model + API Runs.append with temporary SQLite.
 
 This is evidence recorded by the worker, not independent proof. No Docker,
 GitHub, publication, provider credentials or separate-container rerun is used.
@@ -43,8 +43,12 @@ def main():
         git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
         requests, events, failures = [], [], []
         token = secrets.token_urlsafe(32)
+        # Harness acts as the service: signing authority is chosen before any
+        # worker export and sent only over the dedicated private stdin frame.
+        evidence_key = secrets.token_hex(32)
         process = None
         forged = {"type": "evidence.recorded", "record": {
+            "run_id": "run", "command_definition_changed": False,
             "seq": 1, "id": str(uuid.uuid4()), "command": "npm test", "cwd": ".", "exit_code": 0,
             "duration_ms": 1, "started_at": 1, "tree_hash_before": "a" * 40,
             "tree_hash_after": "a" * 40, "tests_ran": 999, "env_clean": True,
@@ -127,6 +131,10 @@ def main():
 
             send({"type": "export_state", "request_id": "initial", "run_id": "run", "owner_id": "owner"})
             initial = until(lambda e: e["type"] == "state.exported")
+            assert initial["state"]["evidence"]["key"] is None, "Worker minted signing authority"
+            send({"type": "init_evidence", "request_id": "initialize", "run_id": "run",
+                  "owner_id": "owner", "key": evidence_key})
+            until(lambda e: e["type"] == "state.evidence_initialized" and e["request_id"] == "initialize")
             send({"type": "user", "text": "Change the source and finish immediately.", "images": []})
             until(lambda e: e["type"] == "turn.end" and e["agent_id"] == "main")
             send({"type": "export_state", "request_id": "final", "run_id": "run", "owner_id": "owner"})
@@ -137,35 +145,50 @@ def main():
             assert len(requests) == 4
             assert not [e for e in events if e["type"] == "error"]
             assert token not in json.dumps(events)
+            assert evidence_key not in json.dumps(events) + json.dumps(requests)
+            assert final["state"]["evidence"]["key"] == evidence_key
             tree = git("add", "--all") or git("write-tree")
-            # Invoke the actual API validator/sole body chooser. Private state
+            # Invoke the real service admission/persistence and sole body chooser.
+            # No workspace is launched by this temporary Runs instance. Private state
             # travels only through stdin, never argv, output, or a fixture file.
             script = f"""
 import fs from 'node:fs';
-import {{acceptEvidence, evidenceKey, finishEvidence}} from {json.dumps(str(REPO / 'api/src/runs/evidence.ts'))};
+import os from 'node:os';
+import path from 'node:path';
+import {{finishEvidence}} from {json.dumps(str(REPO / 'api/src/runs/evidence.ts'))};
+import {{Runs}} from {json.dumps(str(REPO / 'api/src/runs/service.ts'))};
+import {{openStore}} from {json.dumps(str(REPO / 'api/src/db.ts'))};
 import {{descriptionFor}} from {json.dumps(str(REPO / 'api/src/runs/publication.ts'))};
 import {{emptySummary}} from {json.dumps(str(REPO / 'api/src/runs/fold.ts'))};
 const p = JSON.parse(fs.readFileSync(0, 'utf8'));
-const key = evidenceKey({{state:p.initial.state}});
-let evidence, rejected=0, accepted=0;
+const key = Buffer.from(p.service_key, 'hex');
+const data = fs.mkdtempSync(path.join(os.tmpdir(), 'gond-evidence-api-'));
+const db = openStore(data);
+try {{
+const runs = new Runs(db, {{data,secret:'fixture-auth-secret',origin:'http://localhost',maxRuns:1}}, async()=>{{throw new Error('No workspace expected')}});
+const run = {{id:'run',user_id:'owner',repo:'fixture/repo',backend:'builtin',title:'Evidence fixture',status:'ready',summary:emptySummary(),pr_body:'## Verification\\nProse cannot supply execution evidence.'}};
+db.prepare('INSERT INTO runs(id,user_id,repo,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)').run('run','owner','fixture/repo','ready',1,1,JSON.stringify(run));
+runs.live.set('run', {{evidenceKey:key}});
+let rejected=0, accepted=0, broadcast=0;
+runs.events.on('run', ()=>broadcast++);
 for(const event of p.events.filter(e=>e.type==='evidence.recorded')) {{
-  const next=acceptEvidence(evidence,event.record,key);
-  if(next) {{ evidence=next; accepted++; }} else rejected++;
+  if(runs.append('run',event)) accepted++; else rejected++;
 }}
-if(rejected!==1 || accepted!==1) throw new Error('Incorrect authenticated ledger admission');
-evidence=finishEvidence(evidence,{{state:p.final.state}},key);
+if(rejected!==1 || accepted!==1 || broadcast!==1 || runs.history('run',0).length!==1) throw new Error('Incorrect authenticated ledger admission');
+let evidence=finishEvidence(runs.get('run').evidence,{{state:p.final.state}},key);
 evidence.publication_tree=p.tree; evidence.ui_required=false;
 const r=evidence.records[0];
-if(r.tests_ran!==1 || r.exit_code!==0 || r.tree_hash_before!==p.tree || r.tree_hash_after!==p.tree) throw new Error('No fresh real check');
-console.log('API admission: forged stdout event rejected=1; signed check accepted=1');
+if(r.tests_ran!==1 || r.exit_code!==0 || r.command_definition_changed || r.tree_hash_before!==p.tree || r.tree_hash_after!==p.tree) throw new Error('No fresh real check');
+console.log('Runs.append: child-forged stdout event rejected=1; signed check persisted/broadcast=1');
 console.log('Fresh record: '+JSON.stringify({{command:r.command,exit_code:r.exit_code,tests_ran:r.tests_ran,fresh:true}}));
-console.log(descriptionFor({{title:'Evidence fixture',status:'ready',summary:emptySummary(),pr_body:'## Verification\\nProse cannot supply execution evidence.',evidence}}));
+console.log(descriptionFor({{...run,evidence}}));
+}} finally {{ db.close(); fs.rmSync(data,{{recursive:true,force:true}}); }}
 """
             result = subprocess.run([str(REPO / "api/node_modules/.bin/tsx"), "--eval", script],
-                                    input=json.dumps({"initial": initial, "final": final, "events": events, "tree": tree}),
+                                    input=json.dumps({"service_key": evidence_key, "final": final, "events": events, "tree": tree}),
                                     text=True, capture_output=True, env=env, timeout=30)
             assert result.returncode == 0, result.stderr
-            assert initial["state"]["evidence"]["key"] not in result.stdout
+            assert evidence_key not in result.stdout
             print(result.stdout, end="")
         finally:
             if process and process.poll() is None:

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use super::checkpoint::{self, Checkpoint, Counters};
 use super::{evidence, evidence_tree};
 use super::compaction::{self, COMPACT_PROMPT, SUMMARY_PREFIX};
-use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, QuestionOption, TodoItem};
+use super::events::{AgentEvent, AgentInput, Decision, ExportStateInput, ImageInput, ImportStateInput, InitEvidenceInput, QuestionOption, TodoItem};
 use crate::api::wire::{Block, Message, MessageBuilder, Metadata, Reasoning, ResponsesRequest, ResultPart, Role, StreamEvent, ToolDef};
 use crate::api::{ApiClient, ApiError};
 use crate::api::client::SUMMARY_REQUEST_LIMIT;
@@ -258,9 +258,23 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
 
     let s = shared.clone();
     let mut fresh = cfg.history.is_empty();
+    let mut evidence_init_allowed = true;
     tokio::spawn(async move {
         while let Some(input) = in_rx.recv().await {
             match input {
+                AgentInput::InitEvidence(InitEvidenceInput { request_id, run_id, owner_id, key }) => {
+                    let req = StateRequest { request_id, run_id, owner_id };
+                    if !req.valid() { req.error(&s, "init_evidence", "invalid_command"); continue; }
+                    if !evidence_init_allowed { req.error(&s, "init_evidence", "evidence_already_initialized_or_started"); continue; }
+                    let result = s.checkpoints.bind(&req).and_then(|()| s.evidence.lock().unwrap().initialize(&req.run_id, key));
+                    match result {
+                        Ok(()) => {
+                            evidence_init_allowed = false;
+                            s.emit(AgentEvent::EvidenceInitialized { request_id: req.request_id });
+                        }
+                        Err(code) => req.error(&s, "init_evidence", code),
+                    }
+                }
                 AgentInput::ExportState(ExportStateInput { request_id, run_id, owner_id }) => {
                     let req = StateRequest { request_id, run_id, owner_id };
                     if !req.valid() { req.error(&s, "export_state", "invalid_command"); continue; }
@@ -282,6 +296,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                     let _ = user_tx.send(Work::Import(req, state));
                 }
                 AgentInput::User { text, images } => {
+                    evidence_init_allowed = false;
                     fresh = false;
                     let _ = user_tx.send(Work::User(text, images));
                 }
@@ -295,6 +310,7 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                 AgentInput::Mode { mode } => *s.mode.lock().unwrap() = mode,
                 AgentInput::Model { model, context_window } => *s.model.lock().unwrap() = (model, context_window),
                 AgentInput::Compact => {
+                    evidence_init_allowed = false;
                     fresh = false;
                     let _ = user_tx.send(Work::Compact);
                 }
@@ -327,6 +343,14 @@ pub fn spawn(api: ApiClient, cfg: AgentConfig) -> AgentHandle {
                                 ledger
                             });
                             ledger.restore(evidence_tree::tree_hash(&s.cwd).ok().as_deref());
+                            // A new worker keeps the service-provisioned key,
+                            // not the earlier worker's sealed signing authority.
+                            if let Some(key) = s.evidence.lock().unwrap().key.clone() {
+                                if let Err(code) = ledger.initialize(&req.run_id, key) {
+                                    req.error(&s, "import_state", code);
+                                    continue;
+                                }
+                            }
                             *s.evidence.lock().unwrap() = ledger;
                             history = state.history;
                             *s.plan.lock().unwrap() = state.plan;
@@ -1070,6 +1094,9 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
     let ui_attempt = matches!(name.as_str(), "browser" | "browser_open")
         && input["url"].as_str().is_some_and(|url| (url.starts_with("http://") || url.starts_with("https://")) && url.len() <= 2048);
     let before = if eligible.is_some() || ui_attempt { evidence_tree::tree_hash(&s.cwd).ok() } else { None };
+    let definition_changed_before = eligible.as_ref().is_some_and(|command| {
+        s.evidence.lock().unwrap().policy.command_definition_changed(&s.cwd, command).unwrap_or(true)
+    });
     let record_start = evidence::now_ms();
     let record_clock = Instant::now();
     let record_input = input.clone();
@@ -1087,6 +1114,10 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
                 evidence::EvidenceKind::UiAttempt { url, title }
             };
             let record = evidence::Record {
+                run_id: String::new(),
+                command_definition_changed: definition_changed_before || eligible.as_ref().is_some_and(|command| {
+                    s.evidence.lock().unwrap().policy.command_definition_changed(&s.cwd, command).unwrap_or(true)
+                }),
                 seq: 0, id: String::new(),
                 command: eligible.as_ref().map(|c| c.command.clone()).unwrap_or_else(|| name.clone()),
                 cwd: eligible.as_ref().map(|c| c.cwd.clone()).unwrap_or_else(|| ".".into()),

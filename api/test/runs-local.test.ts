@@ -13,9 +13,10 @@ import { gh, git, checkout, importBundle, pushBranch } from "../src/github";
 import { RetryError } from "../src/retry";
 import { command } from "../src/command";
 import * as publication from "../src/runs/publication";
-import { evidenceSigningKey, evidenceState, signedRecord, unverifiedDescription } from "./fixtures/evidence";
+import { evidenceSigningKey, evidenceState, signedRecord, unverifiedDescription as emptyUnverifiedDescription } from "./fixtures/evidence";
 import { createMcp, createToken, sessionState } from "../src/mcp";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+const unverifiedDescription = (body: string) => emptyUnverifiedDescription(body).replace("```text\nNo fresh successful check", "```text\nVerification policy status unavailable.\nNo fresh successful check");
 vi.mock("../src/github", async (original) => {
   const actual = await original<typeof import("../src/github")>();
   return {
@@ -52,8 +53,10 @@ let dir: string,
   events: Record<string, unknown>[],
   destroy: ReturnType<typeof vi.fn<() => Promise<void>>>;
 let workerFailure: string | null;
-let workerTurns: Record<string, unknown>[][];
+type WorkerTurn = Record<string, unknown>[] | ((runId: string, key: Buffer) => Record<string, unknown>[]);
+let workerTurns: WorkerTurn[];
 let workerEvidenceReply: unknown;
+let workerInitialize: () => Promise<void>;
 let relay: (req: Request) => Promise<Response>;
 const cfg = (): Config => ({
   data: dir,
@@ -84,13 +87,19 @@ beforeEach(async () => {
   workerFailure = null;
   workerTurns = [];
   workerEvidenceReply = true;
+  workerInitialize = async () => {};
   destroy = vi.fn(async () => {});
   runs = new Runs(db, cfg(), async (_id, handler) => {
     relay = handler;
+    let serviceKey: Buffer;
     return {
       destroy,
       rpc: async (method, args) => {
         log.push({ method, ...args });
+        if (method === "init_evidence") {
+          serviceKey = Buffer.from(args?.key as string, "hex");
+          await workerInitialize();
+        }
         if (method === "send") {
           const input = args?.input as any;
           if (input.type === "interrupt")
@@ -100,7 +109,10 @@ beforeEach(async () => {
               stop_reason: "interrupted",
             });
           else if (input.type !== "user") return true as any;
-          else if (workerTurns.length) events.push(...workerTurns.shift()!);
+          else if (workerTurns.length) {
+            const turn = workerTurns.shift()!;
+            events.push(...(typeof turn === "function" ? turn(_id, serviceKey) : turn));
+          }
           else if (workerFailure)
             events.push(
               { type: "turn.start", agent_id: "main" },
@@ -118,7 +130,15 @@ beforeEach(async () => {
               { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
             );
         }
-        if (method === "export_state") return workerEvidenceReply as any;
+        if (method === "export_state") {
+          // A conforming worker exports the service-installed key. Deliberate
+          // changed-key and legacy replies stay untouched.
+          const reply = workerEvidenceReply as ReturnType<typeof evidenceState>;
+          if (reply?.state?.evidence?.key === evidenceSigningKey.toString("hex")) {
+            return { state: { evidence: { ...reply.state.evidence, key: serviceKey.toString("hex") } } } as any;
+          }
+          return workerEvidenceReply as any;
+        }
         if (method === "events") {
           const batch = events.splice(0);
           return { events: batch, alive: true } as any;
@@ -141,22 +161,33 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 describe("persistent local run lifecycle", () => {
-  it("captures the private evidence key before work, authenticates events across follow-ups and derives freshness on the service", async () => {
-    workerEvidenceReply = evidenceState();
-    const record = signedRecord();
-    workerTurns.push([
-      { type: "evidence.recorded", record },
-      { type: "evidence.recorded", record }, // replay
-      { type: "evidence.recorded", record: { ...record, command: "forged" } },
-      { type: "evidence.recorded", record: signedRecord({ seq: 3 }), extra: "not allowed" },
-      { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
-    ]);
+  it("installs a service key before work, authenticates events across follow-ups and derives freshness on the service", async () => {
+    workerEvidenceReply = evidenceState("f".repeat(64)); // Initial export cannot choose the service key.
+    let record!: ReturnType<typeof signedRecord>;
+    let key!: Buffer;
+    workerTurns.push((runId, serviceKey) => {
+      workerEvidenceReply = evidenceState(); // Finish metadata reports the installed key.
+      key = serviceKey;
+      record = signedRecord({ run_id: runId }, key);
+      return [
+        { type: "evidence.recorded", record },
+        { type: "evidence.recorded", record }, // replay
+        { type: "evidence.recorded", record: { ...record, command: "forged" } },
+        { type: "evidence.recorded", record: signedRecord({ run_id: runId, seq: 3 }, key), extra: "not allowed" },
+        { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
+      ];
+    });
     const guardedImport = async (cwd: string, _bundle: Buffer, branch: string, _env?: NodeJS.ProcessEnv, _retry?: unknown, options?: import("../src/github").PushOptions) => {
       await options?.beforePush?.({ cwd, branch, head: "b".repeat(40) });
     };
     vi.mocked(importBundle).mockImplementationOnce(guardedImport);
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const initIndex = log.findIndex(call => call.method === "init_evidence");
+    expect(initIndex).toBeGreaterThan(log.findIndex(call => call.method === "start"));
+    expect(initIndex).toBeLessThan(log.findIndex(call => call.method === "export_state"));
+    expect(log[initIndex]).toEqual({ method: "init_evidence", run_id: r.id, owner_id: "u", key: key.toString("hex") });
+    expect(key).toHaveLength(32);
     expect(log.findIndex(call => call.method === "export_state")).toBeLessThan(log.findIndex(call => call.method === "send"));
     expect(log.filter(call => call.method === "export_state")).toEqual([
       { method: "export_state", run_id: r.id, owner_id: "u" }, { method: "export_state", run_id: r.id, owner_id: "u" },
@@ -165,16 +196,22 @@ describe("persistent local run lifecycle", () => {
     expect(publication.descriptionFor(runs.get(r.id))).toContain("1 fresh successful check(s)");
     expect(git).toHaveBeenCalledWith("/fake", "rev-parse", `${"b".repeat(40)}^{tree}`);
     const stored = db.prepare("SELECT data FROM runs WHERE id=?").get(r.id) as { data: string };
-    expect(stored.data).not.toContain(evidenceSigningKey.toString("hex"));
-    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(evidenceSigningKey.toString("hex"));
+    expect(stored.data).not.toContain(key.toString("hex"));
+    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(key.toString("hex"));
+    // Child/stdout-shaped forgeries and even valid MACs for another run are dropped.
+    runs.append(r.id, { type: "state.evidence_initialized", key: key.toString("hex") });
+    runs.append(r.id, { type: "evidence.recorded", record: signedRecord({ run_id: r.id, seq: 2, id: "00000000-0000-4000-8000-000000000002" }, Buffer.alloc(32, 255)) });
+    runs.append(r.id, { type: "evidence.recorded", record: signedRecord({ run_id: "other-run", seq: 2, id: "00000000-0000-4000-8000-000000000003" }, key) });
+    expect(runs.get(r.id).evidence?.last_seq).toBe(1);
+    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(key.toString("hex"));
     expect(runs.history(r.id, 0).filter(e => e.type === "evidence.recorded")).toHaveLength(1);
     const stale = runs.get(r.id);
     // Finish-time key rotation cannot authorize a new signature, nor replace the original key.
     workerEvidenceReply = evidenceState("f".repeat(64));
-    const next = signedRecord({ seq: 2, id: "00000000-0000-4000-8000-000000000002", tree_hash_after: "c".repeat(40) });
+    const next = signedRecord({ run_id: r.id, seq: 2, id: "00000000-0000-4000-8000-000000000002", tree_hash_after: "c".repeat(40) }, key);
     workerTurns.push([
       { type: "evidence.recorded", record: next },
-      { type: "evidence.recorded", record: signedRecord({ seq: 3, id: "00000000-0000-4000-8000-000000000003" }, Buffer.alloc(32, 255)) },
+      { type: "evidence.recorded", record: signedRecord({ run_id: r.id, seq: 3, id: "00000000-0000-4000-8000-000000000003" }, Buffer.alloc(32, 255)) },
       { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
     ]);
     vi.mocked(importBundle).mockImplementationOnce(guardedImport);
@@ -187,12 +224,42 @@ describe("persistent local run lifecycle", () => {
     expect(runs.get(r.id).evidence?.last_seq).toBe(2);
     expect(runs.get(r.id).evidence?.ids).toHaveLength(2);
   });
+  it("waits for private initialization and generates a different service key for a reopened worker", async () => {
+    let initialized!: () => void;
+    workerInitialize = () => new Promise(resolve => { initialized = resolve; });
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(log.some(call => call.method === "init_evidence")).toBe(true));
+    expect(log.some(call => call.method === "send" || call.method === "export_state")).toBe(false);
+    const firstKey = log.find(call => call.method === "init_evidence")!.key;
+    expect(JSON.stringify(log.filter(call => call.method !== "init_evidence"))).not.toContain(firstKey);
+    expect(JSON.stringify(runs.get(r.id))).not.toContain(firstKey);
+    initialized();
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    await runs.closeSession(r.id, "u");
+    workerInitialize = async () => {};
+    runs.enqueue(r.id, "u", "Reopen");
+    await vi.waitFor(() => expect(log.filter(call => call.method === "init_evidence")).toHaveLength(2));
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
+    const secondKey = log.filter(call => call.method === "init_evidence")[1].key;
+    expect(secondKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(secondKey).not.toBe(firstKey);
+    expect(JSON.stringify(runs.get(r.id))).not.toContain(secondKey);
+    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(secondKey);
+  });
+  it("never delivers a task if private evidence initialization fails", async () => {
+    workerInitialize = async () => { throw new Error("Initialization failed"); };
+    const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
+    await vi.waitFor(() => expect(runs.get(r.id).status).toBe("failed"));
+    expect(log.some(call => call.method === "send")).toBe(false);
+    expect(destroy).toHaveBeenCalled();
+    expect(JSON.stringify(runs.history(r.id, 0))).not.toContain(log.find(call => call.method === "init_evidence")!.key);
+  });
   it.each([false, true])("preserves run-wide evidence budgets through reopen and stale saves (records=%s)", async withRecord => {
     const reply = evidenceState();
     reply.state.evidence.gate_rounds = 6;
     workerEvidenceReply = reply;
-    workerTurns.push([
-      ...(withRecord ? [{ type: "evidence.recorded", record: signedRecord({ seq: 8 }) }] : []),
+    workerTurns.push((runId, key) => [
+      ...(withRecord ? [{ type: "evidence.recorded", record: signedRecord({ run_id: runId, seq: 8 }, key) }] : []),
       { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
     ]);
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
@@ -231,13 +298,13 @@ describe("persistent local run lifecycle", () => {
     expect(log.filter(call => call.method === "start")[1]).toMatchObject({ evidence_gate_rounds: 2 });
     expect(runs.get(r.id).evidence).toMatchObject({ gate_budget: 4 });
   });
-  it("fails closed for legacy initial exports even if a key appears at turn finish or in unsolicited events", async () => {
-    workerTurns.push([{ type: "evidence.recorded", record: signedRecord() }, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" }]);
+  it("never adopts exported keys or unsolicited state frames even without initial policy metadata", async () => {
+    workerTurns.push(runId => [{ type: "evidence.recorded", record: signedRecord({ run_id: runId }) }, { type: "turn.end", agent_id: "main", stop_reason: "end_turn" }]);
     const r = await runs.create("u", { repo: "acme/app", model: "auto", prompt: "Work" });
     await vi.waitFor(() => expect(runs.get(r.id).status).toBe("ready"));
     workerEvidenceReply = evidenceState();
     workerTurns.push([
-      { type: "state.exported", ...evidenceState() }, { type: "evidence.recorded", record: signedRecord() },
+      { type: "state.exported", ...evidenceState() }, { type: "evidence.recorded", record: signedRecord({ run_id: r.id }) },
       { type: "turn.end", agent_id: "main", stop_reason: "end_turn" },
     ]);
     runs.enqueue(r.id, "u", "Continue");

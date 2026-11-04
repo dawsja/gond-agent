@@ -230,7 +230,7 @@ describe("automatic CI publication with explicit-branch leases", () => {
     const tree = await f.git(join(dir, "worker"), "rev-parse", `${f.head}^{tree}`);
     const current = runs.get("run");
     const claimed = matching ? tree : "f".repeat(40);
-    current.evidence = acceptEvidence(undefined, signedRecord({ tree_hash_before: claimed, tree_hash_after: claimed }), evidenceSigningKey);
+    current.evidence = acceptEvidence(undefined, signedRecord({ tree_hash_before: claimed, tree_hash_after: claimed }), evidenceSigningKey, "run");
     runs.save(current);
     expect(await service().publish("run", f.live)).toBe(true);
     expect(runs.get("run").evidence?.publication_tree).toBe(tree);
