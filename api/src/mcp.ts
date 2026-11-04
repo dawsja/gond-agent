@@ -1,4 +1,5 @@
 import { planState } from "./runs/fold";
+import { isRunStatus, type RunStatus } from "../../shared/run-state";
 import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
@@ -94,11 +95,25 @@ export function authenticateToken(db: Store, bearer: string | null): Token {
     );
   return row;
 }
+export const MCP_RUN_STATES = {
+  queued: { state: "queued", done: false },
+  working: { state: "working", done: false },
+  ready: { state: "done", done: true },
+  failed: { state: "failed", done: true },
+  stopped: { state: "stopped", done: true },
+  merged: { state: "merged", done: true },
+  interrupted: { state: "interrupted", done: true },
+} as const satisfies Record<RunStatus, { state: string; done: boolean }>;
+
 export function sessionState(r: Run) {
-  const done = ["ready", "failed", "stopped", "merged"].includes(r.status) && !r.pending?.length;
+  if (!isRunStatus(r.status)) throw new Error("Unknown run status");
+  const base = MCP_RUN_STATES[r.status];
+  // Interrupted work is inactive even when it preserves messages or a question.
+  // Wait calls must return, and callers must resume before answering/continuing.
+  const done = base.done && (r.status === "interrupted" || !r.pending?.length);
   const question = !done ? r.summary?.question ?? null : null;
   return {
-    state: done ? (r.status === "ready" ? "done" : r.status) : question ? "waiting_for_input" : r.status === "queued" || r.pending?.length ? "queued" : "working",
+    state: done ? base.state : question ? "waiting_for_input" : r.pending?.length ? "queued" : base.state,
     done,
     queue_position: r.queue_position,
     queue_length: r.queue_length,

@@ -5,6 +5,7 @@ import { Activity } from "@/components/workspace/activity"
 import { ProfileAvatar } from "@/components/profile-avatar"
 import type { Run, RunStatus } from "@/lib/api"
 import { ago, duration } from "@/lib/format"
+import { RUN_UI } from "@/lib/run-state"
 import { useMe, useRunImage } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
@@ -248,9 +249,10 @@ function UserMessage({
 
 function EndMarker({ status, error }: { status: RunStatus; error?: string }) {
   if (status === "merged") return <div><StatusPill status="merged" /></div>
-  const text = status === "failed" ? (error ?? "The run failed") : status === "stopped" ? "Stopped" : "Pull request merged"
+  const ui = RUN_UI[status]
+  const text = status === "failed" ? (error ?? ui.endText) : ui.endText
   return (
-    <Tool status={status === "failed" ? "failed" : "done"} name={status === "failed" ? "Failed" : status === "stopped" ? "Stopped" : "Merged"}>
+    <Tool status={status === "failed" ? "failed" : "done"} name={ui.label}>
       <Branch>
         <span className={status === "failed" ? "text-failed" : ""}>{text}</span>
       </Branch>
@@ -265,7 +267,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
     const keys = new Set<string>()
     let first = true
     for (const item of t.items) {
-      if (item.kind === "user" || item.kind === "ci") first = true
+      if (item.kind === "user" || item.kind === "ci" || item.kind === "run-message") first = true
       else if (item.kind === "text" && first) { keys.add(item.key); first = false }
     }
     return keys
@@ -300,6 +302,8 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
             <TraceTitle>{CI_LABEL[it.state]}{it.round > 0 && ` · round ${it.round}`}{it.failing.length > 0 && ` · ${it.failing.join(", ")}`}{it.reason && ` · ${it.reason}`}</TraceTitle>
           </TraceLine>
         </Trace>
+      case "run-message":
+        return <p key={it.key} role="status" className="text-xs text-muted-foreground">{it.text}</p>
       case "text": {
         return <section key={it.key} className="flex min-w-0 flex-col gap-2.5">
           {headings.has(it.key) && <AgentLabel />}

@@ -6,9 +6,35 @@ import { setTimeout as delay } from "node:timers/promises";
 import { command } from "./command";
 import type { Config } from "./config";
 
+export interface WorkspaceCheckpointOptions {
+  owner_id: string;
+  base_sha: string;
+  /** Known upstream checkout/published commit; omit to use the worker's actual HEAD. */
+  head_sha?: string;
+  identity: { name: string; email: string };
+}
+export interface WorkspaceCheckpoint {
+  boundary_id: string;
+  bundle: string; // base64; opaque bytes, never unpack on the API host
+  base_sha: string;
+  head_sha: string;
+  checkpoint_sha: string;
+  state: { runner_state_version: string; [key: string]: unknown };
+}
+
 export interface Workspace {
   rpc<T = any>(method: string, args?: Record<string, unknown>): Promise<T>;
   destroy(): Promise<void>;
+  /** Call after start/import and before sending work. Save runs while the runner is held.
+   * Optional for alternate WorkspaceFactory implementations without checkpoint support. */
+  enableCheckpoints?(options: WorkspaceCheckpointOptions,
+    save: (checkpoint: WorkspaceCheckpoint) => void | Promise<void>, onError?: (error: unknown) => void): Promise<void>;
+  /** Await any in-flight boundary capture, persistence and release; rejects on failure. */
+  flushCheckpoints?(): Promise<void>;
+  /** After turn.end and publication, hold the idle worker and save its current tree/history once.
+   * Optionally update the restore baseline for this and subsequent captures.
+   * Requires enableCheckpoints; await before closing. Do not concurrently send new work. */
+  captureCheckpoint?(options?: { head_sha: string }): Promise<void>;
 }
 export type WorkspaceFactory = (id: string, modelHandler: (req: Request) => Promise<Response>) => Promise<Workspace>;
 const MANAGED = "io.gond-agent.managed=true";
@@ -116,6 +142,95 @@ export class ContainerPool {
         clearTimeout(timer); pending.delete(key); reject(error);
       });
     });
+    let checkpointHandler: { options: WorkspaceCheckpointOptions; save: (checkpoint: WorkspaceCheckpoint) => void | Promise<void>; onError?: (error: unknown) => void } | undefined;
+    let checkpointBoundary: string | undefined;
+    let checkpointTask: Promise<void> | undefined;
+    let checkpointError: unknown;
+    let checkpointGate: Promise<void> | undefined;
+    let capturePending = false;
+    let checkpointSequence = 0;
+    const checkpointReady = (boundary: unknown) => {
+      if (typeof boundary !== "string" || !/^[a-f0-9]{32}$/.test(boundary) || checkpointBoundary) {
+        fail(new Error("Invalid checkpoint boundary"));
+        void destroy().catch(() => {});
+        return;
+      }
+      checkpointSequence++;
+      checkpointBoundary = boundary;
+      startCheckpointTask();
+    };
+    const startCheckpointTask = () => {
+      // At most one active save and one next held boundary (which can arrive
+      // just before release's RPC reply). Never queue a save per transcript event.
+      checkpointTask ??= (async () => {
+        // An explicit hold emits ready before export_state returns. Do not send
+        // the paired export until that controller state RPC has finished.
+        if (checkpointGate) await checkpointGate;
+        while (checkpointBoundary && !destroyed && !disconnected) {
+          const boundary_id = checkpointBoundary;
+          checkpointBoundary = undefined;
+          try {
+            if (checkpointHandler) {
+              const capture = await rpc<WorkspaceCheckpoint>("checkpoint", {
+                ...checkpointHandler.options, run_id: id, boundary_id,
+              });
+              await checkpointHandler.save(capture);
+              checkpointError = undefined;
+            }
+          } catch (error) {
+            checkpointError = error ?? new Error("Workspace checkpoint save failed");
+            console.error("Workspace checkpoint save failed", id);
+            try { checkpointHandler?.onError?.(error); } catch { /* Never log private state. */ }
+          } finally {
+            if (!destroyed && !disconnected) await rpc("checkpoint.release", { boundary_id });
+          }
+        }
+      })().catch(async (error) => {
+        checkpointError = error ?? new Error("Workspace checkpoint release failed");
+        // A failed release leaves execution position unknown. Never reuse it.
+        console.error("Workspace checkpoint release failed", id);
+        await destroy().catch(() => {});
+      }).finally(() => {
+        checkpointTask = undefined;
+        if (checkpointBoundary && !destroyed && !disconnected) startCheckpointTask();
+      });
+    };
+    const flushCheckpoints = async () => {
+      while (checkpointTask) await checkpointTask;
+      if (checkpointError !== undefined) throw checkpointError;
+      if (destroyed || disconnected) throw new Error("Workspace disconnected");
+    };
+    const captureCheckpoint: NonNullable<Workspace["captureCheckpoint"]> = async (options) => {
+      if (!checkpointHandler) throw new Error("Workspace checkpoints are not enabled");
+      if (capturePending) throw new Error("Workspace checkpoint capture is already pending");
+      capturePending = true;
+      try {
+        await flushCheckpoints();
+        if (options) checkpointHandler.options.head_sha = options.head_sha;
+        const before = checkpointSequence;
+        let unblock!: () => void;
+        checkpointGate = new Promise<void>((resolve) => { unblock = resolve; });
+        try {
+          await rpc("export_state", { run_id: id, owner_id: checkpointHandler.options.owner_id, quiescent: true, hold: true });
+          if (checkpointSequence === before) throw new Error("Missing idle checkpoint boundary");
+        } finally {
+          checkpointGate = undefined;
+          unblock();
+          // Even failed/timed-out requests may already have emitted ready. Finish
+          // their save/release rather than returning while a known hold is active.
+          await flushCheckpoints();
+        }
+      } finally { capturePending = false; }
+    };
+    const enableCheckpoints: NonNullable<Workspace["enableCheckpoints"]> = async (options, save, onError) => {
+      if (checkpointHandler) throw new Error("Workspace checkpoints are already enabled");
+      checkpointHandler = { options: { ...options, identity: { ...options.identity } }, save, onError };
+      try {
+        // This initial idle export binds the runner and opts in; later ready
+        // notifications are emitted once per completed main round, plus turn start.
+        await rpc("export_state", { run_id: id, owner_id: options.owner_id, quiescent: true });
+      } catch (error) { checkpointHandler = undefined; throw error; }
+    };
     const model = async (frame: any) => {
       const key = frame.id;
       if (typeof key !== "string" || models.has(key) || models.size >= 16) throw new Error("Invalid model request");
@@ -179,6 +294,7 @@ export class ContainerPool {
             const frame = JSON.parse(line);
             if (frame.model) { void model(frame.model).catch((error) => fail(error)); continue; }
             if (frame.model_cancel) { models.get(frame.model_cancel)?.abort(); continue; }
+            if (frame.checkpoint) { checkpointReady(frame.checkpoint.boundary_id); continue; }
             const p = pending.get(frame.id);
             if (!p) continue;
             pending.delete(frame.id); clearTimeout(p.timer);
@@ -187,7 +303,7 @@ export class ContainerPool {
         }
       });
       await rpc("ping");
-      return { rpc, destroy };
+      return { rpc, destroy, enableCheckpoints, flushCheckpoints, captureCheckpoint };
     } catch (error) {
       await destroy().catch((cleanupError) => console.error("Workspace startup cleanup failed", id, cleanupError));
       throw error;

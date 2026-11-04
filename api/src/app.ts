@@ -537,6 +537,9 @@ export function createApp(
     runs.enqueue(c.req.param("id"), c.get("user").id, b.text, b.images, b.effort, b.model, undefined, b.pr_body);
     return c.json({ ok: true });
   });
+  app.post("/api/v1/runs/:id/resume", async (c) =>
+    c.json(await runs.resume(c.req.param("id"), c.get("user").id)),
+  );
   app.post("/api/v1/runs/:id/close", async (c) =>
     c.json(await runs.closeSession(c.req.param("id"), c.get("user").id)),
   );

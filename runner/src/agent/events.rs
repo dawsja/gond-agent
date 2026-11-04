@@ -86,6 +86,10 @@ pub enum AgentEvent {
     #[serde(rename = "compacted")]
     Compacted { agent_id: String, reason: String, before: u64, after: u64 },
     /// Control frames; never append these to the user/model transcript.
+    #[serde(rename = "checkpoint.ready")]
+    CheckpointReady { boundary_id: String },
+    #[serde(rename = "checkpoint.released")]
+    CheckpointReleased { request_id: String },
     #[serde(rename = "state.exported")]
     StateExported { request_id: String, state: Box<super::checkpoint::Checkpoint> },
     #[serde(rename = "state.imported")]
@@ -123,6 +127,22 @@ pub struct ExportStateInput {
     pub request_id: String,
     pub run_id: String,
     pub owner_id: String,
+    /// Opt in/out of held boundaries for subsequent main rounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiescent: Option<bool>,
+    /// Require this exact currently held boundary for an atomic tree/state capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_id: Option<String>,
+    /// Establish a new held boundary, only while the main worker is idle.
+    #[serde(default)]
+    pub hold: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointReleaseInput {
+    pub request_id: String,
+    pub boundary_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -137,6 +157,8 @@ pub struct ImportStateInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentInput {
+    #[serde(rename = "checkpoint.release")]
+    CheckpointRelease(CheckpointReleaseInput),
     #[serde(rename = "export_state")]
     ExportState(ExportStateInput),
     #[serde(rename = "import_state")]

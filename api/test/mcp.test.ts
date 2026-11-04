@@ -521,9 +521,9 @@ it.each([
   ["queued", "queued", false], ["working", "working", false],
   ["ready", "done", true], ["failed", "failed", true],
   ["stopped", "stopped", true], ["merged", "merged", true],
-])("exposes completion consistently for %s", async (status, state, done) => {
+] as const)("exposes completion consistently for %s", async (status, state, done) => {
   const r = seed();
-  r.status = status as string;
+  r.status = status;
   r.pr_url = "https://github.com/acme/app/pull/42";
   r.error = status === "failed" ? "Model unavailable" : null;
   db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(status, JSON.stringify(r), r.id);

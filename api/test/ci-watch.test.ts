@@ -73,11 +73,11 @@ describe("CI settings and configuration paths", () => {
   it("uses bounded integer settings, with zero rounds explicitly disabling the watcher", async () => {
     vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", undefined);
     vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", undefined);
-    expect(ciSettings()).toEqual({ rounds: 0, waitMinutes: 20 });
+    expect(ciSettings()).toEqual({ rounds: 2, waitMinutes: 20 });
     for (const invalid of ["", "-1", "1.5", "Infinity", "999999999", "private-value"]) {
       vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", invalid);
       vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", invalid);
-      expect(ciSettings()).toEqual({ rounds: 0, waitMinutes: 20 });
+      expect(ciSettings()).toEqual({ rounds: 2, waitMinutes: 20 });
     }
     vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "10");
     vi.stubEnv("GOND_AGENT_CI_WAIT_MINUTES", "120");

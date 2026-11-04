@@ -31,6 +31,7 @@ export interface Checkpoint {
   state_size: number;
   consumed_at: number | null;
   runner_version: string;
+  claimed_by?: string | null;
 }
 interface Envelope {
   run_id: string;
@@ -95,7 +96,9 @@ export class Checkpoints {
     this.cleanup();
   }
 
-  save(input: CheckpointKey & { bundle: Buffer; state: string; tree: CheckpointTree }): Checkpoint {
+  /** onPublish joins replay acknowledgement/claim consumption to metadata publication.
+   * Call outside any outer transaction: obsolete files are unlinked only after this commit. */
+  save(input: CheckpointKey & { bundle: Buffer; state: string; tree: CheckpointTree }, onPublish?: () => void): Checkpoint {
     this.authorize(input);
     if (!Buffer.isBuffer(input.bundle) || typeof input.state !== "string" || !validTree(input.tree))
       throw new CheckpointError("invalid", "Invalid checkpoint data.");
@@ -122,6 +125,7 @@ export class Checkpoints {
       this.syncDirectory(this.root);
       const { row, removed } = this.db.transaction(() => {
         this.authorize(input);
+        onPublish?.();
         const row = this.db.prepare(`INSERT INTO run_checkpoints(run_id,created_at,bundle_path,state_path,bundle_size,state_size,runner_version)
           VALUES(?,?,?,?,?,?,?) RETURNING *`).get(input.runId, createdAt, bundlePath, statePath, input.bundle.length, sealed.length, input.runnerVersion) as Checkpoint;
         return { row, removed: this.prune(row.seq) };
@@ -139,7 +143,7 @@ export class Checkpoints {
     }
   }
 
-  /** Latest unconsumed checkpoint by default. Loading never marks it consumed. */
+  /** Latest unconsumed checkpoint by default, including claimed ones for inspection. */
   load(key: CheckpointKey, seq?: number): { checkpoint: Checkpoint; bundle: Buffer; state: string; tree: CheckpointTree } | null {
     this.authorize(key);
     if (seq !== undefined && (!Number.isSafeInteger(seq) || seq < 1))
@@ -170,11 +174,48 @@ export class Checkpoints {
     }
   }
 
+  /** Validate and exclusively claim the latest checkpoint, never an older fallback. */
+  claim(key: CheckpointKey): (NonNullable<ReturnType<Checkpoints["load"]>> & { claimToken: string }) | null {
+    return this.db.transaction(() => {
+      this.authorize(key);
+      const latest = this.db.prepare("SELECT * FROM run_checkpoints WHERE run_id=? ORDER BY seq DESC LIMIT 1")
+        .get(key.runId) as Checkpoint | undefined;
+      if (!latest || latest.consumed_at !== null || latest.claimed_by != null) return null;
+      const loaded = this.load(key, latest.seq)!;
+      const claimToken = randomBytes(32).toString("hex");
+      if (!this.db.prepare(`UPDATE run_checkpoints SET claimed_by=?
+        WHERE run_id=? AND seq=? AND runner_version=? AND consumed_at IS NULL AND claimed_by IS NULL`)
+        .run(claimToken, key.runId, loaded.checkpoint.seq, key.runnerVersion).changes) return null;
+      return { ...loaded, checkpoint: { ...loaded.checkpoint, claimed_by: claimToken }, claimToken };
+    }).immediate();
+  }
+
+  /** Release a failed restore. A stale token cannot release a newer attempt's claim. */
+  release(key: CheckpointKey, seq: number, claimToken: string): void {
+    this.authorize(key);
+    if (!this.db.prepare(`UPDATE run_checkpoints SET claimed_by=NULL
+      WHERE run_id=? AND seq=? AND runner_version=? AND consumed_at IS NULL AND claimed_by=?`)
+      .run(key.runId, seq, key.runnerVersion, claimToken).changes) throw unavailable();
+  }
+
+  /** Acknowledge successful restore only for the current claim. Idempotent for that token. */
+  consumeClaim(key: CheckpointKey, seq: number, claimToken: string): void {
+    this.authorize(key);
+    if (!this.db.prepare(`UPDATE run_checkpoints SET consumed_at=coalesce(consumed_at,?)
+      WHERE run_id=? AND seq=? AND runner_version=? AND claimed_by=?`)
+      .run(this.now(), key.runId, seq, key.runnerVersion, claimToken).changes) throw unavailable();
+  }
+
+  /** Service recovery only, after disposable workers have been cleaned up; never on construction. */
+  resetClaims(): void {
+    this.db.prepare("UPDATE run_checkpoints SET claimed_by=NULL WHERE claimed_by IS NOT NULL").run();
+  }
+
   /** Caller acknowledges a successful restore, not merely a successful read. Idempotent. */
   consume(key: CheckpointKey, seq: number): void {
     this.authorize(key);
     if (!this.db.prepare(`UPDATE run_checkpoints SET consumed_at=coalesce(consumed_at,?)
-      WHERE run_id=? AND seq=? AND runner_version=?`).run(this.now(), key.runId, seq, key.runnerVersion).changes)
+      WHERE run_id=? AND seq=? AND runner_version=? AND claimed_by IS NULL`).run(this.now(), key.runId, seq, key.runnerVersion).changes)
       throw unavailable();
   }
 
@@ -294,17 +335,19 @@ export class Checkpoints {
     for (const row of rows) {
       const count = (counts.get(row.run_id) ?? 0) + 1;
       counts.set(row.run_id, count);
-      if (row.seq !== protectedSeq && (count > 2 || row.deleted_at !== null || row.created_at <= this.now() - this.retentionMs)) removed.add(row);
+      if (row.seq !== protectedSeq && !(row.claimed_by && row.consumed_at === null) && (count > 2 || row.deleted_at !== null || row.created_at <= this.now() - this.retentionMs)) removed.add(row);
       else total += row.bundle_size + row.state_size;
     }
     // Oldest consumed first, then ordinary unconsumed, interrupted unconsumed last.
     const priority = (row: typeof rows[number]) => row.consumed_at !== null ? 0 : row.status === "interrupted" ? 2 : 1;
     for (const row of [...rows].sort((a, b) => priority(a) - priority(b) || a.created_at - b.created_at || a.seq - b.seq)) {
       if (total <= this.maxBytes) break;
-      if (removed.has(row) || row.seq === protectedSeq) continue;
+      if (removed.has(row) || row.seq === protectedSeq || (row.claimed_by && row.consumed_at === null)) continue;
       removed.add(row);
       total -= row.bundle_size + row.state_size;
     }
+    if (protectedSeq !== undefined && total > this.maxBytes)
+      throw new CheckpointError("limit", "Checkpoint storage is busy. Try again after the current restore.");
     for (const row of removed) this.db.prepare("DELETE FROM run_checkpoints WHERE seq=?").run(row.seq);
     return [...removed];
   }

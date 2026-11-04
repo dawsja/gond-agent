@@ -68,6 +68,95 @@ it("adds the native schema idempotently to an existing database without changing
   } finally { reopened.close(); }
 });
 
+it("adds nullable claim metadata to existing checkpoints without rewriting them", () => {
+  const saved = save();
+  db.exec("ALTER TABLE run_checkpoints DROP COLUMN claimed_by");
+  db.close();
+  db = openStore(dir);
+  expect(rows()).toEqual([{ ...saved, claimed_by: null }]);
+  store = new Checkpoints(db, dir, secret, { now: () => now });
+  expect(store.load(key())?.state).toBe("supplied-state");
+  db.close();
+  db = openStore(dir);
+  expect(rows()).toEqual([{ ...saved, claimed_by: null }]);
+});
+
+it("exclusively claims the latest checkpoint across connections without falling back to an older one", () => {
+  expect(store.claim(key())).toBeNull();
+  const older = save(), latest = save();
+  const otherDb = openStore(dir);
+  try {
+    const other = new Checkpoints(otherDb, dir, secret, { now: () => now });
+    const claimed = store.claim(key());
+    expect(claimed).toMatchObject({ checkpoint: { ...latest, claimed_by: claimed?.claimToken },
+      bundle: Buffer.from("opaque-not-a-git-bundle"), state: "supplied-state", tree });
+    expect(claimed?.claimToken).toMatch(/^[a-f0-9]{64}$/);
+    expect(other.claim(key())).toBeNull();
+    expect(other.load(key())?.checkpoint.seq).toBe(latest.seq);
+    expect(rows()[0]).toEqual(older);
+    expect(() => other.consume(key(), latest.seq)).toThrow("unavailable");
+    store.consumeClaim(key(), latest.seq, claimed!.claimToken);
+    expect(other.claim(key())).toBeNull(); // A consumed latest checkpoint must not revive the older one.
+  } finally { otherDb.close(); }
+});
+
+it("releases a failed boot for retry and rejects stale tokens for both release and consumption", () => {
+  const saved = save();
+  const first = store.claim(key())!;
+  store.release(key(), saved.seq, first.claimToken);
+  const retry = store.claim(key())!;
+  expect(retry.claimToken).not.toBe(first.claimToken);
+  for (const stale of [first.claimToken, ""]) {
+    expect(() => store.release(key(), saved.seq, stale)).toThrow("unavailable");
+    expect(() => store.consumeClaim(key(), saved.seq, stale)).toThrow("unavailable");
+  }
+  for (const bad of [key(1, "bob"), key(2), { ...key(), runnerVersion: "worker-v2" }]) {
+    expect(() => store.release(bad, saved.seq, retry.claimToken)).toThrow("unavailable");
+    expect(() => store.consumeClaim(bad, saved.seq, retry.claimToken)).toThrow("unavailable");
+  }
+  expect(store.claim(key())).toBeNull();
+  store.consumeClaim(key(), saved.seq, retry.claimToken);
+  const consumedAt = now;
+  now++;
+  store.consumeClaim(key(), saved.seq, retry.claimToken);
+  expect(rows()[0].consumed_at).toBe(consumedAt);
+  expect(() => store.release(key(), saved.seq, retry.claimToken)).toThrow("unavailable");
+  expect(() => store.load(key(), saved.seq)).toThrow("unavailable");
+  expect(store.claim(key())).toBeNull();
+});
+
+it("preserves claims across startup until explicit recovery reset, without reviving consumed checkpoints", () => {
+  const saved = save(), consumed = save(2);
+  const first = store.claim(key())!, done = store.claim(key(2))!;
+  store.consumeClaim(key(2), consumed.seq, done.claimToken);
+  db.close();
+  db = openStore(dir);
+  store = new Checkpoints(db, dir, secret, { now: () => now });
+  expect(store.load(key())?.checkpoint.seq).toBe(saved.seq);
+  expect(store.claim(key())).toBeNull();
+  store.resetClaims(); // Service recovery does this only after cleaning up disposable workers.
+  store.resetClaims();
+  const retry = store.claim(key())!;
+  expect(retry.checkpoint.seq).toBe(saved.seq);
+  expect(retry.claimToken).not.toBe(first.claimToken);
+  expect(() => store.release(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+  expect(() => store.consumeClaim(key(), saved.seq, first.claimToken)).toThrow("unavailable");
+  expect(store.claim(key(2))).toBeNull();
+  expect(rows()[1].consumed_at).toBe(now);
+});
+
+it("validates checkpoint usability before claiming and leaves failed claims unclaimed", () => {
+  const saved = save();
+  for (const bad of [key(1, "bob"), { ...key(), runnerVersion: "worker-v2" }])
+    expect(() => store.claim(bad)).toThrow("unavailable");
+  now = saved.created_at + 7 * DAY;
+  expect(() => store.claim(key())).toThrow("unavailable");
+  now = saved.created_at;
+  fs.writeFileSync(join(root(), saved.bundle_path), Buffer.alloc(saved.bundle_size, 42));
+  expect(() => store.claim(key())).toThrow("could not be read");
+  expect(rows()).toEqual([saved]);
+});
+
 it("round-trips only supplied state, seals it with the auth secret, and stores opaque bundles with private permissions", () => {
   vi.stubEnv("CHECKPOINT_TEST_SECRET", "must-not-be-captured-from-the-api-environment");
   const state = JSON.stringify({ messages: ["private conversation"], supplied_token: "caller-supplied-only" }) + "\n\0opaque runner state\n";

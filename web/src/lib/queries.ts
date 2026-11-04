@@ -77,6 +77,7 @@ function useRunAction<T = void>(path: (id: string, arg: T) => { path: string; me
 
 export const useCloseRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}/close` }))
 export const useStopRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}/stop` }))
+export const useResumeRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}/resume` }))
 export const useCreatePull = () => useRunAction((id) => ({ path: `/v1/runs/${id}/pull` }))
 export const useMergeRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}/merge` }))
 export const useDeleteRun = () => useRunAction((id) => ({ path: `/v1/runs/${id}`, method: "DELETE" }))
