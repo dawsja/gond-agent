@@ -441,6 +441,37 @@ it("wakes a waiting read on completion without a transcript event", async () => 
   finally { clearTimeout(timer); }
 });
 
+it("exposes live queue positions only on the token owner's sessions", async () => {
+  const r = seed(); r.status = "queued";
+  seed(other, "foreign");
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  // Queue metadata is computed on reads, not persisted with the run.
+  const get = runs.get.bind(runs);
+  let queued = true;
+  vi.spyOn(runs, "get").mockImplementation((id, user) => {
+    const run = get(id, user);
+    return queued && id === r.id ? { ...run, queue_position: 2, queue_length: 3 } : run;
+  });
+  const client = await connect();
+  const detail = (await call(client, "get_session", {session_id:r.id})).body;
+  const list = (await call(client, "list_sessions")).body.sessions;
+  const events = (await call(client, "read_session_events", {session_id:r.id})).body;
+  expect(list.map((session: {id:string}) => session.id)).toEqual([r.id]);
+  for (const result of [detail, list[0], events]) {
+    expect(result).toMatchObject({state:"queued", done:false, queue_position:2, queue_length:3});
+  }
+  for (const name of ["get_session", "read_session_events"]) {
+    expect((await call(client, name, {session_id:"foreign"})).body).toMatchObject({error:"not_found"});
+  }
+  queued = false;
+  r.status = "working";
+  db.prepare("UPDATE runs SET status=?,data=? WHERE id=?").run(r.status, JSON.stringify(r), r.id);
+  const resumed = (await call(client, "get_session", {session_id:r.id})).body;
+  expect(resumed.state).toBe("working");
+  expect(resumed).not.toHaveProperty("queue_position");
+  expect(resumed).not.toHaveProperty("queue_length");
+});
+
 it("reports a pending question without calling it done", async () => {
   const r = seed(); r.status = "working";
   r.summary = {...r.summary, question:{request_id:"q1",question:"Which branch?"}};

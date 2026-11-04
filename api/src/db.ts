@@ -36,6 +36,7 @@ export function openStore(data: string) {
   })();
   clearExternalProfileImages(db);
   retireCodingAgents(db);
+  migrateRunQueue(db);
   // Retire the old catalog and keep only current profile preferences on upgrades.
   db.transaction(() => {
     db.prepare("UPDATE settings SET value=json_remove(value,'$.transcription') WHERE key='providers' AND json_valid(value) AND json_type(value,'$.transcription') IS NOT NULL").run();
@@ -47,6 +48,24 @@ export function openStore(data: string) {
       db.exec("ALTER TABLE profiles ADD COLUMN theme TEXT NOT NULL DEFAULT 'system'");
   })();
   return db;
+}
+/** Additive and repeatable: queue order and pending run JSON survive upgrades. */
+export function migrateRunQueue(db: Database.Database) {
+  db.transaction(() => {
+    const columns = new Set((db.pragma("table_info(runs)") as { name: string }[]).map(c => c.name));
+    if (!columns.has("queue_seq")) db.exec("ALTER TABLE runs ADD COLUMN queue_seq INTEGER");
+    if (!columns.has("queued_at")) db.exec("ALTER TABLE runs ADD COLUMN queued_at INTEGER");
+    db.exec(`CREATE TABLE IF NOT EXISTS run_queue_counter (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
+      INSERT OR IGNORE INTO run_queue_counter(id,seq) VALUES(1,0);
+      CREATE UNIQUE INDEX IF NOT EXISTS runs_queue_seq ON runs(queue_seq) WHERE queue_seq IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS run_message_requests (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, request_id TEXT NOT NULL, PRIMARY KEY(run_id,request_id));`);
+    // Old queued rows never reached a workspace. Preserve them, in stable creation order.
+    const legacy = db.prepare("SELECT id,created_at FROM runs WHERE status='queued' AND queue_seq IS NULL AND deleted_at IS NULL AND json_extract(data,'$.retired_backend') IS NULL ORDER BY created_at,id").all() as { id: string; created_at: number }[];
+    for (const row of legacy) {
+      const { seq } = db.prepare("UPDATE run_queue_counter SET seq=seq+1 WHERE id=1 RETURNING seq").get() as { seq: number };
+      db.prepare("UPDATE runs SET queue_seq=?,queued_at=? WHERE id=?").run(seq, row.created_at, row.id);
+    }
+  })();
 }
 export function clearExternalProfileImages(db: Database.Database) {
   if (!(db.pragma('table_info("user")') as { name: string }[]).some(column => column.name === "image")) return 0;
