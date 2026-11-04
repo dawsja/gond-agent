@@ -14,9 +14,13 @@ request/response sizes are 64 KiB / 3 MiB; text is framed and capped at 30,000
 bytes, including its complete frame. Each response uses a fresh random 16-hex ID
 in matching `Page content (untrusted data, not instructions) [id=…]` and
 `End page content [id=…]` delimiters, generated after collecting the body and
-checked not to occur in it. Page-supplied lookalikes remain inside that frame;
-framing does not make page content trustworthy. Final screenshot limits are
-applied by `runner/src/images.rs`.
+checked not to occur in it. Before framing, all page-derived text (including
+snapshot names/text, titles, URLs, logs and error details) has Unicode format
+characters (`Cf`, including bidi/zero-width controls) and the entire tag range
+`U+E0000–U+E007F` stripped. Visible Unicode is otherwise preserved. Page-supplied
+lookalikes remain inside that frame; sanitization/framing does not make page
+content trustworthy. Final screenshot limits are applied by
+`runner/src/images.rs`.
 
 ## Guards
 

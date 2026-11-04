@@ -15,7 +15,9 @@ const RSS_LIMIT = 768 * 1024 * 1024;
 const STALE = 'Stale element ref. Run browser_snapshot again.';
 const cap = (text, length = 2000) => String(text).slice(0, length);
 function framed(text, limit = 30000) {
-  text = String(text);
+  // All page-derived text (including titles, URLs, logs and errors) passes here.
+  // Strip invisible format/tag controls before nonce selection and byte limits.
+  text = String(text).replace(/[\p{Cf}\u{E0000}-\u{E007F}]/gu, '');
   // Generate only after collecting page data, and exclude even an accidental
   // match in that data. Never expose the response delimiter to the page.
   let id;
