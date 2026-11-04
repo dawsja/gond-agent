@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openStore, getSetting, setSetting } from "../src/db";
 import { seal } from "../src/auth";
+import { waitForCondition } from "./wait";
+
+vi.setConfig({ testTimeout: 30_000 });
 import { GithubLogin, deviceLogin, githubEnvFor, type LoginDriver } from "../src/github-login";
 
 const secret = "fixture-auth-secret-at-least-32-characters";
@@ -28,7 +31,10 @@ describe("GitHub browser authorization", () => {
     expect(() => login.start("session-b")).toThrow(/Another session/);
     expect(() => login.cancel("session-b", flow.id!)).toThrow(/another session/);
     job.resolve("fixture-token");
-    await vi.waitFor(() => expect(login.state("session-a").status).toBe("connected"));
+    // start() returns a state snapshot, not completion. Flow.done is private and
+    // close() cancels pending approval, so poll the public post-persistence state
+    // with the shared 15s budget for credential validation, encryption and I/O.
+    await waitForCondition(() => expect(login.state("session-a").status).toBe("connected"));
     expect(JSON.stringify(getSetting(db, "github"))).not.toContain("fixture-token");
     expect(JSON.stringify(login.state("session-a"))).not.toMatch(/fixture-token|ABCD/);
     expect(githubEnvFor(db, secret, "fixture-user").GH_TOKEN === "fixture-token").toBe(true);
@@ -56,7 +62,7 @@ describe("GitHub browser authorization", () => {
     login.start("owner");
     expect(() => login.cancel("owner", "stale-id")).toThrow(/another session/);
     job.reject(new Error("sensitive-upstream-response"));
-    await vi.waitFor(() => expect(login.state("owner").status).toBe("error"));
+    await waitForCondition(() => expect(login.state("owner").status).toBe("error"));
     expect(JSON.stringify(login.state("owner"))).not.toContain("sensitive-upstream-response");
   });
   it.each(["approve", "approve-old", "fail", "cancel"])("runs the real subprocess driver with isolated config and cleans up on %s", async scenario => {
@@ -69,11 +75,11 @@ describe("GitHub browser authorization", () => {
     vi.stubEnv("GITHUB_TOKEN", "inherited-token-must-not-be-used");
     vi.stubEnv("GOND_AGENT_GH_FIXTURE_DIR", fixture);
     login = new GithubLogin(db, secret, dir, deviceLogin); const flow = login.start("owner");
-    await vi.waitFor(() => expect(login.state("owner").code).toBe("ABCD-1234"));
+    await waitForCondition(() => expect(login.state("owner").code).toBe("ABCD-1234"));
     expect(statSync(join(dir, "github-login")).mode & 0o777).toBe(0o700);
     if (mode === "cancel") login.cancel("owner", flow.id!);
     else writeFileSync(join(fixture, mode), "yes");
-    await vi.waitFor(() => expect(login.state("owner").status).toBe(mode === "approve" ? "connected" : mode === "fail" ? "error" : "cancelled"));
+    await waitForCondition(() => expect(login.state("owner").status).toBe(mode === "approve" ? "connected" : mode === "fail" ? "error" : "cancelled"));
     await login.close();
     expect(readdirSync(join(dir, "github-login"))).toEqual([]);
     expect(JSON.stringify(login.state("owner"))).not.toMatch(/sensitive-upstream-response|fixture-only-github-token/);
