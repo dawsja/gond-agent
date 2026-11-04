@@ -43,7 +43,7 @@ import { PullRequests } from "../pull-requests";
 import { CiWatch, ciPushTouchesConfig, ciSettings, type CiInfo } from "./ci-watch";
 import { assertBranchAvailable, descriptionFor, publicationFields, publicationPushOptions } from "./publication";
 import { RunQueue } from "./queue";
-import { acceptEvidence, emptyEvidence, finishEvidence, weakenedEvidence, type Evidence } from "./evidence";
+import { acceptEvidence, emptyEvidence, finishEvidence, MAX_EVIDENCE_IDS, weakenedEvidence, type Evidence } from "./evidence";
 import { RetryError, classifyRetryFailure, withRetry } from "../retry";
 
 export interface Run extends CiInfo {
@@ -318,14 +318,29 @@ export class Runs {
   append(id: string, event: Record<string, unknown>) {
     // State replies are private control data, never transcript events.
     if (typeof event.type === "string" && event.type.startsWith("state.")) return;
+    let recordsCapped = false;
+    if (event.type === "evidence.records_capped") {
+      // Fixed service-owned notice, durable across workers/restarts. Worker
+      // lookalikes cannot invent a cap or choose its text/fields.
+      if ((this.get(id).evidence?.ids.length ?? 0) < MAX_EVIDENCE_IDS || this.db.prepare(
+        "SELECT 1 FROM events WHERE run_id=? AND json_extract(data,'$.type')='evidence.records_capped' LIMIT 1",
+      ).get(id)) return;
+      event = { type: "evidence.records_capped", limit: MAX_EVIDENCE_IDS,
+        message: "Execution evidence reached the 4,096-record limit. Further records will not be accepted for this run." };
+    }
     if (event.type === "evidence.recorded") {
       if (Object.keys(event).some(key => key !== "type" && key !== "record")) return;
       const run = this.get(id);
+      if ((run.evidence?.ids.length ?? 0) >= MAX_EVIDENCE_IDS) {
+        this.append(id, { type: "evidence.records_capped" });
+        return;
+      }
       const evidence = acceptEvidence(run.evidence, event.record, this.live.get(id)?.evidenceKey, id);
       if (!evidence) return;
       run.evidence = evidence;
       this.save(run);
       event = { type: "evidence.recorded", record: evidence.records.at(-1) };
+      recordsCapped = evidence.ids.length === MAX_EVIDENCE_IDS;
     }
     if (event.type === "tool.images") {
       const run = this.get(id);
@@ -348,6 +363,7 @@ export class Runs {
       .run(id, JSON.stringify(ev));
     const result = { ...ev, seq: Number(row.lastInsertRowid) };
     this.events.emit(id, result);
+    if (recordsCapped) this.append(id, { type: "evidence.records_capped" });
     return result;
   }
   history(id: string, after: number) {

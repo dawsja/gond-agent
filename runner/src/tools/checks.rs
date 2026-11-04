@@ -39,7 +39,10 @@ impl Tool for RunChecks {
             let mut check_ctx = ctx.clone();
             check_ctx.cwd = super::real(&ctx.cwd.join(cwd));
             if !check_ctx.cwd.starts_with(super::real(&ctx.cwd)) { return ToolOutput::err("cwd must stay inside the repository"); }
-            let out = super::bash::execute(&check_ctx, input, true).await;
+            let environment = if background { None } else { ctx.check_environment.as_ref() };
+            let mode = environment.map(super::bash::ShellEnvironment::CleanCheck)
+                .unwrap_or(super::bash::ShellEnvironment::InheritedCheck);
+            let out = super::bash::execute(&check_ctx, input, mode).await;
             if background { return out; }
             let text = out.content.iter().filter_map(|p| match p { ResultPart::Text { text } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
             let parsed = failures(&text);
@@ -71,5 +74,84 @@ mod tests {
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["failures"][0]["format"], "tsc");
         assert!(!out.ok);
+    }
+
+    /// Seed a separate test process instead of racing set_var with other tests.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_environments_preserve_toolchains_but_not_secrets() {
+        const TEST: &str = "tools::checks::tests::check_environments_preserve_toolchains_but_not_secrets";
+        const MARKER: &str = "GOND_AGENT_TEST_CHECK_ENV";
+        const SECRET: &str = "check-secret-sentinel-never-print";
+        const IMAGE: &[(&str, &str)] = &[
+            ("NODE_PATH", "/fixture/browser/node_modules"),
+            ("PLAYWRIGHT_BROWSERS_PATH", "/fixture/chromium"),
+            ("BUN_INSTALL", "/fixture/bun"),
+            ("UV_TOOL_DIR", "/fixture/uv"),
+            ("PYTHONUSERBASE", "/fixture/python"),
+        ];
+        if std::env::var(MARKER).as_deref() != Ok(TEST) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", TEST, "--nocapture"]).env(MARKER, TEST).envs(IMAGE.iter().copied());
+            for name in ["GH_TOKEN", "GITHUB_TOKEN", "GOND_AGENT_TOKEN", "GOND_AGENT_OTHER_SECRET", crate::config::RELAY_TOKEN_ENV] {
+                child.env(name, SECRET);
+            }
+            // Harmless injection settings: eligible checks must nevertheless strip them.
+            child.env("NODE_OPTIONS", "--trace-warnings").env("PYTHONPATH", "/fixture/injection")
+                .env("BASH_ENV", "/fixture/nonexistent-bash-env");
+            let output = child.output().unwrap();
+            let logs = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(!logs.contains(SECRET), "fixture secret reached output");
+            assert!(output.status.success(), "seeded checks failed: {logs}");
+            assert!(logs.contains("1 passed"), "fixture test did not run");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, mut events) = super::super::testutil::ctx(dir.path());
+        let no_secrets = r#"for name in $(compgen -e); do
+case "$name" in GH_TOKEN|GITHUB_TOKEN|GOND_AGENT_*) exit 41;; esac
+done"#;
+        let inherited = format!(r#"{no_secrets}
+test "$NODE_PATH" = /fixture/browser/node_modules &&
+test "$PLAYWRIGHT_BROWSERS_PATH" = /fixture/chromium &&
+test "$BUN_INSTALL" = /fixture/bun && test "$UV_TOOL_DIR" = /fixture/uv &&
+test "$PYTHONUSERBASE" = /fixture/python && test "$NODE_OPTIONS" = --trace-warnings &&
+test "$PYTHONPATH" = /fixture/injection && printf inherited-ok"#);
+        // Model-provided flags cannot select the allow-list.
+        let out = RunChecks.run(&ctx, json!({"command":inherited,"env_clean":true,"eligible":true})).await;
+        assert!(out.ok, "noneligible check lost its image environment");
+        assert!(super::super::testutil::text(&out).contains("inherited-ok"));
+
+        ctx.check_environment = Some(crate::agent::evidence::check_environment());
+        let clean = format!(r#"{no_secrets}
+for name in NODE_PATH PLAYWRIGHT_BROWSERS_PATH BUN_INSTALL NODE_OPTIONS PYTHONPATH BASH_ENV; do
+test -z "${{!name+x}}" || exit 42
+done
+test "$UV_TOOL_DIR" = /fixture/uv && test "$PYTHONUSERBASE" = /fixture/python && printf clean-ok"#);
+        let out = RunChecks.run(&ctx, json!({"command":clean,"env_clean":false})).await;
+        assert!(out.ok, "eligible check inherited injection variables");
+        assert!(super::super::testutil::text(&out).contains("clean-ok"));
+
+        // Even a context carrying eligibility must not clean a background check.
+        let out = RunChecks.run(&ctx, json!({"command":format!("{inherited} > background.txt"),"run_in_background":true})).await;
+        assert!(out.ok);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(dir.path().join("background.txt")).unwrap_or_default() == "inherited-ok" { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("background check lost toolchain variables or inherited a secret");
+
+        // Ordinary bash retains GitHub/custom Gond variables and image variables;
+        // only its pre-existing token exclusions apply.
+        let bash = r#"test -n "$GH_TOKEN" && test -n "$GITHUB_TOKEN" && test -n "$GOND_AGENT_OTHER_SECRET" &&
+test -z "${GOND_AGENT_RELAY_TOKEN+x}" && test -z "${GOND_AGENT_TOKEN+x}" &&
+test "$BUN_INSTALL" = /fixture/bun && printf bash-unchanged"#;
+        let out = super::super::bash::Bash.run(&ctx, json!({"command":bash})).await;
+        assert!(out.ok, "ordinary bash environment contract changed");
+        assert!(!format!("{out:?}").contains(SECRET));
+        while let Ok(event) = events.try_recv() {
+            assert!(!format!("{event:?}").contains(SECRET));
+        }
     }
 }

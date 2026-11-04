@@ -504,7 +504,7 @@ class StateControlTest(unittest.TestCase):
             self.assertEqual(frame["type"], "export_state")
             self.assertEqual(frame["boundary_id"], "1")
             self.assertFalse(capture_tree.called, "tree must wait for the held state reply")
-            for operation in ("checkpoint", "checkpoint.release"):
+            for operation in ("checkpoint", "checkpoint.release", "snapshot"):
                 with self.assertRaisesRegex(RuntimeError, "already pending"):
                     agent.dispatch({"method": operation, "boundary_id": token})
             state = {"private": "paired history"}
@@ -816,6 +816,106 @@ class CheckpointTest(unittest.TestCase):
         return (self.git("rev-parse", "HEAD"), self.git("symbolic-ref", "HEAD"),
                 (self.root / ".git/index").read_bytes(), self.git("show-ref"))
 
+    def assert_snapshot_publishes_worktree(self):
+        self.write("edit.txt", "staged, not published\n")
+        self.git("add", "edit.txt")
+        self.write("edit.txt", "published worktree\n")
+        self.write("new.txt", "published untracked\n")
+        self.write("ignored-secret", "not published\n")
+        (self.root / "deleted.txt").unlink()
+        index = self.root / ".git/index"
+        index_before = index.read_bytes()
+        expected = agent.tree_hash()
+        self.assertEqual(index.read_bytes(), index_before)
+        published = agent.dispatch({"method": "snapshot", "identity": self.identity})
+        head = published["head"]
+        self.assertNotEqual(head, self.head)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), head)
+        self.assertEqual(self.git("rev-list", "--parents", "-n", "1", head).decode().strip(),
+                         f"{head} {self.head}")
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").decode().strip(), expected)
+        self.assertEqual(self.git("write-tree").decode().strip(), expected)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
+        self.assertEqual(self.git("diff", "--name-only"), b"")
+        self.assertNotEqual(index.read_bytes(), index_before)
+        self.assertEqual(self.git("show", "HEAD:edit.txt"), b"published worktree\n")
+        self.assertEqual(self.git("show", "HEAD:new.txt"), b"published untracked\n")
+        self.assertNotIn(b"ignored-secret", self.git("ls-tree", "-r", "--name-only", "HEAD"))
+        self.assertEqual((self.root / "ignored-secret").read_text(), "not published\n")
+        self.assertFalse((self.root / ".git/index.lock").exists())
+
+        # Inspect publication through an independent receiver, not the clone's
+        # object store: the bundle must contain the advertised HEAD and tree.
+        bundle = pathlib.Path(self.temp.name, "publication.bundle")
+        bundle.write_bytes(base64.b64decode(published["bundle"]))
+        receiver = pathlib.Path(self.temp.name, "receiver.git")
+        self.git("init", "--bare", "-q", str(receiver))
+        self.assertEqual(self.git("bundle", "list-heads", str(bundle), cwd=receiver).decode(),
+                         f"{head} HEAD\n")
+        self.git("bundle", "verify", str(bundle), cwd=receiver)
+        self.git("fetch", "-q", str(bundle), "HEAD", cwd=receiver)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), head)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}", cwd=receiver).decode().strip(), expected)
+        self.assertEqual(self.git("ls-tree", "-r", "HEAD"),
+                         self.git("ls-tree", "-r", "FETCH_HEAD", cwd=receiver))
+        return head
+
+    def test_snapshot_packed_branch_creates_loose_override_without_rewriting_packed_refs(self):
+        self.git("pack-refs", "--all", "--prune")
+        branch = self.root / ".git/refs/heads/run"
+        self.assertFalse(branch.exists())
+        packed = self.root / ".git/packed-refs"
+        packed_before = packed.read_bytes()
+        head_before = (self.root / ".git/HEAD").read_bytes()
+        head = self.assert_snapshot_publishes_worktree()
+        self.assertEqual((self.root / ".git/HEAD").read_bytes(), head_before)
+        self.assertEqual(self.git("symbolic-ref", "HEAD"), b"refs/heads/run\n")
+        self.assertEqual(branch.read_text(), head + "\n")
+        self.assertEqual(packed.read_bytes(), packed_before)
+        self.assertFalse(branch.with_name("run.lock").exists())
+
+    def test_snapshot_detached_head_stays_detached_and_does_not_move_branch_refs(self):
+        self.git("checkout", "-q", "--detach", self.head)
+        refs_before = self.git("show-ref")
+        head = self.assert_snapshot_publishes_worktree()
+        self.assertEqual((self.root / ".git/HEAD").read_text(), head + "\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("symbolic-ref", "HEAD")
+        self.assertEqual(self.git("show-ref"), refs_before)
+        self.assertFalse((self.root / ".git/HEAD.lock").exists())
+
+    def test_snapshot_busy_index_or_ref_preserves_head_index_worktree_and_existing_lock(self):
+        self.write("edit.txt", "staged\n")
+        self.git("add", "edit.txt")
+        self.write("edit.txt", "unstaged\n")
+        self.write("new.txt", "untracked\n")
+        before = self.state()
+        head_before = (self.root / ".git/HEAD").read_bytes()
+        expected = agent.tree_hash()
+        index_lock = self.root / ".git/index.lock"
+        ref_lock = self.root / ".git/refs/heads/run.lock"
+        for lock in (index_lock, ref_lock):
+            with self.subTest(lock=lock.name):
+                lock.write_bytes(b"owned by another Git operation\n")
+                try:
+                    with self.assertRaises(FileExistsError):
+                        agent.dispatch({"method": "snapshot", "identity": self.identity})
+                    self.assertEqual(lock.read_bytes(), b"owned by another Git operation\n")
+                    self.assertEqual(self.state(), before)
+                    self.assertEqual((self.root / ".git/HEAD").read_bytes(), head_before)
+                    self.assertEqual(agent.tree_hash(), expected)
+                    self.assertEqual((self.root / "edit.txt").read_text(), "unstaged\n")
+                    self.assertEqual((self.root / "new.txt").read_text(), "untracked\n")
+                    self.assertFalse(agent.capture_lock.locked())
+                    self.assertFalse(agent.checkpoint_lock.locked())
+                    other_lock = ref_lock if lock == index_lock else index_lock
+                    self.assertFalse(other_lock.exists())
+                finally:
+                    lock.unlink()
+        published = agent.dispatch({"method": "snapshot", "identity": self.identity})
+        self.assertEqual(self.git("rev-parse", published["head"] + "^{tree}").decode().strip(), expected)
+        self.assertEqual(self.git("write-tree").decode().strip(), expected)
+
     def test_upstream_pin_restores_local_commits_and_dirty_tree_without_local_history(self):
         upstream = pathlib.Path(self.temp.name, "upstream")
         self.git("clone", "-q", "--no-local", str(self.root), str(upstream))
@@ -1011,11 +1111,15 @@ class CheckpointTest(unittest.TestCase):
                 self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}").decode().strip(), expected)
                 self.assertEqual(self.git("show", "FETCH_HEAD:" + name), b"print('included')\n")
 
-    def test_info_exclude_hidden_code_hash_checkpoint_snapshot_parity_without_filters_or_hooks(self):
+    def test_shallow_snapshot_info_exclude_parity_without_filters_or_hooks(self):
         shallow = pathlib.Path(self.temp.name, "publication-shallow")
         self.git("clone", "-q", "--depth", "1", "--no-tags", self.root.as_uri(), str(shallow))
         self.root = shallow
         agent.ROOT = str(shallow)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), b"true\n")
+        shallow_before = (self.root / ".git/shallow").read_bytes()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("cat-file", "-e", self.base)
         self.write(".gitattributes", "*.txt filter=unsafe\n*.py text eol=lf filter=unsafe\n")
         self.write("edit.txt", "published\n")
         code = b"print('included despite private excludes')\n"
@@ -1057,18 +1161,28 @@ class CheckpointTest(unittest.TestCase):
             unchanged = agent.dispatch({"method": "snapshot"})
         self.assertEqual(published["head"], unchanged["head"])
         self.assertEqual((self.root / ".git/config").read_bytes(), config_before)
+        self.assertEqual((self.root / ".git/HEAD").read_bytes(), head_before)
+        self.assertEqual((self.root / ".git/refs/heads/run").read_text(), published["head"] + "\n")
+        self.assertEqual((self.root / ".git/shallow").read_bytes(), shallow_before)
+        self.assertFalse((self.root / ".git/index.lock").exists())
+        self.assertFalse((self.root / ".git/refs/heads/run.lock").exists())
         for name in ("filter-ran", "fsmonitor-ran", "hook-ran", "env-ran"):
             self.assertFalse((self.root / name).exists())
-        with agent.checkpoint_repository() as (git, _, _, head):
+        with agent.checkpoint_repository() as (git, env, _, head):
             self.assertEqual(head, published["head"])
             self.assertEqual(git("rev-parse", head + "^{tree}").decode().strip(), expected)
             self.assertEqual(git("rev-list", "--parents", "-n", "1", head).decode().strip(), f"{head} {self.head}")
+            env["GIT_INDEX_FILE"] = str(self.root / ".git/index")
+            self.assertEqual(git("write-tree").decode().strip(), expected)
         # A normal receiver can import the shallow publication bundle against its
         # existing history, without rewriting that history or losing new files.
         receiver = pathlib.Path(self.temp.name, "receiver")
         self.git("clone", "-q", "--no-local", str(pathlib.Path(self.temp.name, "clone")), str(receiver))
         bundle = pathlib.Path(self.temp.name, "publication.bundle")
         bundle.write_bytes(base64.b64decode(published["bundle"]))
+        self.assertEqual(self.git("bundle", "list-heads", str(bundle), cwd=receiver).decode(),
+                         f'{published["head"]} HEAD\n')
+        self.git("bundle", "verify", str(bundle), cwd=receiver)
         self.git("fetch", "-q", str(bundle), "HEAD", cwd=receiver)
         self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), published["head"])
         self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}", cwd=receiver).decode().strip(), expected)

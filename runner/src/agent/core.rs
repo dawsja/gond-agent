@@ -1198,7 +1198,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
         Access::Write => Some(s.lock_for(s.cwd.join(str_arg(&input, "path").unwrap_or(""))).lock_owned().await),
         _ => None,
     };
-    let ctx = tool_context(s, run, &id, cancel);
+    let mut ctx = tool_context(s, run, &id, cancel);
     // Recheck the resolved paths after any permission wait and while holding the write lock.
     if let Some(kind) = run.kind {
         if tool.access() != Access::Read && inherited_mode(*s.mode.lock().unwrap(), Some(mode)) != mode {
@@ -1212,6 +1212,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
         }
     }
     let eligible = s.evidence.lock().unwrap().check(&name, &input).cloned();
+    ctx.check_environment = eligible.as_ref().map(|_| evidence::check_environment());
     let ui_attempt = matches!(name.as_str(), "browser" | "browser_open")
         && input["url"].as_str().is_some_and(|url| (url.starts_with("http://") || url.starts_with("https://")) && url.len() <= 2048);
     let before = if eligible.is_some() || ui_attempt { evidence_tree::tree_hash(&s.cwd).ok() } else { None };
@@ -1221,7 +1222,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
     let record_start = evidence::now_ms();
     let record_clock = Instant::now();
     let record_input = input.clone();
-    let env_digest = evidence::environment_digest();
+    let env_digest = ctx.check_environment.as_ref().map(evidence::environment_digest_for).unwrap_or_else(evidence::environment_digest);
     let out = tool.run(&ctx, input).await;
     if let Some(before) = before {
         if let Ok(after) = evidence_tree::tree_hash(&s.cwd) {
@@ -1245,7 +1246,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
                 exit_code: if eligible.is_some() { parsed["exit_code"].as_i64().and_then(|v| i32::try_from(v).ok()) } else if out.ok { Some(0) } else { None },
                 duration_ms: record_clock.elapsed().as_millis() as u64, started_at: record_start,
                 tree_hash_before: before, tree_hash_after: after,
-                tests_ran: parsed["tests_ran"].as_u64(), env_clean: eligible.is_some(), env_digest,
+                tests_ran: parsed["tests_ran"].as_u64(), env_clean: ctx.check_environment.is_some(), env_digest,
                 output_tail: if eligible.is_some() { parsed["output_tail"].as_str().unwrap_or("").into() } else { String::new() }, kind, sig: String::new(),
             };
             let recorded = s.evidence.lock().unwrap().record(record);
@@ -1264,7 +1265,7 @@ async fn run_call(s: &Arc<Shared>, turn: Turn<'_>, id: String, name: String, inp
 }
 
 fn tool_context(s: &Shared, run: &Run, id: &str, cancel: &CancellationToken) -> ToolCtx {
-    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone() }
+    ToolCtx { cwd: s.cwd.clone(), agent_id: run.id.clone(), call_id: id.into(), events: s.events.clone(), reads: s.reads.clone(), shells: s.shells.clone(), browser: s.browser.clone(), baseline: s.baseline.clone(), cancel: cancel.clone(), check_environment: None }
 }
 
 fn permission_detail(name: &str, input: &Value) -> String {

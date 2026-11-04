@@ -17,6 +17,7 @@ export const evidenceRecordSchema = z.strictObject({
   sig: z.string().regex(/^[a-f0-9]{64}$/),
 });
 export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
+export const MAX_EVIDENCE_IDS = 4096;
 export interface Evidence {
   records: EvidenceRecord[];
   last_seq: number;
@@ -50,7 +51,7 @@ export function acceptEvidence(current: Evidence | undefined, value: unknown, ke
   if (!parsed.success) return;
   const record = parsed.data, state = current ?? emptyEvidence();
   if (record.run_id !== expectedRunId) return;
-  if (record.seq <= state.last_seq || state.ids.length >= 4096 || state.ids.includes(record.id.toLowerCase())) return;
+  if (record.seq <= state.last_seq || state.ids.length >= MAX_EVIDENCE_IDS || state.ids.includes(record.id.toLowerCase())) return;
   const { sig, ...unsigned } = record;
   const expected = createHmac("sha256", key).update(canonicalEvidence({ domain: "gond-agent:evidence:v1", run_id: record.run_id, record: unsigned })).digest();
   if (!timingSafeEqual(expected, Buffer.from(sig, "hex"))) return;
@@ -106,23 +107,57 @@ function fenced(value: string) {
 export const VERIFICATION_START = "<!-- gond-agent:verification:start -->";
 export const VERIFICATION_END = "<!-- gond-agent:verification:end -->";
 
-/** Treat all selected prose as untrusted, including explicit descriptions. */
+type ModelFence = { char: string; count: number } | undefined;
+function modelFence(line: string, open: ModelFence): ModelFence {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return open;
+  if (open) return match[1][0] === open.char && match[1].length >= open.count && !match[2].trim() ? undefined : open;
+  // Backtick info strings cannot themselves contain backticks.
+  return match[1][0] === "`" && match[2].includes("`") ? undefined : { char: match[1][0], count: match[1].length };
+}
+
+/** Treat selected prose as untrusted without rewriting ordinary prose or fenced code. */
 export function neutralizeVerification(body: string): string {
-  let result = bounded(body, 20000)
-    .replace(/<!--\s*gond-agent:verification:start\s*-->[\s\S]*?(?:<!--\s*gond-agent:verification:end\s*-->|$)/gi, "")
-    .replace(/<!--\s*gond-agent:verification:[^>]*-->/gi, "")
-    .replace(/\bverification\b/gi, "Model-reported checks (unverified)")
-    .replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 20000);
-  // Close any unclosed model fence, so it cannot swallow the service-owned block.
-  let open: { char: string; count: number } | undefined;
-  for (const line of result.split("\n")) {
-    const match = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (!match) continue;
-    if (!open) open = { char: match[1][0], count: match[1].length };
-    else if (match[1][0] === open.char && match[1].length >= open.count && !match[2].trim()) open = undefined;
+  // Unlike tool output, model prose retains joiners (emoji and languages using ZWNJ).
+  const clean = body.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "");
+  const chunks: string[] = [], prose: string[] = [];
+  const flush = () => {
+    if (!prose.length) return;
+    chunks.push(prose.join("\n")
+      // Remove only the reserved comments, never the content between them.
+      .replace(/<!--\s*gond-agent:verification:[\s\S]*?-->/gi, "")
+      .replace(/<!--(?=\s*gond-agent:verification:)/gi, "&lt;!--")
+      .replace(/^( {0,3}#{1,6}[ \t]+)verification([ \t]+#+)?[ \t]*$/gim, "$1Model-reported checks (unverified)$2")
+      .replace(/^( {0,3})verification[ \t]*(\n {0,3}(?:=+|-+)[ \t]*(?=\n|$))/gim, "$1Model-reported checks (unverified)$2")
+      .replace(/<\/?(?:details|summary)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^'">])*(?:>|$)/gi, tag => tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")));
+    prose.length = 0;
+  };
+  let open: ModelFence;
+  for (const line of clean.split(/\r?\n/)) {
+    const next = modelFence(line, open);
+    if (open || next) {
+      flush();
+      chunks.push(line);
+    } else prose.push(line);
+    open = next;
   }
-  if (open) result += `\n${open.char.repeat(open.count)}`;
-  return result;
+  flush();
+  const result = chunks.join("\n");
+  let end = Math.min(result.length, 20000);
+  for (;;) {
+    let prefix = result.slice(0, end);
+    const truncated = end < result.length;
+    if (truncated) {
+      // Never split an entity (including one introduced above) or a UTF-16 pair.
+      prefix = prefix.replace(/&(?:#[xX]?[0-9a-fA-F]*|[A-Za-z][A-Za-z0-9]*)?$/, "").replace(/[\uD800-\uDBFF]$/, "");
+    }
+    open = undefined;
+    for (const line of prefix.split("\n")) open = modelFence(line, open);
+    const suffix = `${truncated ? "\n[truncated]" : ""}${open ? `\n${open.char.repeat(open.count)}` : ""}`;
+    if (prefix.length + suffix.length <= 20000) return prefix + suffix;
+    // Shrink gradually: truncating a long opening fence also shortens its repair.
+    end = Math.max(0, prefix.length - Math.max(1, Math.ceil((prefix.length + suffix.length - 20000) / 2)));
+  }
 }
 
 export function verificationBlock(evidence?: Evidence): string {

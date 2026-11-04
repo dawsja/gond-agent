@@ -51,6 +51,9 @@ pub struct ToolCtx {
     pub browser: persistent_browser::BrowserSession,
     pub baseline: Baseline,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Dispatcher-only snapshot for an exact, frozen-policy foreground check.
+    /// Never populated from tool input.
+    pub(crate) check_environment: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl ToolCtx {
@@ -318,6 +321,7 @@ pub mod testutil {
                 browser: Default::default(),
                 baseline: Default::default(),
                 cancel: Default::default(),
+                check_environment: None,
             },
             rx,
         )

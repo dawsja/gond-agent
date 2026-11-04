@@ -487,7 +487,7 @@ impl Ledger {
     }
 }
 
-/// Exactly the environment installed by run_checks' shell launcher. Its digest
+/// Exactly the environment installed for eligible foreground run_checks. Its digest
 /// describes the allow-list values, not the absence of secrets in HOME/.npmrc.
 pub fn check_environment() -> BTreeMap<String, String> {
     const ALLOWED: &[&str] = &[
@@ -525,8 +525,11 @@ pub fn check_environment() -> BTreeMap<String, String> {
         .collect()
 }
 pub fn environment_digest() -> String {
+    environment_digest_for(&check_environment())
+}
+pub fn environment_digest_for(environment: &BTreeMap<String, String>) -> String {
     hex(&Sha256::digest(
-        serde_json::to_vec(&check_environment()).unwrap(),
+        serde_json::to_vec(environment).unwrap(),
     ))
 }
 
