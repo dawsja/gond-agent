@@ -11,6 +11,7 @@ import { gh, githubStatus, validRepo } from "./github";
 import { GithubLogin, githubEnvFor } from "./github-login";
 import { getSetting, setSetting } from "./db";
 import { photoFor, savePhoto } from "./profile-photo";
+import { DEFAULT_THEME, isTheme } from "../../shared/theme-preference";
 import { ApiError } from "./wire";
 import { clearModelCatalog } from "./models";
 import { deletionPolicy } from "./account";
@@ -165,6 +166,7 @@ export function createApp(
     const accent = (db.prepare("SELECT accent FROM user_accents WHERE user_id=?").get(u.id) as { accent: unknown } | undefined)?.accent;
     return c.json({
       user: { ...u, ...photoFor(db, u) },
+      theme: isTheme(p.theme) ? p.theme : DEFAULT_THEME,
       admin: c.get("admin"),
       accent: isAccent(accent) ? accent : DEFAULT_ACCENT,
       setup_required: !setupComplete(db) && !runs.subscriptions.usable(u.id),
@@ -172,6 +174,14 @@ export function createApp(
         auto_pr: !!p.auto_pr,
       },
     });
+  });
+  app.put("/api/v1/me/theme", async c => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "theme") || !isTheme(body.theme))
+      throw new ApiError(400, "invalid_request", "Choose system, light or dark for your theme.");
+    db.prepare("INSERT INTO profiles(user_id,theme) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme").run(c.get("user").id, body.theme);
+    c.header("Cache-Control", "no-store");
+    return c.json({ theme: body.theme });
   });
   app.put("/api/v1/me/accent", async c => {
     const body = await c.req.json().catch(() => null);

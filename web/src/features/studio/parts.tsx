@@ -73,7 +73,7 @@ export function ModelMark({ id, provider: fallback, className, size = 16 }: { id
         <GondAgentMark size={size * 0.82} />
       ) : src ? (
         <span
-          className={cn("bg-contain bg-center bg-no-repeat", ["openai", "moonshot", "qwen", "zai", "minimax"].includes(provider) && "invert")}
+          className={cn("bg-contain bg-center bg-no-repeat", ["openai", "moonshot", "qwen", "zai", "minimax"].includes(provider) && "dark:invert")}
           style={{ backgroundImage: `url("${src}")`, width: size * 0.82, height: size * 0.82 }}
         />
       ) : provider === "xai" ? (

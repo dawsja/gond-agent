@@ -1,7 +1,8 @@
+import type { Theme } from "../../../shared/theme-preference"
 // Typed client for the self-hosted server. Everything goes through the same origin: `/api/*` and
 // `/ws/*` (under the app's base path) are forwarded to the API (Vite proxy locally, a service binding
 // when deployed).
-import type { Accent } from "@shared/accents"
+import type { Accent } from "../../../shared/accents"
 
 
 export type RunStatus = "queued" | "working" | "ready" | "merged" | "failed" | "stopped"
@@ -42,6 +43,7 @@ export interface Run {
 }
 
 export interface Me {
+  theme: Theme
   accent: Accent
   admin?: boolean
   user: { id: string; email: string | null; name: string | null; image?: string | null; has_photo?: boolean } | null
