@@ -1275,6 +1275,57 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(self.git("show", "HEAD:untracked"), b"new\n")
         self.assertEqual(agent.tree_hash(), first)
 
+    def test_repo_map_cache_is_absent_from_checkpoint_and_publication_bundles(self):
+        self.write("edit.txt", "publish this edit\n")
+        self.write("new.txt", "publish this untracked file\n")
+        expected_tree = agent.tree_hash()
+        expected_paths = set(self.git("ls-tree", "-rz", "--name-only", "HEAD").split(b"\0")) - {b""}
+        expected_paths.add(b"new.txt")
+        private_files = {
+            ".git/gond-agent/repo-map.json": b'{"private_repo_map":"never export cached symbols"}\n',
+            ".git/gond-agent/private/nested/symbols.txt": b"private nested repo-map cache content\n",
+        }
+        private_oids = []
+        for name, content in private_files.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            # Compute without writing objects: their presence in a receiver would
+            # mean the bundle leaked content, even under an unexpected path.
+            private_oids.append(self.git("hash-object", "--stdin", input=content).decode().strip())
+        self.assertEqual(agent.tree_hash(), expected_tree)
+        before = self.state()
+        checkpoint = self.export()
+        self.assertEqual(self.state(), before)
+        published = agent.dispatch({"method": "snapshot", "identity": self.identity, "title": "Public changes only"})
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").decode().strip(), expected_tree)
+        self.assertEqual(self.git("write-tree").decode().strip(), expected_tree)
+
+        # Import each actual wire bundle into its own receiver, with only the
+        # original history required by checkpoint's HEAD prerequisite.
+        for kind, data, ref, commit in (
+                ("checkpoint", checkpoint, agent.CHECKPOINT_REF, checkpoint["checkpoint_sha"]),
+                ("publication", published, "HEAD", published["head"])):
+            with self.subTest(kind=kind):
+                receiver = pathlib.Path(self.temp.name, kind + "-receiver")
+                self.git("init", "-q", str(receiver))
+                self.git("fetch", "-q", str(self.root), self.head, cwd=receiver)
+                bundle = pathlib.Path(self.temp.name, kind + ".bundle")
+                bundle.write_bytes(base64.b64decode(data["bundle"]))
+                self.git("bundle", "verify", str(bundle), cwd=receiver)
+                self.git("fetch", "-q", str(bundle), ref, cwd=receiver)
+                self.assertEqual(self.git("rev-parse", "FETCH_HEAD", cwd=receiver).decode().strip(), commit)
+                self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{tree}", cwd=receiver).decode().strip(), expected_tree)
+                paths = set(self.git("ls-tree", "-rz", "--name-only", "FETCH_HEAD", cwd=receiver).split(b"\0")) - {b""}
+                self.assertEqual(paths, expected_paths)
+                self.assertEqual(self.git("show", "FETCH_HEAD:edit.txt", cwd=receiver), b"publish this edit\n")
+                self.assertEqual(self.git("show", "FETCH_HEAD:new.txt", cwd=receiver), b"publish this untracked file\n")
+                for oid in private_oids:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        self.git("cat-file", "-e", oid, cwd=receiver)
+        for name, content in private_files.items():
+            self.assertEqual((self.root / name).read_bytes(), content)
+
     def test_hash_checkpoint_snapshot_include_code_hidden_by_global_excludes(self):
         home = pathlib.Path(self.temp.name, "global-home")
         (home / ".config/git").mkdir(parents=True)

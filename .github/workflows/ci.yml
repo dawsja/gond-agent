@@ -49,6 +49,8 @@ jobs:
         working-directory: runner
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Cargo runs on the host, not the worker image: parser fixtures need Ctags here too.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends universal-ctags
       - run: rustup toolchain install 1.99.1 --profile minimal --component clippy && rustup default 1.99.1
       - run: cargo clippy --all-targets --locked -- -D warnings
       # Bound process-global fixture resources without skipping any tests.
