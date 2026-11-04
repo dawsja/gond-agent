@@ -52,7 +52,6 @@ let signingKey: Buffer, persistenceDelay: number, persistenceStarted: boolean;
 let calls: string[];
 
 beforeEach(async () => {
-  vi.stubEnv("GOND_AGENT_CI_FIX_ROUNDS", "0");
   vi.clearAllMocks();
   dir = mkdtempSync(join(tmpdir(), "gond-evidence-controller-"));
   repo = join(dir, "repo"); mkdirSync(repo);

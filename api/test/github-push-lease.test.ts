@@ -184,7 +184,7 @@ describe("create-only publication leases", () => {
   it("lets a guard refuse a retry before any further push, preserving its original policy error", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const f = await fixture({ failBeforePush: 1 });
-    const blocked = new ApiError(409, "ci_needs_person", "Automatic fixes cannot push CI configuration changes.");
+    const blocked = new ApiError(409, "publication_refused", "Publication requires approval.");
     let guards = 0;
     const beforePush: PushOptions["beforePush"] = async context => {
       await f.beforePush!(context);

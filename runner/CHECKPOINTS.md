@@ -140,7 +140,7 @@ No checkpoint metadata/schema extension or upstream history rewrite is required.
 
 Service ordering: await `flushCheckpoints?.()` **before**
 publication `snapshot`; publish/push; await `captureCheckpoint?.({head_sha:publishedSHA})` **after**
-publication and **before** auto-close/CI watching. Awaiting the final turn.end
+publication. Awaiting the final turn.end
 alone does not imply that its release acknowledgement has reached the API. The
 postpublication capture pins the pushed HEAD, not its prepublication parent.
 RunService catches save/flush/capture failures and emits
@@ -308,7 +308,7 @@ in a durable service ledger until that same publication transaction acknowledges
 its captured history; a second restart before replacement rebuilds, rather than
 stacks, synthetic continuation inputs. Only model-authored questions are quoted
 as data; human answers are ordinary user text. Delivery framing never mutates
-stored human/CI messages. Finishing-phase recovery verifies publication and
+stored messages. Finishing-phase recovery verifies publication and
 finishes instead of replaying the original task. Pending live request IDs are
 never reused. MCP has no explicit resume tool: `send_session_message` resumes;
 `state:interrupted,done:true` is not successful completion.
@@ -327,7 +327,7 @@ At startup, eligible interactive runs resume through the ordinary queue one at a
 time, at most twice while their checkpoint is under 24 hours old. Scheduled,
 stopped and quota-exhausted runs do not auto-resume. Other recoverable runs stay
 `interrupted` for a human Resume/follow-up. Explicit close/Stop/deletion removes
-checkpoint files; shutdown and automatic CI workspace release preserve them.
+checkpoint files; shutdown and safe idle workspace release preserve them.
 See the root README for configuration, retention and operational limits.
 
 The controller bounds both state pipe writes and reply waits with one 120-second

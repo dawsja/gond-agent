@@ -231,7 +231,7 @@ export async function checkout(
 export interface PushOptions {
   /** #23's caller must set this for an explicit new branch until publication is confirmed; never infer it from a name. */
   lease?: "create-only";
-  /** #22's CI-config guard belongs here, not just before the initial import/push. */
+  /** Recheck caller policy before every push attempt, including retries. */
   beforePush?: (context: { cwd: string; branch: string; head: string }) => Promise<void>;
 }
 

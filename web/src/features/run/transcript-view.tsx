@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils"
 import { DiffView, parseUnifiedDiff } from "@shared/diff"
 import { DiffCounts, Dot, PrChip, StatusPill } from "../studio/parts"
 import { STATUS, mono } from "../studio/theme"
-import { type CiState, type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
+import { type Item, type PlanStep, type SubAgent, type ToolCall, type Transcript } from "./transcript"
 import { Prose as SharedProse } from "@shared/prose"
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceLine, TraceTitle } from "@shared/ui/trace"
 import { AgentLabel } from "./agent-label"
@@ -20,7 +20,6 @@ import { activityLabel, groupLabel } from "./tool-presentation"
 /* ───────────── transcript pieces (TUI language, softened) ───────────── */
 
 const TOOL_STATUS: Record<ToolCall["status"], RunStatus> = { done: "ready", running: "working", failed: "failed" }
-const CI_LABEL: Record<CiState, string> = { pending: "Waiting for CI", passing: "CI passing", failing: "CI failing", none: "No CI checks found", gave_up: "Automatic CI stopped", unavailable: "CI unavailable" }
 
 /** The agent's prose at a readable measure, in the Studio type scale. */
 export const Prose = ({ text, small }: { text: string; small?: boolean }) => <SharedProse text={text} small={small} className={cn("max-w-[62ch]", !small && "text-[14px]")} />
@@ -267,7 +266,7 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
     const keys = new Set<string>()
     let first = true
     for (const item of t.items) {
-      if (item.kind === "user" || item.kind === "ci" || item.kind === "run-message") first = true
+      if (item.kind === "user" || item.kind === "run-message") first = true
       else if (item.kind === "text" && first) { keys.add(item.key); first = false }
     }
     return keys
@@ -289,19 +288,6 @@ export function TranscriptView({ run, t, author }: { run: Run; t: Transcript; au
             first={it.key === firstUser}
           />
         )
-      case "ci":
-        return <Trace key={it.key} aria-label="Automatic CI">
-          <TraceCollapsible>
-            <TraceCollapsibleTrigger><TraceLine><TraceTitle>Automatic CI</TraceTitle></TraceLine></TraceCollapsibleTrigger>
-            <TraceCollapsibleContent><p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{it.text}</p></TraceCollapsibleContent>
-          </TraceCollapsible>
-        </Trace>
-      case "ci-status":
-        return <Trace key={it.key} role="status" aria-label="CI status" title={it.sha}>
-          <TraceLine status={it.state === "failing" ? "error" : undefined}>
-            <TraceTitle>{CI_LABEL[it.state]}{it.round > 0 && ` · round ${it.round}`}{it.failing.length > 0 && ` · ${it.failing.join(", ")}`}{it.reason && ` · ${it.reason}`}</TraceTitle>
-          </TraceLine>
-        </Trace>
       case "run-message":
         return <p key={it.key} role="status" className="text-xs text-muted-foreground">{it.text}</p>
       case "text": {
