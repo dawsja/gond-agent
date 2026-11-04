@@ -1,3 +1,4 @@
+pub mod checkpoint;
 mod compaction;
 pub mod core;
 pub mod events;

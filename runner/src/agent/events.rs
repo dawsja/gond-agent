@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::permissions::Mode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TodoItem {
     pub text: String,
     pub status: TodoStatus,
@@ -84,6 +85,13 @@ pub enum AgentEvent {
     /// Older history was summarized; estimated history token sizes before and after.
     #[serde(rename = "compacted")]
     Compacted { agent_id: String, reason: String, before: u64, after: u64 },
+    /// Control frames; never append these to the user/model transcript.
+    #[serde(rename = "state.exported")]
+    StateExported { request_id: String, state: Box<super::checkpoint::Checkpoint> },
+    #[serde(rename = "state.imported")]
+    StateImported { request_id: String },
+    #[serde(rename = "state.error")]
+    StateError { request_id: String, operation: String, code: String },
     #[serde(rename = "error")]
     Error { agent_id: String, message: String, retryable: bool },
 }
@@ -107,12 +115,35 @@ pub struct ImageInput {
     pub id: Option<String>,
 }
 
+// Only checkpoint controls are closed schemas. Ordinary input frames may carry
+// API metadata (for example user.effort) that the runner does not consume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExportStateInput {
+    pub request_id: String,
+    pub run_id: String,
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImportStateInput {
+    pub request_id: String,
+    pub run_id: String,
+    pub owner_id: String,
+    pub state: Value,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AgentInput {
+    #[serde(rename = "export_state")]
+    ExportState(ExportStateInput),
+    #[serde(rename = "import_state")]
+    ImportState(ImportStateInput),
     #[serde(rename = "user")]
     User {
+        #[serde(default)]
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageInput>,
