@@ -20,14 +20,14 @@ it("renders a replay-safe release explanation without changing turn completion",
 const now = 180_000;
 function safe(): ReleaseCandidate {
   return { run: { status: "ready", phase: "agent", pending: [], summary: emptySummary(), pushed: true,
-    head_sha: "a".repeat(40), pr_state: "open" }, live: true, busy: false, closing: false, booting: false,
+    head_sha: "a".repeat(40), base_sha: "b".repeat(40), pr_state: "open" }, live: true, busy: false, closing: false, booting: false,
     publicationPending: false, checkpointClaimed: false, idleSince: 0, delayMs: 120_000, state: { head: "a".repeat(40), clean: true } };
 }
 
 describe("idle release safety table (shared by reporting and eviction)", () => {
   it.each(["queued", "working", "ready", "failed", "stopped", "merged", "interrupted"] as const)("status %s", status => {
     const candidate = safe(); candidate.run.status = status;
-    expect(releasable(candidate, now)).toBe(status === "ready");
+    expect(releasable(candidate, now)).toBe(status === "ready" || status === "stopped");
   });
   const unsafe: [string, (c: ReleaseCandidate) => void][] = [
     ["pending message", c => { c.run.pending.push({ text: "Continue", images: [] }); }],
@@ -60,8 +60,24 @@ describe("idle release safety table (shared by reporting and eviction)", () => {
     ["disabled", c => { c.delayMs = 0; }],
   ];
   it.each(unsafe)("never releases %s", (_name, change) => {
-    const candidate = safe(); change(candidate);
-    expect(releasable(candidate, now)).toBe(false);
+    for (const status of ["ready", "stopped"] as const) {
+      const candidate = safe(); candidate.run.status = status; change(candidate);
+      expect(releasable(candidate, now)).toBe(false);
+    }
+  });
+  it.each([
+    ["untouched checkout", "b".repeat(40), true, true],
+    ["unpublished local commit", "c".repeat(40), true, false],
+    ["dirty checkout", "b".repeat(40), false, false],
+    ["unknown base", null, true, false],
+  ] as const)("never-pushed stopped workspace: %s", (_name, head, clean, expected) => {
+    const candidate = safe();
+    candidate.run.status = "stopped";
+    candidate.run.pushed = false;
+    candidate.run.head_sha = null;
+    if (!head) candidate.run.base_sha = null;
+    candidate.state = { head: head ?? "b".repeat(40), clean };
+    expect(releasable(candidate, now)).toBe(expected);
   });
   it.each(["open", "merged"] as const)("allows a safely published ready workspace with a %s PR", state => {
     const candidate = safe(); candidate.run.pr_state = state;

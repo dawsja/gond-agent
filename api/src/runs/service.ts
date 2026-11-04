@@ -260,7 +260,7 @@ export class Runs {
   private releaseCandidate(id: string, live: Live): ReleaseCandidate {
     const row = this.db.prepare("SELECT data FROM runs WHERE id=? AND deleted_at IS NULL").get(id) as { data: string } | undefined;
     return {
-      run: row ? parseRun(row.data) : { status: "failed", phase: "idle", pending: [], summary: emptySummary(), pushed: false, head_sha: null, pr_state: null },
+      run: row ? parseRun(row.data) : { status: "failed", phase: "idle", pending: [], summary: emptySummary(), pushed: false, head_sha: null, base_sha: null, pr_state: null },
       live: !!row && this.live.get(id) === live && !live.closed, busy: live.busy, closing: !!live.closing,
       booting: this.booting.has(id), publicationPending: !!live.publishPending,
       checkpointClaimed: !!this.db.prepare("SELECT 1 FROM run_checkpoints WHERE run_id=? AND claimed_by IS NOT NULL AND consumed_at IS NULL LIMIT 1").get(id),
@@ -481,7 +481,7 @@ export class Runs {
       const candidate = this.releaseCandidate(id, live);
       // Probe otherwise-safe workspaces even after a transient failure/dirty
       // observation. This provisional evidence is never counted or used to close.
-      return releasable({ ...candidate, state: { head: candidate.run.head_sha ?? "", clean: true } }, now);
+      return releasable({ ...candidate, state: { head: candidate.run.head_sha ?? candidate.run.base_sha ?? "", clean: true } }, now);
     }).sort((a, b) => a[1].idleSince! - b[1].idleSince!)[0];
     if (!oldest) return;
     const [id, live] = oldest;
@@ -1155,7 +1155,7 @@ export class Runs {
         await this.resumeAfterCiRefusal(id);
         return;
       }
-      if (r.status === "stopped") { live.busy = false; return; }
+      if (r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     }
     if (live.closed || !r.pending.length) { live.busy = false; return; }
     const message=r.pending[0];
@@ -1267,6 +1267,8 @@ export class Runs {
             live.busy = false;
             r.phase = "agent";
             this.status(r, "stopped");
+            await this.observeIdle(id, live);
+            this.drain();
           } else if (event.stop_reason !== "compacted") {
             await this.finish(id, live);
           }
@@ -1286,14 +1288,14 @@ export class Runs {
   }
   private async finish(id: string, live: Live) {
     let r = this.get(id);
-    if (r.status === "stopped") { live.busy = false; return; }
+    if (r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     // The model turn has ended, even if settling its final checkpoint now yields.
     r.recovery_phase = "finishing";
     this.save(r);
     try { await live.workspace.flushCheckpoints?.(); }
     catch { this.checkpointUnavailable(id); }
     r = this.get(id); // Flush yields: preserve messages and Stop accepted meanwhile.
-    if (live.closed || r.status === "stopped") { live.busy = false; return; }
+    if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     delete r.active_message;
     this.autoResuming.delete(id);
     r.auto_resume_pending = false;
@@ -1308,11 +1310,11 @@ export class Runs {
       return;
     }
     r = this.get(id);
-    if (live.closed || r.status === "stopped") { live.busy = false; return; }
+    if (live.closed || r.status === "stopped") { live.busy = false; await this.observeIdle(id, live); return; }
     try { await live.workspace.captureCheckpoint?.(r.head_sha ? { head_sha: r.head_sha } : undefined); }
     catch { this.checkpointUnavailable(id); }
     r = this.get(id);
-    if (live.closed || this.live.get(id) !== live || r.status === "stopped" || r.status === "merged") { live.busy = false; return; }
+    if (live.closed || this.live.get(id) !== live || r.status === "stopped" || r.status === "merged") { live.busy = false; await this.observeIdle(id, live); return; }
     if (published && r.auto_pr && r.files && r.pr_state !== "merged") await this.openPull(id, r.user_id, { backgroundPublication: true });
     r = this.get(id);
     if (live.closed || this.live.get(id) !== live || r.status === "merged") return;
@@ -1328,13 +1330,22 @@ export class Runs {
       await this.close(id, false, true);
       if (published && !this.shuttingDown) this.ci.start(id, r.head_sha!);
     }
-    if (!live.closed && r.status === "ready" && !r.pending.length) {
-      live.idleSince = Date.now();
-      // Read from the worker, not the API clone. Unknown workers fail closed.
-      try { live.state = await live.workspace.rpc<WorkspaceState>("workspace_state"); }
-      catch { live.state = undefined; }
-    }
+    if (!live.closed && r.status === "ready" && !r.pending.length) await this.observeIdle(id, live);
     this.drain();
+  }
+  private async observeIdle(id: string, live: Live) {
+    if (live.closed || live.busy || this.live.get(id) !== live) return;
+    const r = this.get(id);
+    if (!["ready", "stopped"].includes(r.status) || r.pending.length) return;
+    if (r.status === "stopped") { r.phase = "agent"; this.save(r); }
+    const since = live.idleSince = Date.now();
+    live.state = undefined;
+    live.lastIdleProbe = undefined;
+    // Start the delay only once work has actually stopped, not on Stop acceptance.
+    try {
+      const state = await live.workspace.rpc<WorkspaceState>("workspace_state");
+      if (!live.closed && !live.busy && live.idleSince === since) live.state = state;
+    } catch { /* Unknown worker evidence fails closed and is reprobed on drain. */ }
   }
   private checkpointUnavailable(id: string) {
     this.append(id, { type: "run.checkpoint_unavailable", message: "A recovery checkpoint could not be saved. Work will continue; recovery may use an older checkpoint or the last pushed branch." });
@@ -1569,7 +1580,8 @@ export class Runs {
       if (queued) this.append(id, { type: "run.dequeued" });
     })();
     if (kept) { await this.close(id); return; }
-    if (live && live.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    if (live?.busy) await live.workspace.rpc("send", { input: { type: "interrupt" } });
+    else if (live) await this.observeIdle(id, live);
     this.drain();
   }
   async closeSession(id: string, user: string, beforeClose?: () => Promise<boolean>) {
@@ -1601,7 +1613,9 @@ export class Runs {
     if (r.work_kept) { await this.close(id); return { closed: true }; }
     live.closing = true;
     try {
-      await this.publish(id, live, {});
+      // A verified stopped checkout has nothing to publish. Automatic release
+      // must not create a branch or push changes after the person pressed Stop.
+      if (!beforeClose || r.status !== "stopped") await this.publish(id, live, {});
       if (beforeClose && !await beforeClose()) return { closed: false };
       // Automatic idle release preserves the paired tree/conversation checkpoint,
       // just like CI auto-close; explicit Close still discards it.
@@ -1629,7 +1643,7 @@ export class Runs {
       force: true,
     });
   }
-  // Ready workspaces release only for waiting work through the shared safety guard.
+  // Safe ready/stopped workspaces release only for waiting work through the shared guard.
   async close(id: string, forCapacity = false, preserveCheckpoint = false) {
     if (this.queue.has(id)) {
       const r = this.get(id);

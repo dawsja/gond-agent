@@ -492,6 +492,56 @@ describe("persistent workspace queue", () => {
     expect(runs.history(oldest.id, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
   });
 
+  it.each([false, true])("releases the oldest safe stopped workspace at the three-slot cap (published: %s)", async published => {
+    cfg.maxRuns = 3;
+    const stopped: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const run = await create("a", `Stopped ${i}`);
+      if (published) {
+        await finish(run.id);
+        runs.enqueue(run.id, "a", "Started follow-up then stopped"); await flush();
+      } else workspaces.get(run.id)!.state.head = run.base_sha!;
+      await runs.stop(run.id, "a");
+      // The pump uses a real bounded poll delay; wait for turn-end, not just Stop acceptance.
+      await vi.waitFor(() => expect((runs as unknown as { live: Map<string, { busy: boolean }> }).live.get(run.id)?.busy).toBe(false));
+      await flush();
+      expect(runs.get(run.id)).toMatchObject({ status: "stopped", pending: [], pushed: published });
+      stopped.push(run.id);
+      vi.setSystemTime(Date.now() + 1000);
+    }
+    const publications = vi.mocked(importBundle).mock.calls.length;
+    const waiting = await create("b", "Say OK");
+    expect(runs.get(waiting.id)).toMatchObject({ status: "queued", capacity: { max: 3, occupied: 3, working: 0, idle_releasable: 0 } });
+    await vi.advanceTimersByTimeAsync(540_000); await flush();
+    expect(releases).toEqual([]);
+    // No manual close, drain or read: the normal safety-net tick starts waiting work.
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    await vi.waitFor(() => expect(workspaces.get(waiting.id)?.users()).toEqual(["Say OK"]));
+    expect(releases).toEqual([stopped[0]]);
+    expect(starts).toEqual([...stopped, waiting.id]);
+    expect(importBundle).toHaveBeenCalledTimes(publications); // Stop is never bypassed by an automatic push.
+    expect(runs.get(stopped[0]!)).toMatchObject({ status: "stopped", pushed: published, phase: "idle" });
+    expect(runs.history(stopped[0]!, 0)).toContainEqual(expect.objectContaining({ type: "run.released", reason: "idle_for_waiting_work" }));
+  });
+
+  it.each(["dirty", "unpublished commit", "question", "pending message", "CI watch"])("keeps unsafe stopped workspaces: %s", async unsafe => {
+    const active = await create(); await finish(active.id);
+    await runs.stop(active.id, "a"); await flush();
+    const run = runs.get(active.id);
+    if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;
+    if (unsafe === "unpublished commit") { run.pushed = false; run.head_sha = null; workspaces.get(active.id)!.state.head = "c".repeat(40); }
+    if (unsafe === "question") run.summary.question = { request_id: "q", question: "Which?" };
+    if (unsafe === "pending message") run.pending.push({ text: "Still pending", images: [] });
+    if (unsafe === "CI watch") run.ci_active = true;
+    runs.save(run);
+    const waiting = await create("b");
+    await vi.advanceTimersByTimeAsync(600_000); await flush();
+    expect(releases).toEqual([]);
+    expect(starts).toEqual([active.id]);
+    expect(runs.get(waiting.id).status).toBe("queued");
+    expect(importBundle).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["dirty", "different head", "question", "waiting for input", "CI watch", "pending message", "interrupted", "auto resume", "checkpoint resume", "recovery finishing", "merged pending"])("does not release unsafe %s workspaces", async unsafe => {
     const active = await create(); await finish(active.id);
     if (unsafe === "dirty") workspaces.get(active.id)!.state.clean = false;

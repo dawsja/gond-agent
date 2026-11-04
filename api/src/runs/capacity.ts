@@ -5,7 +5,7 @@ export type { Capacity } from "../wire";
 /** A verified worker observation, never inferred from the API checkout or pushed flag. */
 export interface WorkspaceState { head: string; clean: boolean }
 export interface ReleaseCandidate {
-  run: Pick<Run, "status" | "phase" | "pending" | "summary" | "pushed" | "head_sha" | "work_kept" | "kept_commit" | "ci_active" | "ci_publication_pending" | "pr_state" | "auto_resume_pending" | "resume_from_checkpoint" | "recovery_phase">;
+  run: Pick<Run, "status" | "phase" | "pending" | "summary" | "pushed" | "head_sha" | "base_sha" | "work_kept" | "kept_commit" | "ci_active" | "ci_publication_pending" | "pr_state" | "auto_resume_pending" | "resume_from_checkpoint" | "recovery_phase">;
   live: boolean;
   busy: boolean;
   closing: boolean;
@@ -20,11 +20,14 @@ export interface ReleaseCandidate {
 /** The counter and releaser must agree; unknown/unsafe evidence always fails closed. */
 export function releasable(candidate: ReleaseCandidate, now: number): boolean {
   const { run, state } = candidate;
+  // Clean alone does not rule out unpublished commits. A never-pushed stopped
+  // checkout is untouched only when its HEAD still equals the pinned base.
+  const savedHead = run.pushed ? run.head_sha : run.status === "stopped" && !run.head_sha ? run.base_sha : null;
   return candidate.delayMs > 0 && candidate.live && !candidate.busy && !candidate.closing && !candidate.booting &&
     !candidate.publicationPending && !candidate.checkpointClaimed && candidate.idleSince !== undefined && now - candidate.idleSince >= candidate.delayMs &&
-    run.status === "ready" && ["agent", "idle"].includes(run.phase) && !run.pending.length && !run.summary.question &&
+    ["ready", "stopped"].includes(run.status) && ["agent", "idle"].includes(run.phase) && !run.pending.length && !run.summary.question &&
     !run.ci_active && !run.ci_publication_pending && !run.auto_resume_pending && !run.resume_from_checkpoint && !run.recovery_phase &&
-    !run.work_kept && !run.kept_commit && run.pushed && !!run.head_sha && state?.clean === true && state.head === run.head_sha;
+    !run.work_kept && !run.kept_commit && !!savedHead && state?.clean === true && state.head === savedHead;
 }
 
 export function capacityReason(capacity: Capacity): string {
