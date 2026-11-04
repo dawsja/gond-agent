@@ -4,12 +4,14 @@ import http.server
 import json
 import os
 import pathlib
+import secrets
 import subprocess
 import tempfile
 import threading
 
 
 def main():
+    relay_token = secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory(prefix="gond-agent-smoke-") as tmp:
         root = pathlib.Path(tmp) / "repo"
         root.mkdir()
@@ -30,6 +32,7 @@ def main():
 
         app = http.server.ThreadingHTTPServer(("127.0.0.1", 0), App)
         seen = []
+        relay_failures = []
 
         def call(id, name, input):
             return {"type": "tool_call", "id": id, "name": name, "input": input}
@@ -39,25 +42,39 @@ def main():
              call("defs", "symbols", {"action": "definitions", "symbol": "greet"}),
              call("reads", "batch", {"calls": [{"tool": "read", "input": {"path": "app.ts"}}, {"tool": "symbols", "input": {"action": "references", "symbol": "greet"}}]})],
             [call("write", "write", {"path": "feature.txt", "content": "verified\n"})],
-            [call("check", "run_checks", {"command": "test \"$(cat feature.txt)\" = verified && bun --version && uv --version"})],
-            [call("ui", "browser", {"url": f"http://127.0.0.1:{app.server_port}", "script": "await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
+            [call("check", "run_checks", {"command": "test -z \"${GOND_AGENT_RELAY_TOKEN+x}\" && test \"$(cat feature.txt)\" = verified && bun --version && uv --version"})],
+            [call("ui", "browser", {"url": f"http://127.0.0.1:{app.server_port}", "script": "await expect(Object.hasOwn(process.env, 'GOND_AGENT_RELAY_TOKEN')).toBe(false); await page.getByRole('button', {name:'Save', exact:true}).click(); await expect(page.getByRole('button')).toHaveText('Saved');"})],
             [call("search-context", "grep", {"pattern": "greet", "path": "app.ts", "output_mode": "content", "context": 1, "head_limit": 1}),
              call("search-count", "grep", {"pattern": "greet", "path": "app.ts", "output_mode": "count"}),
              call("git-status", "git", {"action": "status"}),
              call("shell-list", "bash_list", {}),
              call("structured-check", "run_checks", {"command": "printf 'check passed'"}),
              call("web-search", "web_search", {"query": "fixture"})],
-            [call("diff", "bash", {"command": "git diff --no-ext-diff; git ls-files --others --exclude-standard; cat feature.txt"})],
+            [call("diff", "bash", {"command": "test -z \"${GOND_AGENT_RELAY_TOKEN+x}\" && git diff --no-ext-diff && git ls-files --others --exclude-standard && cat feature.txt"})],
         ]
 
         class Model(http.server.BaseHTTPRequestHandler):
+            def authenticate(self):
+                try:
+                    assert self.headers.get("Authorization") == f"Bearer {relay_token}", "Missing or invalid relay authorization"
+                    assert "Origin" not in self.headers, "Unexpected relay Origin header"
+                except AssertionError as error:
+                    relay_failures.append(str(error))
+                    self.send_error(401, "Unauthorized")
+                    return False
+                return True
+
             def do_GET(self):
+                if not self.authenticate():
+                    return
                 data = json.dumps({"models": [{"id": "fixture", "context_window": 100000}], "web_search": True}).encode()
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(data)
 
             def do_POST(self):
+                if not self.authenticate():
+                    return
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if self.path == "/v1/search":
                     data = json.dumps({"results": [{"title": "Fixture", "url": "https://example.test", "snippet": "Fixture search text"}]}).encode()
@@ -90,15 +107,20 @@ def main():
         model = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Model)
         for server in [app, model]:
             threading.Thread(target=server.serve_forever, daemon=True).start()
-        env = {**os.environ, "GOND_AGENT_API_URL": f"http://127.0.0.1:{model.server_port}", "GOND_AGENT_MODEL": "fixture", "GOND_AGENT_HOME": str(pathlib.Path(tmp) / "home")}
+        env = {**os.environ, "GOND_AGENT_API_URL": f"http://127.0.0.1:{model.server_port}", "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_MODEL": "fixture", "GOND_AGENT_HOME": str(pathlib.Path(tmp) / "home")}
         try:
             try:
-                proc = subprocess.run(["/usr/local/bin/gond-agent-worker"], input='{"type":"user","text":"Implement and verify the feature"}\n', text=True, capture_output=True, cwd=root, env=env, timeout=180)
+                proc = subprocess.run([os.environ.get("GOND_IMAGE_WORKER", "/usr/local/bin/gond-agent-worker")], input='{"type":"user","text":"Implement and verify the feature"}\n', text=True, capture_output=True, cwd=root, env=env, timeout=180)
             except subprocess.TimeoutExpired as error:
+                assert relay_token.encode() not in (error.stdout or b""), "Relay token leaked to worker stdout"
+                assert relay_token.encode() not in (error.stderr or b""), "Relay token leaked to worker stderr"
                 output = (error.stdout or b"").decode(errors="replace")
                 events = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
                 progress = [{k: e[k] for k in ["type", "call_id", "name", "ok", "summary"] if k in e} for e in events[-12:]]
                 raise RuntimeError(f"Worker smoke timed out after {len(seen)} model requests: {progress}") from None
+            assert relay_token not in proc.stdout, "Relay token leaked to worker stdout"
+            assert relay_token not in proc.stderr, "Relay token leaked to worker stderr"
+            assert not relay_failures, relay_failures
             assert proc.returncode == 0, proc.stderr
             events = [json.loads(line) for line in proc.stdout.splitlines()]
             failures = [e for e in events if e["type"] == "error" or (e["type"] == "tool.end" and not e["ok"])]

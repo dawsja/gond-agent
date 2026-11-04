@@ -79,7 +79,7 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
-        let http = crate::http::builder().connect_timeout(Duration::from_secs(15)).build().expect("http client");
+        let http = crate::http::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(15)).build().expect("http client");
         ApiClient { http, base: base.into().trim_end_matches('/').to_owned(), retry_delay: Duration::from_secs(1), token: Arc::new(RwLock::new(token)) }
     }
 
@@ -107,7 +107,7 @@ impl ApiClient {
         e.to_string()
     }
 
-    fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut r = self.http.request(method, format!("{}{}", self.base, path));
         if let Some(t) = self.token.read().ok().and_then(|t| t.clone()) {
             r = r.bearer_auth(t);
@@ -301,7 +301,7 @@ mod tests {
         use super::super::wire::{Message, Metadata};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api = ApiClient::new(format!("http://{}", listener.local_addr().unwrap()), None).with_retry_delay(Duration::ZERO);
+        let api = ApiClient::new(format!("http://{}", listener.local_addr().unwrap()), Some("relay-body-retry".into())).with_retry_delay(Duration::ZERO);
         let server = tokio::spawn(async move {
             let mut bodies = Vec::new();
             for attempt in 0..3 {
@@ -315,6 +315,7 @@ mod tests {
                     if let Some(index) = received.windows(4).position(|s| s == b"\r\n\r\n") { break index + 4; }
                 };
                 let headers = String::from_utf8_lossy(&received[..header_end]).to_lowercase();
+                assert!(headers.lines().any(|line| line == "authorization: bearer relay-body-retry"));
                 let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
                 while received.len() < header_end + length {
                     let n = socket.read(&mut chunk).await.unwrap();

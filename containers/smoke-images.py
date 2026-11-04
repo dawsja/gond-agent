@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -15,6 +16,7 @@ from PIL import Image
 
 def main():
     worker = os.environ.get("GOND_IMAGE_WORKER", "/usr/local/bin/gond-agent-worker")
+    relay_token = secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory(prefix="gond-images-") as tmp:
         root = pathlib.Path(tmp)
         source = io.BytesIO()
@@ -26,7 +28,19 @@ def main():
             def log_message(self, *_):
                 pass
 
+            def authenticate(self):
+                try:
+                    assert self.headers.get("Authorization") == f"Bearer {relay_token}", "Missing or invalid relay authorization"
+                    assert "Origin" not in self.headers, "Unexpected relay Origin header"
+                except AssertionError as error:
+                    failures.append(str(error))
+                    self.send_error(401, "Unauthorized")
+                    return False
+                return True
+
             def do_GET(self):
+                if self.path == "/v1/models" and not self.authenticate():
+                    return
                 data = (json.dumps({"models": [{"id": "fixture", "context_window": 100000}]}).encode()
                         if self.path == "/v1/models" else b"<button onclick=\"this.textContent='Saved'\">Save</button>")
                 self.send_response(200)
@@ -34,6 +48,8 @@ def main():
                 self.wfile.write(data)
 
             def do_POST(self):
+                if not self.authenticate():
+                    return
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 index = len(requests)
                 requests.append(request)
@@ -80,12 +96,14 @@ def main():
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         env = {**os.environ, "GOND_AGENT_API_URL": f"http://127.0.0.1:{server.server_port}",
-               "GOND_AGENT_MODEL": "fixture", "GOND_AGENT_HOME": str(root / "home")}
+               "GOND_AGENT_RELAY_TOKEN": relay_token, "GOND_AGENT_MODEL": "fixture", "GOND_AGENT_HOME": str(root / "home")}
         message = {"type": "user", "text": "Inspect attached image and browser fixture", "images": [
             {"media_type": "image/png", "data": base64.b64encode(source.getvalue()).decode()}]}
         try:
             proc = subprocess.run([worker], input=json.dumps(message) + "\n", text=True,
                                   capture_output=True, cwd=root, env=env, timeout=180)
+            assert relay_token not in proc.stdout, "Relay token leaked to worker stdout"
+            assert relay_token not in proc.stderr, "Relay token leaked to worker stderr"
             assert proc.returncode == 0, proc.stderr
             events = [json.loads(line) for line in proc.stdout.splitlines()]
             assert not [e for e in events if e["type"] == "error" or (e["type"] == "tool.end" and not e["ok"])], proc.stdout
