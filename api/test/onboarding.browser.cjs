@@ -635,9 +635,23 @@ const key = 'fixture-only-provider-key';
       queuePosition = 2;
       await page.reload();
       await expect(page.getByText('Waiting for a free workspace (position 2 of 3)', { exact: true })).toBeVisible();
+      const queuedRow = page.getByRole('listitem').filter({ hasText: 'Composer preview' });
+      await expect(queuedRow.getByText('Queued', { exact: true })).toBeVisible();
+      await expect(queuedRow.getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
+      await capture('queued-list-menu-closed');
+      await queuedRow.getByRole('button', { name: 'Run actions', exact: true }).focus();
+      await page.keyboard.press('Enter');
+      const cancelItem = page.getByRole('menuitem', { name: 'Cancel', exact: true });
+      await expect(cancelItem).toBeVisible();
+      await expect(cancelItem).toBeFocused();
+      await expect(page.getByRole('menuitem', { name: 'Stop', exact: true })).toHaveCount(0);
+      await capture('queued-list-menu-open');
       const cancelled = page.waitForResponse(r => r.url() === fixtureRunURL + '/stop' && r.request().method() === 'POST');
-      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.keyboard.press('Enter');
       expect((await cancelled).status()).toBe(200);
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+      await expect(page.getByRole('alertdialog')).toHaveCount(0);
+      await expect(page.getByRole('menu')).toHaveCount(0);
       await expect(page.getByText('Waiting for a free workspace', { exact: false })).toHaveCount(0);
 
       for (const backend of ['claude-code', 'codex']) {

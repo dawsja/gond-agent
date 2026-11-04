@@ -72,7 +72,6 @@ function RunMenu({ run, first }: { run: Run; first?: boolean }) {
 
 function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelName?: string }) {
   const navigate = useNavigate()
-  const stop = useStopRun()
   const live = run.status === "working" || run.status === "queued"
   const ended = run.status === "failed" || run.status === "stopped"
   const note = run.status === "queued" ? queueLabel(run) : live ? (run.step ?? "Working") : ended ? (run.error ?? "Stopped") : undefined
@@ -147,16 +146,6 @@ function RunRow({ run, first, modelName }: { run: Run; first?: boolean; modelNam
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-5 max-md:-mt-1 max-md:-mr-1">
-        {run.status === "queued" && (
-          <button
-            type="button"
-            disabled={stop.isPending}
-            onClick={(e) => { e.stopPropagation(); stop.mutate({ id: run.id, arg: undefined }) }}
-            className="inline-flex h-8 items-center rounded-[4px] border border-border px-3 text-[13px] text-foreground transition-colors hover:bg-raised"
-          >
-            Cancel
-          </button>
-        )}
         <div className="w-[112px] max-md:hidden">
           <PrChip status={run.status} state={run.pr_state} number={run.pr_number} files={run.files} />
         </div>
