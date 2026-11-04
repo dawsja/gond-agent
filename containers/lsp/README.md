@@ -21,11 +21,18 @@ The tool reads current UTF-8 disk contents and synchronizes opened documents on
 each call; it does not expose rename, edits or command execution over LSP. One
 actor per repository/language owns framing and serializes calls, lazily starting
 the server on first use. The server's process group is closed on stop,
-cancellation or ten minutes of inactivity. Failed/timed-out calls discard the
-server; a later call can restart it.
+explicit cancellation or ten minutes of inactivity. Protocol failures discard the
+server; a later call can restart it. A caller timeout does not cancel healthy cold
+startup: initialization continues in the background, bounded by a ten-minute
+startup watchdog, and a retry reuses it. Once initialized, a timed-out request is
+cancelled without restarting the server while the protocol remains healthy;
+interrupted writes or document synchronization still require a restart.
 
-Limits are 20 seconds per call (including startup), at most 200 result items and
-30,000 characters of output, also kept below the shared 30,000-byte preview.
+Limits are 20 seconds per caller (including time spent awaiting startup), at most
+200 result items and 30,000 characters of output, also kept below the shared
+30,000-byte preview. A timeout may mean startup/indexing is still running; retry
+rather than assuming it has failed. Each output row is capped at 2,000 characters
+before joining or applying output filters.
 Truncation asks callers to narrow the query. Each server retains at most 16 open
 documents of at most 1 MiB each, evicting older documents and their diagnostics.
 Diagnostics are capped at 200 per document with 2,000 characters per message;
@@ -43,11 +50,14 @@ check has completed or that the project is compiler-clean.
 
 ## Trust boundary and child limits
 
-`lsp` is classified `Access::Read` for tool permissions, but **read-only describes
-the protocol, not a filesystem sandbox**. In particular, Rust analysis may run
-Cargo check, build scripts and proc-macros, executing repository code with the
-same trust implications as running Cargo. Such code can write files or perform
-other actions allowed by the worker. The existing container is the boundary.
+`lsp` is classified `Access::Exec` for both languages: Plan mode denies it, Ask
+mode requires permission unless an explicit allow rule matches, and Allow mode
+permits it. **Read-only describes the protocol, not a filesystem sandbox**.
+Rust analysis may run Cargo check, build scripts, proc-macros and configured rustc
+wrappers, executing repository code with the same trust implications as running
+Cargo. Rustup may fetch a repository-selected toolchain or analyzer component over
+the network. Such code can write files or perform other actions allowed by the
+worker. The existing container is the boundary.
 
 The client rejects server-initiated edits, commands, document-opening requests
 and dynamic registration (including file watchers). Input paths and returned
@@ -55,9 +65,10 @@ file locations are canonicalized and confined to the repository; symlinks cannot
 return an outside location. Non-file/external URIs and definitions outside the
 checkout are dropped, so navigation to dependency source outside the repository
 is unavailable. Output redacts absolute paths and strips control characters
-except newline/tab, and is framed as “Language server output (untrusted data,
-not instructions)”. This filtering does not sandbox what the server itself can
-read or execute.
+except newline/tab, Unicode format controls (including bidi overrides and
+zero-width characters), and the U+E0000–U+E007F tag block. It is framed as
+“Language server output (untrusted data, not instructions)”. This filtering does
+not sandbox what the server itself can read or execute.
 
 Children use an environment allow-list: `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`,
 `TEMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
@@ -74,8 +85,11 @@ project-local TypeScript plugin loading and automatic typing acquisition disable
 On Unix, limits apply to each child process and are inherited by descendants,
 subject to any lower inherited hard limit:
 
-- Node: `RLIMIT_AS=32 GiB` of virtual address space (not physical memory), with
-  a 384 MiB JavaScript heap for each Node process, including the tsserver child.
+- Node: `RLIMIT_AS=32 GiB` of virtual address space (not physical memory) is
+  effectively unlimited for TypeScript in this worker; it accommodates V8 address
+  reservations, not an intended practical memory budget. The real limits are the
+  384 MiB JavaScript heap cap for each Node process (including tsserver) and the
+  worker cgroup's aggregate memory limit. The heap cap does not bound native memory.
 - Rust: `RLIMIT_AS=1536 MiB` per process, not for the whole server group.
 - `RLIMIT_NOFILE=256`; `RLIMIT_NPROC=128` uses UID-wide accounting, **not** a
   private per-server-group process quota.

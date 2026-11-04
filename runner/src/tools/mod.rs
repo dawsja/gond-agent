@@ -110,7 +110,7 @@ pub trait Tool: Send + Sync {
         str_arg(input, "path").map(|p| vec![p.to_owned()]).unwrap_or_default()
     }
     fn run<'a>(&'a self, ctx: &'a ToolCtx, input: Value) -> BoxFuture<'a, ToolOutput>;
-    /// Stop long-lived read-only services even when no tool call is currently active.
+    /// Stop long-lived services even when no tool call is currently active.
     fn stop(&self) {}
 
     fn def(&self) -> ToolDef {

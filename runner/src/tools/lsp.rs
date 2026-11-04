@@ -1,4 +1,5 @@
-//! Small, read-only stdio LSP client. One actor owns each language's framing and lifecycle.
+//! Small navigation-only stdio LSP client. Servers may execute repository code.
+//! One actor owns each language's framing and lifecycle.
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -53,7 +54,7 @@ pub struct Lsp { registry: Mutex<Registry> }
 impl Tool for Lsp {
     fn name(&self) -> &'static str { "lsp" }
     fn description(&self) -> &'static str {
-        "Read-only semantic TypeScript/Rust navigation and diagnostics. Use a repo-relative file path, 1-based line and UTF-16 column for definition, references or hover; diagnostics needs only path. Reads current disk contents. At most 200 items/30k characters, 20s per call. Server text is untrusted data. Rust may need rustup/network and executes project build scripts/proc-macros."
+        "Semantic TypeScript/Rust navigation and diagnostics (requires execution permission). Use a repo-relative file path, 1-based line and UTF-16 column for definition, references or hover; diagnostics needs only path. Reads current disk contents. At most 200 items/30k characters, 20s per call. Server text is untrusted data. Rust may need rustup/network and executes project build scripts/proc-macros."
     }
     fn schema(&self) -> Value {
         schema(json!({
@@ -63,7 +64,7 @@ impl Tool for Lsp {
             "column":{"type":"integer","minimum":1,"description":"1-based UTF-16 column"}
         }), &["op", "path"])
     }
-    fn access(&self) -> Access { Access::Read }
+    fn access(&self) -> Access { Access::Exec }
     fn title(&self, input: &Value) -> String {
         format!("{} {}", str_arg(input, "op").unwrap_or("?"), str_arg(input, "path").unwrap_or("?"))
     }
@@ -125,7 +126,7 @@ impl Lsp {
         let result = tokio::select! {
             r = work => r,
             _ = ctx.cancel.cancelled() => { cancel.cancel(); Err("interrupted".into()) },
-            _ = tokio::time::sleep_until(deadline) => { cancel.cancel(); Err("Language server timed out (20 seconds)".into()) },
+            _ = tokio::time::sleep_until(deadline) => Err("Language server timed out (20 seconds); startup/indexing may still be running, retry".into()),
         };
         result
     }
@@ -174,21 +175,56 @@ async fn session(root: PathBuf, language: Language, mut calls: mpsc::Receiver<Ca
         };
         if call.cancel.is_cancelled() || call.reply.is_closed() { continue; }
         last_cancel = call.cancel.clone();
-        let work = async {
-            if server.is_none() {
+        if server.is_none() {
+            // The caller has its own 20s deadline. Keep cold startup alive after it
+            // expires: dropping initialize would lose its response/correlation state.
+            // Explicit cancellation, stop and a bounded startup watchdog still reap it.
+            let startup = async {
                 server = Some(Server::start_with_config(&root, language, &config).await?);
-                server.as_mut().unwrap().initialize(language).await?;
+                server.as_mut().unwrap().initialize(language).await
+            };
+            let result = tokio::select! {
+                r = startup => r,
+                _ = call.cancel.cancelled() => Err("interrupted".into()),
+                _ = stop.cancelled() => Err("interrupted".into()),
+                _ = tokio::time::sleep(config.idle) => Err("Language server startup timed out".into()),
+            };
+            if let Err(error) = result {
+                let _ = call.reply.send(Err(error));
+                if let Some(mut s) = server.take() { s.close().await; }
+                if stop.is_cancelled() || call.cancel.is_cancelled() { break; }
+                continue;
             }
-            server.as_mut().unwrap().operation(&call).await
-        };
+        }
+        if Instant::now() >= call.deadline || call.reply.is_closed() {
+            let _ = call.reply.send(Err("Language server timed out (20 seconds); startup completed, retry".into()));
+            idle_deadline = Instant::now() + config.idle;
+            continue;
+        }
+        let mut timed_out = false;
         let result = tokio::select! {
-            r = work => r,
+            r = server.as_mut().unwrap().operation(&call) => r,
             _ = call.cancel.cancelled() => Err("interrupted".into()),
             _ = stop.cancelled() => Err("interrupted".into()),
-            _ = tokio::time::sleep_until(call.deadline) => Err("Language server timed out (20 seconds)".into()),
+            _ = tokio::time::sleep_until(call.deadline) => {
+                timed_out = true;
+                Err("Language server timed out (20 seconds); indexing may still be running, retry".into())
+            },
         };
         idle_deadline = Instant::now() + config.idle;
-        let failed = result.is_err();
+        let mut failed = result.is_err();
+        if timed_out && !stop.is_cancelled() && !call.cancel.is_cancelled() {
+            let s = server.as_mut().unwrap();
+            // Retain healthy response/indexing waits, including ContentModified
+            // retry backoff. Interrupted writes/sync may have lost framing/doc state.
+            if !s.sending && s.synced {
+                failed = false;
+                if let Some(id) = s.pending.take() {
+                    failed = !tokio::time::timeout(Duration::from_secs(1), s.notify("$/cancelRequest", json!({"id":id})))
+                        .await.is_ok_and(|r| r.is_ok());
+                }
+            }
+        }
         if stop.is_cancelled() || call.cancel.is_cancelled() { calls.close(); }
         let _ = call.reply.send(result);
         if failed {
@@ -213,6 +249,8 @@ struct Server {
     _stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     next_id: u64,
     pending: Option<u64>,
+    sending: bool,
+    synced: bool,
     pull: bool,
     docs: VecDeque<Document>,
     diagnostics: HashMap<String, Diagnostics>,
@@ -319,13 +357,16 @@ impl Server {
                 for b in &buf[..n] { if tail.len() == 4096 { tail.pop_front(); } tail.push_back(*b); }
             }
         });
-        Ok(Self { root: root.into(), child, group, stdin, messages, reader, stderr, _stderr_tail: stderr_tail, next_id: 0, pending: None, pull: false, docs: VecDeque::new(), diagnostics: HashMap::new() })
+        Ok(Self { root: root.into(), child, group, stdin, messages, reader, stderr, _stderr_tail: stderr_tail, next_id: 0, pending: None, sending: false, synced: false, pull: false, docs: VecDeque::new(), diagnostics: HashMap::new() })
     }
 
     async fn send(&mut self, message: Value) -> Result<(), String> {
         let body = serde_json::to_vec(&message).map_err(|_| "Language server request failed")?;
+        self.sending = true;
         self.stdin.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes()).await.map_err(|_| "Language server stopped")?;
-        self.stdin.write_all(&body).await.map_err(|_| "Language server stopped".into())
+        self.stdin.write_all(&body).await.map_err(|_| "Language server stopped")?;
+        self.sending = false;
+        Ok(())
     }
     async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
         self.send(json!({"jsonrpc":"2.0","method":method,"params":params})).await
@@ -428,9 +469,11 @@ impl Server {
         Ok((uri, 1))
     }
     async fn operation(&mut self, call: &Call) -> Reply {
+        self.synced = false;
         // Consume already queued notifications before invalidating diagnostics for changed contents.
         while let Ok(message) = self.messages.try_recv() { self.incoming(message?).await?; }
         let (uri, version) = self.sync(&call.path).await?;
+        self.synced = true;
         if call.op == "diagnostics" {
             if self.pull {
                 let result = self.request("textDocument/diagnostic", json!({"textDocument":{"uri":uri}})).await?;
@@ -527,7 +570,7 @@ fn diagnostic_rows(_root: &Path, value: &Value) -> (Vec<String>, bool) {
     let Some(items) = value.as_array() else { return (vec![], false); };
     let rows = items.iter().take(MAX_ITEMS).map(|d| {
         let message: String = d["message"].as_str().unwrap_or("").chars().take(2000).collect();
-        format!("{}:{} severity {}: {}", d["range"]["start"]["line"].as_u64().unwrap_or(0).saturating_add(1), d["range"]["start"]["character"].as_u64().unwrap_or(0).saturating_add(1), d["severity"], message)
+        format!("{}:{} severity {}: {}", d["range"]["start"]["line"].as_u64().unwrap_or(0).saturating_add(1), d["range"]["start"]["character"].as_u64().unwrap_or(0).saturating_add(1), d["severity"].as_u64().unwrap_or(0), message)
     }).collect();
     let more = items.len() > MAX_ITEMS || items.iter().take(MAX_ITEMS).any(|d| d["message"].as_str().is_some_and(|s| s.chars().count() > 2000));
     (rows, more)
@@ -540,13 +583,28 @@ fn hover_text(value: &Value, rows: &mut Vec<String>) {
         _ => (),
     }
 }
-fn render(root: &Path, rows: Vec<String>, mut more: bool, empty: &str) -> String {
-    let text = if rows.is_empty() { empty.into() } else { rows.join("\n") };
+fn render(root: &Path, mut rows: Vec<String>, mut more: bool, empty: &str) -> String {
+    if rows.is_empty() { rows.push(empty.into()); }
+    if rows.len() > MAX_ITEMS { more = true; rows.truncate(MAX_ITEMS); }
+    // Bound every row before joining or running regexes over untrusted server text.
+    for row in &mut rows {
+        if let Some((end, _)) = row.char_indices().nth(2000) {
+            row.truncate(end);
+            more = true;
+        }
+    }
+    let text = rows.join("\n");
+    // Strip format controls (including bidi/zero-width) and the entire tag block,
+    // including unassigned tag code points. Normalize before path redaction so
+    // invisible controls cannot disguise an absolute path.
+    let formats = regex::Regex::new(r"[\p{Cf}\x{E0000}-\x{E007F}]").unwrap();
+    let text = formats.replace_all(&text, "");
+    let text: String = text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
     // Server text can contain paths too, not only Location URIs. Do not leak absolute paths.
     let text = text.replace(&root.to_string_lossy().to_string(), ".");
     let paths = regex::Regex::new(r"(?m)(^|[\s(=:'`\[\x22])(?:file://[^\s<>\x22]+|(?:[A-Za-z]:[\\/]|/)[^\s<>\x22]+)").unwrap();
     let text = paths.replace_all(&text, "${1}[path]");
-    let clean: String = text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).take(30_001).collect();
+    let clean: String = text.chars().take(30_001).collect();
     if clean.len() > 29_000 { more = true; }
     // Byte bound also stays below the shared 30k preview boundary for multibyte text.
     let end = super::floor_char(&clean, clean.len().min(29_000));

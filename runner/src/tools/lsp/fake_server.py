@@ -51,7 +51,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="push", choices=(
         "push", "pull", "quiet", "hang-hover", "crash-hover", "oversize-hover",
-        "idle-notifications", "modified-once",
+        "idle-notifications", "modified-once", "slow-initialize",
     ))
     parser.add_argument("--log", required=True)
     args = parser.parse_args()
@@ -108,6 +108,10 @@ def main():
                 pending_denials = None
             continue
         if method == "initialize":
+            if args.mode == "slow-initialize":
+                marker = os.path.join(os.path.dirname(args.log), "initialize-ready")
+                while not os.path.exists(marker):
+                    time.sleep(0.005)
             initialization = params
             capabilities = {"positionEncoding": "utf-16", "textDocumentSync": 1}
             if args.mode == "pull":

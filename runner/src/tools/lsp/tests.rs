@@ -110,6 +110,20 @@ fn fixture_pid(root: &Path) -> u32 {
     transcript(root).iter().find(|m| m["test"] == "started").unwrap()["pid"].as_u64().unwrap() as u32
 }
 
+#[test]
+fn lsp_requires_execution_permission_including_for_read_operations() {
+    use crate::permissions::{Mode, Rule, Verdict, decide};
+    let tool = crate::tools::builtin().into_iter().find(|tool| tool.name() == "lsp").unwrap();
+    assert_eq!(tool.access(), Access::Exec);
+    let rules = [Rule::parse("lsp").unwrap()];
+    for path in ["src/main.rs", "src/main.ts"] {
+        assert!(matches!(decide(Mode::Plan, tool.access(), "lsp", path, &rules), Verdict::Deny(_)));
+        assert_eq!(decide(Mode::Ask, tool.access(), "lsp", path, &[]), Verdict::Ask);
+        assert_eq!(decide(Mode::Ask, tool.access(), "lsp", path, &rules), Verdict::Allow);
+        assert_eq!(decide(Mode::Allow, tool.access(), "lsp", path, &[]), Verdict::Allow);
+    }
+}
+
 #[tokio::test]
 async fn framing_uses_byte_lengths_and_rejects_untrusted_headers_and_bodies() {
     let value = json!({"jsonrpc":"2.0","id":1,"result":"λ😀"});
@@ -307,7 +321,7 @@ async fn actor_cancellation_sends_cancel_before_shutdown_and_exits() {
 }
 
 #[tokio::test]
-async fn actor_deadline_crash_and_oversize_fail_safely_then_restart_on_next_call() {
+async fn actor_timeout_preserves_healthy_server_but_crash_and_oversize_restart() {
     for mode in ["hang-hover", "crash-hover", "oversize-hover"] {
         let dir = project();
         let path = dir.path().join("main.ts");
@@ -325,9 +339,14 @@ async fn actor_deadline_crash_and_oversize_fail_safely_then_restart_on_next_call
         // This is the SAME actor/channel, not a manually constructed replacement.
         assert!(actor_operation(&tx, &path, "diagnostics").await.contains("error in version 1"));
         let messages = transcript(dir.path());
-        assert_eq!(messages.iter().filter(|m| m["method"] == "initialize").count(), 2, "{mode}");
-        assert_eq!(messages.iter().filter(|m| m["method"] == "initialized").count(), 2, "{mode}");
-        assert_eq!(messages.iter().filter(|m| m["method"] == "textDocument/didOpen").count(), 2, "{mode}");
+        let starts = if mode == "hang-hover" { 1 } else { 2 };
+        assert_eq!(messages.iter().filter(|m| m["method"] == "initialize").count(), starts, "{mode}");
+        assert_eq!(messages.iter().filter(|m| m["method"] == "initialized").count(), starts, "{mode}");
+        assert_eq!(messages.iter().filter(|m| m["method"] == "textDocument/didOpen").count(), starts, "{mode}");
+        if mode == "hang-hover" {
+            let hover = messages.iter().find(|m| m["method"] == "textDocument/hover").unwrap();
+            assert!(messages.iter().any(|m| m["method"] == "$/cancelRequest" && m["params"]["id"] == hover["id"]));
+        }
         stop.cancel();
         stopped(task).await;
         #[cfg(unix)]
@@ -342,6 +361,48 @@ async fn actor_deadline_crash_and_oversize_fail_safely_then_restart_on_next_call
     assert!(!error.contains("outside-secret"));
     assert!(!error.contains("private path"));
     server.close().await;
+}
+
+#[tokio::test]
+async fn slow_initialization_survives_call_deadline_and_second_call_reuses_server() {
+    let dir = project();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(session(dir.path().into(), Language::Rust, rx, stop.clone(), SessionConfig {
+        idle: IDLE, fake_mode: Some("slow-initialize"),
+    }));
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"slow\"\nversion = \"0.1.0\"\n").unwrap();
+    let tool = Arc::new(Lsp::default());
+    tool.registry.lock().unwrap().sessions.insert((dir.path().canonicalize().unwrap(), Language::Rust), tx.clone());
+    let (ctx, _events) = crate::tools::testutil::ctx(dir.path());
+    let first = tokio::spawn({
+        let tool = tool.clone();
+        async move { tool.call(&ctx, &json!({"op":"hover","path":"main.rs","line":1,"column":1})).await }
+    });
+    wait_log(dir.path(), |m| m["method"] == "initialize").await;
+    let pid = fixture_pid(dir.path());
+    // Advance beyond the real call budget while the peer is blocked on a marker,
+    // avoiding a 20s wall-clock sleep or a race with process startup.
+    tokio::time::pause();
+    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert!(first.await.unwrap().unwrap_err().contains("timed out"));
+    assert!(!tx.is_closed(), "a public call timeout must not cancel cold startup");
+    let second = enqueue(&tx, &path, "hover", CancellationToken::new(), CALL_TIMEOUT).await;
+    std::fs::write(dir.path().join("initialize-ready"), "now").unwrap();
+    assert!(reply(second).await.unwrap().contains("fixture hover"));
+    let messages = transcript(dir.path());
+    assert_eq!(messages.iter().filter(|m| m["test"] == "started").count(), 1);
+    assert_eq!(messages.iter().filter(|m| m["method"] == "initialize").count(), 1);
+    assert_eq!(messages.iter().filter(|m| m["method"] == "initialized").count(), 1);
+    stop.cancel();
+    stopped(task).await;
+    #[cfg(unix)]
+    wait_dead(pid).await;
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[tokio::test]
@@ -534,6 +595,47 @@ fn locations_and_output_are_confined_bounded_and_marked_untrusted() {
     let mut hover = Vec::new();
     hover_text(&json!(["plain", {"language":"typescript","value":"const value: number"}, {"kind":"markdown","value":"**untrusted**"}]), &mut hover);
     assert_eq!(hover, vec!["plain", "const value: number", "**untrusted**"]);
+}
+
+#[test]
+fn output_strips_unicode_format_controls_and_the_entire_tag_block() {
+    let controls = "\u{ad}\u{61c}\u{180e}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2060}\u{2066}\u{2067}\u{2068}\u{2069}\u{feff}\u{110bd}\u{1d173}";
+    let tags: String = (0xE0000..=0xE007F).map(|n| char::from_u32(n).unwrap()).collect();
+    let output = render(Path::new("/repo"), vec![format!("λ😀\tvisible\n{controls}{tags}\u{0}\u{1b}kept")], false, "empty");
+    assert_eq!(output, format!("{FRAME}\nλ😀\tvisible\nkept"));
+    let output = render(Path::new("/repo"), vec!["path: \u{200b}/private/secret.ts".into()], false, "empty");
+    assert_eq!(output, format!("{FRAME}\npath: [path]"));
+}
+
+#[test]
+fn output_caps_each_row_before_joining_and_path_redaction() {
+    let mut rows = Vec::new();
+    hover_text(&json!([
+        format!("{} HOVER_TAIL", "λ".repeat(100_000)),
+        {"kind":"markdown","value":format!("/{} PATH_TAIL", "x".repeat(100_000))},
+        "later row"
+    ]), &mut rows);
+    let output = render(Path::new("/repo"), rows, false, "empty");
+    let lines: Vec<_> = output.lines().collect();
+    assert_eq!(lines[0], FRAME);
+    assert_eq!(lines[1], "λ".repeat(2000));
+    assert_eq!(lines[2], "[path]");
+    assert_eq!(lines[3], "later row");
+    assert_eq!(lines[4], "[truncated: narrow the query]");
+    // Redacting the huge path before capping would expose PATH_TAIL.
+    assert!(!output.contains("TAIL"));
+    let exact = render(Path::new("/repo"), vec!["😀".repeat(2000)], false, "empty");
+    assert!(!exact.contains("[truncated"));
+}
+
+#[test]
+fn diagnostic_output_formats_only_numeric_severity() {
+    let invalid = [json!({"injected":"x".repeat(100_000)}), json!([1, 2]), json!("1"), json!(true), Value::Null, json!(-1), json!(1.5)];
+    for (severity, expected) in invalid.into_iter().map(|severity| (severity, 0)).chain([(json!(2), 2)]) {
+        let (rows, more) = diagnostic_rows(Path::new("/repo"), &json!([{"severity":severity,"message":"message"}]));
+        assert_eq!(rows, vec![format!("1:1 severity {expected}: message")]);
+        assert!(!more);
+    }
 }
 
 // Language servers may answer before initial indexing finishes. Retry only the
