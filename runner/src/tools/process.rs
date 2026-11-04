@@ -41,15 +41,18 @@ pub async fn capture(ctx: &ToolCtx, mut command: Command, input: Vec<u8>, max: u
     result
 }
 
-struct ProcessGroup(Option<u32>);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
+pub(super) struct ProcessGroup(pub(super) Option<u32>);
+impl ProcessGroup {
+    pub(super) fn kill(&self) {
         #[cfg(unix)]
         if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 1) {
             // SAFETY: this child owns a process group; a negative pid targets only its descendants.
             unsafe { libc::kill(-pid, libc::SIGKILL); }
         }
     }
+}
+impl Drop for ProcessGroup {
+    fn drop(&mut self) { self.kill(); }
 }
 
 #[cfg(all(test, unix))]
