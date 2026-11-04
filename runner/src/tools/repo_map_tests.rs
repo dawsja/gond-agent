@@ -44,7 +44,7 @@ async fn language_fixtures_ranking_focus_and_determinism() {
     assert!(out.find("\na.ts\n").unwrap() < out.find("\nunused.ts\n").unwrap());
     let focused = render(&m, 2000, &["unused.ts".into()]);
     assert!(focused.find("\nunused.ts\n").unwrap() < focused.find("\na.ts\n").unwrap());
-    assert!(out.contains("notes.xyzunknown\n"));
+    assert!(!out.contains("notes.xyzunknown\n"), "unsupported files are skipped rather than snapshotted");
     assert_eq!(out, render(&build(d.path()).await, 2000, &[]));
 }
 
@@ -58,23 +58,24 @@ async fn cache_hit_head_version_corruption_oversize_and_private_atomic_file() {
     assert!(cache.exists());
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(fs::metadata(&cache).unwrap().permissions().mode() & 0o777, 0o600); }
     assert_eq!(fs::read_dir(cache.parent().unwrap()).unwrap().count(), 1, "no leftover temp file");
+    assert_eq!(render(&first, 2000, &[]), render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]));
     put(d.path(), "a.ts", b"export function edited() {}\n");
-    assert_eq!(render(&first, 2000, &[]), render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]), "same HEAD is a cache hit, including dirty edits");
-    assert!(cache_read(d.path(), "a different head").is_none());
+    assert!(render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]).contains("edited"), "same-HEAD edits invalidate the cache");
+    assert!(cache_read(d.path(), "a different head", &first.worktree).is_none());
     let mut bad = serde_json::to_value(&first).unwrap(); bad["version"] = json!(VERSION + 1);
     fs::write(&cache, serde_json::to_vec(&bad).unwrap()).unwrap();
-    assert!(cache_read(d.path(), &first.head).is_none());
+    assert!(cache_read(d.path(), &first.head, &first.worktree).is_none());
     for content in [b"corrupt".as_slice(), b"{}".as_slice()] {
         fs::write(&cache, content).unwrap();
         assert!(render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]).contains("edited"));
     }
     File::create(&cache).unwrap().set_len(CACHE_MAX as u64 + 1).unwrap();
-    assert!(cache_read(d.path(), &first.head).is_none());
+    assert!(cache_read(d.path(), &first.head, &first.worktree).is_none());
     assert!(render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]).contains("edited"));
     let mut new_head = first; new_head.head = "1111111111111111111111111111111111111111".into();
     cache_write(d.path(), &new_head);
-    assert!(cache_read(d.path(), "unborn").is_none());
-    assert!(cache_read(d.path(), &new_head.head).is_some());
+    assert!(cache_read(d.path(), "unborn", &new_head.worktree).is_none());
+    assert!(cache_read(d.path(), &new_head.head, &new_head.worktree).is_some());
 }
 
 #[tokio::test]
@@ -98,7 +99,7 @@ async fn bounds_ignore_generated_binary_symlinks_and_tracked_priority() {
     }
     let m = build(d.path()).await;
     let paths: Vec<_> = m.files.iter().map(|f| f.path.as_str()).collect();
-    assert!(paths.contains(&"small.ts") && paths.contains(&"lossy.unknown"));
+    assert!(paths.contains(&"small.ts") && !paths.contains(&"lossy.unknown"));
     assert!(!paths.iter().any(|p| p.contains("escape") || p.contains("ignored") || p.contains("generated") || p.contains("huge") || p.contains("binary")));
     assert!(m.skipped >= 12);
     // Tracked files must precede lexicographically earlier untracked files under a tiny cap.
@@ -116,7 +117,7 @@ async fn bounds_ignore_generated_binary_symlinks_and_tracked_priority() {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), d.path().join(".git/gond-agent")).unwrap();
         cache_write(d.path(), &m);
-        assert!(cache_read(d.path(), &m.head).is_none());
+        assert!(cache_read(d.path(), &m.head, &m.worktree).is_none());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }
@@ -148,6 +149,113 @@ async fn budget_sanitization_empty_single_and_schema_prompt_contract() {
     assert_eq!(tool.schema()["properties"]["budget_tokens"]["maximum"], 8000);
     assert!(crate::prompt::main_prompt(d.path()).contains("Use repo_map first on an unfamiliar repository"));
     assert!(text(&tool.run(&c, json!({})).await).starts_with(FRAME));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_timer_stays_responsive_during_large_map() {
+    let d = repo();
+    let content = "// lexical words in a comment\n".repeat(4500);
+    for i in 0..64 { put(d.path(), &format!("file{i:03}.ts"), content.as_bytes()); }
+    let (c, _rx) = ctx(d.path());
+    let mapping = load(&c, Limits::default(), false);
+    tokio::pin!(mapping);
+    let mut timer = tokio::time::interval(Duration::from_millis(5));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last = Instant::now();
+    let mut worst = Duration::ZERO;
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            result = &mut mapping => { assert!(!result.unwrap().partial); break; }
+            _ = timer.tick() => {
+                worst = worst.max(last.elapsed()); last = Instant::now(); ticks += 1;
+            }
+        }
+    }
+    worst = worst.max(last.elapsed());
+    assert!(ticks > 2 && worst < Duration::from_millis(150), "timer stalled during map: {worst:?}, {ticks} ticks");
+}
+
+#[tokio::test]
+async fn long_tracked_extensions_do_not_abort_or_enter_the_map() {
+    let d = repo();
+    for i in 0..12 { put(d.path(), &format!("a{i:02}.ts"), b"export function safe() {}\n"); }
+    // A valid 255-byte filename whose snapshot prefix would exceed NAME_MAX.
+    let long = format!("z.{}", "x".repeat(253));
+    put(d.path(), &long, b"unsupported\n");
+    assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
+    // Git can track a 300-character extension even though Linux cannot materialize it.
+    let impossible = format!("z.{}", "x".repeat(300));
+    let output = std::process::Command::new("git").current_dir(d.path()).args(["hash-object", "-w", "--stdin"]).output().unwrap();
+    assert!(output.status.success());
+    let oid = String::from_utf8(output.stdout).unwrap();
+    assert!(std::process::Command::new("git").current_dir(d.path()).args(["update-index", "--add", "--cacheinfo", "100644", oid.trim(), &impossible]).status().unwrap().success());
+    let (c, _rx) = ctx(d.path());
+    let result = load(&c, Limits::default(), false).await;
+    assert!(result.is_ok(), "unsupported extension must not abort the map");
+    let m = result.unwrap();
+    assert_eq!(m.files.len(), 12);
+    assert!(m.skipped >= 2);
+    assert!(!m.partial);
+}
+
+#[tokio::test]
+async fn tracked_edits_invalidate_cache_and_unchanged_tree_hits_it() {
+    let d = repo();
+    put(d.path(), "a.ts", b"export function original() {}\n");
+    assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
+    assert!(std::process::Command::new("git").current_dir(d.path()).args(["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--quiet", "--no-gpg-sign", "-m", "fixture"]).status().unwrap().success());
+    let (c, _rx) = ctx(d.path());
+    let first = load(&c, Limits::default(), true).await.unwrap();
+    let cache = d.path().join(".git/gond-agent/repo-map.json");
+    let modified = fs::metadata(&cache).unwrap().modified().unwrap();
+    // A cache hit bypasses even a zero construction budget and leaves the file untouched.
+    let hit = load(&c, Limits { wall: Duration::ZERO, ..Limits::default() }, true).await.unwrap();
+    assert_eq!(render(&first, 2000, &[]), render(&hit, 2000, &[]));
+    assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), modified);
+    for name in ["edited", "edited_again"] {
+        put(d.path(), "a.ts", format!("export function {name}() {{}}\n").as_bytes());
+        let m = load(&c, Limits::default(), true).await.unwrap();
+        assert!(m.files[0].symbols.iter().any(|s| s.name == name), "edit {name} not reflected in cached map");
+    }
+    put(d.path(), "new.ts", b"export function added() {}\n");
+    assert!(render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]).contains("added"));
+    put(d.path(), "new.ts", b"export function changed_untracked() {}\n");
+    assert!(render(&load(&c, Limits::default(), true).await.unwrap(), 2000, &[]).contains("changed_untracked"));
+}
+
+#[test]
+fn snapshot_write_failure_skips_file_and_continues() {
+    let d = repo();
+    put(d.path(), "a.ts", b"export function skipped() {}\n");
+    put(d.path(), "b.rs", b"pub fn kept() {}\n");
+    let scratch = Scratch::new().unwrap();
+    // A directory at the destination makes write fail even when the process owns the scratch dir.
+    fs::create_dir(scratch.0.join("0.ts")).unwrap();
+    let mut scan = Scan { map: Map::default(), scratch, snapshots: vec![], remaining: 1024, scanned: 0 };
+    scan.listing(d.path(), b"a.ts\0b.rs\0", Limits::default(), Instant::now(), &CancellationToken::new());
+    assert_eq!(scan.map.skipped, 1);
+    assert_eq!(scan.map.files.len(), 1);
+    assert_eq!(scan.map.files[0].path, "b.rs");
+    assert_eq!(scan.snapshots[0].file_name().unwrap(), "0.rs");
+}
+
+#[tokio::test]
+async fn status_filters_never_execute_repository_code() {
+    let d = repo();
+    put(d.path(), "a.ts", b"export function original() {}\n");
+    assert!(std::process::Command::new("git").current_dir(d.path()).args(["add", "."]).status().unwrap().success());
+    let (c, _rx) = ctx(d.path());
+    load(&c, Limits::default(), true).await.unwrap();
+    put(d.path(), ".gitattributes", b"*.ts filter=hostile\n");
+    for (key, value) in [("filter.hostile.clean", "touch FILTER_EXECUTED; cat"), ("filter.hostile.required", "true")] {
+        assert!(std::process::Command::new("git").current_dir(d.path()).args(["config", key, value]).status().unwrap().success());
+    }
+    put(d.path(), "a.ts", b"export function changed() {}\n");
+    let map = load(&c, Limits::default(), true).await.unwrap();
+    assert!(render(&map, 2000, &[]).contains("changed"));
+    assert!(!d.path().join("FILTER_EXECUTED").exists(), "status invoked a clean filter");
+    assert!(map.worktree.is_empty(), "unsafe status must bypass caching");
 }
 
 // Offline benchmark bridge: invokes the shipped implementation, not a Python reimplementation.
