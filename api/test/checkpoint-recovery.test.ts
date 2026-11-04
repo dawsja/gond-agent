@@ -299,9 +299,11 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
   it("routes an initial-delivery failure through the same final-capture guard with zero keep time", async () => {
     vi.stubEnv("GOND_AGENT_FAILED_KEEP_MINUTES", "0");
     const rpc = FakeWorkspace.prototype.rpc;
+    let rejectAcknowledgement = true;
     vi.spyOn(FakeWorkspace.prototype, "rpc").mockImplementation(async function(this: FakeWorkspace, method, args) {
       const result = await rpc.call(this, method, args);
-      if (method === "send" && (args?.input as { type: string }).type === "user") {
+      if (rejectAcknowledgement && method === "send" && (args?.input as { type: string }).type === "user") {
+        rejectAcknowledgement = false;
         this.tree = { "initial.txt": "unpublished initial delivery" };
         this.history.push(message("assistant", "Initial delivery failed after this decision."));
         throw new Error("Delivery connection failed");
@@ -317,6 +319,17 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
     expect(JSON.parse(readFileSync(join(dir, "checkpoints", rows(run.id).at(-1)!.bundle_path), "utf8"))).toEqual(worker.tree);
     expect(importBundle).not.toHaveBeenCalled();
     expect(pushBranch).not.toHaveBeenCalled();
+    await restart();
+    finishUsers = true;
+    runs.enqueue(run.id, "u", "Continue after acknowledgement was lost.");
+    await vi.waitFor(() => expect(runs.get(run.id).status).toBe("ready"), { timeout: 5000 });
+    const resumed = workers.at(-1)!;
+    expect(resumed.imported?.history).toEqual(worker.history);
+    expect(resumed.users().filter(text => text.includes(PROMPT))).toHaveLength(1);
+    // Safe replay bias: the delivered request is already in imported history,
+    // then appears once more because the service never received acknowledgement.
+    expect(resumed.history.filter(msg => msg.role === "user" && msg.content.some(block => block.text.includes(PROMPT))))
+      .toHaveLength(2);
   });
 
   it.each(["model", "effort", "user"])("does not consume an initial request when %s input delivery fails before acceptance", async inputType => {
@@ -376,6 +389,49 @@ describe("checkpoint-backed Runs recovery (fake Workspace, real SQLite/files)", 
       expect(rows(run.id)).toHaveLength(0); // A late private reply cannot recreate the deleted pair.
       expect(importBundle).not.toHaveBeenCalled();
       expect(pushBranch).not.toHaveBeenCalled();
+    } finally { gate.resolve(); vi.useRealTimers(); }
+  });
+
+  it.each(["timeout", "saved"] as const)("attempts final capture once across all five still-live destruction attempts (%s)", async outcome => {
+    const { run, worker } = await failLive("model");
+    expect(rows(run.id).length).toBeGreaterThan(0); // An older valid pair exists.
+    const live = (runs as unknown as { live: Map<string, { closed: boolean }> }).live.get(run.id)!;
+    const gate = deferred();
+    if (outcome === "timeout") worker.captureGate = gate.promise;
+    const destroy = worker.destroy.getMockImplementation()!;
+    let destroyAttempts = 0;
+    worker.destroy.mockImplementation(async () => {
+      if (++destroyAttempts < 5) {
+        // Exercise the capture guard independently of the incidental closed flag:
+        // the worker is still alive when destruction fails and must be retried.
+        live.closed = false;
+        throw new Error("Destroy unavailable");
+      }
+      await destroy();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const closing = expect(runs.close(run.id)).rejects.toThrow("Destroy unavailable");
+    try {
+      await vi.advanceTimersByTimeAsync(outcome === "timeout" ? 10_001 : 0);
+      await closing;
+      expect(worker.finalCaptures).toBe(1);
+      const finalSeq = rows(run.id).at(-1)?.seq;
+      expect(runs.get(run.id).resume_from_checkpoint).toBe(outcome === "saved");
+      expect(finalSeq === undefined).toBe(outcome === "timeout");
+      for (const backoff of [1_000, 2_000, 4_000, 8_000]) await vi.advanceTimersByTimeAsync(backoff);
+      expect(worker.destroy).toHaveBeenCalledTimes(5);
+      expect(worker.destroyed).toBe(true);
+      expect(worker.finalCaptures).toBe(1);
+      expect(rows(run.id).at(-1)?.seq).toBe(finalSeq);
+      expect(runs.get(run.id).resume_from_checkpoint).toBe(outcome === "saved");
+      expect(runs.history(run.id, 0).filter(event => event.type === "run.checkpoint_unavailable"))
+        .toHaveLength(outcome === "timeout" ? 1 : 0);
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rows(run.id).at(-1)?.seq).toBe(finalSeq); // No late resurrection after timeout.
+      expect(importBundle).not.toHaveBeenCalled();
+      expect(pushBranch).not.toHaveBeenCalled();
+      console.info(`[failed capture retry ${outcome}] captures=${worker.finalCaptures} destroy_attempts=${destroyAttempts} checkpoint_preserved=${finalSeq !== undefined}`);
     } finally { gate.resolve(); vi.useRealTimers(); }
   });
 

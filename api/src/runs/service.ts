@@ -173,6 +173,8 @@ interface Live {
   releaseForWaiting?: boolean;
   /** Fence late saves after a failed-release capture times out. Never reuse this worker. */
   checkpointDisabled?: boolean;
+  /** Final capture outcome for this failure; destruction retries must not capture again. */
+  failureCheckpointResult?: boolean;
   /** Active user delivery has not been acknowledged; a failure capture must not consume it. */
   pendingDeliveryId?: string;
   keepTimer?: ReturnType<typeof setTimeout>;
@@ -1270,6 +1272,7 @@ export class Runs {
     clearTimeout(live.keepTimer);
     live.keepTimer = undefined;
     live.keptSince = undefined;
+    live.failureCheckpointResult = undefined; // A newly accepted turn has a new failure lifecycle.
     // Publication belongs to the previous turn. Never send more work until its
     // exact kept commit is pushed, even if a follow-up chooses another model.
     if (r.work_kept || live.publishPending) {
@@ -1852,7 +1855,8 @@ export class Runs {
    * Capture only at release: an in-window follow-up keeps the original live-workspace semantics.
    * The closing reservation excludes new delivery until the paired capture has settled. */
   private async checkpointFailedWorkspace(id: string, live: Live | undefined) {
-    if (!live || !this.workerAlive(live) || this.get(id).status !== "failed") return;
+    if (!live || live.closed || live.destruction || live.checkpointDisabled ||
+        live.failureCheckpointResult !== undefined || !this.workerAlive(live) || this.get(id).status !== "failed") return;
     live.closing = true;
     try {
       await evidenceRequest(async () => {
@@ -1862,10 +1866,12 @@ export class Runs {
         await live.workspace.captureCheckpoint();
       }, FAILED_CHECKPOINT_TIMEOUT_MS);
       if (!this.usableCheckpoint(this.get(id))) throw new Error("Workspace checkpoint unavailable");
+      live.failureCheckpointResult = true;
       return { saved: true, message: FAILED_CHECKPOINT_SAVED };
     } catch (error) {
       // Caller timeout does not cancel the RPC. Fence its save callback before
       // deleting artifacts, so a late reply cannot resurrect a closed run's pair.
+      live.failureCheckpointResult = false;
       live.checkpointDisabled = true;
       if (live.workspace.captureCheckpoint) this.checkpointUnavailable(id, error);
       const failureReason = checkpointFailureReason(error);
