@@ -10,6 +10,7 @@ const origin = process.env.GOND_AGENT_BROWSER_ORIGIN || 'http://gond-agent:8787'
 const providerOrigin = process.env.GOND_AGENT_PROVIDER_FIXTURE_URL || 'http://provider-fixture:3030';
 const fixtureDir = process.env.GOND_AGENT_GH_FIXTURE_DIR || '/fixture';
 const screenshots = [];
+const navigation = { settings: [], github: null };
 const key = 'fixture-only-provider-key';
 
 (async () => {
@@ -85,7 +86,7 @@ const key = 'fixture-only-provider-key';
     await expect.poll(() => page.evaluate(() => localStorage.getItem('gond-agent-theme'))).toBe(theme.toLowerCase());
   };
   const verifyTheme = async () => {
-     await page.goto(origin + '/agents/settings/appearance');
+    await page.goto(origin + '/agents/settings/appearance');
     await expect(page.getByRole('heading', { name: 'Appearance', level: 3, exact: true })).toBeVisible();
     await chooseTheme('Light');
     await resolvedTheme('light');
@@ -966,22 +967,25 @@ const key = 'fixture-only-provider-key';
     await expect(page).toHaveURL(origin + '/agents/settings/account');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
     await verifyTheme();
-    if (!returning) {
-      const topics = [['account', 'Account'], ['appearance', 'Appearance'], ['models', 'Models'], ['agent-access', 'Agent access'], ['sign-in-people', 'Sign-in & people'], ['danger-zone', 'Danger zone']];
-      for (const [id, name] of topics) {
-        await page.goto(origin + '/agents/settings/' + id);
-        const heading = page.getByRole('heading', { name, exact: true, level: 2 });
-        await heading.scrollIntoViewIfNeeded();
-        const category = page.getByRole('region', { name, exact: true });
-        const firstCard = category.locator('[data-slot="card"]').first();
-        await expect(firstCard.getByRole('heading', { level: 3 })).toBeVisible();
-        const style = await heading.evaluate(element => ({ size: parseFloat(getComputedStyle(element).fontSize), color: getComputedStyle(element).color, left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right }));
-        expect(style.size).toBeGreaterThanOrEqual(22);
-        expect(style.color).toBe(await page.locator('body').evaluate(element => getComputedStyle(element).color));
-        expect(style.right).toBeLessThanOrEqual(width);
-        expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
-        await captureThemes('settings-page-' + id);
-      }
+    const topics = [['account', 'Account'], ['appearance', 'Appearance'], ['models', 'Models'], ['agent-access', 'Agent access'], ['sign-in-people', 'Sign-in & people'], ['danger-zone', 'Danger zone']];
+    for (const [id, name] of topics) {
+      await page.goto(origin + '/agents/settings/' + id);
+      await expect(page).toHaveURL(origin + '/agents/settings/' + id);
+      await expect(page.getByRole('heading', { level: 2 })).toHaveText([name]);
+      await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toHaveCount(0);
+      await expect(page.getByRole('button', { name: /Connect GitHub|Reconnect GitHub|Disconnect/ })).toHaveCount(0);
+      navigation.settings.push({ path: new URL(page.url()).pathname, heading: name });
+      const heading = page.getByRole('heading', { name, exact: true, level: 2 });
+      await heading.scrollIntoViewIfNeeded();
+      const category = page.getByRole('region', { name, exact: true });
+      const firstCard = category.locator('[data-slot="card"]').first();
+      await expect(firstCard.getByRole('heading', { level: 3 })).toBeVisible();
+      const style = await heading.evaluate(element => ({ size: parseFloat(getComputedStyle(element).fontSize), color: getComputedStyle(element).color, left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right }));
+      expect(style.size).toBeGreaterThanOrEqual(22);
+      expect(style.color).toBe(await page.locator('body').evaluate(element => getComputedStyle(element).color));
+      expect(style.right).toBeLessThanOrEqual(width);
+      expect(Math.abs(style.left - (await firstCard.boundingBox()).x)).toBeLessThanOrEqual(1);
+      if (!returning) await captureThemes('settings-page-' + id);
     }
     await page.goto(origin + '/agents/settings/models');
     await expect(page.getByRole('region', { name: 'Models', exact: true }).getByRole('heading', { level: 3 })).toHaveText(['ChatGPT plan', 'Model providers']);
@@ -1157,7 +1161,14 @@ const key = 'fixture-only-provider-key';
     await page.getByRole('link', { name: /GitHub Manage your GitHub connection/ }).click();
     await expect(page).toHaveURL(origin + '/agents/plugins/github');
     await expect(page.getByRole('heading', { name: 'GitHub', level: 1, exact: true })).toBeVisible();
+    // The first account is an administrator: both connection cards belong here,
+    // including before connecting GitHub and after restarting the service.
+    await expect(page.getByRole('heading', { level: 2 })).toHaveText(['Your connection', 'Shared connection']);
+    await expect(page.getByRole('switch', { name: 'Use the shared GitHub connection for accounts without their own', exact: true })).toBeEnabled();
+    await expect(page.getByText('No shared GitHub account connected', { exact: true })).toBeVisible();
+    navigation.github = { path: new URL(page.url()).pathname, headings: await page.getByRole('heading', { level: 2 }).allTextContents() };
     if (!returning) {
+      await expect(page.getByRole('button', { name: 'Connect GitHub', exact: true })).toHaveCount(2);
       await page.getByRole('button', { name: 'Connect GitHub', exact: true }).first().click();
       await expect(page.getByLabel('One-time code', { exact: true })).toHaveValue('ABCD-1234');
       await expect(page.getByRole('link', { name: 'Continue on GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
@@ -1316,7 +1327,7 @@ const key = 'fixture-only-provider-key';
     }
     expect(errors).toEqual([]);
     expect(externalRequests).toEqual([]);
-    console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, screenshots }));
+    console.log(JSON.stringify({ passed: true, width, phase: process.env.PHASE, navigation, screenshots }));
   } catch (error) {
     await capture('failure').catch(() => {});
     console.log(JSON.stringify({ error: error.stack || error.message, diagnostics: { errors, authResponses }, screenshots }));
